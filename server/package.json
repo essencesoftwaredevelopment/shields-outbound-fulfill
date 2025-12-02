@@ -1,0 +1,21 @@
+{
+    "name": "shields-outbound-server",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "node src/index.js"
+    },
+    "dependencies": {
+        "axios": "^1.7.7",
+        "cors": "^2.8.5",
+        "csv-parse": "^5.5.4",
+        "csv-parser": "^3.0.0",
+        "dotenv": "^16.4.5",
+        "express": "^4.19.2",
+        "multer": "^1.4.5-lts.1",
+        "node-fetch": "^3.3.2",
+        "openai": "^4.73.1",
+        "p-limit": "^5.0.0"
+    }
+}
