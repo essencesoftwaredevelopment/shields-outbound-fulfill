@@ -7,16 +7,6 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SERPER_API_KEY = process.env.SERPER_API_KEY;
-
-if (!OPENAI_API_KEY) {
-    throw new Error('Missing OPENAI_API_KEY');
-}
-if (!SERPER_API_KEY) {
-    throw new Error('Missing SERPER_API_KEY');
-}
-
 const PROMPT_ID = 'pmpt_68bde13aebf88197b441c1e165fe0a760d8445c1682d9156';
 
 const SERPER_URL = 'https://google.serper.dev/search';
@@ -31,8 +21,6 @@ const AI_TOP_ORGANIC = 10;
 
 const MAX_RETRIES = 2;
 const BASE_DELAY_MS = 500;
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -77,7 +65,7 @@ class RateLimiter {
 
 const aiRateLimiter = new RateLimiter(AI_MAX_RPS, AI_MAX_RPM);
 
-async function withRetry(fn, label, shouldBackoff = () => true, logger = () => {}) {
+async function withRetry(fn, label, shouldBackoff = () => true, logger = () => { }) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
             return await fn();
@@ -125,7 +113,7 @@ async function readDomains(filePath) {
     return domains;
 }
 
-async function aiFindFounder(searchResults, companyDomain, logger) {
+async function aiFindFounder(searchResults, companyDomain, logger, openai) {
     const slim = searchResults.slice(0, AI_TOP_ORGANIC).map(r => ({
         t: r.title || '',
         u: r.link || '',
@@ -155,8 +143,18 @@ async function aiFindFounder(searchResults, companyDomain, logger) {
     return (res && res.output_text) ? res.output_text.trim() : 'Not Found';
 }
 
-export async function runFounderFinder({ inputCsv, outputCsv, log = () => {} }) {
-    log('Founders: starting processing...');
+export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, log = () => { } }) {
+    const OPENAI_API_KEY = apiKeys.openai;
+    const SERPER_API_KEY = apiKeys.serper;
+
+    if (!OPENAI_API_KEY) {
+        throw new Error('Missing OpenAI API key');
+    }
+    if (!SERPER_API_KEY) {
+        throw new Error('Missing Serper API key');
+    }
+
+    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
     if (fs.existsSync(outputCsv)) {
         fs.unlinkSync(outputCsv);
@@ -238,7 +236,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, log = () => {} }) 
 
                     if (searchResults.length > 0) {
                         try {
-                            name = await aiFindFounder(searchResults, domain, log);
+                            name = await aiFindFounder(searchResults, domain, log, openai);
                         } catch (err) {
                             if (err?.isQuotaExceeded) {
                                 fatalQuotaError = fatalQuotaError || err;

@@ -38,7 +38,7 @@ export default function AuthPage() {
                 <div>
                     <p className="eyebrow">Shield&apos;s Outbound</p>
                     <h1 className="auth-card__title">{mode === "signin" ? "Sign in" : "Create account"}</h1>
-                    <p className="auth-card__subtitle">Use your email + password combo for now. SSO coming soon.</p>
+                    <p className="auth-card__subtitle">Get ready to scale</p>
                 </div>
 
                 {error && <p className="auth-card__error">{error}</p>}

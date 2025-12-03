@@ -42,3 +42,10 @@ next-env.d.ts
 
 # server node modules
 server/node_modules
+
+# server secrets
+server/.secrets
+
+# tmporary files
+tmp/
+server/tmp_test/

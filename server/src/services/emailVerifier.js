@@ -6,12 +6,6 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const API_KEY = process.env.KITT_API_KEY;
-
-if (!API_KEY) {
-    throw new Error('Missing KITT_API_KEY');
-}
-
 const CONCURRENCY = 15;
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
@@ -41,7 +35,7 @@ async function readEmailCandidates(filePath) {
     });
 }
 
-async function verifyEmail(email) {
+async function verifyEmail(email, apiKey) {
     let attempt = 0;
     let backoff = INITIAL_BACKOFF_MS;
 
@@ -52,7 +46,7 @@ async function verifyEmail(email) {
             const res = await fetch('https://api.trykitt.ai/job/verify_email', {
                 method: 'POST',
                 headers: {
-                    'x-api-key': API_KEY,
+                    'x-api-key': apiKey,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
@@ -109,10 +103,13 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, log = () => {} }) {
-    log('Verify: loading email candidates...');
+export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, log = () => { } }) {
+    const API_KEY = apiKeys.kitt;
+
+    if (!API_KEY) {
+        throw new Error('Missing Kitt API key');
+    }
     const candidates = await readEmailCandidates(inputCsv);
-    log(`Verify: ${candidates.length} rows loaded.`);
 
     const rows = candidates.map(row => ({
         ...row,
@@ -127,15 +124,24 @@ export async function runEmailVerifier({ inputCsv, outputCsv, log = () => {} }) 
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
 
+    log(`Verify: ${candidates.length} rows loaded | ${toVerify.length} eligible emails.`);
+
     if (toVerify.length === 0) {
-        log('Verify: no emails to verify, skipping API calls.');
+        log('Verify: no emails to verify, skipping API calls.', {
+            progress: {
+                stage: 'verification',
+                processed: 0,
+                total: 0,
+                stats
+            }
+        });
     } else {
         log(`Verify: verifying ${toVerify.length} emails with concurrency ${CONCURRENCY}...`);
     }
 
     const tasks = toVerify.map(item =>
         limit(async () => {
-            const result = await verifyEmail(item.row.email);
+            const result = await verifyEmail(item.row.email, API_KEY);
             const status = result.validity || 'unknown';
             rows[item.index].email_status = status;
 
@@ -183,8 +189,9 @@ export async function runEmailVerifier({ inputCsv, outputCsv, log = () => {} }) 
     log(`Verify: verification complete. Results written to ${outputCsv}`);
 
     return {
-        total: rows.length,
-        verified: toVerify.length,
+        totalRows: rows.length,
+        eligible: toVerify.length,
+        verified: completed,
         valid: stats.valid,
         invalid: stats.invalid,
         'valid-risky': stats['valid-risky'],

@@ -6,12 +6,6 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const API_KEY = process.env.KITT_API_KEY;
-
-if (!API_KEY) {
-    throw new Error('Missing KITT_API_KEY');
-}
-
 const CONCURRENCY = 10;
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
@@ -46,26 +40,38 @@ async function readFounders(filePath) {
 
 function extractEmail(payload) {
     if (!payload || typeof payload !== 'object') return null;
-    if (typeof payload.email === 'string') return payload.email;
-    if (typeof payload.emailAddress === 'string') return payload.emailAddress;
+    const sanitize = v => {
+        if (typeof v !== 'string') return null;
+        const trimmed = v.trim();
+        if (!trimmed) return null;
+        // Treat known sentinel strings or non-address values as no email
+        if (trimmed.toLowerCase() === 'no-results-found') return null;
+        if (!trimmed.includes('@')) return null;
+        return trimmed;
+    };
+
+    const directEmail = sanitize(payload.email) || sanitize(payload.emailAddress);
+    if (directEmail) return directEmail;
     if (payload.data) {
-        if (typeof payload.data.email === 'string') return payload.data.email;
+        const de = sanitize(payload.data.email);
+        if (de) return de;
         if (Array.isArray(payload.data.emails) && payload.data.emails.length) {
-            const first = payload.data.emails.find(e => typeof e === 'string' && e.includes('@'));
+            const first = payload.data.emails.map(sanitize).find(e => !!e);
             if (first) return first;
         }
     }
     if (Array.isArray(payload.emails) && payload.emails.length) {
-        const first = payload.emails.find(e => typeof e === 'string' && e.includes('@'));
+        const first = payload.emails.map(sanitize).find(e => !!e);
         if (first) return first;
     }
-    if (payload.result && typeof payload.result.email === 'string') {
-        return payload.result.email;
+    if (payload.result) {
+        const re = sanitize(payload.result.email);
+        if (re) return re;
     }
     return null;
 }
 
-async function lookupEmail(fullName, domain) {
+async function lookupEmail(fullName, domain, apiKey) {
     let attempt = 0;
     let backoff = INITIAL_BACKOFF_MS;
     const body = {
@@ -82,7 +88,7 @@ async function lookupEmail(fullName, domain) {
             const res = await fetch('https://api.trykitt.ai/job/find_email', {
                 method: 'POST',
                 headers: {
-                    'x-api-key': API_KEY,
+                    'x-api-key': apiKey,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify(body)
@@ -141,19 +147,52 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailFinder({ inputCsv, outputCsv, log = () => {} }) {
-    log('Emails: loading founder results...');
-    const founders = await readFounders(inputCsv);
-    log(`Emails: ${founders.length} founders ready for lookup.`);
+export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () => { } }) {
+    const API_KEY = apiKeys.kitt;
 
-    const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
-    writer.write('domain,founder_name,email,lookup_status\n');
+    if (!API_KEY) {
+        throw new Error('Missing Kitt API key');
+    }
+    const founders = await readFounders(inputCsv);
+    const totalRows = founders.length;
+
+    const indexedFounders = founders.map((row, index) => ({ ...row, index }));
+    const eligibleFounders = indexedFounders.filter(
+        row => !!row.domain && !needsSkip(row.founder_name)
+    );
+    const eligibleTotal = eligibleFounders.length;
+
+    log(`Emails: ${totalRows} founders loaded | ${eligibleTotal} eligible for lookup.`);
 
     const limit = pLimit(CONCURRENCY);
-    let completed = 0;
+    let completedEligible = 0;
     const stats = { found: 0, notFound: 0, skipped: 0, errors: 0 };
+    const results = new Array(totalRows);
 
-    const tasks = founders.map((row, idx) =>
+    // Pre-fill rows that should be skipped or error out without hitting the API
+    indexedFounders.forEach(row => {
+        if (!row.domain) {
+            stats.errors += 1;
+            results[row.index] = {
+                domain: row.domain,
+                founder_name: row.founder_name,
+                email: '',
+                status: 'error: missing_domain'
+            };
+            return;
+        }
+        if (needsSkip(row.founder_name)) {
+            stats.skipped += 1;
+            results[row.index] = {
+                domain: row.domain,
+                founder_name: row.founder_name,
+                email: '',
+                status: 'skipped_no_founder'
+            };
+        }
+    });
+
+    const tasks = eligibleFounders.map(row =>
         limit(async () => {
             const domain = row.domain;
             const founderName = row.founder_name;
@@ -161,52 +200,77 @@ export async function runEmailFinder({ inputCsv, outputCsv, log = () => {} }) {
             let email = '';
             let status = 'not_started';
 
-            if (!domain) {
-                status = 'error: missing_domain';
-                stats.errors += 1;
-            } else if (needsSkip(founderName)) {
-                status = 'skipped_no_founder';
-                stats.skipped += 1;
-            } else {
-                const lookup = await lookupEmail(founderName, domain);
-                email = lookup.email || '';
-                status = lookup.status || (email ? 'found' : 'not_found');
+            const lookup = await lookupEmail(founderName, domain, API_KEY);
+            email = lookup.email || '';
+            status = lookup.status || (email ? 'found' : 'not_found');
 
-                if (email) {
-                    stats.found += 1;
-                } else if (String(status).startsWith('error')) {
-                    stats.errors += 1;
-                } else {
-                    stats.notFound += 1;
-                }
+            // Normalize external "no-results-found" to our canonical not_found
+            if (status === 'no-results-found') {
+                status = 'not_found';
             }
 
-            completed += 1;
+            if (email) {
+                stats.found += 1;
+            } else if (String(status).startsWith('error')) {
+                stats.errors += 1;
+            } else {
+                stats.notFound += 1;
+            }
+
+            completedEligible += 1;
             const progressPayload = {
                 progress: {
                     stage: 'emailDiscovery',
-                    processed: completed,
-                    total: founders.length,
+                    processed: completedEligible,
+                    total: eligibleTotal,
                     stats
                 }
             };
-            if (completed % 10 === 0 || completed <= 5) {
-                log(`Emails: processed ${completed}/${founders.length}`, progressPayload);
+            if (completedEligible % 10 === 0 || completedEligible <= 5 || completedEligible === eligibleTotal) {
+                log(`Emails: processed ${completedEligible}/${eligibleTotal} eligible founders`, progressPayload);
             } else {
                 log(null, progressPayload);
             }
 
-            const rowCsv = [
-                toCsvValue(domain),
-                toCsvValue(founderName),
-                toCsvValue(email),
-                toCsvValue(status)
-            ].join(',');
-            writer.write(`${rowCsv}\n`);
+            results[row.index] = {
+                domain,
+                founder_name: founderName,
+                email,
+                status
+            };
         })
     );
 
-    await Promise.all(tasks);
+    if (eligibleTotal === 0) {
+        log('Emails: no eligible founders to process, skipping lookups.', {
+            progress: {
+                stage: 'emailDiscovery',
+                processed: 0,
+                total: 0,
+                stats
+            }
+        });
+    } else {
+        await Promise.all(tasks);
+    }
+
+    const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
+    writer.write('domain,founder_name,email,lookup_status\n');
+    results.forEach((row, index) => {
+        const safeRow = row || {
+            domain: founders[index]?.domain,
+            founder_name: founders[index]?.founder_name,
+            email: '',
+            status: 'not_processed'
+        };
+        const rowCsv = [
+            toCsvValue(safeRow.domain),
+            toCsvValue(safeRow.founder_name),
+            toCsvValue(safeRow.email),
+            toCsvValue(safeRow.status)
+        ].join(',');
+        writer.write(`${rowCsv}\n`);
+    });
 
     writer.end();
     await new Promise(res => writer.on('finish', res));
@@ -214,7 +278,9 @@ export async function runEmailFinder({ inputCsv, outputCsv, log = () => {} }) {
     log(`Emails: lookup finished. Results written to ${outputCsv}`);
 
     return {
-        total: founders.length,
+        totalRows,
+        eligible: eligibleTotal,
+        processed: completedEligible,
         ...stats
     };
 }
