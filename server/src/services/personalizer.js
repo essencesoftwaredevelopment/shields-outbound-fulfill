@@ -77,10 +77,22 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
     await new Promise((resolve, reject) => {
         fs.createReadStream(inputCsv)
             .pipe(csvParse({ columns: true, trim: true }))
-            .on('data', (row) => rows.push(row))
+            .on('data', (row) => {
+                // Only process verified emails
+                const emailStatus = (row.email_status || '').toLowerCase();
+                if (emailStatus === 'valid' || emailStatus === 'verified') {
+                    rows.push(row);
+                }
+            })
             .on('end', resolve)
             .on('error', reject);
     });
+
+    if (rows.length === 0) {
+        log?.('No verified emails found, skipping Shopify detection');
+        fs.writeFileSync(outputCsv, 'domain,shopify,founder_name,email,email_status\n');
+        return { total: 0, shopifyStores: 0 };
+    }
 
     const results = [];
     let processed = 0;

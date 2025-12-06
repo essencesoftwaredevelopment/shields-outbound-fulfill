@@ -18,6 +18,11 @@ export interface CreatePipelineJobOptions {
     nicheId?: string;
     nicheLabel?: string;
     dedupeStrategy?: 'skip' | 'include';
+    campaignId?: string;
+    findFounder?: boolean;
+    findEmail?: boolean;
+    verifyEmail?: boolean;
+    personalizeFirstLine?: boolean;
     signal?: AbortSignal;
 }
 
@@ -33,7 +38,7 @@ export function getJobResultUrl(jobId: string) {
     return `${pipelineBaseUrl}/api/jobs/${jobId}/result`;
 }
 
-export async function createPipelineJob({ file, idToken, clientId, nicheId, nicheLabel, signal }: CreatePipelineJobOptions) {
+export async function createPipelineJob({ file, idToken, clientId, nicheId, nicheLabel, campaignId, findFounder, findEmail, verifyEmail, personalizeFirstLine, signal }: CreatePipelineJobOptions) {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("idToken", idToken);
@@ -45,6 +50,22 @@ export async function createPipelineJob({ file, idToken, clientId, nicheId, nich
     }
     if (nicheLabel) {
         formData.append("nicheLabel", nicheLabel);
+    }
+    if (campaignId) {
+        formData.append("campaignId", campaignId);
+    }
+    // Processing options
+    if (typeof findFounder === 'boolean') {
+        formData.append("findFounder", String(findFounder));
+    }
+    if (typeof findEmail === 'boolean') {
+        formData.append("findEmail", String(findEmail));
+    }
+    if (typeof verifyEmail === 'boolean') {
+        formData.append("verifyEmail", String(verifyEmail));
+    }
+    if (typeof personalizeFirstLine === 'boolean') {
+        formData.append("personalizeFirstLine", String(personalizeFirstLine));
     }
     // include dedupe strategy if provided
     // @ts-ignore

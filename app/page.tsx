@@ -18,6 +18,7 @@ import {
   PipelineStageState,
   PipelineStageStatus,
 } from "@/lib/pipeline/types";
+import { log } from "util";
 
 type Niche = {
   id: string;
@@ -235,8 +236,6 @@ export default function Home() {
   const jobStreamRef = useRef<EventSource | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVisible, setToastVisible] = useState(false);
-  const [dedupeModalOpen, setDedupeModalOpen] = useState(false);
-  const [dedupeModalMessage, setDedupeModalMessage] = useState<string>("");
   const [editClientModalOpen, setEditClientModalOpen] = useState(false);
   const [editingClient, setEditingClient] = useState<{ id: string; name: string } | null>(null);
   const [editClientName, setEditClientName] = useState("");
@@ -566,6 +565,12 @@ export default function Home() {
       });
 
       const freshJob = response.job;
+      console.log('=== UPLOAD RESPONSE DEBUG ===');
+      console.log('Full response:', JSON.stringify(response, null, 2));
+      console.log('Fresh job:', JSON.stringify(freshJob, null, 2));
+      console.log('Dedupe stats exists?', !!freshJob.dedupeStats);
+      console.log('Dedupe stats value:', freshJob.dedupeStats);
+      console.log('=============================');
       setJobState(freshJob);
       // logs removed
       setJobStatusMessage("Job queued.");
@@ -589,15 +594,32 @@ export default function Home() {
 
       // Show toast with deduplication stats
       if (freshJob.dedupeStats) {
+        console.log('Dedupe stats:', freshJob.dedupeStats);
         const { total, skipped, new: newCount } = freshJob.dedupeStats;
-        if (skipped > 0) {
-          const msg = `${skipped} duplicate domain${skipped !== 1 ? 's' : ''} removed. ${newCount} unique domain${newCount !== 1 ? 's' : ''} will be processed.`;
-          setDedupeModalMessage(msg);
-          setDedupeModalOpen(true);
+
+        if (dedupeStrategy === 'include') {
+          // Include strategy: show how many are being processed vs already exist
+          const existing = total - newCount;
+          if (existing > 0) {
+            const msg = `Processing all ${total} domain${total !== 1 ? 's' : ''} (${newCount} new, ${existing} existing).`;
+            setToastMessage(msg);
+            setToastVisible(true);
+          } else {
+            const msg = `Processing ${total} new domain${total !== 1 ? 's' : ''}.`;
+            setToastMessage(msg);
+            setToastVisible(true);
+          }
         } else {
-          const msg = `All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
-          setDedupeModalMessage(msg);
-          setDedupeModalOpen(true);
+          // Skip strategy: show how many were filtered out
+          if (skipped > 0) {
+            const msg = `${skipped} duplicate domain${skipped !== 1 ? 's' : ''} removed. ${newCount} unique domain${newCount !== 1 ? 's' : ''} will be processed.`;
+            setToastMessage(msg);
+            setToastVisible(true);
+          } else {
+            const msg = `All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
+            setToastMessage(msg);
+            setToastVisible(true);
+          }
         }
       }
 
@@ -881,7 +903,7 @@ export default function Home() {
               <div key={client.id} className="niche-card" style={{ position: 'relative' }}>
                 <button
                   type="button"
-                  onClick={() => router.push(`/clients/${client.id}/leads`)}
+                  onClick={() => router.push(`/clients/${client.id}`)}
                   style={{ border: 'none', background: 'none', padding: 0, width: '100%', textAlign: 'left', cursor: 'pointer' }}
                 >
                   <span className="niche-card__icon" aria-hidden>
@@ -1394,39 +1416,30 @@ export default function Home() {
         )
       }
 
-      {
-        dedupeModalOpen && createPortal(
-          (
-            <div
-              className="modal-overlay"
-              role="dialog"
-              aria-modal="true"
-              onClick={() => setDedupeModalOpen(false)}
-            >
-              <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '520px' }}>
-                <div className="modal__header">
-                  <div>
-                    <p className="eyebrow eyebrow--muted">Info</p>
-                    <h2 className="modal__title">Upload Status</h2>
-                    <p className="modal__description">{dedupeModalMessage}</p>
-                  </div>
-                </div>
-
-                <div className="modal__actions modal__actions--end" style={{ marginTop: '1.25rem' }}>
-                  <button
-                    type="button"
-                    className="primary-button"
-                    onClick={() => setDedupeModalOpen(false)}
-                  >
-                    Close
-                  </button>
-                </div>
-              </div>
-            </div>
-          ),
-          document.body
-        )
-      }
+      {toastVisible && toastMessage && (
+        <div
+          className="toast"
+          role="status"
+          aria-live="polite"
+          style={{
+            position: 'fixed',
+            bottom: '24px',
+            right: '24px',
+            background: '#1f2937',
+            color: '#f9fafb',
+            padding: '16px 20px',
+            borderRadius: '8px',
+            boxShadow: '0 10px 25px rgba(0, 0, 0, 0.3)',
+            maxWidth: '420px',
+            zIndex: 10000,
+            fontSize: '14px',
+            lineHeight: '1.5',
+            animation: 'slideIn 0.3s ease-out',
+          }}
+        >
+          {toastMessage}
+        </div>
+      )}
     </AppShell>
   );
 }

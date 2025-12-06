@@ -1,0 +1,23 @@
+# PM2 process management commands for production
+
+# Start the server
+pm2 start src/index.js --name shields-outbound-server
+
+# View logs
+pm2 logs shields-outbound-server
+
+# List all processes
+pm2 list
+
+# Restart the server
+pm2 restart shields-outbound-server
+
+# Stop the server
+pm2 stop shields-outbound-server
+
+# Save process list for auto-restart on reboot
+pm2 save
+
+# Setup PM2 to launch on system startup
+pm2 startup
+# (Run the command output by pm2 startup as root)

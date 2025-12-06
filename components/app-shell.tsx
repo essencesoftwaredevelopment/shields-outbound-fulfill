@@ -42,13 +42,6 @@ export default function AppShell({ children }: { children: ReactNode }) {
                         >
                             🏠  Home
                         </button>
-                        <button
-                            type="button"
-                            className={`sidebar__btn${pathname === '/clients' ? ' sidebar__btn--active' : ''}`}
-                            onClick={() => router.push('/clients')}
-                        >
-                            👤  Clients
-                        </button>
                     </div>
                     <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                         <button
