@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { createPortal } from "react-dom";
 import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, deleteDoc, onSnapshot } from "firebase/firestore";
@@ -210,7 +210,7 @@ const readKeysFromSnapshot = (data: Record<string, unknown> | undefined): ApiKey
   kitt: typeof data?.[FIRESTORE_FIELD_MAP.kitt] === "string" ? (data[FIRESTORE_FIELD_MAP.kitt] as string) : "",
 });
 
-export default function Home() {
+function HomeContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { user, loading } = useAuth();
@@ -1499,5 +1499,19 @@ export default function Home() {
         </div>
       )}
     </AppShell>
+  );
+}
+
+export default function Home() {
+  return (
+    <Suspense fallback={
+      <div className="auth-gate">
+        <p className="eyebrow">Shield&apos;s Outbound</p>
+        <h2>Loading...</h2>
+        <p className="auth-card__subtitle">Preparing your workspace.</p>
+      </div>
+    }>
+      <HomeContent />
+    </Suspense>
   );
 }

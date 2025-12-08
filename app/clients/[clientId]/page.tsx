@@ -209,7 +209,7 @@ export default function ClientPage() {
     const [activeJobStatus, setActiveJobStatus] = useState<string | null>(null);
     const [uploadMetrics, setUploadMetrics] = useState<{ count: number; total: number } | null>(null);
     const [instantlyUploadError, setInstantlyUploadError] = useState<string | null>(null);
-    const [savingClientInfo, setSavingClientInfo] = useState(false);
+    const [isSavingClient, setIsSavingClient] = useState(false);
 
     const createEmptyStageState = useCallback((): PipelineStageState => ({
         status: "pending",
@@ -1156,7 +1156,7 @@ export default function ClientPage() {
 
     const handleSaveClientInfo = async () => {
         if (!user || !clientId) return;
-        setSavingClientInfo(true);
+        setIsSavingClient(true);
         try {
             const ref = doc(firestore, "users", user.uid, "clients", clientId);
             await setDoc(ref, {
@@ -1170,7 +1170,7 @@ export default function ClientPage() {
             setToastMessage(error instanceof Error ? error.message : 'Failed to save client info');
             setToastVisible(true);
         } finally {
-            setSavingClientInfo(false);
+            setIsSavingClient(false);
         }
     };
 
@@ -1963,9 +1963,9 @@ export default function ClientPage() {
                                     type="button"
                                     className="primary-button"
                                     onClick={handleSaveClientInfo}
-                                    disabled={savingClientInfo}
+                                    disabled={isSavingClient}
                                 >
-                                    {savingClientInfo ? 'Saving...' : 'Save'}
+                                    {isSavingClient ? 'Saving...' : 'Save'}
                                 </button>
                             </div>
                         </div>
