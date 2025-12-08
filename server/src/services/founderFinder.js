@@ -7,7 +7,7 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-4o-mini';
+const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-5-mini-2025-08-07';
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
@@ -133,7 +133,7 @@ async function aiFindFounder(searchResults, companyDomain, logger, openai) {
             openai.responses.create({
                 model: FOUNDER_MODEL,
                 input: promptInput,
-                text: { format: { type: 'text' }, verbosity: 'low' }
+                text: { format: { type: 'text' } }
             }),
         `OpenAI for ${companyDomain}`,
         status => status === 429 || (status >= 500 && status < 600),
