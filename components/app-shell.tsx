@@ -1,6 +1,6 @@
 "use client";
 
-import { ReactNode } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { signOut } from "firebase/auth";
 import { firebaseAuth } from "@/lib/firebase/auth";
@@ -8,6 +8,12 @@ import { firebaseAuth } from "@/lib/firebase/auth";
 export default function AppShell({ children }: { children: ReactNode }) {
     const router = useRouter();
     const pathname = usePathname();
+    const [today, setToday] = useState<string>("");
+    const isActive = (path: string) => pathname === path || pathname.startsWith(`${path}/`);
+
+    useEffect(() => {
+        setToday(new Date().toLocaleDateString());
+    }, []);
 
     return (
         <div className="dashboard">
@@ -22,7 +28,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                 }}
             >
                 <div className="sidebar__brand">
-                    <span className="sidebar__tag">{new Date().toLocaleDateString()}</span>
+                    <span className="sidebar__tag">{today}</span>
                 </div>
                 <div
                     className="sidebar__nav"
@@ -31,22 +37,29 @@ export default function AppShell({ children }: { children: ReactNode }) {
                         flexDirection: 'column',
                         height: 'calc(100vh - 64px)',
                         gap: '0.5rem',
-                        justifyContent: 'space-between',
-                    }}
-                >
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                        <button
-                            type="button"
-                            className={`sidebar__btn${pathname === '/' ? ' sidebar__btn--active' : ''}`}
-                            onClick={() => router.push('/')}
-                        >
-                            🏠  Home
-                        </button>
-                    </div>
-                    <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                        <button
-                            type="button"
-                            className="sidebar__btn"
+                    justifyContent: 'space-between',
+                }}
+            >
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <button
+                        type="button"
+                        className={`sidebar__btn${isActive('/') ? ' sidebar__btn--active' : ''}`}
+                        onClick={() => router.push('/')}
+                    >
+                        🏠  Home
+                    </button>
+                    <button
+                        type="button"
+                        className={`sidebar__btn${isActive('/account') ? ' sidebar__btn--active' : ''}`}
+                        onClick={() => router.push('/account')}
+                    >
+                        👤  Account
+                    </button>
+                </div>
+                <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <button
+                        type="button"
+                        className="sidebar__btn"
                             onClick={() => router.push('/?showKeys=1')}
                         >
                             🔑  Keys
