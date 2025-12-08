@@ -7,7 +7,7 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const PROMPT_ID = 'pmpt_68bde13aebf88197b441c1e165fe0a760d8445c1682d9156';
+const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-4o-mini';
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
@@ -131,7 +131,7 @@ async function aiFindFounder(searchResults, companyDomain, logger, openai) {
     const res = await withRetry(
         () =>
             openai.responses.create({
-                // prompt: { id: PROMPT_ID, version: '4' },
+                model: FOUNDER_MODEL,
                 input: promptInput,
                 text: { format: { type: 'text' }, verbosity: 'low' }
             }),
