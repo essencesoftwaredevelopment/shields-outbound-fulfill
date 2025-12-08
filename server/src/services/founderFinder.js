@@ -124,7 +124,13 @@ async function aiFindFounder(searchResults, companyDomain, logger, openai) {
         searchString = searchString.slice(0, AI_TRUNCATE_CHARS) + '\n[TRUNCATED]';
     }
 
-    const promptInput = `Use only these first-page snippets to identify the founder, CEO, or owner full name and current title for the domain below. If unclear, return \"Not Found\".\nSearch results (compressed JSON): ${searchString}\nCompany Domain: ${companyDomain}`;
+    const promptInput = `From the first-page snippets only, extract the founder or CEO or owner **full name** for the domain below.
+Output rules:
+- Output ONLY the person's full name in the format: First Last
+- Do NOT include titles, commas, qualifiers, companies, or extra words
+- If multiple names appear, pick the one most clearly associated with founder, CEO, or owner
+- If no clear single person is identified, output exactly: Not found
+Search results (compressed JSON): ${searchString}\nCompany Domain: ${companyDomain}`;
 
     await aiRateLimiter.acquire();
 
