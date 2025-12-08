@@ -35,6 +35,11 @@ const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   serper: "serper_key",
   kitt: "trykitt_key",
 };
+const API_KEY_LABELS: Record<ApiKeyName, string> = {
+  openai: "OpenAI",
+  serper: "Serper",
+  kitt: "TryKitt",
+};
 type ApiKeyState = Record<ApiKeyName, string>;
 
 const STAGE_ORDER: PipelineStageKey[] = ["founders", "emailDiscovery", "verification", "personalization"];
@@ -247,6 +252,15 @@ export default function Home() {
 
   const [clients, setClients] = useState<Array<{ id: string; name: string; totalLeads?: number }>>([]);
 
+  const showToast = useCallback((message: string) => {
+    setToastMessage(message);
+    setToastVisible(true);
+  }, [setToastMessage, setToastVisible]);
+
+  const missingVaultKeys = useMemo(() => API_KEY_FIELDS.filter((key) => !lastSavedKeys[key]?.trim()), [lastSavedKeys]);
+  const hasRequiredKeys = missingVaultKeys.length === 0;
+  const missingKeyLabels = missingVaultKeys.map((key) => API_KEY_LABELS[key]);
+
   const niches = useMemo<Niche[]>(
     () => [
       {
@@ -304,13 +318,20 @@ export default function Home() {
     setVaultModalOpen(false);
   }
 
+  const openVaultFromUpload = useCallback(() => {
+    setModalOpen(false);
+    setActiveNiche(null);
+    setVaultModalOpen(true);
+    setUploadError("");
+  }, [setModalOpen, setActiveNiche, setVaultModalOpen, setUploadError]);
+
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0] ?? null;
     setSelectedFile(file);
     setUploadError("");
   };
 
-  const uploadDisabled = !selectedFile || !selectedClient.trim() || uploading;
+  const uploadDisabled = !selectedFile || !selectedClient.trim() || uploading || !hasRequiredKeys;
 
   const handleKeyChange = (event: ChangeEvent<HTMLInputElement>, key: ApiKeyName) => {
     if (vaultMessage.tone !== "idle") {
@@ -323,20 +344,32 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (toastVisible) {
-      const timer = setTimeout(() => {
-        setToastVisible(false);
-        setTimeout(() => setToastMessage(null), 300);
-      }, 5000);
-      return () => clearTimeout(timer);
+    if (!toastVisible || !toastMessage) {
+      return;
     }
-  }, [toastVisible]);
+    const timer = setTimeout(() => {
+      setToastVisible(false);
+      setTimeout(() => setToastMessage(null), 300);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [toastVisible, toastMessage]);
 
   useEffect(() => {
     if (!loading && !user) {
       router.replace("/auth");
     }
   }, [loading, user, router]);
+
+  useEffect(() => {
+    if (!jobStatusMessage) {
+      return;
+    }
+    const normalized = jobStatusMessage.toLowerCase();
+    const criticalFragments = ["fail", "error", "lost connection", "missing", "finish", "complete", "queued"];
+    if (criticalFragments.some((fragment) => normalized.includes(fragment))) {
+      showToast(jobStatusMessage);
+    }
+  }, [jobStatusMessage, showToast]);
 
   // Open modals based on query params (e.g., Keys from /clients)
   useEffect(() => {
@@ -551,6 +584,12 @@ export default function Home() {
     if (!selectedFile || !user) {
       return;
     }
+    if (!hasRequiredKeys) {
+      const message = "Please save your API keys in the vault before uploading.";
+      setUploadError(message);
+      showToast(message);
+      return;
+    }
     setUploadError("");
     setUploading(true);
     try {
@@ -602,23 +641,19 @@ export default function Home() {
           const existing = total - newCount;
           if (existing > 0) {
             const msg = `Processing all ${total} domain${total !== 1 ? 's' : ''} (${newCount} new, ${existing} existing).`;
-            setToastMessage(msg);
-            setToastVisible(true);
+            showToast(msg);
           } else {
             const msg = `Processing ${total} new domain${total !== 1 ? 's' : ''}.`;
-            setToastMessage(msg);
-            setToastVisible(true);
+            showToast(msg);
           }
         } else {
           // Skip strategy: show how many were filtered out
           if (skipped > 0) {
             const msg = `${skipped} duplicate domain${skipped !== 1 ? 's' : ''} removed. ${newCount} unique domain${newCount !== 1 ? 's' : ''} will be processed.`;
-            setToastMessage(msg);
-            setToastVisible(true);
+            showToast(msg);
           } else {
             const msg = `All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
-            setToastMessage(msg);
-            setToastVisible(true);
+            showToast(msg);
           }
         }
       }
@@ -629,7 +664,9 @@ export default function Home() {
       setSelectedFile(null);
       setSelectedClient("");
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : "Unable to start pipeline.");
+      const message = error instanceof Error ? error.message : "Unable to start pipeline.";
+      setUploadError(message);
+      showToast(message);
     } finally {
       setUploading(false);
     }
@@ -805,13 +842,11 @@ export default function Home() {
         totalLeads: (d.data().totalLeads as number) || 0
       })));
 
-      setToastMessage(`Client "${editingClient.name}" deleted successfully.`);
-      setToastVisible(true);
+      showToast(`Client "${editingClient.name}" deleted successfully.`);
       setEditClientModalOpen(false);
       setEditingClient(null);
     } catch (error) {
-      setToastMessage(`Failed to delete client: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      setToastVisible(true);
+      showToast(`Failed to delete client: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
       setIsDeleting(false);
     }
@@ -1106,6 +1141,24 @@ export default function Home() {
                   </select>
                   <span className="settings-field__hint">Deduplication is scoped to the selected client.</span>
                 </label>
+
+                {!hasRequiredKeys && (
+                  <div className="upload-warning" role="alert">
+                    <p className="upload-warning__heading">Connect your provider keys before uploading.</p>
+                    <p className="upload-warning__detail">
+                      Missing: {missingKeyLabels.join(", ") || "API keys"}.
+                    </p>
+                    <div className="upload-warning__actions">
+                      <button
+                        type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={openVaultFromUpload}
+                      >
+                        Open API Vault
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 <label className="upload-area">
                   <span className="upload-area__title">Drop CSV or click to browse</span>

@@ -131,7 +131,7 @@ async function aiFindFounder(searchResults, companyDomain, logger, openai) {
     const res = await withRetry(
         () =>
             openai.responses.create({
-                prompt: { id: PROMPT_ID, version: '4' },
+                // prompt: { id: PROMPT_ID, version: '4' },
                 input: promptInput,
                 text: { format: { type: 'text' }, verbosity: 'low' }
             }),
