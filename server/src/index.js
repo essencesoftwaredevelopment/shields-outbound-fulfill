@@ -246,6 +246,9 @@ function pushState(job) {
         fileName: job.fileName
     };
     broadcast(job, { type: 'state', state });
+    persistJobState(job).catch(() => {
+        /* already handled */
+    });
 }
 
 function log(job, message = null, meta = {}) {
@@ -270,6 +273,8 @@ function log(job, message = null, meta = {}) {
             }
         };
         pushState(job);
+    } else if (message) {
+        pushState(job);
     }
 }
 
@@ -281,8 +286,38 @@ function updateStage(job, stageKey, updates) {
     pushState(job);
 }
 
+async function persistJobState(job) {
+    if (!job?.uid || !job?.clientId) {
+        return;
+    }
+    try {
+        const jobRef = firestore
+            .collection('users').doc(job.uid)
+            .collection('clients').doc(job.clientId)
+            .collection('jobs').doc(job.id);
+
+        const payload = {
+            ...serializeJob(job),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        if (!job.__persistedOnce) {
+            await jobRef.set({
+                ...payload,
+                createdAtServer: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+            job.__persistedOnce = true;
+        } else {
+            await jobRef.set(payload, { merge: true });
+        }
+    } catch (error) {
+        console.error(`[${job?.id || 'unknown'}] Job persistence error:`, error?.message || error);
+    }
+}
+
 function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip') {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
     const dir = path.join(TMP_ROOT, id);
     fs.mkdirSync(dir, { recursive: true });
 
@@ -451,6 +486,36 @@ async function processJob(job) {
 
         // If all domains were filtered out AND we're using skip strategy, complete early
         if (job.dedupeStats && job.dedupeStats.new === 0 && job.dedupeStrategy === 'skip') {
+            try {
+                fs.writeFileSync(job.paths.final, 'domain,email,email_status,founder_name\n');
+            } catch (err) {
+                console.warn(`[${job.id}] Failed to write placeholder final.csv`, err?.message || err);
+            }
+            try {
+                fs.writeFileSync(job.paths.personalized, 'domain,url,title,description,date,first_line\n');
+            } catch (err) {
+                console.warn(`[${job.id}] Failed to write placeholder personalized.csv`, err?.message || err);
+            }
+
+            Object.entries(job.stages).forEach(([stageKey, stage]) => {
+                job.stages[stageKey] = {
+                    ...stage,
+                    status: 'completed',
+                    startedAt: stage.startedAt || new Date().toISOString(),
+                    completedAt: new Date().toISOString(),
+                    summary: {
+                        skipped: job.dedupeStats?.skipped || job.dedupeStats?.total || 0,
+                        processed: 0
+                    },
+                    error: null,
+                    progress: {
+                        stage: stageKey,
+                        processed: 0,
+                        total: job.dedupeStats?.total || 0
+                    }
+                };
+            });
+
             job.status = 'completed';
             job.completedAt = new Date().toISOString();
             pushState(job);

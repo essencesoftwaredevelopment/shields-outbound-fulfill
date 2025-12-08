@@ -38,7 +38,7 @@ export function getJobResultUrl(jobId: string) {
     return `${pipelineBaseUrl}/api/jobs/${jobId}/result`;
 }
 
-export async function createPipelineJob({ file, idToken, clientId, nicheId, nicheLabel, campaignId, findFounder, findEmail, verifyEmail, personalizeFirstLine, signal }: CreatePipelineJobOptions) {
+export async function createPipelineJob({ file, idToken, clientId, nicheId, nicheLabel, campaignId, findFounder, findEmail, verifyEmail, personalizeFirstLine, dedupeStrategy, signal }: CreatePipelineJobOptions) {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("idToken", idToken);
@@ -67,11 +67,8 @@ export async function createPipelineJob({ file, idToken, clientId, nicheId, nich
     if (typeof personalizeFirstLine === 'boolean') {
         formData.append("personalizeFirstLine", String(personalizeFirstLine));
     }
-    // include dedupe strategy if provided
-    // @ts-ignore
-    if (typeof arguments[0]?.dedupeStrategy === 'string') {
-        // @ts-ignore
-        formData.append("dedupeStrategy", arguments[0].dedupeStrategy);
+    if (typeof dedupeStrategy === 'string') {
+        formData.append("dedupeStrategy", dedupeStrategy);
     }
 
     const response = await fetch(`${pipelineBaseUrl}/api/jobs`, {

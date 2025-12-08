@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, onSnapshot } from "firebase/firestore";
+import { doc, getDoc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy } from "firebase/firestore";
 import { getIdToken } from "firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
@@ -80,6 +80,13 @@ const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
     running: "Running",
     completed: "Completed",
     error: "Error",
+};
+
+const JOB_STATUS_COLORS: Record<JobStatus, string> = {
+    queued: "#fbbf24",
+    running: "#3b82f6",
+    completed: "#22c55e",
+    error: "#f87171",
 };
 
 const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
@@ -182,9 +189,59 @@ export default function ClientPage() {
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState("");
     const [jobState, setJobState] = useState<PipelineJob | null>(null);
+    const [jobHistory, setJobHistory] = useState<PipelineJob[]>([]);
     const [jobStatusMessage, setJobStatusMessage] = useState("");
     const [jobStreamConnected, setJobStreamConnected] = useState(false);
     const jobStreamRef = useRef<EventSource | null>(null);
+    const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const reconnectAttemptsRef = useRef(0);
+    const lastStreamingJobIdRef = useRef<string | null>(null);
+    const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+
+    const createEmptyStageState = useCallback((): PipelineStageState => ({
+        status: "pending",
+        startedAt: null,
+        completedAt: null,
+        summary: null,
+        error: null,
+        progress: null,
+    }), []);
+
+    const normalizeStages = useCallback((raw: unknown): Record<PipelineStageKey, PipelineStageState> => {
+        const source = (raw && typeof raw === "object") ? raw as Record<string, Partial<PipelineStageState>> : {};
+        const stages: Record<PipelineStageKey, PipelineStageState> = {
+            founders: createEmptyStageState(),
+            emailDiscovery: createEmptyStageState(),
+            verification: createEmptyStageState(),
+            personalization: createEmptyStageState(),
+        };
+        STAGE_ORDER.forEach((key) => {
+            const value = source[key];
+            if (value && typeof value === "object") {
+                stages[key] = {
+                    status: value.status || stages[key].status,
+                    startedAt: value.startedAt ?? stages[key].startedAt,
+                    completedAt: value.completedAt ?? stages[key].completedAt,
+                    summary: value.summary ?? stages[key].summary,
+                    error: value.error ?? stages[key].error,
+                    progress: value.progress ?? stages[key].progress,
+                };
+            }
+        });
+        return stages;
+    }, [createEmptyStageState]);
+
+    const formatJobDate = useCallback((value: string | null | undefined) => {
+        if (!value) {
+            return "—";
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return value;
+        }
+        return date.toLocaleString();
+    }, []);
+
     const [toastMessage, setToastMessage] = useState<string | null>(null);
     const [toastVisible, setToastVisible] = useState(false);
 
@@ -333,6 +390,11 @@ export default function ClientPage() {
     }, [toastVisible]);
 
     const closeJobStream = useCallback(() => {
+        if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+        }
+        reconnectAttemptsRef.current = 0;
         jobStreamRef.current?.close();
         jobStreamRef.current = null;
         setJobStreamConnected(false);
@@ -344,6 +406,20 @@ export default function ClientPage() {
         };
     }, [closeJobStream]);
 
+    const fetchJobSnapshot = useCallback(async (jobId: string) => {
+        if (!jobId) return;
+        try {
+            const response = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobId}`);
+            if (!response.ok) return;
+            const payload = await response.json();
+            if (payload?.job) {
+                setJobState(payload.job);
+            }
+        } catch (error) {
+            console.error('Failed to fetch job snapshot:', error);
+        }
+    }, []);
+
     const handleServerEvent = useCallback((payload: PipelineServerEvent) => {
         if (payload.type === "state" && payload.state) {
             setJobState(payload.state);
@@ -353,12 +429,18 @@ export default function ClientPage() {
     }, []);
 
     const openJobStream = useCallback(
-        (jobId: string) => {
+        (jobId: string, isReconnect = false) => {
             if (!jobId) {
                 return;
             }
             closeJobStream();
-            setJobStatusMessage("Connecting to pipeline...");
+            if (!isReconnect) {
+                reconnectAttemptsRef.current = 0;
+            }
+            setSelectedJobId(jobId);
+            lastStreamingJobIdRef.current = jobId;
+            setJobStatusMessage(isReconnect ? "Reconnecting to pipeline..." : "Connecting to pipeline...");
+            fetchJobSnapshot(jobId);
 
             const stream = new EventSource(getJobStreamUrl(jobId));
             jobStreamRef.current = stream;
@@ -366,6 +448,7 @@ export default function ClientPage() {
             stream.onopen = () => {
                 setJobStreamConnected(true);
                 setJobStatusMessage("Live updates streaming.");
+                reconnectAttemptsRef.current = 0;
             };
 
             stream.onmessage = (event) => {
@@ -382,12 +465,26 @@ export default function ClientPage() {
 
             stream.onerror = () => {
                 setJobStreamConnected(false);
-                setJobStatusMessage("Lost connection to pipeline stream.");
+                setJobStatusMessage("Lost connection to pipeline stream, retrying...");
                 stream.close();
                 jobStreamRef.current = null;
+                fetchJobSnapshot(jobId);
+
+                const MAX_RETRIES = 5;
+                if (reconnectAttemptsRef.current >= MAX_RETRIES) {
+                    setJobStatusMessage("Unable to reconnect to pipeline stream.");
+                    return;
+                }
+
+                const attempt = reconnectAttemptsRef.current;
+                reconnectAttemptsRef.current = attempt + 1;
+                const delay = Math.min(10000, 1000 * Math.pow(2, attempt));
+                reconnectTimeoutRef.current = setTimeout(() => {
+                    openJobStream(jobId, true);
+                }, delay);
             };
         },
-        [closeJobStream, handleServerEvent],
+        [closeJobStream, handleServerEvent, fetchJobSnapshot],
     );
 
     // Check for active job on mount (after openJobStream is defined)
@@ -405,9 +502,12 @@ export default function ClientPage() {
                         if (data.status === 'pending-upload') {
                             // Job is completed and pending upload
                             setJobPendingUpload(data.jobId);
+                            fetchJobSnapshot(data.jobId);
                         } else if (data.status !== 'completed' && data.status !== 'error') {
                             // Reconnect to active job
                             openJobStream(data.jobId);
+                        } else {
+                            fetchJobSnapshot(data.jobId);
                         }
                     }
                 }
@@ -419,13 +519,93 @@ export default function ClientPage() {
         return () => {
             cancelled = true;
         };
-    }, [user, clientId, openJobStream]);
+    }, [user, clientId, openJobStream, fetchJobSnapshot]);
+
+    useEffect(() => {
+        if (!user || !clientId) {
+            return;
+        }
+        const jobsRef = collection(firestore, "users", user.uid, "clients", clientId, "jobs");
+        const jobsQuery = query(jobsRef, orderBy("createdAt", "desc"));
+        const unsubscribe = onSnapshot(jobsQuery, (snap) => {
+            const rows = snap.docs.map((docSnap) => {
+                const data = docSnap.data() as Record<string, unknown>;
+                const id = (data.id as string) || docSnap.id;
+                const createdAt = typeof data.createdAt === "string" && data.createdAt
+                    ? data.createdAt
+                    : new Date().toISOString();
+                const completedAt = typeof data.completedAt === "string" ? data.completedAt : null;
+                const dedupe = data.dedupeStats as { total?: number; skipped?: number; new?: number } | undefined;
+                const totalVal = Number(dedupe?.total ?? 0);
+                const skippedVal = Number(dedupe?.skipped ?? 0);
+                const newVal = Number(dedupe?.new ?? 0);
+                const jobObj: PipelineJob = {
+                    id,
+                    status: (data.status as PipelineJob["status"]) || "queued",
+                    error: (data.error as string) || null,
+                    fileName: (data.fileName as string) || id,
+                    createdAt,
+                    completedAt,
+                    stages: normalizeStages(data.stages),
+                    dedupeStats: dedupe
+                        ? {
+                            total: Number.isFinite(totalVal) ? totalVal : 0,
+                            skipped: Number.isFinite(skippedVal) ? skippedVal : 0,
+                            new: Number.isFinite(newVal) ? newVal : 0,
+                        }
+                        : null,
+                };
+                return jobObj;
+            });
+            setJobHistory(rows);
+        }, (error) => {
+            console.error('Job history subscription error:', error);
+            setJobHistory([]);
+        });
+
+        return () => unsubscribe();
+    }, [user, clientId, normalizeStages]);
+
+    useEffect(() => {
+        if (!jobHistory.length) {
+            if (!jobState) {
+                setSelectedJobId(null);
+            }
+            return;
+        }
+
+        const latest = jobHistory[0];
+        if (!jobState) {
+            setJobState(latest);
+            return;
+        }
+
+        const hasActiveStream = jobStreamConnected || jobState.status === "running";
+        if (jobState.id === latest.id) {
+            if (!hasActiveStream && (jobState.status !== latest.status || jobState.completedAt !== latest.completedAt)) {
+                setJobState(latest);
+            }
+        } else if (!hasActiveStream) {
+            setJobState(latest);
+        }
+    }, [jobHistory, jobState, jobStreamConnected]);
+
+    useEffect(() => {
+        if (jobState) {
+            setSelectedJobId(jobState.id);
+        }
+    }, [jobState?.id]);
 
     useEffect(() => {
         if (!jobState || !user || !clientId) {
             return;
         }
+
+        const isLiveJob = lastStreamingJobIdRef.current === jobState.id;
         if (jobState.status === "completed") {
+            if (!isLiveJob) {
+                return;
+            }
             setJobStatusMessage("Pipeline finished.");
             closeJobStream();
             setJobPendingUpload(jobState.id);
@@ -439,7 +619,11 @@ export default function ClientPage() {
                     console.error('Failed to update job status:', error);
                 }
             })();
+            lastStreamingJobIdRef.current = null;
         } else if (jobState.status === "error") {
+            if (!isLiveJob) {
+                return;
+            }
             setJobStatusMessage(jobState.error || "Pipeline failed.");
             closeJobStream();
 
@@ -452,6 +636,7 @@ export default function ClientPage() {
                     console.error('Failed to update job status:', error);
                 }
             })();
+            lastStreamingJobIdRef.current = null;
         }
     }, [jobState, closeJobStream, user, clientId]);
 
@@ -460,6 +645,23 @@ export default function ClientPage() {
         setSelectedFile(file);
         setUploadError("");
     };
+
+    const handleSelectJob = useCallback((job: PipelineJob) => {
+        if (!job) {
+            return;
+        }
+        setJobState(job);
+        setSelectedJobId(job.id);
+
+        if (job.status === "running" || job.status === "queued") {
+            openJobStream(job.id);
+        } else {
+            lastStreamingJobIdRef.current = null;
+            closeJobStream();
+        }
+
+        fetchJobSnapshot(job.id);
+    }, [closeJobStream, openJobStream, fetchJobSnapshot]);
 
     const handleUploadClick = async () => {
         if (!selectedFile || !user) {
@@ -581,7 +783,16 @@ export default function ClientPage() {
             });
 
             if (!response.ok) {
-                throw new Error('Failed to fetch CSV preview');
+                let message = 'Failed to fetch CSV preview';
+                try {
+                    const payload = await response.json();
+                    if (payload?.error) {
+                        message = String(payload.error);
+                    }
+                } catch {
+                    /* noop */
+                }
+                throw new Error(message);
             }
 
             const data = await response.json();
@@ -924,6 +1135,115 @@ export default function ClientPage() {
                                         </p>
                                     </div>
                                 )}
+
+                                <div style={{ marginTop: '2.5rem' }}>
+                                    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem' }}>
+                                        <p className="eyebrow eyebrow--muted">Job history</p>
+                                        {jobHistory.length > 0 && (
+                                            <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.55)' }}>
+                                                {jobHistory.length} run{jobHistory.length === 1 ? '' : 's'} saved
+                                            </span>
+                                        )}
+                                    </div>
+                                    {jobHistory.length > 0 ? (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '1rem' }}>
+                                            {jobHistory.map((job) => {
+                                                const isSelected = job.id === selectedJobId;
+                                                const statusColor = JOB_STATUS_COLORS[job.status];
+                                                const totalProcessed = job.stages?.verification?.progress?.total
+                                                    || job.dedupeStats?.total
+                                                    || job.dedupeStats?.new
+                                                    || job.stages?.founders?.progress?.total
+                                                    || 0;
+                                                const validLeads = job.stages?.verification?.summary?.valid
+                                                    || job.stages?.emailDiscovery?.summary?.found
+                                                    || 0;
+                                                return (
+                                                    <button
+                                                        key={job.id}
+                                                        type="button"
+                                                        onClick={() => handleSelectJob(job)}
+                                                        style={{
+                                                            all: 'unset',
+                                                            display: 'grid',
+                                                            gridTemplateColumns: 'minmax(0, 1fr) 120px 160px',
+                                                            alignItems: 'center',
+                                                            gap: '1rem',
+                                                            padding: '1rem 1.25rem',
+                                                            borderRadius: '12px',
+                                                            border: `1px solid ${isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)'}`,
+                                                            background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+                                                            cursor: 'pointer',
+                                                            transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.2s ease',
+                                                        }}
+                                                        onMouseEnter={(event) => {
+                                                            event.currentTarget.style.transform = 'translateY(-2px)';
+                                                            if (!isSelected) {
+                                                                event.currentTarget.style.borderColor = 'rgba(59, 130, 246, 0.35)';
+                                                            }
+                                                        }}
+                                                        onMouseLeave={(event) => {
+                                                            event.currentTarget.style.transform = 'translateY(0)';
+                                                            event.currentTarget.style.borderColor = isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)';
+                                                        }}
+                                                    >
+                                                        <div>
+                                                            <p style={{
+                                                                margin: 0,
+                                                                fontWeight: 600,
+                                                                color: '#ffffff',
+                                                                fontSize: '0.95rem'
+                                                            }}>{job.fileName || job.id}</p>
+                                                            <p style={{
+                                                                margin: '0.35rem 0 0',
+                                                                fontSize: '0.8rem',
+                                                                color: 'rgba(255, 255, 255, 0.55)'
+                                                            }}>Started {formatJobDate(job.createdAt)}</p>
+                                                        </div>
+                                                        <div style={{ display: 'flex', justifyContent: 'center' }}>
+                                                            <span style={{
+                                                                display: 'inline-flex',
+                                                                alignItems: 'center',
+                                                                justifyContent: 'center',
+                                                                padding: '0.3rem 0.75rem',
+                                                                borderRadius: '999px',
+                                                                fontSize: '0.72rem',
+                                                                fontWeight: 600,
+                                                                letterSpacing: '0.03em',
+                                                                textTransform: 'uppercase',
+                                                                background: `${statusColor}22`,
+                                                                color: statusColor,
+                                                                border: `1px solid ${statusColor}55`
+                                                            }}>{JOB_STATUS_LABELS[job.status]}</span>
+                                                        </div>
+                                                        <div style={{ textAlign: 'right' }}>
+                                                            <p style={{
+                                                                margin: 0,
+                                                                color: 'rgba(255, 255, 255, 0.7)',
+                                                                fontSize: '0.8rem'
+                                                            }}>Completed</p>
+                                                            <p style={{
+                                                                margin: '0.25rem 0 0',
+                                                                fontSize: '0.9rem',
+                                                                fontWeight: 500,
+                                                                color: job.status === 'completed' ? '#22c55e' : 'rgba(255, 255, 255, 0.6)'
+                                                            }}>{job.status === 'completed' ? formatJobDate(job.completedAt) : 'In progress'}</p>
+                                                            <p style={{
+                                                                margin: '0.25rem 0 0',
+                                                                fontSize: '0.75rem',
+                                                                color: 'rgba(255, 255, 255, 0.45)'
+                                                            }}>{validLeads.toLocaleString()} valid · {totalProcessed.toLocaleString()} total</p>
+                                                        </div>
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                    ) : (
+                                        <p className="pipeline-panel__subtitle" style={{ marginTop: '1rem' }}>
+                                            No completed jobs yet. Run the pipeline to populate history.
+                                        </p>
+                                    )}
+                                </div>
                             </div>
                         </>
                     )}
