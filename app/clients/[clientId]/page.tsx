@@ -191,6 +191,7 @@ export default function ClientPage() {
     // Step 3: Personalization options
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
     const [personalizeFirstLine, setPersonalizeFirstLine] = useState(false);
+    const [skipFounderFinder, setSkipFounderFinder] = useState(false);
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState("");
     const [jobState, setJobState] = useState<PipelineJob | null>(null);
@@ -1042,6 +1043,7 @@ export default function ClientPage() {
                 dedupeStrategy,
                 campaignId: selectedCampaignId || undefined,
                 findFounder,
+                skipFounderFinder,
                 findEmail,
                 verifyEmail,
                 personalizeFirstLine,
@@ -2084,7 +2086,7 @@ export default function ClientPage() {
                                                     const checked = e.target.checked;
                                                     setFindFounder(checked);
                                                     // If unchecking, cascade disable dependent options
-                                                    if (!checked) {
+                                                    if (!checked && !skipFounderFinder) {
                                                         setFindEmail(false);
                                                         setVerifyEmail(false);
                                                     }
@@ -2136,14 +2138,68 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: findFounder ? 'pointer' : 'not-allowed',
+                                            cursor: 'pointer',
+                                            padding: '0.5rem'
+                                        }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={skipFounderFinder}
+                                                onChange={(e) => setSkipFounderFinder(e.target.checked)}
+                                                style={{
+                                                    width: '18px',
+                                                    height: '18px',
+                                                    cursor: 'pointer',
+                                                    borderRadius: '4px',
+                                                    appearance: 'none',
+                                                    border: `2px solid rgba(255, 255, 255, ${skipFounderFinder ? '0.3' : '0.15'})`,
+                                                    background: skipFounderFinder ? '#3b82f6' : 'transparent',
+                                                    position: 'relative',
+                                                    flexShrink: 0
+                                                }}
+                                            />
+                                            {skipFounderFinder && (
+                                                <svg
+                                                    style={{
+                                                        position: 'absolute',
+                                                        width: '18px',
+                                                        height: '18px',
+                                                        pointerEvents: 'none',
+                                                        marginLeft: '0px'
+                                                    }}
+                                                    viewBox="0 0 18 18"
+                                                    fill="none"
+                                                >
+                                                    <path
+                                                        d="M14 6L7.5 12.5L4 9"
+                                                        stroke="white"
+                                                        strokeWidth="2"
+                                                        strokeLinecap="round"
+                                                        strokeLinejoin="round"
+                                                    />
+                                                </svg>
+                                            )}
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    CSV already has founders
+                                                </div>
+                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                    Skip founder finder when CSV includes a founder_name column
+                                                </div>
+                                            </div>
+                                        </label>
+
+                                        <label style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.75rem',
+                                            cursor: (findFounder || skipFounderFinder) ? 'pointer' : 'not-allowed',
                                             padding: '0.5rem',
-                                            opacity: findFounder ? 1 : 0.5
+                                            opacity: (findFounder || skipFounderFinder) ? 1 : 0.5
                                         }}>
                                             <input
                                                 type="checkbox"
                                                 checked={findEmail}
-                                                disabled={!findFounder}
+                                                disabled={!(findFounder || skipFounderFinder)}
                                                 onChange={(e) => {
                                                     const checked = e.target.checked;
                                                     setFindEmail(checked);
@@ -2155,10 +2211,10 @@ export default function ClientPage() {
                                                 style={{
                                                     width: '18px',
                                                     height: '18px',
-                                                    cursor: findFounder ? 'pointer' : 'not-allowed',
+                                                    cursor: (findFounder || skipFounderFinder) ? 'pointer' : 'not-allowed',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${findFounder ? '0.3' : '0.15'})`,
+                                                    border: `2px solid rgba(255, 255, 255, ${(findFounder || skipFounderFinder) ? '0.3' : '0.15'})`,
                                                     background: findEmail ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
@@ -2199,22 +2255,22 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: (findFounder && findEmail) ? 'pointer' : 'not-allowed',
+                                            cursor: ((findFounder || skipFounderFinder) && findEmail) ? 'pointer' : 'not-allowed',
                                             padding: '0.5rem',
-                                            opacity: (findFounder && findEmail) ? 1 : 0.5
+                                            opacity: ((findFounder || skipFounderFinder) && findEmail) ? 1 : 0.5
                                         }}>
                                             <input
                                                 type="checkbox"
                                                 checked={verifyEmail}
-                                                disabled={!findFounder || !findEmail}
+                                                disabled={!(findFounder || skipFounderFinder) || !findEmail}
                                                 onChange={(e) => setVerifyEmail(e.target.checked)}
                                                 style={{
                                                     width: '18px',
                                                     height: '18px',
-                                                    cursor: (findFounder && findEmail) ? 'pointer' : 'not-allowed',
+                                                    cursor: ((findFounder || skipFounderFinder) && findEmail) ? 'pointer' : 'not-allowed',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${(findFounder && findEmail) ? '0.3' : '0.15'})`,
+                                                    border: `2px solid rgba(255, 255, 255, ${((findFounder || skipFounderFinder) && findEmail) ? '0.3' : '0.15'})`,
                                                     background: verifyEmail ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0

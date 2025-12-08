@@ -20,6 +20,7 @@ export interface CreatePipelineJobOptions {
     dedupeStrategy?: 'skip' | 'include';
     campaignId?: string;
     findFounder?: boolean;
+    skipFounderFinder?: boolean;
     findEmail?: boolean;
     verifyEmail?: boolean;
     personalizeFirstLine?: boolean;
@@ -58,6 +59,9 @@ export async function createPipelineJob({ file, idToken, clientId, nicheId, nich
     // Processing options
     if (typeof findFounder === 'boolean') {
         formData.append("findFounder", String(findFounder));
+    }
+    if (typeof skipFounderFinder === 'boolean') {
+        formData.append("skipFounderFinder", String(skipFounderFinder));
     }
     if (typeof findEmail === 'boolean') {
         formData.append("findEmail", String(findEmail));

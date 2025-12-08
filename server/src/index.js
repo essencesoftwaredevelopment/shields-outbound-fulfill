@@ -143,7 +143,8 @@ const uploadFields = upload.fields([
     { name: 'idToken', maxCount: 1 },
     { name: 'clientId', maxCount: 1 },
     { name: 'nicheId', maxCount: 1 },
-    { name: 'nicheLabel', maxCount: 1 }
+    { name: 'nicheLabel', maxCount: 1 },
+    { name: 'skipFounderFinder', maxCount: 1 }
 ]);
 
 const jobs = new Map();
@@ -332,7 +333,7 @@ function computeJobCost(job) {
     return job.cost;
 }
 
-function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip') {
+function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip', options = {}) {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const dir = path.join(TMP_ROOT, id);
@@ -353,6 +354,8 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         clientId,
         dedupeStrategy,
         cancelled: false,
+        skipFounderFinder: options.skipFounderFinder || false,
+        findFounder: options.findFounder !== false,
         cost: 0,
         stages: {
             founders: initialStageState(),
@@ -515,6 +518,42 @@ function resolveJobPaths(jobId) {
         personalizedPath: job?.paths?.personalized || path.join(jobDir, 'personalized.csv'),
         uploadPath: job?.paths?.upload || path.join(jobDir, 'upload.csv')
     };
+}
+
+async function buildFoundersCsvFromInput({ filteredDomainsPath, originalInputPath, outputPath }) {
+    const domainSet = new Set();
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(filteredDomainsPath)
+            .pipe(csvParse({ columns: true, trim: true }))
+            .on('data', row => {
+                const domain = String(row.domain || '').toLowerCase();
+                if (domain) domainSet.add(domain);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    const domainToFounder = new Map();
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(originalInputPath)
+            .pipe(csvParse({ columns: true, trim: true }))
+            .on('data', row => {
+                const domain = String(row.domain || '').toLowerCase();
+                const founder = String(row.founder_name || row.founder || '').trim();
+                if (domain) domainToFounder.set(domain, founder);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    const writer = fs.createWriteStream(outputPath);
+    writer.write('domain,founder_name\n');
+    domainSet.forEach(domain => {
+        const name = (domainToFounder.get(domain) || '').replace(/"/g, '""');
+        writer.write(`${domain},"${name}"\n`);
+    });
+    writer.end();
+    await new Promise(resolve => writer.on('finish', resolve));
 }
 
 async function buildUnifiedRows(jobId, scope = 'all') {
@@ -695,15 +734,42 @@ async function processJob(job) {
             return;
         }
 
-        await runStage(job, 'founders', () =>
-            runFounderFinder({
-                inputCsv: filteredDomainsPath,
-                outputCsv: job.paths.founders,
-                apiKeys: job.apiKeys,
-                pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
-                log: (message, meta) => log(job, message, meta)
-            })
-        );
+        if (job.skipFounderFinder) {
+            try {
+                await buildFoundersCsvFromInput({
+                    filteredDomainsPath,
+                    originalInputPath: job.paths.domains,
+                    outputPath: job.paths.founders
+                });
+                const processed = job.dedupeStats?.total || 0;
+                updateStage(job, 'founders', {
+                    status: 'completed',
+                    completedAt: new Date().toISOString(),
+                    startedAt: job.stages.founders.startedAt || new Date().toISOString(),
+                    summary: { processed, cost: 0, skipped: 0 },
+                    progress: {
+                        stage: 'founders',
+                        processed,
+                        total: processed,
+                        stats: { processed, total: processed, cost: 0 }
+                    }
+                });
+                log(job, `Founders skipped (CSV included founder_name). Processed ${processed} domains.`);
+            } catch (err) {
+                console.error(`[${job.id}] Failed to build founders CSV from input:`, err?.message || err);
+                throw err;
+            }
+        } else {
+            await runStage(job, 'founders', () =>
+                runFounderFinder({
+                    inputCsv: filteredDomainsPath,
+                    outputCsv: job.paths.founders,
+                    apiKeys: job.apiKeys,
+                    pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
+                    log: (message, meta) => log(job, message, meta)
+                })
+            );
+        }
         computeJobCost(job);
 
         if (job.cancelled) {
@@ -858,7 +924,10 @@ app.post('/api/jobs', uploadFields, async (req, res) => {
         const file = req.files.file[0];
         const clientId = (req.body.clientId || '').toString().trim();
         const dedupeStrategy = (req.body.dedupeStrategy || 'skip').toString(); // 'skip' | 'include'
-        const job = createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientId, dedupeStrategy);
+        const rawSkipFounder = String(req.body.skipFounderFinder || '').toLowerCase() === 'true';
+        const rawFindFounder = String(req.body.findFounder ?? 'true').toLowerCase() !== 'false';
+        const skipFounderFinder = rawSkipFounder || !rawFindFounder;
+        const job = createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientId, dedupeStrategy, { skipFounderFinder, findFounder: rawFindFounder });
         log(job, `Job queued with file ${job.fileName} for user ${uid}`);
 
         // Calculate dedupe stats synchronously before responding
