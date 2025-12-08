@@ -21,6 +21,8 @@ const __dirname = path.dirname(__filename);
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
+const VALID_UPLOAD_STATUSES = new Set(['valid', 'verified', 'valid-risky']);
+
 // Initialize Firebase Admin
 const serviceAccountPath = path.join(__dirname, '..', '.secrets', 'service-account.json');
 admin.initializeApp({
@@ -119,6 +121,23 @@ const upload = multer({
     limits: { fileSize: 10 * 1024 * 1024 } // 10MB
 });
 
+const DEFAULT_PRICING = {
+    stages: {
+        founders: {
+            serper_request_cost: 0.001,
+            openai_per_million_input: 0.25,
+            openai_per_million_output: 2.0
+        },
+        emailDiscovery: { request_cost: 0 },
+        verification: { request_cost: 0 },
+        personalization: {
+            openai_per_million_input: 0.25,
+            openai_per_million_output: 2.0
+        }
+    },
+    currency: 'USD'
+};
+
 const uploadFields = upload.fields([
     { name: 'file', maxCount: 1 },
     { name: 'idToken', maxCount: 1 },
@@ -141,71 +160,15 @@ app.post('/api/jobs/:id/csv-preview', async (req, res) => {
         const decoded = await admin.auth().verifyIdToken(idToken);
         const uid = decoded.uid;
 
-        let job = jobs.get(jobId);
-        // Resolve file paths even if job object is missing (e.g., server restarted)
-        const jobDir = job?.paths?.dir || path.join(TMP_ROOT, jobId);
-        const finalPath = job?.paths?.final || path.join(jobDir, 'final.csv');
-        const personalizedPath = job?.paths?.personalized || path.join(jobDir, 'personalized.csv');
-
-        if (!fs.existsSync(finalPath)) return res.status(404).json({ error: 'Result file missing' });
-
-        // Read final.csv (verification results)
-        const finalContent = fs.readFileSync(finalPath, 'utf-8');
-        const finalRows = [];
-        await new Promise((resolve, reject) => {
-            const parser = csvParse({ columns: true, skip_empty_lines: true });
-            parser.on('data', (row) => finalRows.push(row));
-            parser.on('end', resolve);
-            parser.on('error', reject);
-            parser.write(finalContent);
-            parser.end();
-        });
-
-        // Read personalized.csv if available and merge personalization fields by domain
-        let personalizedByDomain = new Map();
-        if (fs.existsSync(personalizedPath)) {
-            const personalizedContent = fs.readFileSync(personalizedPath, 'utf-8');
-            await new Promise((resolve, reject) => {
-                const parser = csvParse({ columns: true, skip_empty_lines: true });
-                parser.on('data', (row) => {
-                    const domainKey = String(row.domain || '').toLowerCase();
-                    if (domainKey) personalizedByDomain.set(domainKey, row);
-                });
-                parser.on('end', resolve);
-                parser.on('error', reject);
-                parser.write(personalizedContent);
-                parser.end();
-            });
+        const unified = await buildUnifiedRows(jobId, 'valid');
+        if (!unified.length) {
+            return res.status(404).json({ error: 'No verified leads available for upload.' });
         }
 
-        // Build unified rows with derived first_name, last_name and personalization fields
-        const unified = finalRows.map(r => {
-            const domainKey = String(r.domain || '').toLowerCase();
-            const founder = String(r.founder_name || '').trim();
-            const parts = founder.split(/\s+/);
-            const first_name = parts[0] || '';
-            const last_name = parts.length > 1 ? parts.slice(1).join(' ') : '';
-            const personal = personalizedByDomain.get(domainKey) || {};
-
-            // Debug log for first row
-            if (finalRows.indexOf(r) === 0) {
-                console.log(`[CSV Preview] First row from final.csv:`, r);
-                console.log(`[CSV Preview] Personalized data for ${domainKey}:`, personal);
-            }
-
-            return {
-                domain: r.domain || '',
-                email: r.email || '',
-                email_status: r.email_status || r.lookup_status || '',
-                first_name,
-                last_name,
-                personalization: personal.first_line || personal.personalization_first_line || '',
-                product_title: personal.title || personal.personalization_title || ''
-            };
-        });
-
-        const headers = ['domain', 'first_name', 'last_name', 'personalization', 'product_title', 'email', 'email_status'];
-        const previewRows = unified.slice(0, 3);
+        const allKeys = new Set();
+        unified.forEach((row) => Object.keys(row).forEach((k) => allKeys.add(k)));
+        const headers = Array.from(allKeys);
+        const previewRows = unified.slice(0, 100);
 
         res.json({ headers, previewRows });
     } catch (error) {
@@ -233,6 +196,17 @@ function broadcast(job, payload) {
     });
 }
 
+function closeStreams(job) {
+    job.streams.forEach(stream => {
+        try {
+            stream.end();
+        } catch {
+            /* noop */
+        }
+    });
+    job.streams = [];
+}
+
 function pushState(job) {
     const state = {
         id: job.id,
@@ -243,6 +217,7 @@ function pushState(job) {
         completedAt: job.completedAt,
         clientId: job.clientId,
         dedupeStats: job.dedupeStats || null,
+        cost: typeof job.cost === 'number' ? job.cost : 0,
         fileName: job.fileName
     };
     broadcast(job, { type: 'state', state });
@@ -315,6 +290,48 @@ async function persistJobState(job) {
     }
 }
 
+async function loadPricing(uid) {
+    let pricing = { ...DEFAULT_PRICING };
+    try {
+        // Try user-level override first
+        if (uid) {
+            const userPricingRef = firestore.collection('users').doc(uid).collection('config').doc('pricing');
+            const snap = await userPricingRef.get();
+            if (snap.exists) {
+                pricing = { ...pricing, ...snap.data() };
+            }
+        }
+        // Root-level default
+        const rootPricingRef = firestore.collection('config').doc('pricing');
+        const rootSnap = await rootPricingRef.get();
+        if (rootSnap.exists) {
+            pricing = { ...pricing, ...rootSnap.data() };
+        }
+    } catch (err) {
+        console.warn('Pricing load failed, using defaults:', err?.message || err);
+    }
+
+    // Ensure nested stage defaults exist
+    pricing.stages = pricing.stages || {};
+    pricing.stages.founders = pricing.stages.founders || DEFAULT_PRICING.stages.founders;
+    pricing.stages.emailDiscovery = pricing.stages.emailDiscovery || DEFAULT_PRICING.stages.emailDiscovery;
+    pricing.stages.verification = pricing.stages.verification || DEFAULT_PRICING.stages.verification;
+    pricing.stages.personalization = pricing.stages.personalization || DEFAULT_PRICING.stages.personalization;
+    return pricing;
+}
+
+function computeJobCost(job) {
+    const stageKeys = Object.keys(job.stages || {});
+    const total = stageKeys.reduce((sum, key) => {
+        const stage = job.stages[key];
+        const fromSummary = stage?.summary && typeof stage.summary.cost === 'number' ? stage.summary.cost : 0;
+        const fromProgress = stage?.progress && typeof stage.progress.cost === 'number' ? stage.progress.cost : 0;
+        return sum + (fromSummary || fromProgress || 0);
+    }, 0);
+    job.cost = Number((total || 0).toFixed(6));
+    return job.cost;
+}
+
 function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip') {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -335,6 +352,8 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         uid,
         clientId,
         dedupeStrategy,
+        cancelled: false,
+        cost: 0,
         stages: {
             founders: initialStageState(),
             emailDiscovery: initialStageState(),
@@ -349,7 +368,8 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
             founders: path.join(dir, 'founders.csv'),
             emails: path.join(dir, 'emails.csv'),
             final: path.join(dir, 'final.csv'),
-            personalized: path.join(dir, 'personalized.csv')
+            personalized: path.join(dir, 'personalized.csv'),
+            upload: path.join(dir, 'upload.csv')
         }
     };
 
@@ -454,7 +474,8 @@ async function runStage(job, stageKey, handler) {
     updateStage(job, stageKey, { status: 'running', startedAt: new Date().toISOString(), error: null });
     try {
         const summary = await handler();
-        updateStage(job, stageKey, { status: 'completed', completedAt: new Date().toISOString(), summary });
+        const safeSummary = summary || {};
+        updateStage(job, stageKey, { status: 'completed', completedAt: new Date().toISOString(), summary: safeSummary });
         return summary;
     } catch (err) {
         const message = err?.message || 'Unknown error';
@@ -463,12 +484,153 @@ async function runStage(job, stageKey, handler) {
     }
 }
 
+function markCancelled(job, reason = 'Cancelled by user') {
+    job.cancelled = true;
+    job.status = 'cancelled';
+    job.error = reason;
+    job.completedAt = job.completedAt || new Date().toISOString();
+    pushState(job);
+    closeStreams(job);
+}
+
+async function readCsvToArray(filePath) {
+    const rows = [];
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(filePath)
+            .pipe(csvParse({ columns: true, skip_empty_lines: true, trim: true }))
+            .on('data', (row) => rows.push(row))
+            .on('end', resolve)
+            .on('error', reject);
+    });
+    return rows;
+}
+
+function resolveJobPaths(jobId) {
+    const job = jobs.get(jobId);
+    const jobDir = job?.paths?.dir || path.join(TMP_ROOT, jobId);
+    return {
+        job,
+        jobDir,
+        finalPath: job?.paths?.final || path.join(jobDir, 'final.csv'),
+        personalizedPath: job?.paths?.personalized || path.join(jobDir, 'personalized.csv'),
+        uploadPath: job?.paths?.upload || path.join(jobDir, 'upload.csv')
+    };
+}
+
+async function buildUnifiedRows(jobId, scope = 'all') {
+    const { finalPath, personalizedPath } = resolveJobPaths(jobId);
+    if (!fs.existsSync(finalPath)) {
+        return [];
+    }
+
+    const finalRows = await readCsvToArray(finalPath);
+
+    const personalizedByDomain = new Map();
+    if (fs.existsSync(personalizedPath)) {
+        const personalizedRows = await readCsvToArray(personalizedPath);
+        personalizedRows.forEach((row) => {
+            const domainKey = String(row.domain || '').toLowerCase();
+            if (domainKey) personalizedByDomain.set(domainKey, row);
+        });
+    }
+
+    const unified = finalRows.map((r) => {
+        const domainKey = String(r.domain || '').toLowerCase();
+        const founder = String(r.founder_name || '').trim();
+        const parts = founder.split(/\s+/);
+        const first_name = parts[0] || '';
+        const last_name = parts.length > 1 ? parts.slice(1).join(' ') : '';
+        const personal = personalizedByDomain.get(domainKey) || {};
+        return {
+            domain: r.domain || '',
+            founder_name: r.founder_name || '',
+            email: r.email || '',
+            email_status: r.email_status || r.lookup_status || '',
+            first_name,
+            last_name,
+            personalization: personal.first_line || personal.personalization_first_line || '',
+            personalization_first_line: personal.first_line || personal.personalization_first_line || '',
+            personalization_title: personal.title || personal.personalization_title || '',
+            personalization_url: personal.url || personal.personalization_url || '',
+            product_title: personal.title || personal.personalization_title || ''
+        };
+    });
+
+    if (scope === 'valid') {
+        return unified.filter(r => VALID_UPLOAD_STATUSES.has((r.email_status || '').toLowerCase()));
+    }
+
+    return unified;
+}
+
+async function writeUploadCsv(filePath, rows) {
+    if (!rows || !Array.isArray(rows)) return;
+    const headers = ['domain', 'founder_name', 'email', 'email_status', 'first_name', 'last_name', 'personalization', 'personalization_first_line', 'personalization_title', 'personalization_url', 'product_title'];
+    const writer = fs.createWriteStream(filePath);
+    writer.write(headers.join(',') + '\n');
+    rows.forEach((row) => {
+        const line = headers.map((key) => {
+            const value = row[key] ?? '';
+            const safe = String(value).replace(/"/g, '""');
+            return `"${safe}"`;
+        }).join(',');
+        writer.write(line + '\n');
+    });
+    writer.end();
+    await new Promise(resolve => writer.on('finish', resolve));
+}
+
+async function attachCampaignToLeads({ uid, clientId, campaignId, rows }) {
+    if (!uid || !clientId || !campaignId || !Array.isArray(rows) || rows.length === 0) return;
+    const leadsCol = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('leads');
+    const writer = firestore.bulkWriter();
+    writer.onWriteError((error) => {
+        const willRetry = error?.failedAttempts < 3;
+        return willRetry;
+    });
+
+    rows.forEach((row) => {
+        const domain = String(row.domain || '').toLowerCase();
+        if (!domain) return;
+        const ref = leadsCol.doc(domain);
+        writer.set(ref, {
+            campaignId,
+            campaigns: admin.firestore.FieldValue.arrayUnion(campaignId),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+    });
+
+    await writer.close();
+}
+
+async function incrementCampaignLeadCount({ uid, clientId, campaignId, delta }) {
+    if (!uid || !clientId || !campaignId || !Number.isFinite(delta) || delta <= 0) return;
+    const campaignRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('campaigns').doc(campaignId);
+    await campaignRef.set({
+        totalLeads: admin.firestore.FieldValue.increment(delta),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+}
+
 async function processJob(job) {
     job.status = 'running';
     pushState(job);
     log(job, 'Job started.');
 
     try {
+        // Load pricing configuration
+        try {
+            job.pricing = await loadPricing(job.uid);
+        } catch (err) {
+            console.warn(`[${job.id}] Pricing load warning:`, err?.message || err);
+            job.pricing = DEFAULT_PRICING;
+        }
+
+        if (job.cancelled) {
+            markCancelled(job, 'Cancelled before start');
+            return;
+        }
+
         // Use pre-calculated filtered path if available (from job creation), otherwise calculate now
         let filteredDomainsPath = job.paths.filtered;
         if (!filteredDomainsPath) {
@@ -495,6 +657,11 @@ async function processJob(job) {
                 fs.writeFileSync(job.paths.personalized, 'domain,url,title,description,date,first_line\n');
             } catch (err) {
                 console.warn(`[${job.id}] Failed to write placeholder personalized.csv`, err?.message || err);
+            }
+            try {
+                fs.writeFileSync(job.paths.upload, 'domain,founder_name,email,email_status,first_name,last_name,personalization,personalization_first_line,personalization_title,personalization_url,product_title\n');
+            } catch (err) {
+                console.warn(`[${job.id}] Failed to write placeholder upload.csv`, err?.message || err);
             }
 
             Object.entries(job.stages).forEach(([stageKey, stage]) => {
@@ -523,17 +690,34 @@ async function processJob(job) {
             return;
         }
 
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
+
         await runStage(job, 'founders', () =>
             runFounderFinder({
                 inputCsv: filteredDomainsPath,
                 outputCsv: job.paths.founders,
                 apiKeys: job.apiKeys,
+                pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
                 log: (message, meta) => log(job, message, meta)
             })
         );
+        computeJobCost(job);
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         // Upsert leads with founder info
         await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.founders, type: 'founders', dedupeStrategy: job.dedupeStrategy });
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         await runStage(job, 'emailDiscovery', () =>
             runEmailFinder({
@@ -543,9 +727,20 @@ async function processJob(job) {
                 log: (message, meta) => log(job, message, meta)
             })
         );
+        computeJobCost(job);
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         // Upsert leads with email lookup results
         await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.emails, type: 'emails', dedupeStrategy: job.dedupeStrategy });
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         await runStage(job, 'verification', () =>
             runEmailVerifier({
@@ -555,27 +750,58 @@ async function processJob(job) {
                 log: (message, meta) => log(job, message, meta)
             })
         );
+        computeJobCost(job);
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         // Upsert leads with verification status
         await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.final, type: 'verification', dedupeStrategy: job.dedupeStrategy });
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         await runStage(job, 'personalization', () =>
             runPersonalization({
                 inputCsv: job.paths.final,
                 outputCsv: job.paths.personalized,
                 apiKeys: job.apiKeys,
-                log: (message, meta) => log(job, message, meta)
+                log: (message, meta) => log(job, message, meta),
+                removeB2B: process.env.PERSONALIZATION_FILTER_B2B !== 'false'
             })
         );
+        computeJobCost(job);
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
 
         // Upsert leads with personalization data
         await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.personalized, type: 'personalization', dedupeStrategy: job.dedupeStrategy });
+
+        // Build upload-ready CSV (valid/verified/valid-risky only)
+        try {
+            const uploadRows = await buildUnifiedRows(job.id, 'valid');
+            await writeUploadCsv(job.paths.upload, uploadRows);
+            log(job, `Upload CSV ready at ${job.paths.upload} (${uploadRows.length} rows)`);
+        } catch (err) {
+            console.warn(`[${job.id}] Failed to build upload.csv`, err?.message || err);
+        }
 
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
         pushState(job);
         log(job, `Job completed. Final CSV ready at ${job.paths.final}`);
     } catch (err) {
+        if (job.cancelled) {
+            markCancelled(job, 'Cancelled during processing');
+            return;
+        }
         job.status = 'error';
         job.error = err?.message || 'Unexpected pipeline error';
         pushState(job);
@@ -593,7 +819,8 @@ function serializeJob(job) {
         completedAt: job.completedAt,
         stages: job.stages,
         dedupeStats: job.dedupeStats || null,
-        clientId: job.clientId
+        clientId: job.clientId,
+        cost: typeof job.cost === 'number' ? job.cost : 0
     };
 }
 
@@ -667,18 +894,87 @@ app.get('/api/jobs/:id', (req, res) => {
     res.json({ job: serializeJob(job) });
 });
 
-app.get('/api/jobs/:id/result', (req, res) => {
-    const job = jobs.get(req.params.id);
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found' });
+// Stop a running job
+app.post('/api/jobs/:id/stop', async (req, res) => {
+    try {
+        const jobId = req.params.id;
+        const { idToken, clientId } = req.body || {};
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
+        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        const job = jobs.get(jobId);
+        if (!job) {
+            return res.status(404).json({ error: 'Job not found.' });
+        }
+        if (job.uid !== uid || job.clientId !== clientId) {
+            return res.status(403).json({ error: 'Unauthorized to stop this job.' });
+        }
+        if (job.cancelled || job.status === 'cancelled') {
+            return res.json({ status: 'cancelled', message: 'Job already cancelled.' });
+        }
+
+        job.cancelled = true;
+        markCancelled(job, 'Cancelled by user');
+
+        // Update activeJob doc to reflect cancellation
+        try {
+            const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
+            await activeJobRef.set({
+                jobId,
+                status: 'cancelled',
+                uploadError: null,
+                uploadMetrics: null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        } catch (err) {
+            console.warn('Failed to persist cancelled status to Firestore', err?.message || err);
+        }
+
+        return res.json({ status: 'cancelled' });
+    } catch (error) {
+        console.error('Stop job error:', error);
+        return res.status(500).json({ error: 'Failed to cancel job.' });
     }
-    if (job.status !== 'completed') {
-        return res.status(409).json({ error: 'Job not completed yet' });
-    }
-    if (!fs.existsSync(job.paths.final)) {
+});
+
+app.get('/api/jobs/:id/result', async (req, res) => {
+    const jobId = req.params.id;
+    const scopeParam = (req.query?.scope || '').toString() === 'valid' ? 'valid' : 'all';
+    const { job, finalPath } = resolveJobPaths(jobId);
+
+    if (!fs.existsSync(finalPath)) {
         return res.status(404).json({ error: 'Result file missing' });
     }
-    res.download(job.paths.final, `results-${job.id}.csv`);
+    if (job && job.status !== 'completed') {
+        return res.status(409).json({ error: 'Job not completed yet' });
+    }
+
+    try {
+        const rows = await buildUnifiedRows(jobId, scopeParam);
+        if (!rows.length) {
+            return res.status(404).json({ error: 'No data to export.' });
+        }
+        const headers = Array.from(new Set(rows.flatMap(r => Object.keys(r))));
+        const csvLines = [headers.join(',')];
+        rows.forEach((row) => {
+            const line = headers.map((key) => {
+                const safe = String(row[key] ?? '').replace(/"/g, '""');
+                return `"${safe}"`;
+            }).join(',');
+            csvLines.push(line);
+        });
+        const filename = `results-${jobId}-${scopeParam}.csv`;
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(csvLines.join('\n'));
+    } catch (error) {
+        console.error('Result download error:', error);
+        res.status(500).json({ error: 'Failed to build export.' });
+    }
 });
 
 app.get('/api/jobs/:id/stream', (req, res) => {
@@ -910,9 +1206,65 @@ app.post('/api/clients/:id/campaigns', async (req, res) => {
 
 // Upload completed job results to Instantly campaign
 app.post('/api/jobs/:id/upload-to-instantly', async (req, res) => {
+    const jobId = req.params.id;
+    let activeJobRef = null;
+    let jobDocRef = null;
+    let campaignIdParam = null;
+
+    const recordUploadStatus = async (count, total) => {
+        if (!activeJobRef) {
+            return;
+        }
+        try {
+            const updates = [
+                activeJobRef.set({
+                    jobId,
+                    status: 'uploaded',
+                    uploadMetrics: { count, total },
+                    uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    campaignId: campaignIdParam || null,
+                    uploadError: admin.firestore.FieldValue.delete ? admin.firestore.FieldValue.delete() : null,
+                }, { merge: true })
+            ];
+
+            if (jobDocRef) {
+                updates.push(
+                    jobDocRef.set({
+                        instantlyUpload: {
+                            count,
+                            total,
+                            campaignId: campaignIdParam || null,
+                            uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
+                        },
+                    }, { merge: true })
+                );
+            }
+
+            await Promise.all(updates);
+        } catch (firestoreError) {
+            console.error('Failed to record Instantly upload status:', firestoreError);
+        }
+    };
+
+    const recordUploadFailure = async (message) => {
+        if (!activeJobRef) {
+            return;
+        }
+        try {
+            await activeJobRef.set({
+                jobId,
+                status: 'pending-upload',
+                uploadError: message,
+                lastUploadErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+        } catch (firestoreError) {
+            console.error('Failed to persist Instantly upload error state:', firestoreError);
+        }
+    };
+
     try {
         const { idToken, clientId, campaignId, columnMapping } = req.body || {};
-        const jobId = req.params.id;
+        campaignIdParam = campaignId;
 
         if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
@@ -922,14 +1274,6 @@ app.post('/api/jobs/:id/upload-to-instantly', async (req, res) => {
 
         const decoded = await admin.auth().verifyIdToken(idToken);
         const uid = decoded.uid;
-
-        // Get the job or resolve paths from jobId
-        let job = jobs.get(jobId);
-        const jobDir = job?.paths?.dir || path.join(TMP_ROOT, jobId);
-        const finalPath = job?.paths?.final || path.join(jobDir, 'final.csv');
-        const personalizedPath = job?.paths?.personalized || path.join(jobDir, 'personalized.csv');
-
-        if (!fs.existsSync(finalPath)) return res.status(404).json({ error: 'Result file missing' });
 
         // Get client's Instantly API key
         const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
@@ -942,65 +1286,19 @@ app.post('/api/jobs/:id/upload-to-instantly', async (req, res) => {
             return res.status(400).json({ error: 'Client has no Instantly API key configured' });
         }
 
-        // Read final.csv (verification results)
-        const finalContent = fs.readFileSync(finalPath, 'utf-8');
-        const finalRows = [];
-        await new Promise((resolve, reject) => {
-            const parser = csvParse({ columns: true, skip_empty_lines: true });
-            parser.on('data', (row) => finalRows.push(row));
-            parser.on('end', resolve);
-            parser.on('error', reject);
-            parser.write(finalContent);
-            parser.end();
-        });
+        activeJobRef = clientRef.collection('activeJob').doc('current');
+        jobDocRef = clientRef.collection('jobs').doc(jobId);
 
-        // Read personalized.csv if available and merge personalization fields by domain
-        let personalizedByDomain = new Map();
-        if (fs.existsSync(personalizedPath)) {
-            const personalizedContent = fs.readFileSync(personalizedPath, 'utf-8');
-            await new Promise((resolve, reject) => {
-                const parser = csvParse({ columns: true, skip_empty_lines: true });
-                parser.on('data', (row) => {
-                    const domainKey = String(row.domain || '').toLowerCase();
-                    if (domainKey) personalizedByDomain.set(domainKey, row);
-                });
-                parser.on('end', resolve);
-                parser.on('error', reject);
-                parser.write(personalizedContent);
-                parser.end();
-            });
-        }
-
-        // Build unified rows with derived first_name, last_name and personalization fields
-        const records = finalRows.map(r => {
-            const domainKey = String(r.domain || '').toLowerCase();
-            const founder = String(r.founder_name || '').trim();
-            const parts = founder.split(/\s+/);
-            const first_name = parts[0] || '';
-            const last_name = parts.length > 1 ? parts.slice(1).join(' ') : '';
-            const personal = personalizedByDomain.get(domainKey) || {};
-            return {
-                domain: r.domain || '',
-                email: r.email || '',
-                email_status: r.email_status || r.lookup_status || '',
-                first_name,
-                last_name,
-                personalization: personal.first_line || personal.personalization_first_line || '',
-                product_title: personal.title || personal.personalization_title || ''
-            };
-        });
-
-        // Filter for verified emails only (include valid-risky)
-        const verified = records.filter(r => r.email_status === 'valid' || r.email_status === 'verified' || r.email_status === 'valid-risky');
+        const verified = await buildUnifiedRows(jobId, 'valid');
 
         if (verified.length === 0) {
-            return res.json({ count: 0, message: 'No verified emails to upload' });
+            await recordUploadStatus(0, 0);
+            return res.json({ count: 0, total: 0, message: 'No verified emails to upload' });
         }
 
         // Upload to Instantly in batches
         const batchSize = 100;
         let uploaded = 0;
-        let authFailed = false;
 
         for (let i = 0; i < verified.length; i += batchSize) {
             const batch = verified.slice(i, i + batchSize);
@@ -1063,7 +1361,7 @@ app.post('/api/jobs/:id/upload-to-instantly', async (req, res) => {
                     const errorText = await response.text().catch(() => '');
                     console.error(`Instantly v2 upload failed for batch ${i / batchSize + 1}: (${status}) ${errorText}`);
                     if (status === 401) {
-                        authFailed = true;
+                        await recordUploadFailure('Instantly v2 authentication failed. Check API key and permissions.');
                         return res.status(401).json({ error: 'ERR_AUTH_FAILED', message: 'Instantly v2 authentication failed. Check API key and permissions.' });
                     }
                     throw new Error(`Instantly v2 API error: ${status}`);
@@ -1074,15 +1372,25 @@ app.post('/api/jobs/:id/upload-to-instantly', async (req, res) => {
                 console.log(`Successfully uploaded batch ${i / batchSize + 1}: ${leads.length} leads (total: ${uploaded}/${verified.length})`);
             } catch (error) {
                 console.error('Error uploading batch to Instantly v2:', error);
-                if (authFailed) return; // response already sent
                 // Continue with other batches on non-auth errors
             }
         }
 
-        res.json({ count: uploaded, total: verified.length });
+        await recordUploadStatus(uploaded, verified.length);
+        // Persist campaign association and counts in Firestore
+        try {
+            if (uploaded > 0) {
+                await attachCampaignToLeads({ uid, clientId, campaignId, rows: verified.slice(0, uploaded) });
+                await incrementCampaignLeadCount({ uid, clientId, campaignId, delta: uploaded });
+            }
+        } catch (firestoreError) {
+            console.warn('Failed to persist campaign lead linkage/counts:', firestoreError?.message || firestoreError);
+        }
+        return res.json({ count: uploaded, total: verified.length });
     } catch (error) {
         console.error('Upload to Instantly error:', error);
-        res.status(500).json({ error: 'Failed to upload to Instantly.' });
+        await recordUploadFailure('Failed to upload to Instantly.');
+        return res.status(500).json({ error: 'Failed to upload to Instantly.' });
     }
 });
 

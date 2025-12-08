@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { createPortal } from "react-dom";
 import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, deleteDoc, onSnapshot } from "firebase/firestore";
 import { getIdToken, signOut } from "firebase/auth";
@@ -70,6 +70,7 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
   running: "Running",
   completed: "Completed",
   error: "Error",
+  cancelled: "Cancelled",
 };
 
 const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
@@ -211,6 +212,7 @@ const readKeysFromSnapshot = (data: Record<string, unknown> | undefined): ApiKey
 
 export default function Home() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { user, loading } = useAuth();
   const [activeNiche, setActiveNiche] = useState<Niche | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -373,25 +375,28 @@ export default function Home() {
 
   // Open modals based on query params (e.g., Keys from /clients)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const params = new URLSearchParams(window.location.search);
-    const showKeys = params.get('showKeys');
-    const clientParam = params.get('client');
-    if (showKeys === '1') {
+    if (!searchParams) return;
+    const showKeysParam = searchParams.get('showKeys');
+    const clientParam = searchParams.get('client');
+
+    const clearParam = (param: string) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.delete(param);
+      const query = params.toString();
+      router.replace(query ? `/?${query}` : '/', { scroll: false });
+    };
+
+    if (showKeysParam === '1') {
       setVaultModalOpen(true);
-      // Clean up param so back/refresh doesn't keep reopening
-      const url = new URL(window.location.href);
-      url.searchParams.delete('showKeys');
-      window.history.replaceState({}, '', url.toString());
+      clearParam('showKeys');
     }
+
     if (clientParam) {
       setSelectedClient(clientParam);
       setModalOpen(true);
-      const url = new URL(window.location.href);
-      url.searchParams.delete('client');
-      window.history.replaceState({}, '', url.toString());
+      clearParam('client');
     }
-  }, []);
+  }, [searchParams, router]);
 
   const closeJobStream = useCallback(() => {
     jobStreamRef.current?.close();
@@ -987,7 +992,7 @@ export default function Home() {
                 </button>
 
                 {/* Upload Leads button (bottom-right) */}
-                <button
+                {/* <button
                   type="button"
                   className="primary-button"
                   onClick={(e) => {
@@ -1000,8 +1005,8 @@ export default function Home() {
                   title="Upload Leads"
                   style={{ position: 'absolute', bottom: '8px', right: '8px' }}
                 >
-                  Upload Leads
-                </button>
+                  📤 Upload Leads
+                </button> */}
               </div>
             ))
           )}

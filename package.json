@@ -4,6 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:app": "next dev",
+    "dev:server": "npm --prefix server run dev",
+    "dev:all": "bash -c \"npm run dev:server & npm run dev:app; wait\"",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

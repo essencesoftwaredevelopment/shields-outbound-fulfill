@@ -23,7 +23,7 @@ export interface PipelineStageState {
 
 export interface PipelineJob {
     id: string;
-    status: "queued" | "running" | "completed" | "error";
+    status: "queued" | "running" | "completed" | "error" | "cancelled";
     error: string | null;
     fileName: string;
     createdAt: string;

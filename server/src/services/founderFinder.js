@@ -146,10 +146,24 @@ Search results (compressed JSON): ${searchString}\nCompany Domain: ${companyDoma
         logger
     );
 
-    return (res && res.output_text) ? res.output_text.trim() : 'Not Found';
+    const usage = res?.usage || {};
+    const inputTokens = usage.input_tokens ?? usage.input_tokens_text ?? usage.prompt_tokens ?? 0;
+    const outputTokens = usage.output_tokens ?? usage.output_tokens_text ?? usage.completion_tokens ?? 0;
+
+    const name = (res && res.output_text) ? res.output_text.trim() : 'Not Found';
+    return { name, tokensIn: inputTokens, tokensOut: outputTokens };
 }
 
-export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, log = () => { } }) {
+function computeFounderCost({ tokensIn = 0, tokensOut = 0, pricing }) {
+    const serperCost = pricing?.serper_request_cost || 0;
+    const inputRate = pricing?.openai_per_million_input || 0;
+    const outputRate = pricing?.openai_per_million_output || 0;
+    const openaiCost = ((tokensIn / 1_000_000) * inputRate) + ((tokensOut / 1_000_000) * outputRate);
+    const leadCost = serperCost + openaiCost;
+    return { serperCost, openaiCost, leadCost };
+}
+
+export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, log = () => { } }) {
     const OPENAI_API_KEY = apiKeys.openai;
     const SERPER_API_KEY = apiKeys.serper;
 
@@ -192,6 +206,9 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, log = () 
     const aiTasks = [];
     let notFoundCount = 0;
     let foundCount = 0;
+    let stageCost = 0;
+    let serperCostTotal = 0;
+    let openaiCostTotal = 0;
 
     const serperTasks = chunks.map((chunk, batchIdx) =>
         serperLimit(async () => {
@@ -239,10 +256,15 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, log = () 
                     }
 
                     let name = 'Not Found';
+                    let tokensIn = 0;
+                    let tokensOut = 0;
 
                     if (searchResults.length > 0) {
                         try {
-                            name = await aiFindFounder(searchResults, domain, log, openai);
+                            const result = await aiFindFounder(searchResults, domain, log, openai);
+                            name = result?.name || 'Not Found';
+                            tokensIn = result?.tokensIn || 0;
+                            tokensOut = result?.tokensOut || 0;
                         } catch (err) {
                             if (err?.isQuotaExceeded) {
                                 fatalQuotaError = fatalQuotaError || err;
@@ -258,14 +280,33 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, log = () 
                         foundCount++;
                     }
 
+                    const { serperCost, openaiCost, leadCost } = computeFounderCost({
+                        tokensIn,
+                        tokensOut,
+                        pricing
+                    });
+                    serperCostTotal += serperCost;
+                    openaiCostTotal += openaiCost;
+                    stageCost += leadCost;
+
                     processed++;
+                    const costNumber = Number(stageCost.toFixed(6));
                     const progressPayload = {
                         progress: {
                             stage: 'founders',
                             processed,
                             total: domains.length,
                             found: foundCount,
-                            notFound: notFoundCount
+                            notFound: notFoundCount,
+                            cost: costNumber,
+                            stats: {
+                                found: foundCount,
+                                notFound: notFoundCount,
+                                processed,
+                                total: domains.length,
+                                cost: costNumber,
+                                costDisplay: `$${costNumber.toFixed(4)}`
+                            }
                         }
                     };
                     if (processed % 25 === 0 || processed <= 10) {
@@ -298,7 +339,9 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, log = () 
         total: domains.length,
         processed,
         found: foundCount,
-        notFound: notFoundCount
+        notFound: notFoundCount,
+        cost: Number(stageCost.toFixed(6)),
+        costDisplay: `$${stageCost.toFixed(4)}`
     };
 
     log(`Founders: done. Results written to ${outputCsv}`);

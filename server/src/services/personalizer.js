@@ -288,8 +288,8 @@ function isB2B(text) {
     return B2B_KEYWORDS.some(keyword => lower.includes(keyword));
 }
 
-async function cleanProductData({ inputJson, outputCsv, log, maxBodyLength = 800 }) {
-    log?.('Cleaning product data...');
+async function cleanProductData({ inputJson, outputCsv, log, maxBodyLength = 800, removeB2B = true }) {
+    log?.(`Cleaning product data...${removeB2B ? '' : ' (B2B filter disabled)'}`);
 
     const products = JSON.parse(fs.readFileSync(inputJson, 'utf-8'));
     const cleaned = [];
@@ -308,7 +308,7 @@ async function cleanProductData({ inputJson, outputCsv, log, maxBodyLength = 800
 
         // Check if B2B
         const combinedText = `${title} ${bodyText} ${tags} ${url}`;
-        if (isB2B(combinedText)) {
+        if (removeB2B && isB2B(combinedText)) {
             removed++;
             if (removedExamples.length < 3) {
                 removedExamples.push({ title, url });
@@ -520,7 +520,7 @@ Write a single, warm, conversational first line that references this specific pr
     };
 }
 
-export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log }) {
+export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log, removeB2B = true }) {
     const jobDir = path.dirname(inputCsv);
     const shopifyDetectionCsv = path.join(jobDir, 'shopify-detection.csv');
     const productsJson = path.join(jobDir, 'products.json');
@@ -576,7 +576,8 @@ export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log }) 
         inputJson: productsJson,
         outputCsv: cleanedProductsCsv,
         log,
-        maxBodyLength: 800
+        maxBodyLength: 800,
+        removeB2B
     });
 
     // If no products after cleaning, skip personalization

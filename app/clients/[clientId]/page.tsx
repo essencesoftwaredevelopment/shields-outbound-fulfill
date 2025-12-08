@@ -1,8 +1,8 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { doc, getDoc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy } from "firebase/firestore";
+import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, DocumentSnapshot } from "firebase/firestore";
 import { getIdToken } from "firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
@@ -35,6 +35,7 @@ type Lead = {
     personalizationUrl?: string;
     personalizationTitle?: string;
     updatedAt?: string;
+    campaigns?: string[];
 };
 
 type Campaign = {
@@ -73,6 +74,7 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
     running: "Running",
     completed: "Completed",
     error: "Error",
+    cancelled: "Cancelled",
 };
 
 const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
@@ -87,6 +89,7 @@ const JOB_STATUS_COLORS: Record<JobStatus, string> = {
     running: "#3b82f6",
     completed: "#22c55e",
     error: "#f87171",
+    cancelled: "#a1a1aa",
 };
 
 const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
@@ -135,11 +138,12 @@ const describeStageProgress = (stage?: PipelineStageState) => {
 };
 
 const extractStageSummary = (stage?: PipelineStageState) => {
-    if (!stage?.summary) {
+    if (!stage) {
         return [] as Array<[string, unknown]>;
     }
-
-    return Object.entries(stage.summary).slice(0, 4);
+    const fallbackStats = stage.progress?.stats || {};
+    const source = (stage.summary && Object.keys(stage.summary).length > 0) ? stage.summary : fallbackStats;
+    return Object.entries(source).slice(0, 4);
 };
 
 const formatSummaryValue = (value: unknown) => {
@@ -166,11 +170,12 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
 
-    const [activeTab, setActiveTab] = useState<"campaigns" | "leads">(
-        (searchParams?.get("tab") as "campaigns" | "leads") || "campaigns"
+    const [activeTab, setActiveTab] = useState<"info" | "campaigns" | "leads">(
+        (searchParams?.get("tab") as "info" | "campaigns" | "leads") || "campaigns"
     );
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
+    const [clientInstantlyKey, setClientInstantlyKey] = useState<string>("");
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -196,7 +201,15 @@ export default function ClientPage() {
     const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const reconnectAttemptsRef = useRef(0);
     const lastStreamingJobIdRef = useRef<string | null>(null);
+    const lastActiveStatusRef = useRef<string | null>(null);
+    const previousJobIdRef = useRef<string | null>(null);
+    const lastUploadErrorRef = useRef<string | null>(null);
+    const jobStateRef = useRef<PipelineJob | null>(null);
     const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+    const [activeJobStatus, setActiveJobStatus] = useState<string | null>(null);
+    const [uploadMetrics, setUploadMetrics] = useState<{ count: number; total: number } | null>(null);
+    const [instantlyUploadError, setInstantlyUploadError] = useState<string | null>(null);
+    const [savingClientInfo, setSavingClientInfo] = useState(false);
 
     const createEmptyStageState = useCallback((): PipelineStageState => ({
         status: "pending",
@@ -251,14 +264,25 @@ export default function ClientPage() {
     const [csvPreviewRows, setCsvPreviewRows] = useState<Record<string, string>[]>([]);
     const [columnMapping, setColumnMapping] = useState<Record<string, { column: string; isCustom: boolean }>>({});
     const [jobPendingUpload, setJobPendingUpload] = useState<string | null>(null);
+    const [downloadModalOpen, setDownloadModalOpen] = useState(false);
+    const [downloadScope, setDownloadScope] = useState<'all' | 'valid'>('all');
+    const [stoppingJob, setStoppingJob] = useState(false);
+    const leadsContainerRef = useRef<HTMLDivElement | null>(null);
 
     // Leads state
     const [leads, setLeads] = useState<Lead[]>([]);
     const [stats, setStats] = useState<{ total: number; verified: number; unverified: number }>(() => ({ total: 0, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
+    const [leadsLoading, setLeadsLoading] = useState(false);
+    const [leadsHasMore, setLeadsHasMore] = useState(true);
+    const [leadsCursor, setLeadsCursor] = useState<DocumentSnapshot | null>(null);
+    const [campaignFilterId, setCampaignFilterId] = useState<string>("");
+    const [campaignNameFilter, setCampaignNameFilter] = useState<string>("");
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+    const [syncingCampaigns, setSyncingCampaigns] = useState(false);
+    const [campaignSyncMessage, setCampaignSyncMessage] = useState("");
 
     const niches = useMemo<Niche[]>(
         () => [
@@ -294,6 +318,118 @@ export default function ClientPage() {
         [],
     );
 
+    const canUploadToInstantly = useMemo(() => {
+        if (!jobState) {
+            return false;
+        }
+        if (jobPendingUpload) {
+            return true;
+        }
+        if (activeJobStatus === "pending-upload") {
+            return true;
+        }
+        if (!activeJobStatus && jobState.status === "completed") {
+            return true;
+        }
+        return false;
+    }, [activeJobStatus, jobPendingUpload, jobState]);
+
+    const stageCompletionPercent = useMemo(() => {
+        if (!jobState?.stages) return 0;
+        const totalStages = STAGE_ORDER.length;
+        const completedStages = STAGE_ORDER.filter((key) => jobState.stages[key]?.status === 'completed').length;
+        return Math.round((completedStages / totalStages) * 100);
+    }, [jobState?.stages]);
+
+    const validLeadsCompleted = useMemo(() => {
+        const verValid = jobState?.stages?.verification?.summary?.valid;
+        const emailFound = jobState?.stages?.emailDiscovery?.summary?.found;
+        if (typeof verValid === 'number') return verValid;
+        if (typeof emailFound === 'number') return emailFound;
+        return 0;
+    }, [jobState?.stages]);
+
+    const activeStatusLabel = useMemo(() => {
+        if (!activeJobStatus) {
+            return "";
+        }
+
+        const formatNumber = (value: unknown) =>
+            typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : null;
+
+        if (activeJobStatus === "pending-upload") {
+            const readyCount = formatNumber(
+                jobState?.stages?.verification?.summary?.valid
+                ?? jobState?.stages?.emailDiscovery?.summary?.found
+                ?? jobState?.dedupeStats?.new
+            );
+            const totalCount = formatNumber(
+                jobState?.stages?.verification?.progress?.total
+                ?? jobState?.dedupeStats?.total
+            );
+            const baseMessage = readyCount && totalCount
+                ? `Ready to upload ${readyCount} of ${totalCount} leads to Instantly.`
+                : readyCount
+                    ? `Ready to upload ${readyCount} leads to Instantly.`
+                    : "Ready for Instantly upload.";
+            if (instantlyUploadError) {
+                return `${baseMessage} Last upload attempt failed: ${instantlyUploadError}`;
+            }
+            return baseMessage;
+        }
+
+        if (activeJobStatus === "uploaded") {
+            const uploadedCount = formatNumber(uploadMetrics?.count);
+            const uploadedTotal = formatNumber(uploadMetrics?.total);
+            if (uploadedCount && uploadedTotal && uploadedCount !== uploadedTotal) {
+                return `Uploaded ${uploadedCount} of ${uploadedTotal} leads to Instantly.`;
+            }
+            if (uploadedCount) {
+                return `Uploaded ${uploadedCount} leads to Instantly.`;
+            }
+            return "Leads uploaded to Instantly.";
+        }
+
+        if (activeJobStatus === "discarded") {
+            return "Job discarded. Download CSV if you still need the leads.";
+        }
+
+        if (activeJobStatus === "error") {
+            return jobState?.error || instantlyUploadError || "Pipeline failed.";
+        }
+
+        if (activeJobStatus === "running") {
+            return "Pipeline running.";
+        }
+
+        if (activeJobStatus === "queued") {
+            return "Pipeline queued.";
+        }
+
+        if (activeJobStatus === "completed") {
+            return "Pipeline completed.";
+        }
+
+        return "";
+    }, [activeJobStatus, uploadMetrics, instantlyUploadError, jobState]);
+
+    const uploadedSummary = useMemo(() => {
+        if (activeJobStatus !== "uploaded") {
+            return "";
+        }
+        const count = uploadMetrics?.count;
+        const total = uploadMetrics?.total;
+        if (typeof count === "number" && Number.isFinite(count)) {
+            if (typeof total === "number" && Number.isFinite(total) && total !== count) {
+                return `${count.toLocaleString()} / ${total.toLocaleString()} leads uploaded`;
+            }
+            return `${count.toLocaleString()} leads uploaded`;
+        }
+        return "Uploaded to Instantly";
+    }, [activeJobStatus, uploadMetrics]);
+
+    const canDiscardJob = activeJobStatus === "pending-upload";
+
     useEffect(() => {
         if (!loading && !user) {
             router.replace("/auth");
@@ -304,50 +440,21 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         let cancelled = false;
 
-        // Load client data
-        (async () => {
-            try {
-                const ref = doc(firestore, "users", user.uid, "clients", clientId);
-                const snap = await getDoc(ref);
-                if (!cancelled && snap.exists()) {
-                    const data = snap.data();
-                    setClientName((data.name as string) || clientId);
-                    setClientIndustry((data.industry as Niche["id"]) || "ecom");
-                }
-            } catch {
-                /* noop */
-            }
-        })();
-
-        // Subscribe to leads subcollection
-        const leadsCol = collection(firestore, "users", user.uid, "clients", clientId, "leads");
-        const unsubLeads = onSnapshot(leadsCol, (snap) => {
+        // Subscribe to client data
+        const clientRef = doc(firestore, "users", user.uid, "clients", clientId);
+        const unsubClient = onSnapshot(clientRef, (snap) => {
             if (cancelled) return;
-            const rows = snap.docs.map((d) => {
-                const data = d.data();
-                const emailStatus = (data.email_status as string) || "";
-                const isVerified = emailStatus === "valid" || emailStatus === "verified";
-                return {
-                    id: d.id,
-                    domain: (data.domain as string) || (data.website as string) || "",
-                    email: (data.email as string) || "",
-                    status: emailStatus,
-                    verified: isVerified,
-                    firstLine: (data.personalization_first_line as string) || "",
-                    founderName: (data.founder_name as string) || "",
-                    personalizationUrl: (data.personalization_url as string) || "",
-                    personalizationTitle: (data.personalization_title as string) || "",
-                    updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
-                } as Lead;
-            });
-            setLeads(rows);
-            const verified = rows.filter((r) => r.verified).length;
-            const total = rows.length;
-            setStats({ total, verified, unverified: Math.max(0, total - verified) });
+            if (snap.exists()) {
+                const data = snap.data();
+                setClientName((data.name as string) || clientId);
+                setClientIndustry((data.industry as Niche["id"]) || "ecom");
+                setClientInstantlyKey((data.instantly_key as string) || "");
+            }
         }, () => {
             if (!cancelled) {
-                setLeads([]);
-                setStats({ total: 0, verified: 0, unverified: 0 });
+                setClientName(clientId);
+                setClientIndustry("ecom");
+                setClientInstantlyKey("");
             }
         });
 
@@ -374,10 +481,19 @@ export default function ClientPage() {
 
         return () => {
             cancelled = true;
-            try { unsubLeads(); } catch { }
+            try { unsubClient(); } catch { }
             try { unsubCampaigns(); } catch { }
         };
     }, [user, clientId]);
+
+    useEffect(() => {
+        if (!user || !clientId) return;
+        setLeads([]);
+        setLeadsCursor(null);
+        setLeadsHasMore(true);
+        fetchLeads(true);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [user, clientId, campaignFilterId, campaignNameFilter]);
 
     useEffect(() => {
         if (toastVisible) {
@@ -400,11 +516,104 @@ export default function ClientPage() {
         setJobStreamConnected(false);
     }, []);
 
+    const matchingCampaignIds = useMemo(() => {
+        if (!campaignNameFilter.trim()) return [];
+        const lower = campaignNameFilter.toLowerCase();
+        return campaigns
+            .filter(c => c.name.toLowerCase().includes(lower))
+            .slice(0, 10)
+            .map(c => c.id);
+    }, [campaignNameFilter, campaigns]);
+
+    const campaignIdToName = useMemo(() => {
+        const map = new Map<string, string>();
+        campaigns.forEach((c) => map.set(c.id, c.name));
+        return map;
+    }, [campaigns]);
+
+    const getCampaignNamesForLead = useCallback((lead: Lead) => {
+        if (!lead.campaigns || lead.campaigns.length === 0) return [];
+        return lead.campaigns.map((id) => campaignIdToName.get(id) || id);
+    }, [campaignIdToName]);
+
+    const fetchLeads = useCallback(async (reset = false) => {
+        if (!user || !clientId) return;
+        setLeadsLoading(true);
+        try {
+            const leadsCol = collection(firestore, "users", user.uid, "clients", clientId, "leads");
+            const constraints: unknown[] = [];
+            if (campaignFilterId) {
+                constraints.push(where("campaigns", "array-contains", campaignFilterId));
+            } else if (campaignNameFilter.trim()) {
+                if (matchingCampaignIds.length === 0) {
+                    setLeads([]);
+                    setStats({ total: 0, verified: 0, unverified: 0 });
+                    setLeadsHasMore(false);
+                    setLeadsCursor(null);
+                    setLeadsLoading(false);
+                    return;
+                }
+                constraints.push(where("campaigns", "array-contains-any", matchingCampaignIds));
+            }
+
+            const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
+            if (!reset && leadsCursor) {
+                clauses.push(startAfter(leadsCursor));
+            }
+            clauses.push(limit(200));
+            const baseQuery = query(leadsCol, ...clauses);
+
+            const snap = await getDocs(baseQuery);
+            const mapped = snap.docs.map((d) => {
+                const data = d.data();
+                const emailStatus = (data.email_status as string) || "";
+                const isVerified = emailStatus === "valid" || emailStatus === "verified";
+                return {
+                    id: d.id,
+                    domain: (data.domain as string) || (data.website as string) || "",
+                    email: (data.email as string) || "",
+                    status: emailStatus,
+                    verified: isVerified,
+                    firstLine: (data.personalization_first_line as string) || "",
+                    founderName: (data.founder_name as string) || "",
+                    personalizationUrl: (data.personalization_url as string) || "",
+                    personalizationTitle: (data.personalization_title as string) || "",
+                    updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
+                    campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
+                } as Lead;
+            });
+
+            setLeads((prev) => {
+                const next = reset ? mapped : [...prev, ...mapped];
+                const total = next.length;
+                const verified = next.filter((r) => r.verified).length;
+                setStats({ total, verified, unverified: Math.max(0, total - verified) });
+                return next;
+            });
+            setLeadsCursor(snap.docs[snap.docs.length - 1] || null);
+            setLeadsHasMore(snap.size === 200);
+        } catch (error) {
+            console.error('Failed to fetch leads:', error);
+            setLeadsHasMore(false);
+        } finally {
+            setLeadsLoading(false);
+        }
+    }, [user, clientId, campaignFilterId, campaignNameFilter, matchingCampaignIds, leadsCursor]);
+
+    const loadMoreLeads = useCallback(() => {
+        if (leadsLoading || !leadsHasMore) return;
+        fetchLeads(false);
+    }, [fetchLeads, leadsHasMore, leadsLoading]);
+
     useEffect(() => {
         return () => {
             closeJobStream();
         };
     }, [closeJobStream]);
+
+    useEffect(() => {
+        jobStateRef.current = jobState;
+    }, [jobState]);
 
     const fetchJobSnapshot = useCallback(async (jobId: string) => {
         if (!jobId) return;
@@ -489,37 +698,128 @@ export default function ClientPage() {
 
     // Check for active job on mount (after openJobStream is defined)
     useEffect(() => {
-        if (!user || !clientId) return;
-        let cancelled = false;
+        if (!user || !clientId) {
+            return;
+        }
 
-        (async () => {
-            try {
-                const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-                const jobSnap = await getDoc(jobRef);
-                if (!cancelled && jobSnap.exists()) {
-                    const data = jobSnap.data();
-                    if (data.jobId) {
-                        if (data.status === 'pending-upload') {
-                            // Job is completed and pending upload
-                            setJobPendingUpload(data.jobId);
-                            fetchJobSnapshot(data.jobId);
-                        } else if (data.status !== 'completed' && data.status !== 'error') {
-                            // Reconnect to active job
-                            openJobStream(data.jobId);
-                        } else {
-                            fetchJobSnapshot(data.jobId);
-                        }
-                    }
-                }
-            } catch (error) {
-                console.error('Failed to check for active job:', error);
+        const activeJobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
+        const unsubscribe = onSnapshot(activeJobRef, (snap) => {
+            if (!snap.exists()) {
+                setActiveJobStatus(null);
+                setJobPendingUpload(null);
+                setUploadMetrics(null);
+                setJobStatusMessage("");
+                setInstantlyUploadError(null);
+                lastActiveStatusRef.current = null;
+                previousJobIdRef.current = null;
+                lastUploadErrorRef.current = null;
+                return;
             }
-        })();
+
+            const data = snap.data() as Record<string, unknown>;
+            const jobId = typeof data.jobId === "string" ? data.jobId : null;
+            const status = typeof data.status === "string" ? data.status : null;
+            const uploadErrorMessage = typeof data.uploadError === "string" ? data.uploadError : null;
+            const errorMessage = typeof data.error === "string" ? data.error : uploadErrorMessage;
+            const metricsRaw = data.uploadMetrics as Record<string, unknown> | undefined;
+
+            const parsedMetrics = metricsRaw
+                ? {
+                    count: (() => {
+                        const value = metricsRaw.count;
+                        return typeof value === "number" && Number.isFinite(value) ? value : 0;
+                    })(),
+                    total: (() => {
+                        const value = metricsRaw.total ?? metricsRaw.count;
+                        return typeof value === "number" && Number.isFinite(value) ? value : 0;
+                    })(),
+                }
+                : null;
+
+            setActiveJobStatus(status);
+            setUploadMetrics(parsedMetrics);
+            setInstantlyUploadError(uploadErrorMessage);
+
+            if (status === "pending-upload") {
+                if (uploadErrorMessage && uploadErrorMessage !== lastUploadErrorRef.current) {
+                    setToastMessage(uploadErrorMessage);
+                    setToastVisible(true);
+                }
+                lastUploadErrorRef.current = uploadErrorMessage;
+            } else {
+                lastUploadErrorRef.current = null;
+            }
+
+            if (status === "pending-upload" && jobId) {
+                setJobPendingUpload(jobId);
+            } else if (status && status !== "pending-upload") {
+                setJobPendingUpload(null);
+            }
+
+            if (jobId) {
+                setSelectedJobId(jobId);
+                const compositeKey = `${jobId}:${status ?? ""}`;
+                if (previousJobIdRef.current !== compositeKey) {
+                    previousJobIdRef.current = compositeKey;
+                    fetchJobSnapshot(jobId);
+                }
+            } else {
+                previousJobIdRef.current = null;
+            }
+
+            const shouldStream = status === "running" || status === "queued";
+            const isStreaming = jobId && lastStreamingJobIdRef.current === jobId && Boolean(jobStreamRef.current);
+            if (jobId && shouldStream) {
+                if (!isStreaming) {
+                    openJobStream(jobId);
+                }
+            } else if (isStreaming && (!status || status === "completed" || status === "pending-upload" || status === "uploaded" || status === "error" || status === "discarded")) {
+                closeJobStream();
+            }
+
+            if (status && status !== lastActiveStatusRef.current) {
+                if (status === "pending-upload") {
+                    const message = "Pipeline finished. Ready for Instantly upload.";
+                    setJobStatusMessage(message);
+                    setToastMessage(message);
+                    setToastVisible(true);
+                } else if (status === "uploaded") {
+                    const uploadedCount = parsedMetrics?.count ?? 0;
+                    const uploadedTotal = parsedMetrics?.total ?? 0;
+                    const detail = uploadedTotal
+                        ? `Uploaded ${uploadedCount.toLocaleString()} of ${uploadedTotal.toLocaleString()} leads to Instantly.`
+                        : `Uploaded ${uploadedCount.toLocaleString()} leads to Instantly.`;
+                    setJobStatusMessage(detail);
+                    setToastMessage(detail);
+                    setToastVisible(true);
+                    setUploadModalOpen(false);
+                } else if (status === "discarded") {
+                    const message = "Job discarded.";
+                    setJobStatusMessage(message);
+                    setToastMessage(message);
+                    setToastVisible(true);
+                    setUploadModalOpen(false);
+                    setJobState(null);
+                } else if (status === "error") {
+                    const message = errorMessage || "Pipeline failed.";
+                    setJobStatusMessage(message);
+                    setToastMessage(message);
+                    setToastVisible(true);
+                } else if (status === "queued") {
+                    setJobStatusMessage("Pipeline queued.");
+                } else if (status === "running") {
+                    setJobStatusMessage("Pipeline running.");
+                }
+                lastActiveStatusRef.current = status;
+            }
+        }, (error) => {
+            console.error("Active job subscription error:", error);
+        });
 
         return () => {
-            cancelled = true;
+            unsubscribe();
         };
-    }, [user, clientId, openJobStream, fetchJobSnapshot]);
+    }, [user, clientId, fetchJobSnapshot, openJobStream, closeJobStream]);
 
     useEffect(() => {
         if (!user || !clientId) {
@@ -575,20 +875,56 @@ export default function ClientPage() {
         }
 
         const latest = jobHistory[0];
-        if (!jobState) {
-            setJobState(latest);
+        const selectedFromHistory = selectedJobId
+            ? jobHistory.find((job) => job.id === selectedJobId) || null
+            : null;
+
+        const streamingSelected = (jobStreamConnected || jobState?.status === "running") && jobState && selectedJobId === jobState.id;
+
+        if (selectedFromHistory && streamingSelected) {
+            const statusChanged = jobState?.status !== selectedFromHistory.status;
+            const completedChanged = jobState?.completedAt !== selectedFromHistory.completedAt;
+            const errorChanged = jobState?.error !== selectedFromHistory.error;
+            if (statusChanged || completedChanged || errorChanged) {
+                setJobState((prev) => prev && prev.id === selectedFromHistory.id
+                    ? { ...prev, ...selectedFromHistory, stages: selectedFromHistory.stages || prev.stages }
+                    : selectedFromHistory);
+            }
+        }
+
+        // If a job is selected and not streaming, keep it in sync with history
+        if (selectedFromHistory && !streamingSelected) {
+            setJobState((prev) => {
+                const sameId = prev?.id === selectedFromHistory.id;
+                const sameStatus = prev?.status === selectedFromHistory.status;
+                const sameCompleted = prev?.completedAt === selectedFromHistory.completedAt;
+                const sameError = prev?.error === selectedFromHistory.error;
+                const prevStages = prev?.stages ? JSON.stringify(prev.stages) : null;
+                const nextStages = selectedFromHistory.stages ? JSON.stringify(selectedFromHistory.stages) : null;
+                const sameStages = prevStages === nextStages;
+                if (sameId && sameStatus && sameCompleted && sameError && sameStages) {
+                    return prev;
+                }
+                return { ...selectedFromHistory, stages: selectedFromHistory.stages || prev?.stages };
+            });
             return;
         }
 
-        const hasActiveStream = jobStreamConnected || jobState.status === "running";
-        if (jobState.id === latest.id) {
-            if (!hasActiveStream && (jobState.status !== latest.status || jobState.completedAt !== latest.completedAt)) {
+        // If nothing selected yet, default to latest
+        if (!selectedJobId) {
+            setSelectedJobId(latest.id);
+            if (!streamingSelected) {
                 setJobState(latest);
             }
-        } else if (!hasActiveStream) {
+            return;
+        }
+
+        // If the previously selected job disappeared, fall back to latest
+        if (!selectedFromHistory && !streamingSelected) {
+            setSelectedJobId(latest.id);
             setJobState(latest);
         }
-    }, [jobHistory, jobState, jobStreamConnected]);
+    }, [jobHistory, jobState, jobStreamConnected, selectedJobId]);
 
     useEffect(() => {
         if (jobState) {
@@ -614,7 +950,7 @@ export default function ClientPage() {
             (async () => {
                 try {
                     const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-                    await setDoc(jobRef, { status: 'pending-upload' }, { merge: true });
+                    await setDoc(jobRef, { status: 'pending-upload', uploadError: null, uploadMetrics: null }, { merge: true });
                 } catch (error) {
                     console.error('Failed to update job status:', error);
                 }
@@ -631,7 +967,7 @@ export default function ClientPage() {
             (async () => {
                 try {
                     const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-                    await setDoc(jobRef, { status: 'error', error: jobState.error }, { merge: true });
+                    await setDoc(jobRef, { status: 'error', error: jobState.error, uploadMetrics: null }, { merge: true });
                 } catch (error) {
                     console.error('Failed to update job status:', error);
                 }
@@ -639,6 +975,31 @@ export default function ClientPage() {
             lastStreamingJobIdRef.current = null;
         }
     }, [jobState, closeJobStream, user, clientId]);
+
+    const handleRefreshCampaigns = useCallback(async () => {
+        if (!user || !clientId) return;
+        setSyncingCampaigns(true);
+        setCampaignSyncMessage("");
+        try {
+            const idToken = await getIdToken(user);
+            const resp = await fetch(`/api/clients/${encodeURIComponent(clientId)}/campaigns`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ idToken })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Refresh failed (${resp.status})`);
+            }
+            const data = await resp.json();
+            setCampaignSyncMessage(`Synced ${data.count ?? campaigns.length} campaigns.`);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to refresh campaigns';
+            setCampaignSyncMessage(message);
+        } finally {
+            setSyncingCampaigns(false);
+        }
+    }, [user, clientId, campaigns.length]);
 
     const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0] ?? null;
@@ -739,7 +1100,9 @@ export default function ClientPage() {
                     jobId,
                     status: freshJob.status,
                     createdAt: serverTimestamp(),
-                    campaignId: selectedCampaignId || null
+                    campaignId: selectedCampaignId || null,
+                    uploadError: null,
+                    uploadMetrics: null
                 }, { merge: true });
             } catch (error) {
                 console.error('Failed to save job to Firestore:', error);
@@ -756,12 +1119,66 @@ export default function ClientPage() {
         }
     };
 
-    const handleDownloadResults = () => {
+    const handleDownloadResults = (scope: 'all' | 'valid') => {
         if (!jobState || jobState.status !== "completed") {
             return;
         }
-        const url = getJobResultUrl(jobState.id);
+        const url = getJobResultUrl(jobState.id, scope);
         window.open(url, "_blank", "noopener,noreferrer");
+        setDownloadModalOpen(false);
+    };
+
+    const handleStopJob = async () => {
+        if (!jobState || !user) return;
+        setStoppingJob(true);
+        setJobStatusMessage('Stopping job...');
+        try {
+            const idToken = await getIdToken(user);
+            const resp = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/stop`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ idToken, clientId })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to stop job (${resp.status})`);
+            }
+            closeJobStream();
+            setJobState((prev) => prev ? { ...prev, status: 'cancelled', error: 'Cancelled by user' } : prev);
+            setJobStatusMessage('Job cancelled.');
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to stop job');
+            setToastVisible(true);
+        } finally {
+            setStoppingJob(false);
+        }
+    };
+
+    const handleSaveClientInfo = async () => {
+        if (!user || !clientId) return;
+        setSavingClientInfo(true);
+        try {
+            const ref = doc(firestore, "users", user.uid, "clients", clientId);
+            await setDoc(ref, {
+                name: clientName?.trim() || clientId,
+                industry: clientIndustry,
+                instantly_key: clientInstantlyKey?.trim() || ""
+            }, { merge: true });
+            setToastMessage('Client info saved');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save client info');
+            setToastVisible(true);
+        } finally {
+            setSavingClientInfo(false);
+        }
+    };
+
+    const handleLeadsScroll = (event: UIEvent<HTMLDivElement>) => {
+        const target = event.currentTarget;
+        if (target.scrollTop + target.clientHeight >= target.scrollHeight - 50) {
+            loadMoreLeads();
+        }
     };
 
     const handleUploadToInstantly = async () => {
@@ -851,16 +1268,22 @@ export default function ClientPage() {
             }
 
             const result = await response.json();
-            setToastMessage(`Successfully uploaded ${result.count || 0} leads to Instantly`);
+            const uploadedCount = typeof result.count === 'number' && Number.isFinite(result.count) ? result.count : 0;
+            const totalCount = typeof result.total === 'number' && Number.isFinite(result.total)
+                ? result.total
+                : uploadedCount;
+            const toastText = result.message
+                ? String(result.message)
+                : (totalCount && uploadedCount !== totalCount)
+                    ? `Uploaded ${uploadedCount.toLocaleString()} of ${totalCount.toLocaleString()} leads to Instantly`
+                    : `Uploaded ${uploadedCount.toLocaleString()} leads to Instantly`;
+            setToastMessage(toastText);
             setToastVisible(true);
             setUploadModalOpen(false);
-
-            // Clear pending upload state
-            setJobPendingUpload(null);
-            const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-            await setDoc(jobRef, { status: 'uploaded' }, { merge: true });
         } catch (error) {
-            alert(error instanceof Error ? error.message : 'Failed to upload to Instantly');
+            const message = error instanceof Error ? error.message : 'Failed to upload to Instantly';
+            setToastMessage(message);
+            setToastVisible(true);
         } finally {
             setUploading(false);
         }
@@ -871,7 +1294,7 @@ export default function ClientPage() {
 
         try {
             const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-            await setDoc(jobRef, { status: 'discarded' }, { merge: true });
+            await setDoc(jobRef, { status: 'discarded', uploadError: null, uploadMetrics: null }, { merge: true });
             setJobPendingUpload(null);
             setJobState(null);
         } catch (error) {
@@ -932,30 +1355,52 @@ export default function ClientPage() {
                         >
                             All Leads
                         </button>
+                        <button
+                            className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
+                            onClick={() => setActiveTab("info")}
+                        >
+                            Info
+                        </button>
                     </div>
 
                     {/* Campaigns Tab */}
                     {activeTab === "campaigns" && (
                         <>
                             <div style={{ marginTop: '2rem' }}>
-                                <button
-                                    type="button"
-                                    className="primary-button"
-                                    onClick={() => {
-                                        setModalOpen(true);
-                                        setWizardStep(1);
-                                        setSelectedFile(null);
-                                        setDedupeStrategy('skip');
-                                        setFindFounder(true);
-                                        setFindEmail(true);
-                                        setVerifyEmail(true);
-                                        setPersonalizeFirstLine(false);
-                                        setSelectedCampaignId("");
-                                        setUploadError("");
-                                    }}
-                                >
-                                    Upload Leads
-                                </button>
+                                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                                    <button
+                                        type="button"
+                                        className="primary-button"
+                                        onClick={() => {
+                                            setModalOpen(true);
+                                            setWizardStep(1);
+                                            setSelectedFile(null);
+                                            setDedupeStrategy('skip');
+                                            setFindFounder(true);
+                                            setFindEmail(true);
+                                            setVerifyEmail(true);
+                                            setPersonalizeFirstLine(false);
+                                            setSelectedCampaignId("");
+                                            setUploadError("");
+                                        }}
+                                    >
+                                        📤 Upload Leads
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="secondary-button secondary-button--active"
+                                        onClick={handleRefreshCampaigns}
+                                        disabled={syncingCampaigns}
+                                        style={{ minWidth: '180px' }}
+                                    >
+                                        {syncingCampaigns ? 'Refreshing...' : 'Refresh campaigns'}
+                                    </button>
+                                    {campaignSyncMessage && (
+                                        <span style={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.9rem' }}>
+                                            {campaignSyncMessage}
+                                        </span>
+                                    )}
+                                </div>
                             </div>
 
                             {/* Active Campaigns List */}
@@ -1042,7 +1487,7 @@ export default function ClientPage() {
                                         </p>
                                         <h2 className="pipeline-panel__title">
                                             {jobState
-                                                ? `${jobState.stages.verification?.summary?.valid || 0} / ${jobState.stages.verification?.progress?.total || jobState.dedupeStats?.new || 0}`
+                                                ? `${stageCompletionPercent || 0}% completed`
                                                 : "No runs yet"}
                                         </h2>
                                         {!jobState && (
@@ -1050,32 +1495,83 @@ export default function ClientPage() {
                                                 Upload leads to see stage progress and pipeline status.
                                             </p>
                                         )}
+                                        {jobState && (
+                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem' }}>
+                                                Valid leads: {validLeadsCompleted.toLocaleString()}
+                                            </p>
+                                        )}
+                                        {jobState && (
+                                            <div className="pipeline-status-row">
+                                                <p className="pipeline-panel__subtitle pipeline-panel__subtitle--status">
+                                                    Viewing job: {jobState.fileName || jobState.id} · {JOB_STATUS_LABELS[jobState.status]}
+                                                </p>
+                                                {(jobState.status === 'running' || jobState.status === 'queued') && (
+                                                    <button
+                                                        type="button"
+                                                        className="destructive-button pipeline-status-action"
+                                                        onClick={handleStopJob}
+                                                        disabled={stoppingJob}
+                                                    >
+                                                        {stoppingJob ? 'Stopping...' : 'Stop run'}
+                                                    </button>
+                                                )}
+                                            </div>
+                                        )}
+                                        {activeStatusLabel && jobState && (
+                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.75rem' }}>
+                                                {activeStatusLabel}
+                                            </p>
+                                        )}
                                     </div>
-                                    {(jobState?.status === 'completed' || jobPendingUpload) && (
-                                        <div style={{ display: 'flex', gap: '0.75rem' }}>
+                                    {jobState?.status === 'completed' && (
+                                        <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
                                             <button
                                                 type="button"
                                                 className="secondary-button secondary-button--active"
-                                                onClick={handleDownloadResults}
+                                                onClick={() => {
+                                                    setDownloadScope('all');
+                                                    setDownloadModalOpen(true);
+                                                }}
                                             >
                                                 Download CSV
                                             </button>
-                                            <button
-                                                type="button"
-                                                className="primary-button"
-                                                onClick={handleUploadToInstantly}
-                                                disabled={uploading}
-                                            >
-                                                {uploading ? 'Uploading...' : 'Upload to Instantly'}
-                                            </button>
-                                            <button
-                                                type="button"
-                                                className="secondary-button"
-                                                onClick={handleDiscardJob}
-                                                style={{ color: 'rgba(239, 68, 68, 0.9)' }}
-                                            >
-                                                Discard
-                                            </button>
+                                            {canUploadToInstantly ? (
+                                                <button
+                                                    type="button"
+                                                    className="primary-button"
+                                                    onClick={handleUploadToInstantly}
+                                                    disabled={uploading}
+                                                >
+                                                    {uploading ? 'Uploading...' : 'Upload to Instantly'}
+                                                </button>
+                                            ) : activeJobStatus === 'uploaded' ? (
+                                                <span
+                                                    style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        padding: '0.35rem 0.75rem',
+                                                        borderRadius: '999px',
+                                                        fontSize: '0.75rem',
+                                                        fontWeight: 600,
+                                                        letterSpacing: '0.02em',
+                                                        background: 'rgba(34, 197, 94, 0.12)',
+                                                        color: '#22c55e',
+                                                        border: '1px solid rgba(34, 197, 94, 0.35)'
+                                                    }}
+                                                >
+                                                    {uploadedSummary}
+                                                </span>
+                                            ) : null}
+                                            {canDiscardJob && (
+                                                <button
+                                                    type="button"
+                                                    className="destructive-button"
+                                                    onClick={handleDiscardJob}
+                                                    style={{ color: 'rgba(239, 68, 68, 0.9)' }}
+                                                >
+                                                    Discard
+                                                </button>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -1150,9 +1646,8 @@ export default function ClientPage() {
                                             {jobHistory.map((job) => {
                                                 const isSelected = job.id === selectedJobId;
                                                 const statusColor = JOB_STATUS_COLORS[job.status];
-                                                const totalProcessed = job.stages?.verification?.progress?.total
-                                                    || job.dedupeStats?.total
-                                                    || job.dedupeStats?.new
+                                                const totalProcessed = job.dedupeStats?.total
+                                                    || job.stages?.verification?.progress?.total
                                                     || job.stages?.founders?.progress?.total
                                                     || 0;
                                                 const validLeads = job.stages?.verification?.summary?.valid
@@ -1271,6 +1766,37 @@ export default function ClientPage() {
                                 </div>
                             </div>
 
+                            <div style={{
+                                marginTop: '1rem',
+                                display: 'flex',
+                                gap: '0.75rem',
+                                flexWrap: 'wrap',
+                                alignItems: 'flex-end'
+                            }}>
+                                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '220px' }}>
+                                    <span className="settings-field__label">Filter by Campaign</span>
+                                    <select
+                                        value={campaignFilterId}
+                                        onChange={(e) => setCampaignFilterId(e.target.value)}
+                                    >
+                                        <option value="">All campaigns</option>
+                                        {campaigns.map((c) => (
+                                            <option key={c.id} value={c.id}>{c.name}</option>
+                                        ))}
+                                    </select>
+                                </label>
+                                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '240px' }}>
+                                    <span className="settings-field__label">Filter by Campaign Name</span>
+                                    <input
+                                        type="text"
+                                        value={campaignNameFilter}
+                                        onChange={(e) => setCampaignNameFilter(e.target.value)}
+                                        placeholder="Search campaign name"
+                                    />
+                                    <span className="settings-field__hint">Matches assigned campaigns by name.</span>
+                                </label>
+                            </div>
+
                             <div style={{ marginTop: '1.5rem' }}>
                                 {leads.length === 0 ? (
                                     <div className="pipeline-panel__empty">
@@ -1282,106 +1808,167 @@ export default function ClientPage() {
                                         overflowX: 'auto',
                                         border: '1px solid rgba(255, 255, 255, 0.1)',
                                         borderRadius: '8px',
-                                        backgroundColor: 'rgba(0, 0, 0, 0.2)'
+                                        backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                                        maxHeight: '520px',
+                                        overflowY: 'auto'
                                     }}>
-                                        <table style={{
-                                            width: '100%',
-                                            borderCollapse: 'collapse',
-                                            fontSize: '0.875rem'
-                                        }}>
-                                            <thead>
-                                                <tr style={{
-                                                    backgroundColor: 'rgba(255, 255, 255, 0.05)',
-                                                    borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
-                                                }}>
-                                                    <th style={{
-                                                        textAlign: 'left',
-                                                        padding: '0.75rem 1rem',
-                                                        fontWeight: 600,
-                                                        color: 'rgba(255, 255, 255, 0.9)'
-                                                    }}>Domain</th>
-                                                    <th style={{
-                                                        textAlign: 'left',
-                                                        padding: '0.75rem 1rem',
-                                                        fontWeight: 600,
-                                                        color: 'rgba(255, 255, 255, 0.9)'
-                                                    }}>Email</th>
-                                                    <th style={{
-                                                        textAlign: 'left',
-                                                        padding: '0.75rem 1rem',
-                                                        fontWeight: 600,
-                                                        color: 'rgba(255, 255, 255, 0.9)'
-                                                    }}>Status</th>
-                                                    <th style={{
-                                                        textAlign: 'left',
-                                                        padding: '0.75rem 1rem',
-                                                        fontWeight: 600,
-                                                        color: 'rgba(255, 255, 255, 0.9)'
-                                                    }}>Verified</th>
-                                                    <th style={{
-                                                        textAlign: 'left',
-                                                        padding: '0.75rem 1rem',
-                                                        fontWeight: 600,
-                                                        color: 'rgba(255, 255, 255, 0.9)'
-                                                    }}>First Line</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {leads.slice(0, 20).map((lead, index) => (
-                                                    <tr
-                                                        key={lead.id}
-                                                        onClick={() => setSelectedLead(lead)}
-                                                        style={{
-                                                            backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
-                                                            borderBottom: index < 19 && index < leads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
-                                                            cursor: 'pointer',
-                                                            transition: 'background-color 0.15s ease'
-                                                        }}
-                                                        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
-                                                        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
-                                                    >
-                                                        <td style={{
+                                        <div
+                                            ref={leadsContainerRef}
+                                            onScroll={handleLeadsScroll}
+                                            style={{ maxHeight: '520px', overflowY: 'auto' }}
+                                        >
+                                            <table style={{
+                                                width: '100%',
+                                                borderCollapse: 'collapse',
+                                                fontSize: '0.875rem'
+                                            }}>
+                                                <thead>
+                                                    <tr style={{
+                                                        backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                                                        borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                                    }}>
+                                                        <th style={{
+                                                            textAlign: 'left',
                                                             padding: '0.75rem 1rem',
-                                                            maxWidth: '200px',
-                                                            overflow: 'hidden',
-                                                            textOverflow: 'ellipsis',
-                                                            whiteSpace: 'nowrap'
-                                                        }}>{lead.domain || '—'}</td>
-                                                        <td style={{
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Domain</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
                                                             padding: '0.75rem 1rem',
-                                                            maxWidth: '250px',
-                                                            overflow: 'hidden',
-                                                            textOverflow: 'ellipsis',
-                                                            whiteSpace: 'nowrap'
-                                                        }}>{lead.email || '—'}</td>
-                                                        <td style={{
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Email</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
                                                             padding: '0.75rem 1rem',
-                                                            maxWidth: '120px',
-                                                            overflow: 'hidden',
-                                                            textOverflow: 'ellipsis',
-                                                            whiteSpace: 'nowrap'
-                                                        }}>{lead.status || '—'}</td>
-                                                        <td style={{
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Status</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
                                                             padding: '0.75rem 1rem',
-                                                            color: lead.verified ? '#16a34a' : 'rgba(255, 255, 255, 0.5)'
-                                                        }}>{lead.verified ? 'Yes' : 'No'}</td>
-                                                        <td style={{
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Verified</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
                                                             padding: '0.75rem 1rem',
-                                                            maxWidth: '400px',
-                                                            overflow: 'hidden',
-                                                            textOverflow: 'ellipsis',
-                                                            whiteSpace: 'nowrap',
-                                                            fontStyle: lead.firstLine ? 'italic' : 'normal',
-                                                            color: lead.firstLine ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 255, 255, 0.3)'
-                                                        }}>{lead.firstLine || '—'}</td>
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>First Line</th>
                                                     </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
+                                                </thead>
+                                                <tbody>
+                                                    {leads.map((lead, index) => (
+                                                        <tr
+                                                            key={lead.id}
+                                                            onClick={() => setSelectedLead(lead)}
+                                                            style={{
+                                                                backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
+                                                                borderBottom: index < leads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+                                                                cursor: 'pointer',
+                                                                transition: 'background-color 0.15s ease'
+                                                            }}
+                                                            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
+                                                            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
+                                                        >
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '200px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.domain || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '250px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.email || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '120px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.status || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                color: lead.verified ? '#16a34a' : 'rgba(255, 255, 255, 0.5)'
+                                                            }}>{lead.verified ? 'Yes' : 'No'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '400px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap',
+                                                                fontStyle: lead.firstLine ? 'italic' : 'normal',
+                                                                color: lead.firstLine ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 255, 255, 0.3)'
+                                                            }}>{lead.firstLine || '—'}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                            {(leadsLoading || leadsHasMore) && (
+                                                <div style={{ padding: '0.75rem 1rem', color: 'rgba(255,255,255,0.7)' }}>
+                                                    {leadsLoading ? 'Loading leads...' : 'Scroll to load more'}
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
                             </div>
                         </>
+                    )}
+
+                    {/* Info Tab */}
+                    {activeTab === "info" && (
+                        <div style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', maxWidth: '640px' }}>
+                            <p className="eyebrow eyebrow--muted">Client details</p>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Client Name</span>
+                                <input
+                                    type="text"
+                                    value={clientName}
+                                    onChange={(e) => setClientName(e.target.value)}
+                                    placeholder="Client name"
+                                />
+                            </label>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Industry</span>
+                                <select
+                                    value={clientIndustry}
+                                    onChange={(e) => setClientIndustry(e.target.value as Niche['id'])}
+                                >
+                                    <option value="ecom">E-commerce</option>
+                                    <option value="saas">SaaS</option>
+                                    <option value="agency">Agency</option>
+                                    <option value="local">Local Business</option>
+                                </select>
+                                <span className="settings-field__hint">Used for personalization defaults.</span>
+                            </label>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Instantly API Key</span>
+                                <input
+                                    type="password"
+                                    value={clientInstantlyKey}
+                                    onChange={(e) => setClientInstantlyKey(e.target.value)}
+                                    placeholder="Paste Instantly API key"
+                                />
+                            </label>
+                            <div className="modal__actions" style={{ justifyContent: 'flex-start' }}>
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={handleSaveClientInfo}
+                                    disabled={savingClientInfo}
+                                >
+                                    {savingClientInfo ? 'Saving...' : 'Save'}
+                                </button>
+                            </div>
+                        </div>
                     )}
                 </section>
             </AppShell>
@@ -1905,6 +2492,81 @@ export default function ClientPage() {
                 </div>
             )}
 
+            {/* Download CSV scope modal */}
+            {downloadModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => setDownloadModalOpen(false)}
+                >
+                    <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '520px' }}>
+                        <div className="modal__header">
+                            <div>
+                                <h2 className="modal__title">Download results</h2>
+                                <p className="modal__description">
+                                    Choose whether to include all leads or only verified/valid-risky leads.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            {[
+                                { value: 'all', label: 'All leads', description: 'Exports every processed lead, regardless of verification status.' },
+                                { value: 'valid', label: 'Valid only', description: 'Exports only valid, verified, or valid-risky emails (recommended for sending).' }
+                            ].map((option) => (
+                                <label
+                                    key={option.value}
+                                    style={{
+                                        display: 'flex',
+                                        gap: '0.75rem',
+                                        alignItems: 'flex-start',
+                                        padding: '0.85rem 1rem',
+                                        borderRadius: '10px',
+                                        border: downloadScope === option.value ? '1px solid rgba(59, 130, 246, 0.6)' : '1px solid rgba(255, 255, 255, 0.08)',
+                                        background: downloadScope === option.value ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+                                        cursor: 'pointer'
+                                    }}
+                                >
+                                    <input
+                                        type="radio"
+                                        name="download-scope"
+                                        value={option.value}
+                                        checked={downloadScope === option.value}
+                                        onChange={() => setDownloadScope(option.value as 'all' | 'valid')}
+                                        style={{ marginTop: '0.35rem', cursor: 'pointer' }}
+                                    />
+                                    <div>
+                                        <div style={{ fontWeight: 600, color: '#fff' }}>{option.label}</div>
+                                        <div style={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.9rem', marginTop: '0.25rem' }}>
+                                            {option.description}
+                                        </div>
+                                    </div>
+                                </label>
+                            ))}
+                        </div>
+
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setDownloadModalOpen(false)}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                disabled={!jobState || jobState.status !== 'completed'}
+                                onClick={() => handleDownloadResults(downloadScope)}
+                            >
+                                Download
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Lead Detail Panel */}
             {selectedLead && (
                 <>
@@ -1967,6 +2629,25 @@ export default function ClientPage() {
                                 ✕
                             </button>
                         </div>
+
+                        {selectedLead?.campaigns && selectedLead.campaigns.length > 0 && (
+                            <div style={{ margin: '0 0 1rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                {getCampaignNamesForLead(selectedLead).map((name) => (
+                                    <span key={name} style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        padding: '0.35rem 0.65rem',
+                                        borderRadius: '999px',
+                                        background: 'rgba(59, 130, 246, 0.15)',
+                                        color: '#bfdbfe',
+                                        fontSize: '0.8rem',
+                                        border: '1px solid rgba(59, 130, 246, 0.35)'
+                                    }}>
+                                        {name}
+                                    </span>
+                                ))}
+                            </div>
+                        )}
 
                         <div className="modal__body">
                             <label className="settings-field">

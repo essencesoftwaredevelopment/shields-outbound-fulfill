@@ -34,8 +34,9 @@ export function getJobStreamUrl(jobId: string) {
     return `${pipelineBaseUrl}/api/jobs/${jobId}/stream`;
 }
 
-export function getJobResultUrl(jobId: string) {
-    return `${pipelineBaseUrl}/api/jobs/${jobId}/result`;
+export function getJobResultUrl(jobId: string, scope: 'all' | 'valid' = 'all') {
+    const query = scope === 'valid' ? '?scope=valid' : '';
+    return `${pipelineBaseUrl}/api/jobs/${jobId}/result${query}`;
 }
 
 export async function createPipelineJob({ file, idToken, clientId, nicheId, nicheLabel, campaignId, findFounder, findEmail, verifyEmail, personalizeFirstLine, dedupeStrategy, signal }: CreatePipelineJobOptions) {
