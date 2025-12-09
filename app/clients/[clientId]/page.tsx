@@ -179,8 +179,11 @@ export default function ClientPage() {
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
-    const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
+    const [wizardStep, setWizardStep] = useState<1 | 2 | 3 | 4>(1);
     const [selectedFile, setSelectedFile] = useState<File | null>(null);
+    const [csvColumns, setCsvColumns] = useState<string[]>([]);
+    const [domainColumn, setDomainColumn] = useState<string>("");
+    const [founderColumn, setFounderColumn] = useState<string>("");
 
     // Step 2: Processing options
     const [dedupeStrategy, setDedupeStrategy] = useState<'skip' | 'include'>('skip');
@@ -1089,10 +1092,48 @@ export default function ClientPage() {
         }
     }, [user, clientId, campaigns.length]);
 
-    const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const guessColumn = (columns: string[], candidates: string[]) => {
+        const lower = columns.map((c) => c.toLowerCase());
+        for (const candidate of candidates) {
+            const idx = lower.findIndex((col) => col === candidate || col.includes(candidate));
+            if (idx >= 0) return columns[idx];
+        }
+        return "";
+    };
+
+    const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0] ?? null;
         setSelectedFile(file);
         setUploadError("");
+
+        // Reset mappings when a new file is chosen
+        setCsvColumns([]);
+        setDomainColumn("");
+        setFounderColumn("");
+
+        if (!file) return;
+
+        try {
+            const text = await file.text();
+            const headerLine = text.split(/\r?\n/).find((line) => line.trim().length > 0) || "";
+            if (!headerLine) return;
+            const columns = headerLine
+                .split(",")
+                .map((col) => col.trim().replace(/^"|"$/g, ""))
+                .filter(Boolean);
+            setCsvColumns(columns);
+
+            const detectedDomain = guessColumn(columns, ["domain", "website", "url", "company"]);
+            const detectedFounder = guessColumn(columns, ["founder_name", "founder", "owner", "ceo", "name"]);
+            if (detectedDomain) {
+                setDomainColumn(detectedDomain);
+            }
+            if (detectedFounder) {
+                setFounderColumn(detectedFounder);
+            }
+        } catch (error) {
+            console.error("Failed to read CSV header", error);
+        }
     };
 
     const handleSelectJob = useCallback((job: PipelineJob) => {
@@ -1207,6 +1248,26 @@ export default function ClientPage() {
             setUploading(false);
         }
     };
+
+    // Adjust founder-related options based on mapped columns
+    useEffect(() => {
+        const hasFounderColumn = founderColumn.trim().length > 0;
+        if (hasFounderColumn) {
+            setSkipFounderFinder(true);
+            setFindFounder(false);
+        } else {
+            setSkipFounderFinder(false);
+            setFindFounder(true);
+        }
+    }, [founderColumn]);
+
+    // Keep downstream steps coherent when founder finding is disabled
+    useEffect(() => {
+        if (!findFounder && !skipFounderFinder) {
+            setFindEmail(false);
+            setVerifyEmail(false);
+        }
+    }, [findFounder, skipFounderFinder]);
 
     const handleDownloadResults = (scope: 'all' | 'valid') => {
         if (!jobState || jobState.status !== "completed") {
@@ -2082,16 +2143,18 @@ export default function ClientPage() {
                     <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '720px' }}>
                         <div className="modal__header">
                             <div>
-                                <p className="eyebrow eyebrow--muted">Step {wizardStep} / 3</p>
+                                <p className="eyebrow eyebrow--muted">Step {wizardStep} / 4</p>
                                 <h2 className="modal__title">
                                     {wizardStep === 1 && '📤 Upload CSV'}
-                                    {wizardStep === 2 && '⚙️ Processing Options'}
-                                    {wizardStep === 3 && '✨ Personalization'}
+                                    {wizardStep === 2 && '🗂️ Map Columns'}
+                                    {wizardStep === 3 && '⚙️ Processing Options'}
+                                    {wizardStep === 4 && '✨ Personalization'}
                                 </h2>
                                 <p className="modal__description">
                                     {wizardStep === 1 && 'Upload your CSV file with domain column'}
-                                    {wizardStep === 2 && 'Configure enrichment and verification steps'}
-                                    {wizardStep === 3 && 'Industry-specific personalization settings'}
+                                    {wizardStep === 2 && 'Confirm which CSV columns map to required fields'}
+                                    {wizardStep === 3 && 'Configure enrichment and verification steps'}
+                                    {wizardStep === 4 && 'Industry-specific personalization settings'}
                                 </p>
                             </div>
                         </div>
@@ -2103,7 +2166,7 @@ export default function ClientPage() {
                                 gap: '0.5rem',
                                 marginBottom: '1.5rem'
                             }}>
-                                {[1, 2, 3].map((step) => (
+                                {[1, 2, 3, 4].map((step) => (
                                     <div
                                         key={step}
                                         style={{
@@ -2143,8 +2206,53 @@ export default function ClientPage() {
                                 </>
                             )}
 
-                            {/* Step 2: Processing Options */}
+                            {/* Step 2: Column Mapping */}
                             {wizardStep === 2 && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                    <div style={{ fontSize: '0.95rem', color: 'rgba(255,255,255,0.8)' }}>
+                                        Map the CSV columns so the pipeline knows where to find required fields.
+                                    </div>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Domain column <span style={{ color: '#f87171' }}>*</span></span>
+                                        <select
+                                            value={domainColumn}
+                                            onChange={(e) => setDomainColumn(e.target.value)}
+                                            disabled={!csvColumns.length}
+                                        >
+                                            <option value="">Select column</option>
+                                            {csvColumns.map((col) => (
+                                                <option key={col} value={col}>{col}</option>
+                                            ))}
+                                        </select>
+                                        <span className="settings-field__hint">
+                                            {csvColumns.length === 0 ? 'Upload a CSV in Step 1 to detect columns.' : 'Auto-detected similar names like domain/website/url.'}
+                                        </span>
+                                    </label>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Founder name column (optional)</span>
+                                        <select
+                                            value={founderColumn}
+                                            onChange={(e) => setFounderColumn(e.target.value)}
+                                            disabled={!csvColumns.length}
+                                        >
+                                            <option value="">Select column (or none)</option>
+                                            {csvColumns.map((col) => (
+                                                <option key={col} value={col}>{col}</option>
+                                            ))}
+                                        </select>
+                                        <span className="settings-field__hint">
+                                            {founderColumn
+                                                ? `Using "${founderColumn}" for founder names. Founder finder will be skipped.`
+                                                : 'Auto-detects columns like founder_name, founder, owner, ceo. Leave blank to run founder finder.'}
+                                        </span>
+                                    </label>
+                                </div>
+                            )}
+
+                            {/* Step 3: Processing Options */}
+                            {wizardStep === 3 && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
                                     <label className="settings-field">
                                         <span className="settings-field__label">Duplicates</span>
@@ -2171,13 +2279,14 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: 'pointer',
+                                            cursor: founderColumn ? 'not-allowed' : 'pointer',
                                             padding: '0.5rem',
-                                            opacity: 1
+                                            opacity: founderColumn ? 0.6 : 1
                                         }}>
                                             <input
                                                 type="checkbox"
                                                 checked={findFounder}
+                                                disabled={!!founderColumn}
                                                 onChange={(e) => {
                                                     const checked = e.target.checked;
                                                     setFindFounder(checked);
@@ -2234,12 +2343,14 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: 'pointer',
-                                            padding: '0.5rem'
+                                            cursor: founderColumn ? 'pointer' : 'not-allowed',
+                                            padding: '0.5rem',
+                                            opacity: founderColumn ? 1 : 0.6
                                         }}>
                                             <input
                                                 type="checkbox"
                                                 checked={skipFounderFinder}
+                                                disabled={!founderColumn}
                                                 onChange={(e) => setSkipFounderFinder(e.target.checked)}
                                                 style={{
                                                     width: '18px',
@@ -2406,8 +2517,8 @@ export default function ClientPage() {
                                 </div>
                             )}
 
-                            {/* Step 3: Personalization */}
-                            {wizardStep === 3 && (
+                            {/* Step 4: Personalization */}
+                            {wizardStep === 4 && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
                                     <label className="settings-field">
                                         <span className="settings-field__label">Industry</span>
@@ -2543,17 +2654,20 @@ export default function ClientPage() {
                                     <button
                                         type="button"
                                         className="secondary-button secondary-button--active"
-                                        onClick={() => setWizardStep((prev) => (prev - 1) as 1 | 2 | 3)}
+                                        onClick={() => setWizardStep((prev) => (prev - 1) as 1 | 2 | 3 | 4)}
                                     >
                                         Back
                                     </button>
                                 )}
-                                {wizardStep < 3 ? (
+                                {wizardStep < 4 ? (
                                     <button
                                         type="button"
                                         className="primary-button"
-                                        disabled={wizardStep === 1 ? !selectedFile : false}
-                                        onClick={() => setWizardStep((prev) => (prev + 1) as 1 | 2 | 3)}
+                                        disabled={
+                                            (wizardStep === 1 && !selectedFile) ||
+                                            (wizardStep === 2 && !domainColumn)
+                                        }
+                                        onClick={() => setWizardStep((prev) => (prev + 1) as 1 | 2 | 3 | 4)}
                                     >
                                         Next
                                     </button>

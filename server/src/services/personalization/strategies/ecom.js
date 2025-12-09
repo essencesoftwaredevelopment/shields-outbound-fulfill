@@ -378,7 +378,7 @@ function getHumanTimeframe(dateStr) {
     }
 }
 
-async function personalizeWithLLM({ inputCsv, outputCsv, apiKeys, log, concurrency = 15, model = 'gpt-4o-mini' }) {
+async function personalizeWithLLM({ inputCsv, outputCsv, apiKeys, log, concurrency = 15, model = 'gpt-5-nano' }) {
     log?.('Generating personalized first lines with OpenAI...');
 
     if (!apiKeys.openai) {
@@ -408,13 +408,20 @@ async function personalizeWithLLM({ inputCsv, outputCsv, apiKeys, log, concurren
                 await new Promise(resolve => setTimeout(resolve, backoffMs));
             }
 
-            const prompt = `You are writing a personalized cold email first line. Given this product information from a Shopify store:
+            const prompt = `Write one natural, human-sounding sentence using this structure:
+"We were taking a look at the {natural product name} and {short, real human compliment}."
+Follow these style rules:
+Use active voice.Talk directly, like you’re speaking to one person.Be concise.Use simple language.Cut all fluff.Focus on clarity.Sound conversational and real.Avoid marketing language entirely.Avoid clichés, jargon, hashtags, semicolons, emojis, asterisks, and dashes.Vary sentence rhythm but keep it one sentence total.Avoid AI-filler phrases.If something is certain, say it directly.No repetition.
+About the product name:Shorten it to a human version, brand plus simple category.
+
+About the compliment:Make it brief, specific, human, grounded in real life.Don't make a generic compliment, make it about a detail or something specific.Make the comment enthusiastic, feel free to use a '!' where it would suit.Do not imply you bought or used the product.
+If the product title is nonsense or only an SKU, return exactly: invalid.
+Output:One sentence only. No extra text or explanation.Inputs:Product Title
+Product Description:
 
 Product: ${title}
 Description: ${description}
-Released: ${timeframe}
-
-Write a single, warm, conversational first line that references this specific product. Keep it under 20 words. Be genuine and specific.`;
+`;
 
             const completion = await openai.chat.completions.create({
                 model,

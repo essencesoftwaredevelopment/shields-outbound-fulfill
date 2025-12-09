@@ -40,7 +40,21 @@ export function getJobResultUrl(jobId: string, scope: 'all' | 'valid' = 'all') {
     return `${pipelineBaseUrl}/api/jobs/${jobId}/result${query}`;
 }
 
-export async function createPipelineJob({ file, idToken, clientId, nicheId, nicheLabel, campaignId, findFounder, skipFounderFinder, findEmail, verifyEmail, personalizeFirstLine, dedupeStrategy, signal }: CreatePipelineJobOptions) {
+export async function createPipelineJob({
+    file,
+    idToken,
+    clientId,
+    nicheId,
+    nicheLabel,
+    campaignId,
+    findFounder,
+    skipFounderFinder,
+    findEmail,
+    verifyEmail,
+    personalizeFirstLine,
+    dedupeStrategy,
+    signal,
+}: CreatePipelineJobOptions) {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("idToken", idToken);

@@ -12,13 +12,11 @@ import { createPipelineJob, getJobResultUrl, getJobStreamUrl } from "@/lib/pipel
 import AppShell from "@/components/app-shell";
 import {
   PipelineJob,
-  PipelineLogEntry,
   PipelineServerEvent,
   PipelineStageKey,
   PipelineStageState,
   PipelineStageStatus,
 } from "@/lib/pipeline/types";
-import { log } from "util";
 
 type Niche = {
   id: string;
@@ -42,126 +40,6 @@ const API_KEY_LABELS: Record<ApiKeyName, string> = {
 };
 type ApiKeyState = Record<ApiKeyName, string>;
 
-const STAGE_ORDER: PipelineStageKey[] = ["founders", "emailDiscovery", "verification", "personalization"];
-const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }> = {
-  founders: {
-    title: "Founder Finder",
-    detail: "Serper batches + OpenAI reasoning",
-  },
-  emailDiscovery: {
-    title: "Email Discovery",
-    detail: "TryKitt find_email automation",
-  },
-  verification: {
-    title: "Verification",
-    detail: "TryKitt verify_email final pass",
-  },
-  personalization: {
-    title: "Personalization",
-    detail: "Shopify detection + AI first-lines",
-  },
-};
-
-type JobStatus = PipelineJob["status"];
-type StageStatus = PipelineStageStatus;
-
-const JOB_STATUS_LABELS: Record<JobStatus, string> = {
-  queued: "Queued",
-  running: "Running",
-  completed: "Completed",
-  error: "Error",
-  cancelled: "Cancelled",
-};
-
-const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
-  pending: "Pending",
-  running: "Running",
-  completed: "Completed",
-  error: "Error",
-};
-
-const formatJobStatus = (status?: JobStatus) => (status ? JOB_STATUS_LABELS[status] : "Idle");
-
-const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
-
-const humanizeKey = (value: string) =>
-  value
-    .replace(/[_-]/g, " ")
-    .replace(/\b(\w)/g, (match) => match.toUpperCase());
-
-const describeStageProgress = (stage?: PipelineStageState) => {
-  if (!stage) {
-    return "Awaiting scheduler.";
-  }
-  const processed = typeof stage.progress?.processed === "number" ? stage.progress.processed : null;
-  const total = typeof stage.progress?.total === "number" ? stage.progress.total : null;
-
-  if (processed !== null && total) {
-    return `${processed.toLocaleString()} / ${total.toLocaleString()} processed`;
-  }
-
-  const stats = stage.progress?.stats;
-  if (stats && Object.keys(stats).length > 0) {
-    const summary = Object.entries(stats)
-      .filter(([, value]) => typeof value === "number")
-      .slice(0, 3)
-      .map(([key, value]) => `${humanizeKey(key)}: ${value}`)
-      .join(" • ");
-    if (summary) {
-      return summary;
-    }
-  }
-
-  if (stage.status === "completed") {
-    return "Stage completed.";
-  }
-
-  if (stage.status === "running") {
-    return "Running...";
-  }
-
-  if (stage.status === "error") {
-    return stage.error || "Stage failed.";
-  }
-
-  return "Queued.";
-};
-
-const extractStageSummary = (stage?: PipelineStageState) => {
-  if (!stage?.summary) {
-    return [] as Array<[string, unknown]>;
-  }
-
-  return Object.entries(stage.summary).slice(0, 4);
-};
-
-const formatSummaryValue = (value: unknown) => {
-  if (typeof value === "number") {
-    return value.toLocaleString();
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value === null || typeof value === "undefined") {
-    return "—";
-  }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-};
-
-const formatLogTimestamp = (timestamp: string) => {
-  if (!timestamp) {
-    return "";
-  }
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    return timestamp;
-  }
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-};
 
 type VaultMessage = {
   tone: "idle" | "success" | "error";
@@ -212,13 +90,8 @@ const readKeysFromSnapshot = (data: Record<string, unknown> | undefined): ApiKey
 
 function HomeContent() {
   const router = useRouter();
-  const searchParams = useSearchParams();
   const { user, loading } = useAuth();
-  const [activeNiche, setActiveNiche] = useState<Niche | null>(null);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [apiKeys, setApiKeys] = useState<ApiKeyState>(() => createEmptyKeys());
-  const [savedFingerprints, setSavedFingerprints] = useState<ApiKeyState>(() => createEmptyKeys());
   const [lastSavedKeys, setLastSavedKeys] = useState<ApiKeyState>(() => createEmptyKeys());
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
   const [clientModalOpen, setClientModalOpen] = useState(false);
@@ -227,20 +100,12 @@ function HomeContent() {
   const [newClientInstantlyKey, setNewClientInstantlyKey] = useState("");
   const [clientSaving, setClientSaving] = useState(false);
   const [clientMessage, setClientMessage] = useState<VaultMessage>({ tone: "idle", text: "" });
-  const [selectedClient, setSelectedClient] = useState("");
-  const [dedupeStrategy, setDedupeStrategy] = useState<'skip' | 'include'>('skip');
   const [vaultSaving, setVaultSaving] = useState(false);
   const [vaultLoading, setVaultLoading] = useState(false);
   const [vaultMessage, setVaultMessage] = useState<VaultMessage>({ tone: "idle", text: "" });
-  const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState("");
   const [jobState, setJobState] = useState<PipelineJob | null>(null);
   const [jobClientName, setJobClientName] = useState<string>("");
   const [jobClientId, setJobClientId] = useState<string>("");
-  // Removed live logs UI per request
-  const [jobStatusMessage, setJobStatusMessage] = useState("");
-  const [jobStreamConnected, setJobStreamConnected] = useState(false);
-  const jobStreamRef = useRef<EventSource | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVisible, setToastVisible] = useState(false);
   const [clients, setClients] = useState<Array<{ id: string; name: string; totalLeads?: number }>>([]);
@@ -250,81 +115,14 @@ function HomeContent() {
     setToastVisible(true);
   }, [setToastMessage, setToastVisible]);
 
-  const missingVaultKeys = useMemo(() => API_KEY_FIELDS.filter((key) => !lastSavedKeys[key]?.trim()), [lastSavedKeys]);
-  const hasRequiredKeys = missingVaultKeys.length === 0;
-  const missingKeyLabels = missingVaultKeys.map((key) => API_KEY_LABELS[key]);
 
-  const niches = useMemo<Niche[]>(
-    () => [
-      {
-        id: "ecom",
-        label: "E-commerce",
-        detail: "Shopify optimized",
-        icon: "🛍️",
-        hint: "Get ecommerce signals and product info.",
-      },
-      {
-        id: "saas",
-        label: "SaaS",
-        detail: "B2B tech focus",
-        icon: "🌐",
-        hint: "Get feature benefits and marketing info.",
-      },
-      {
-        id: "agency",
-        label: "Agency",
-        detail: "Service business focus",
-        icon: "🏢",
-        hint: "Get service offerings, client types, and current client names",
-      },
-      {
-        id: "local",
-        label: "Local Biz",
-        detail: "Geo-specific focus",
-        icon: "🔧",
-        hint: "Get location-based info and local market details.",
-      },
-    ],
-    [],
-  );
-
-  const handleCardClick = (niche: Niche) => {
-    setActiveNiche(niche);
-    setModalOpen(true);
-    setSelectedFile(null);
-    setUploadError("");
-  };
-
-  const closeModal = () => {
-    setModalOpen(false);
-    setActiveNiche(null);
-    setSelectedFile(null);
-    setUploadError("");
-  };
-
-  const openVaultModal = () => setVaultModalOpen(true);
   const closeVaultModal = () => {
     // set local state back to live saved keys in Firestore
     // set status messages back to idle
     setApiKeys(lastSavedKeys);
     setVaultMessage({ tone: "idle", text: "" });
     setVaultModalOpen(false);
-  }
-
-  const openVaultFromUpload = useCallback(() => {
-    setModalOpen(false);
-    setActiveNiche(null);
-    setVaultModalOpen(true);
-    setUploadError("");
-  }, [setModalOpen, setActiveNiche, setVaultModalOpen, setUploadError]);
-
-  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0] ?? null;
-    setSelectedFile(file);
-    setUploadError("");
   };
-
-  const uploadDisabled = !selectedFile || !selectedClient.trim() || uploading || !hasRequiredKeys;
 
   const handleKeyChange = (event: ChangeEvent<HTMLInputElement>, key: ApiKeyName) => {
     if (vaultMessage.tone !== "idle") {
@@ -352,62 +150,6 @@ function HomeContent() {
       router.replace("/auth");
     }
   }, [loading, user, router]);
-
-  useEffect(() => {
-    if (!jobStatusMessage) {
-      return;
-    }
-    const normalized = jobStatusMessage.toLowerCase();
-    const criticalFragments = ["fail", "error", "lost connection", "missing", "finish", "complete", "queued"];
-    if (criticalFragments.some((fragment) => normalized.includes(fragment))) {
-      showToast(jobStatusMessage);
-    }
-  }, [jobStatusMessage, showToast]);
-
-  // Open modals based on query params (e.g., Keys from /clients)
-  useEffect(() => {
-    if (!searchParams) return;
-    const showKeysParam = searchParams.get('showKeys');
-    const clientParam = searchParams.get('client');
-
-    const clearParam = (param: string) => {
-      const params = new URLSearchParams(searchParams.toString());
-      params.delete(param);
-      const query = params.toString();
-      router.replace(query ? `/?${query}` : '/', { scroll: false });
-    };
-
-    if (showKeysParam === '1') {
-      setVaultModalOpen(true);
-      clearParam('showKeys');
-    }
-
-    if (clientParam) {
-      setSelectedClient(clientParam);
-      setModalOpen(true);
-      clearParam('client');
-    }
-  }, [searchParams, router]);
-
-  const closeJobStream = useCallback(() => {
-    jobStreamRef.current?.close();
-    jobStreamRef.current = null;
-    setJobStreamConnected(false);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      closeJobStream();
-    };
-  }, [closeJobStream]);
-
-  const handleServerEvent = useCallback((payload: PipelineServerEvent) => {
-    if (payload.type === "state" && payload.state) {
-      setJobState(payload.state);
-    } else if (payload.type === "error" && payload.error) {
-      setJobStatusMessage(payload.error);
-    }
-  }, []);
 
   // Resolve client name for current job by looking up clients list or fetching the doc
   useEffect(() => {
@@ -439,49 +181,10 @@ function HomeContent() {
     };
   }, [jobClientId, clients, user]);
 
-  const openJobStream = useCallback(
-    (jobId: string) => {
-      if (!jobId) {
-        return;
-      }
-      closeJobStream();
-      setJobStatusMessage("Connecting to pipeline...");
-
-      const stream = new EventSource(getJobStreamUrl(jobId));
-      jobStreamRef.current = stream;
-
-      stream.onopen = () => {
-        setJobStreamConnected(true);
-        setJobStatusMessage("Live updates streaming.");
-      };
-
-      stream.onmessage = (event) => {
-        if (!event.data) {
-          return;
-        }
-        try {
-          const parsed = JSON.parse(event.data) as PipelineServerEvent;
-          handleServerEvent(parsed);
-        } catch (error) {
-          console.warn("Unable to parse pipeline event", error);
-        }
-      };
-
-      stream.onerror = () => {
-        setJobStreamConnected(false);
-        setJobStatusMessage("Lost connection to pipeline stream.");
-        stream.close();
-        jobStreamRef.current = null;
-      };
-    },
-    [closeJobStream, handleServerEvent],
-  );
-
   useEffect(() => {
     if (!user) {
       setVaultLoading(false);
       setApiKeys(createEmptyKeys());
-      setSavedFingerprints(createEmptyKeys());
       setLastSavedKeys(createEmptyKeys());
       setClients([]);
       return;
@@ -497,7 +200,6 @@ function HomeContent() {
         if (!snapshot.exists()) {
           if (!cancelled) {
             setApiKeys(createEmptyKeys());
-            setSavedFingerprints(createEmptyKeys());
             setLastSavedKeys(createEmptyKeys());
           }
           return;
@@ -508,7 +210,6 @@ function HomeContent() {
 
         if (!cancelled) {
           setApiKeys(storedKeys);
-          setSavedFingerprints(fingerprints);
           setLastSavedKeys(storedKeys);
         }
       } catch (error) {
@@ -561,121 +262,6 @@ function HomeContent() {
     };
   }, [user]);
 
-  // Removed animated leads; show live values directly
-
-  useEffect(() => {
-    if (!jobState) {
-      return;
-    }
-    if (jobState.status === "completed") {
-      setJobStatusMessage("Pipeline finished.");
-      closeJobStream();
-    } else if (jobState.status === "error") {
-      setJobStatusMessage(jobState.error || "Pipeline failed.");
-      closeJobStream();
-    }
-  }, [jobState, closeJobStream]);
-
-  const handleUploadClick = async () => {
-    if (!selectedFile || !user) {
-      return;
-    }
-    if (!hasRequiredKeys) {
-      const message = "Please save your API keys in the vault before uploading.";
-      setUploadError(message);
-      showToast(message);
-      return;
-    }
-    setUploadError("");
-    setUploading(true);
-    try {
-      const idToken = await getIdToken(user);
-      const response = await createPipelineJob({
-        file: selectedFile,
-        idToken,
-        clientId: selectedClient,
-        nicheId: activeNiche?.id,
-        nicheLabel: activeNiche?.label,
-        dedupeStrategy,
-      });
-
-      const freshJob = response.job;
-      console.log('=== UPLOAD RESPONSE DEBUG ===');
-      console.log('Full response:', JSON.stringify(response, null, 2));
-      console.log('Fresh job:', JSON.stringify(freshJob, null, 2));
-      console.log('Dedupe stats exists?', !!freshJob.dedupeStats);
-      console.log('Dedupe stats value:', freshJob.dedupeStats);
-      console.log('=============================');
-      setJobState(freshJob);
-      // logs removed
-      setJobStatusMessage("Job queued.");
-
-      // Track client context for job and resolve name immediately
-      setJobClientId(selectedClient);
-      const localClientName = clients.find((c) => c.id === selectedClient)?.name || "";
-      if (localClientName) {
-        setJobClientName(localClientName);
-      } else {
-        // Fallback fetch if not in local cache
-        try {
-          const clientRef = doc(firestore, "users", user.uid, "clients", selectedClient);
-          const snap = await getDoc(clientRef);
-          const name = (snap.data()?.name as string) || selectedClient;
-          setJobClientName(name);
-        } catch {
-          setJobClientName(selectedClient);
-        }
-      }
-
-      // Show toast with deduplication stats
-      if (freshJob.dedupeStats) {
-        console.log('Dedupe stats:', freshJob.dedupeStats);
-        const { total, skipped, new: newCount } = freshJob.dedupeStats;
-
-        if (dedupeStrategy === 'include') {
-          // Include strategy: show how many are being processed vs already exist
-          const existing = total - newCount;
-          if (existing > 0) {
-            const msg = `Processing all ${total} domain${total !== 1 ? 's' : ''} (${newCount} new, ${existing} existing).`;
-            showToast(msg);
-          } else {
-            const msg = `Processing ${total} new domain${total !== 1 ? 's' : ''}.`;
-            showToast(msg);
-          }
-        } else {
-          // Skip strategy: show how many were filtered out
-          if (skipped > 0) {
-            const msg = `${skipped} duplicate domain${skipped !== 1 ? 's' : ''} removed. ${newCount} unique domain${newCount !== 1 ? 's' : ''} will be processed.`;
-            showToast(msg);
-          } else {
-            const msg = `All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
-            showToast(msg);
-          }
-        }
-      }
-
-      openJobStream(response.jobId || freshJob.id);
-      setModalOpen(false);
-      setActiveNiche(null);
-      setSelectedFile(null);
-      setSelectedClient("");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to start pipeline.";
-      setUploadError(message);
-      showToast(message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const handleDownloadResults = () => {
-    if (!jobState || jobState.status !== "completed") {
-      return;
-    }
-    const url = getJobResultUrl(jobState.id);
-    window.open(url, "_blank", "noopener,noreferrer");
-  };
-
   const handleVaultSave = async () => {
     if (!user) {
       setVaultMessage({ tone: "error", text: "You must be signed in to save keys." });
@@ -710,7 +296,6 @@ function HomeContent() {
       );
 
       setApiKeys(sanitizedKeys);
-      setSavedFingerprints(fingerprints);
       setLastSavedKeys(sanitizedKeys);
       setVaultMessage({ tone: "success", text: "Keys saved to your vault." });
     } catch (error) {
@@ -773,14 +358,6 @@ function HomeContent() {
     }
   };
 
-  const fingerprintLabel = (key: ApiKeyName) => {
-    const hash = savedFingerprints[key];
-    if (!hash) {
-      return "No saved fingerprint yet.";
-    }
-    return `Fingerprint · ${hash.slice(0, 8)}…${hash.slice(-6)}`;
-  };
-
   const showVaultStatus = vaultLoading || Boolean(vaultMessage.text);
   const vaultStatusTone = vaultLoading ? "idle" : vaultMessage.tone;
   const vaultStatusText = vaultLoading ? "Loading saved keys..." : vaultMessage.text;
@@ -826,28 +403,6 @@ function HomeContent() {
           </div>
         </div>
 
-        {/* Niche cards commented out for future use */}
-        {false && (
-          <div className="niche-grid">
-            {niches.map((niche) => (
-              <button
-                type="button"
-                key={niche.id}
-                onClick={() => handleCardClick(niche)}
-                className="niche-card"
-              >
-                <span className="niche-card__icon" aria-hidden>
-                  {niche.icon}
-                </span>
-                <div className="niche-card__text">
-                  <p className="niche-card__label">{niche.label}</p>
-                  <p className="niche-card__detail">{niche.detail}</p>
-                </div>
-                <span className="niche-card__cta">Upload CSV →</span>
-              </button>
-            ))}
-          </div>
-        )}
 
         <div className="niche-grid">
           {clients.length === 0 ? (
@@ -908,111 +463,6 @@ function HomeContent() {
           </div>
         </div>
       </section>
-
-      {
-        modalOpen && (
-          <div
-            className="modal-overlay"
-            role="dialog"
-            aria-modal="true"
-            onClick={closeModal}
-          >
-            <div className="modal" onClick={(event) => event.stopPropagation()}>
-              <div className="modal__header">
-                <div>
-                  <p className="eyebrow eyebrow--muted">{activeNiche?.detail || "Upload"}</p>
-                  <h2 className="modal__title">
-                    {activeNiche?.icon || "📤"}  {activeNiche?.label || "Upload CSV"}
-                  </h2>
-                  <p className="modal__description">{activeNiche?.hint || "Upload your domains CSV to start the pipeline."}</p>
-                </div>
-              </div>
-
-              <div className="modal__body">
-                <label className="settings-field">
-                  <span className="settings-field__label">Client Account</span>
-                  <select
-                    value={selectedClient}
-                    onChange={(event) => setSelectedClient(event.target.value)}
-                  >
-                    <option value="">Select client...</option>
-                    {clients.map((client) => (
-                      <option key={client.id} value={client.id}>
-                        {client.name}
-                      </option>
-                    ))}
-                  </select>
-                  <span className="settings-field__hint">
-                    Route leads into the client’s Instantly workspace.
-                  </span>
-                </label>
-
-                <label className="settings-field">
-                  <span className="settings-field__label">Duplicates</span>
-                  <select
-                    value={dedupeStrategy}
-                    onChange={(e) => setDedupeStrategy(e.target.value as 'skip' | 'include')}
-                  >
-                    <option value="skip">Skip already processed domains</option>
-                    <option value="include">Include duplicates in processed-domains</option>
-                  </select>
-                  <span className="settings-field__hint">Deduplication is scoped to the selected client.</span>
-                </label>
-
-                {!hasRequiredKeys && (
-                  <div className="upload-warning" role="alert">
-                    <p className="upload-warning__heading">Connect your provider keys before uploading.</p>
-                    <p className="upload-warning__detail">
-                      Missing: {missingKeyLabels.join(", ") || "API keys"}.
-                    </p>
-                    <div className="upload-warning__actions">
-                      <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={openVaultFromUpload}
-                      >
-                        Open API Vault
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                <label className="upload-area">
-                  <span className="upload-area__title">Drop CSV or click to browse</span>
-                  <span className="upload-area__hint">Max 50k rows · UTF-8</span>
-                  {selectedFile && (
-                    <span className="upload-area__file" title={selectedFile.name}>
-                      {selectedFile?.name}
-                    </span>
-                  )}
-                  <input
-                    type="file"
-                    accept=".csv"
-                    className="sr-only"
-                    onChange={handleFileChange}
-                  />
-                </label>
-                {uploadError && (
-                  <p className="form-error" role="alert">
-                    {uploadError}
-                  </p>
-                )}
-                <div className="modal__actions">
-                  <button
-                    type="button"
-                    className="primary-button"
-                    disabled={uploadDisabled}
-                    aria-disabled={uploadDisabled}
-                    onClick={handleUploadClick}
-                  >
-                    {uploading ? "Uploading..." : "Upload & Validate"}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )
-      }
 
       {
         vaultModalOpen && (
