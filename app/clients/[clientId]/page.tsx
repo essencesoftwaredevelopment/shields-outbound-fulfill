@@ -2609,10 +2609,10 @@ export default function ClientPage() {
                                                 />
                                                 <div style={{ flex: 1 }}>
                                                     <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
-                                                        Personalize with Client Name
+                                                        Personalize with Website Info
                                                     </div>
                                                     <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
-                                                        Generate first line referencing current clients
+                                                        Generate first line referencing website content
                                                     </div>
                                                 </div>
                                             </label>
