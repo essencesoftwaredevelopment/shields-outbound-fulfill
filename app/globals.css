@@ -777,6 +777,43 @@ body {
   line-height: 1;
 }
 
+/* Account page variants */
+.account-metric-grid {
+  margin-top: 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.account-metric-chip {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  min-width: 220px;
+  text-align: left;
+  align-items: flex-start;
+}
+
+.account-metric-chip__label {
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.6);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+
+.account-metric-chip__value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #fff;
+  word-break: break-all;
+}
+
 .tab-nav {
   display: flex;
   gap: 0.5rem;

@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, DocumentSnapshot } from "firebase/firestore";
+import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, startAt, endAt, DocumentSnapshot } from "firebase/firestore";
 import { getIdToken } from "firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
@@ -278,7 +278,8 @@ export default function ClientPage() {
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<DocumentSnapshot | null>(null);
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
-    const [campaignNameFilter, setCampaignNameFilter] = useState<string>("");
+    const [leadSearch, setLeadSearch] = useState<string>("");
+    const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -450,12 +451,14 @@ export default function ClientPage() {
                 setClientName((data.name as string) || clientId);
                 setClientIndustry((data.industry as Niche["id"]) || "ecom");
                 setClientInstantlyKey((data.instantly_key as string) || "");
+                setClientTotalLeads((data.totalLeads as number) || 0);
             }
         }, () => {
             if (!cancelled) {
                 setClientName(clientId);
                 setClientIndustry("ecom");
                 setClientInstantlyKey("");
+                setClientTotalLeads(0);
             }
         });
 
@@ -494,7 +497,7 @@ export default function ClientPage() {
         setLeadsHasMore(true);
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, campaignFilterId, campaignNameFilter]);
+    }, [user, clientId, campaignFilterId, leadSearch]);
 
     useEffect(() => {
         if (toastVisible) {
@@ -517,15 +520,6 @@ export default function ClientPage() {
         setJobStreamConnected(false);
     }, []);
 
-    const matchingCampaignIds = useMemo(() => {
-        if (!campaignNameFilter.trim()) return [];
-        const lower = campaignNameFilter.toLowerCase();
-        return campaigns
-            .filter(c => c.name.toLowerCase().includes(lower))
-            .slice(0, 10)
-            .map(c => c.id);
-    }, [campaignNameFilter, campaigns]);
-
     const campaignIdToName = useMemo(() => {
         const map = new Map<string, string>();
         campaigns.forEach((c) => map.set(c.id, c.name));
@@ -542,19 +536,79 @@ export default function ClientPage() {
         setLeadsLoading(true);
         try {
             const leadsCol = collection(firestore, "users", user.uid, "clients", clientId, "leads");
+            const rawSearch = leadSearch.trim();
+            const isSearchMode = Boolean(rawSearch);
+            const searchTerms = isSearchMode
+                ? Array.from(new Set([rawSearch, rawSearch.toLowerCase(), rawSearch.toUpperCase()])).filter(Boolean)
+                : [];
+
+            if (isSearchMode) {
+                const searchFields: Array<keyof Lead> = ["domain", "email", "founderName"];
+                const snapshots = await Promise.allSettled(
+                    searchFields.flatMap((field) => {
+                        const fieldKey = field === "founderName" ? "founder_name" : field;
+                        return searchTerms.map((term) => {
+                            const clauses: any[] = [];
+                            if (campaignFilterId) {
+                                clauses.push(where("campaigns", "array-contains", campaignFilterId));
+                            }
+                            clauses.push(
+                                orderBy(fieldKey),
+                                startAt(term),
+                                endAt(`${term}\uf8ff`),
+                                limit(200)
+                            );
+                            return getDocs(query(leadsCol, ...clauses));
+                        });
+                    })
+                );
+
+                const mapped: Lead[] = [];
+                const seen = new Set<string>();
+                snapshots.forEach((result) => {
+                    if (result.status !== "fulfilled") return;
+                    result.value.docs.forEach((d) => {
+                        if (seen.has(d.id)) return;
+                        const data = d.data();
+                        const emailStatus = (data.email_status as string) || "";
+                        const isVerified = emailStatus === "valid" || emailStatus === "verified";
+                        const lead: Lead = {
+                            id: d.id,
+                            domain: (data.domain as string) || (data.website as string) || "",
+                            email: (data.email as string) || "",
+                            status: emailStatus,
+                            verified: isVerified,
+                            firstLine: (data.personalization_first_line as string) || "",
+                            founderName: (data.founder_name as string) || "",
+                            personalizationUrl: (data.personalization_url as string) || "",
+                            personalizationTitle: (data.personalization_title as string) || "",
+                            updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
+                            campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
+                        };
+                        if (campaignFilterId && (!lead.campaigns || !lead.campaigns.includes(campaignFilterId))) {
+                            return;
+                        }
+                        seen.add(d.id);
+                        mapped.push(lead);
+                    });
+                });
+
+                setLeads(mapped);
+                const totalFromData = mapped.length;
+                const verifiedFromData = mapped.filter((r) => r.verified).length;
+                setStats({
+                    total: totalFromData,
+                    verified: verifiedFromData,
+                    unverified: Math.max(0, totalFromData - verifiedFromData),
+                });
+                setLeadsCursor(null);
+                setLeadsHasMore(false);
+                return;
+            }
+
             const constraints: unknown[] = [];
             if (campaignFilterId) {
                 constraints.push(where("campaigns", "array-contains", campaignFilterId));
-            } else if (campaignNameFilter.trim()) {
-                if (matchingCampaignIds.length === 0) {
-                    setLeads([]);
-                    setStats({ total: 0, verified: 0, unverified: 0 });
-                    setLeadsHasMore(false);
-                    setLeadsCursor(null);
-                    setLeadsLoading(false);
-                    return;
-                }
-                constraints.push(where("campaigns", "array-contains-any", matchingCampaignIds));
             }
 
             const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
@@ -582,13 +636,21 @@ export default function ClientPage() {
                     updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
                     campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
                 } as Lead;
+            }).filter((lead) => {
+                if (!campaignFilterId) return true;
+                return Array.isArray(lead.campaigns) && lead.campaigns.includes(campaignFilterId);
             });
 
             setLeads((prev) => {
                 const next = reset ? mapped : [...prev, ...mapped];
-                const total = next.length;
-                const verified = next.filter((r) => r.verified).length;
-                setStats({ total, verified, unverified: Math.max(0, total - verified) });
+                const totalFromData = next.length;
+                const verifiedFromData = next.filter((r) => r.verified).length;
+                const total = campaignFilterId ? totalFromData : (clientTotalLeads || totalFromData);
+                setStats({
+                    total,
+                    verified: verifiedFromData,
+                    unverified: Math.max(0, totalFromData - verifiedFromData),
+                });
                 return next;
             });
             setLeadsCursor(snap.docs[snap.docs.length - 1] || null);
@@ -599,12 +661,37 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, campaignFilterId, campaignNameFilter, matchingCampaignIds, leadsCursor]);
+    }, [user, clientId, campaignFilterId, clientTotalLeads, leadSearch, leadsCursor]);
 
     const loadMoreLeads = useCallback(() => {
-        if (leadsLoading || !leadsHasMore) return;
+        if (leadsLoading || !leadsHasMore || leadSearch.trim()) return;
         fetchLeads(false);
-    }, [fetchLeads, leadsHasMore, leadsLoading]);
+    }, [fetchLeads, leadsHasMore, leadsLoading, leadSearch]);
+
+    const filteredLeads = useMemo(() => {
+        if (!leadSearch.trim()) return leads;
+        const term = leadSearch.trim().toLowerCase();
+        return leads.filter((lead) => {
+            const domain = (lead.domain || "").toLowerCase();
+            const email = (lead.email || "").toLowerCase();
+            const founder = (lead.founderName || "").toLowerCase();
+            return domain.includes(term) || email.includes(term) || founder.includes(term);
+        });
+    }, [leadSearch, leads]);
+
+    const displayedStats = useMemo(() => {
+        const hasFilters = Boolean(campaignFilterId) || Boolean(leadSearch.trim());
+        if (hasFilters) {
+            const total = filteredLeads.length;
+            const verified = filteredLeads.filter((r) => r.verified).length;
+            return { total, verified, unverified: Math.max(0, total - verified) };
+        }
+        return {
+            total: clientTotalLeads || stats.total,
+            verified: stats.verified,
+            unverified: stats.unverified,
+        };
+    }, [campaignFilterId, clientTotalLeads, filteredLeads, leadSearch, stats]);
 
     useEffect(() => {
         return () => {
@@ -1754,18 +1841,27 @@ export default function ClientPage() {
                                 marginTop: '2rem',
                                 flexWrap: 'wrap'
                             }}>
-                                <div className="metric-chip">
-                                    <span className="metric-chip__label">Total</span>
-                                    <span className="metric-chip__value">{stats.total.toLocaleString()}</span>
-                                </div>
-                                <div className="metric-chip">
-                                    <span className="metric-chip__label">Verified</span>
-                                    <span className="metric-chip__value" style={{ color: '#16a34a' }}>{stats.verified.toLocaleString()}</span>
-                                </div>
-                                <div className="metric-chip">
-                                    <span className="metric-chip__label">Unverified</span>
-                                    <span className="metric-chip__value" style={{ color: '#a1a1aa' }}>{stats.unverified.toLocaleString()}</span>
-                                </div>
+                                {campaignFilterId || leadSearch.trim() ? (
+                                    <>
+                                        <div className="metric-chip">
+                                            <span className="metric-chip__label">Filtered Total</span>
+                                            <span className="metric-chip__value">{displayedStats.total.toLocaleString()}</span>
+                                        </div>
+                                        <div className="metric-chip">
+                                            <span className="metric-chip__label">Verified</span>
+                                            <span className="metric-chip__value" style={{ color: '#16a34a' }}>{displayedStats.verified.toLocaleString()}</span>
+                                        </div>
+                                        <div className="metric-chip">
+                                            <span className="metric-chip__label">Unverified</span>
+                                            <span className="metric-chip__value" style={{ color: '#a1a1aa' }}>{displayedStats.unverified.toLocaleString()}</span>
+                                        </div>
+                                    </>
+                                ) : (
+                                    <div className="metric-chip">
+                                        <span className="metric-chip__label">Total Leads</span>
+                                        <span className="metric-chip__value">{displayedStats.total.toLocaleString()}</span>
+                                    </div>
+                                )}
                             </div>
 
                             <div style={{
@@ -1787,20 +1883,19 @@ export default function ClientPage() {
                                         ))}
                                     </select>
                                 </label>
-                                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '240px' }}>
-                                    <span className="settings-field__label">Filter by Campaign Name</span>
+                                <label className="settings-field" style={{ flex: '2 1 260px', minWidth: '260px' }}>
+                                    <span className="settings-field__label">Search leads</span>
                                     <input
                                         type="text"
-                                        value={campaignNameFilter}
-                                        onChange={(e) => setCampaignNameFilter(e.target.value)}
-                                        placeholder="Search campaign name"
+                                        value={leadSearch}
+                                        onChange={(e) => setLeadSearch(e.target.value)}
+                                        placeholder="Search by domain, email, or founder name"
                                     />
-                                    <span className="settings-field__hint">Matches assigned campaigns by name.</span>
                                 </label>
                             </div>
 
                             <div style={{ marginTop: '1.5rem' }}>
-                                {leads.length === 0 ? (
+                                {filteredLeads.length === 0 ? (
                                     <div className="pipeline-panel__empty">
                                         <p>No leads yet.</p>
                                         <p className="pipeline-panel__subtitle">Upload leads to start seeing them here.</p>
@@ -1834,7 +1929,7 @@ export default function ClientPage() {
                                                             padding: '0.75rem 1rem',
                                                             fontWeight: 600,
                                                             color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Domain</th>
+                                                        }}>Founder Name</th>
                                                         <th style={{
                                                             textAlign: 'left',
                                                             padding: '0.75rem 1rem',
@@ -1852,23 +1947,23 @@ export default function ClientPage() {
                                                             padding: '0.75rem 1rem',
                                                             fontWeight: 600,
                                                             color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Verified</th>
+                                                        }}>Domain</th>
                                                         <th style={{
                                                             textAlign: 'left',
                                                             padding: '0.75rem 1rem',
                                                             fontWeight: 600,
                                                             color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>First Line</th>
+                                                        }}>Campaign</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody>
-                                                    {leads.map((lead, index) => (
+                                                    {filteredLeads.map((lead, index) => (
                                                         <tr
                                                             key={lead.id}
                                                             onClick={() => setSelectedLead(lead)}
                                                             style={{
                                                                 backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
-                                                                borderBottom: index < leads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+                                                                borderBottom: index < filteredLeads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
                                                                 cursor: 'pointer',
                                                                 transition: 'background-color 0.15s ease'
                                                             }}
@@ -1877,11 +1972,11 @@ export default function ClientPage() {
                                                         >
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
-                                                                maxWidth: '200px',
+                                                                maxWidth: '220px',
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
                                                                 whiteSpace: 'nowrap'
-                                                            }}>{lead.domain || '—'}</td>
+                                                            }}>{lead.founderName || '—'}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
                                                                 maxWidth: '250px',
@@ -1891,24 +1986,25 @@ export default function ClientPage() {
                                                             }}>{lead.email || '—'}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
-                                                                maxWidth: '120px',
+                                                                maxWidth: '140px',
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
                                                                 whiteSpace: 'nowrap'
                                                             }}>{lead.status || '—'}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
-                                                                color: lead.verified ? '#16a34a' : 'rgba(255, 255, 255, 0.5)'
-                                                            }}>{lead.verified ? 'Yes' : 'No'}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '400px',
+                                                                maxWidth: '220px',
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap',
-                                                                fontStyle: lead.firstLine ? 'italic' : 'normal',
-                                                                color: lead.firstLine ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 255, 255, 0.3)'
-                                                            }}>{lead.firstLine || '—'}</td>
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.domain || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '220px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{getCampaignNamesForLead(lead).join(', ') || '—'}</td>
                                                         </tr>
                                                     ))}
                                                 </tbody>

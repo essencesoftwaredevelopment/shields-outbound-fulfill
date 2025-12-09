@@ -3,7 +3,7 @@
 import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { createPortal } from "react-dom";
-import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, deleteDoc, onSnapshot } from "firebase/firestore";
+import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, onSnapshot } from "firebase/firestore";
 import { getIdToken, signOut } from "firebase/auth";
 import { firebaseAuth } from "@/lib/firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
@@ -243,15 +243,6 @@ function HomeContent() {
   const jobStreamRef = useRef<EventSource | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVisible, setToastVisible] = useState(false);
-  const [editClientModalOpen, setEditClientModalOpen] = useState(false);
-  const [editingClient, setEditingClient] = useState<{ id: string; name: string } | null>(null);
-  const [editClientName, setEditClientName] = useState("");
-  const [editClientIndustry, setEditClientIndustry] = useState<Niche["id"]>("ecom");
-  const [editClientInstantlyKey, setEditClientInstantlyKey] = useState("");
-  const [editClientSaving, setEditClientSaving] = useState(false);
-  const [editClientMessage, setEditClientMessage] = useState<VaultMessage>({ tone: "idle", text: "" });
-  const [isDeleting, setIsDeleting] = useState(false);
-
   const [clients, setClients] = useState<Array<{ id: string; name: string; totalLeads?: number }>>([]);
 
   const showToast = useCallback((message: string) => {
@@ -782,80 +773,6 @@ function HomeContent() {
     }
   };
 
-  const handleEditClientSave = async () => {
-    if (!user || !editingClient) return;
-    if (!editClientName.trim()) {
-      setEditClientMessage({ tone: "error", text: "Client name is required." });
-      return;
-    }
-    setEditClientSaving(true);
-    setEditClientMessage({ tone: "idle", text: "" });
-    try {
-      const clientRef = doc(firestore, "users", user.uid, "clients", editingClient.id);
-      await setDoc(
-        clientRef,
-        {
-          name: editClientName.trim(),
-          industry: editClientIndustry,
-          instantly_key: editClientInstantlyKey.trim(),
-        },
-        { merge: true },
-      );
-      setEditClientMessage({ tone: "success", text: "Client updated." });
-      setEditClientSaving(false);
-
-      // Refresh client list
-      const colRef = collection(firestore, "users", user.uid, "clients");
-      const snap = await getDocs(colRef);
-      setClients(snap.docs.map((d) => ({
-        id: d.id,
-        name: (d.data().name as string) || d.id,
-        totalLeads: (d.data().totalLeads as number) || 0
-      })));
-
-      setTimeout(() => {
-        setEditClientModalOpen(false);
-        setEditingClient(null);
-      }, 800);
-    } catch (error) {
-      setEditClientSaving(false);
-      setEditClientMessage({ tone: "error", text: error instanceof Error ? error.message : "Unable to update client." });
-    }
-  };
-
-  const handleDeleteClient = async () => {
-    if (!user || !editingClient) return;
-    setIsDeleting(true);
-    try {
-      const idToken = await getIdToken(user);
-      const resp = await fetch(`/api/clients/${encodeURIComponent(editingClient.id)}/delete`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idToken })
-      });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        throw new Error(data.error || `Delete failed (${resp.status})`);
-      }
-
-      // Refresh client list
-      const colRef = collection(firestore, "users", user.uid, "clients");
-      const snap = await getDocs(colRef);
-      setClients(snap.docs.map((d) => ({
-        id: d.id,
-        name: (d.data().name as string) || d.id,
-        totalLeads: (d.data().totalLeads as number) || 0
-      })));
-
-      showToast(`Client "${editingClient.name}" deleted successfully.`);
-      setEditClientModalOpen(false);
-      setEditingClient(null);
-    } catch (error) {
-      showToast(`Failed to delete client: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    } finally {
-      setIsDeleting(false);
-    }
-  };
   const fingerprintLabel = (key: ApiKeyName) => {
     const hash = savedFingerprints[key];
     if (!hash) {
@@ -959,54 +876,6 @@ function HomeContent() {
                   </div>
                   <span className="niche-card__cta">View leads →</span>
                 </button>
-
-                {/* Edit client button (top-right) */}
-                <button
-                  type="button"
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    setEditingClient(client);
-                    setEditClientName(client.name);
-                    setEditClientMessage({ tone: "idle", text: "" });
-
-                    // Load full client data from Firestore
-                    if (user) {
-                      try {
-                        const clientRef = doc(firestore, "users", user.uid, "clients", client.id);
-                        const clientSnap = await getDoc(clientRef);
-                        if (clientSnap.exists()) {
-                          const data = clientSnap.data();
-                          setEditClientIndustry((data.industry as Niche["id"]) || "ecom");
-                          setEditClientInstantlyKey(data.instantly_key || "");
-                        }
-                      } catch { }
-                    }
-
-                    setEditClientModalOpen(true);
-                  }}
-                  className="client-edit-btn"
-                  aria-label="Edit client"
-                  title="Edit client"
-                >
-                  ✏️
-                </button>
-
-                {/* Upload Leads button (bottom-right) */}
-                {/* <button
-                  type="button"
-                  className="primary-button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedClient(client.id);
-                    setActiveNiche(null);
-                    setModalOpen(true);
-                  }}
-                  aria-label="Upload Leads"
-                  title="Upload Leads"
-                  style={{ position: 'absolute', bottom: '8px', right: '8px' }}
-                >
-                  📤 Upload Leads
-                </button> */}
               </div>
             ))
           )}
@@ -1038,63 +907,6 @@ function HomeContent() {
             )}
           </div>
         </div>
-
-        {jobState ? (
-          <div className="stage-grid">
-            {[...STAGE_ORDER]
-              .map((stageKey) => {
-                const stage = jobState.stages[stageKey];
-                const meta = STAGE_METADATA[stageKey];
-                const summaryEntries = extractStageSummary(stage);
-                const processed = typeof stage?.progress?.processed === "number" ? stage.progress.processed : null;
-                const total = typeof stage?.progress?.total === "number" ? stage.progress.total : null;
-                return (
-                  <article
-                    key={stageKey}
-                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""}`}
-                  >
-                    <div className="stage-card__head">
-                      <div>
-                        <p className="stage-card__label">{meta.title}</p>
-                        <p className="stage-card__detail">{meta.detail}</p>
-                      </div>
-                      <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
-                    </div>
-                    <p className="stage-card__progress">
-                      {processed !== null && total ? (
-                        <span>
-                          <span className="stage-card__progress-number">{processed.toLocaleString()}</span>
-                          <span> / </span>
-                          <span className="stage-card__progress-number stage-card__progress-total">{total.toLocaleString()}</span>
-                          <span> processed</span>
-                        </span>
-                      ) : (
-                        describeStageProgress(stage)
-                      )}
-                    </p>
-                    {stage?.error && <p className="stage-card__error">{stage.error}</p>}
-                    {summaryEntries.length > 0 && (
-                      <dl className="stage-card__summary">
-                        {summaryEntries.map(([key, value]) => (
-                          <div key={key} className="stage-card__summary-row">
-                            <dt>{humanizeKey(key)}</dt>
-                            <dd>{formatSummaryValue(value)}</dd>
-                          </div>
-                        ))}
-                      </dl>
-                    )}
-                  </article>
-                );
-              })}
-          </div>
-        ) : (
-          <div className="pipeline-panel__empty">
-            <p>No pipeline runs yet.</p>
-            <p className="pipeline-panel__subtitle">
-              Select a niche, upload your CSV, and we&apos;ll stream the progress here.
-            </p>
-          </div>
-        )}
       </section>
 
       {
@@ -1360,120 +1172,6 @@ function HomeContent() {
         )
       }
 
-      {
-        editClientModalOpen && editingClient && (
-          <div
-            className="modal-overlay"
-            role="dialog"
-            aria-modal="true"
-            onClick={() => {
-              if (!editClientSaving && !isDeleting) {
-                setEditClientModalOpen(false);
-                setEditingClient(null);
-              }
-            }}
-          >
-            <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '480px' }}>
-              <div className="modal__header">
-                <div>
-                  <p className="eyebrow eyebrow--muted">Edit</p>
-                  <h2 className="modal__title">Edit Client</h2>
-                  <p className="modal__description">
-                    Update the client information below.
-                  </p>
-                </div>
-              </div>
-
-              <div className="modal__body">
-                <label className="label">
-                  Client Name
-                  <input
-                    className="input"
-                    type="text"
-                    placeholder="e.g. ACME Corp"
-                    value={editClientName}
-                    onChange={(e) => setEditClientName(e.target.value)}
-                    disabled={editClientSaving || isDeleting}
-                  />
-                </label>
-
-                <label className="label">
-                  Industry
-                  <select
-                    className="select"
-                    value={editClientIndustry}
-                    onChange={(e) => setEditClientIndustry(e.target.value as Niche["id"])}
-                    disabled={editClientSaving || isDeleting}
-                  >
-                    <option value="ecom">E-Commerce</option>
-                    <option value="saas">SaaS</option>
-                    <option value="agency">Agency</option>
-                    <option value="local-biz">Local Business</option>
-                  </select>
-                </label>
-
-                <label className="label">
-                  Instantly API Key
-                  <input
-                    className="input"
-                    type="text"
-                    placeholder="Enter API key"
-                    value={editClientInstantlyKey}
-                    onChange={(e) => setEditClientInstantlyKey(e.target.value)}
-                    disabled={editClientSaving || isDeleting}
-                  />
-                </label>
-
-                {editClientMessage.tone !== "idle" && (
-                  <div className={`vault-message vault-message--${editClientMessage.tone}`}>
-                    {editClientMessage.text}
-                  </div>
-                )}
-
-                <div className="modal__actions" style={{ gap: '0.75rem' }}>
-                  {/* <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => {
-                      setEditClientModalOpen(false);
-                      setEditingClient(null);
-                    }}
-                    disabled={editClientSaving || isDeleting}
-                    style={{ flex: 1 }}
-                  >
-                    Cancel
-                  </button> */}
-                  <button
-                    type="button"
-                    className="primary-button"
-                    onClick={handleEditClientSave}
-                    disabled={editClientSaving || isDeleting}
-                    style={{ flex: 1 }}
-                  >
-                    {editClientSaving ? 'Saving...' : 'Save Changes'}
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={handleDeleteClient}
-                  disabled={editClientSaving || isDeleting}
-                  style={{
-                    background: '#ef4444',
-                    color: '#fff',
-                    marginTop: '1rem',
-                    width: '100%'
-                  }}
-                >
-                  {isDeleting ? 'Deleting...' : 'Delete Client'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )
-      }
-
       {toastVisible && toastMessage && (
         <div
           className="toast"
@@ -1506,7 +1204,7 @@ export default function Home() {
   return (
     <Suspense fallback={
       <div className="auth-gate">
-        <p className="eyebrow">Shield&apos;s Outbound</p>
+        <p className="eyebrow">Shields Outbound</p>
         <h2>Loading...</h2>
         <p className="auth-card__subtitle">Preparing your workspace.</p>
       </div>

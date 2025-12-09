@@ -7,6 +7,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { parse as csvParse } from 'csv-parse';
 import admin from 'firebase-admin';
+import Stripe from 'stripe';
 
 import { runFounderFinder } from './services/founderFinder.js';
 import { runEmailFinder } from './services/emailFinder.js';
@@ -22,6 +23,12 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
 const VALID_UPLOAD_STATUSES = new Set(['valid', 'verified', 'valid-risky']);
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
+const STRIPE_SUCCESS_URL = process.env.STRIPE_SUCCESS_URL || 'http://localhost:3000/account?checkout=success';
+const STRIPE_CANCEL_URL = process.env.STRIPE_CANCEL_URL || 'http://localhost:3000/account?checkout=cancelled';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripeClient = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' }) : null;
 
 // Initialize Firebase Admin
 const serviceAccountPath = path.join(__dirname, '..', '.secrets', 'service-account.json');
@@ -114,6 +121,7 @@ fs.mkdirSync(TMP_ROOT, { recursive: true });
 
 const app = express();
 app.use(cors());
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 const upload = multer({
@@ -1461,6 +1469,110 @@ app.post('/api/jobs/:id/upload-to-instantly', async (req, res) => {
         await recordUploadFailure('Failed to upload to Instantly.');
         return res.status(500).json({ error: 'Failed to upload to Instantly.' });
     }
+});
+
+app.post('/api/stripe/checkout', async (req, res) => {
+    try {
+        if (!stripeClient) {
+            return res.status(500).json({ error: 'Stripe secret key is not configured.' });
+        }
+        const { idToken, priceId: bodyPriceId, successUrl, cancelUrl } = req.body || {};
+        if (!idToken) {
+            return res.status(400).json({ error: 'Missing idToken.' });
+        }
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        const priceId = bodyPriceId || STRIPE_PRICE_ID;
+        if (!priceId) {
+            return res.status(400).json({ error: 'priceId is required.' });
+        }
+
+        const session = await stripeClient.checkout.sessions.create({
+            mode: 'subscription',
+            payment_method_types: ['card'],
+            line_items: [
+                {
+                    price: priceId,
+                    quantity: 1,
+                },
+            ],
+            success_url: successUrl || STRIPE_SUCCESS_URL,
+            cancel_url: cancelUrl || STRIPE_CANCEL_URL,
+            metadata: {
+                uid,
+            },
+        });
+        return res.json({ url: session.url });
+    } catch (error) {
+        console.error('Stripe checkout error:', error);
+        return res.status(500).json({ error: 'Failed to create checkout session.' });
+    }
+});
+
+app.post('/api/stripe/webhook', async (req, res) => {
+    if (!stripeClient || !STRIPE_WEBHOOK_SECRET) {
+        return res.status(500).json({ error: 'Stripe webhook is not configured.' });
+    }
+    const signature = req.headers['stripe-signature'];
+    if (!signature) {
+        return res.status(400).json({ error: 'Missing Stripe signature.' });
+    }
+
+    let event;
+    try {
+        event = stripeClient.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.error('Stripe webhook signature verification failed:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+        if (event.type === 'checkout.session.completed') {
+            const session = event.data.object;
+            const uid = session?.metadata?.uid;
+            const customerId = session?.customer || null;
+            const subscriptionId = session?.subscription || null;
+
+            let priceId = null;
+            let status = session?.payment_status || null;
+            let currentPeriodEnd = null;
+
+            if (subscriptionId) {
+                try {
+                    const sub = await stripeClient.subscriptions.retrieve(subscriptionId);
+                    priceId = sub?.items?.data?.[0]?.price?.id || null;
+                    status = sub?.status || status;
+                    currentPeriodEnd = sub?.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+                } catch (subError) {
+                    console.warn('Failed to retrieve subscription details:', subError?.message || subError);
+                }
+            }
+
+            if (uid) {
+                try {
+                    const userRef = firestore.collection('users').doc(uid);
+                    await userRef.set({
+                        stripe: {
+                            customerId,
+                            subscriptionId,
+                            priceId,
+                            status,
+                            currentPeriodEnd: currentPeriodEnd ? admin.firestore.Timestamp.fromDate(currentPeriodEnd) : null,
+                            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                        },
+                    }, { merge: true });
+                } catch (writeError) {
+                    console.error('Failed to persist Stripe details to user doc:', writeError);
+                }
+            }
+        }
+    } catch (handlerError) {
+        console.error('Stripe webhook handler error:', handlerError);
+        return res.status(500).json({ error: 'Failed to handle webhook.' });
+    }
+
+    return res.json({ received: true });
 });
 
 app.listen(PORT, () => {
