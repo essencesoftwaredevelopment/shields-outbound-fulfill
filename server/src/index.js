@@ -29,7 +29,7 @@ const STRIPE_SUCCESS_URL = process.env.STRIPE_SUCCESS_URL || 'http://localhost:3
 const STRIPE_CANCEL_URL = process.env.STRIPE_CANCEL_URL || 'http://localhost:3000/account?checkout=cancelled';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripeClient = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' }) : null;
-
+// test
 // Initialize Firebase Admin
 const serviceAccountPath = path.join(__dirname, '..', '.secrets', 'service-account.json');
 admin.initializeApp({
