@@ -16,6 +16,7 @@ export default function AccountPage() {
     }, []);
 
     const handleSubscribe = async () => {
+        if (checkoutLoading) return; // prevent accidental double submission
         setCheckoutError(null);
         setCheckoutLoading(true);
         try {
