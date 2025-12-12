@@ -166,7 +166,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
 
     const limit = pLimit(CONCURRENCY);
     let completedEligible = 0;
-    const stats = { found: 0, notFound: 0, skipped: 0, errors: 0 };
+    const stats = { Found: 0, 'Not Found': 0, Skipped: 0, errors: 0 };
     const results = new Array(totalRows);
 
     // Pre-fill rows that should be skipped or error out without hitting the API
@@ -182,7 +182,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
             return;
         }
         if (needsSkip(row.founder_name)) {
-            stats.skipped += 1;
+            stats.Skipped += 1;
             results[row.index] = {
                 domain: row.domain,
                 founder_name: row.founder_name,
@@ -210,11 +210,11 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
             }
 
             if (email) {
-                stats.found += 1;
+                stats['Found'] += 1;
             } else if (String(status).startsWith('error')) {
                 stats.errors += 1;
             } else {
-                stats.notFound += 1;
+                stats['Not Found'] += 1;
             }
 
             completedEligible += 1;

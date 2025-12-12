@@ -521,9 +521,9 @@ Description: ${description}
 
     return {
         personalized: processed,
-        inputTokens: totalInputTokens,
-        outputTokens: totalOutputTokens,
-        estimatedCost
+        // inputTokens: totalInputTokens,
+        // outputTokens: totalOutputTokens,
+        'Estimated Cost': estimatedCost
     };
 }
 
@@ -611,15 +611,13 @@ export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log, re
     });
 
     return {
-        shopifyStores: shopifyStats.shopifyStores,
-        productsFetched: fetchStats.fetched,
-        productsFailed: fetchStats.failed,
-        productsAfterCleaning: cleanStats.kept,
-        productsRemoved: cleanStats.removed,
-        productsTruncated: cleanStats.truncated,
-        personalized: personalizeStats.personalized,
-        inputTokens: personalizeStats.inputTokens,
-        outputTokens: personalizeStats.outputTokens,
-        estimatedCost: personalizeStats.estimatedCost
+        processed: personalizeStats.personalized,
+        total: shopifyStats.total,
+        ['Shopify Stores']: shopifyStats.shopifyStores,
+        ['Products Fetched']: fetchStats.fetched,
+        ['Products Failed']: fetchStats.failed,
+        ['Products Removed']: cleanStats.removed,
+        ['Personalized']: personalizeStats.personalized,
+        ['Estimated Cost']: personalizeStats['Estimated Cost']
     };
 }

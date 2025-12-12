@@ -189,13 +189,12 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, log = () 
     log(`Verify: verification complete. Results written to ${outputCsv}`);
 
     return {
-        totalRows: rows.length,
-        eligible: toVerify.length,
-        verified: completed,
-        valid: stats.valid,
-        invalid: stats.invalid,
-        'valid-risky': stats['valid-risky'],
-        unknown: stats.unknown,
-        stats
+        'Total Rows': rows.length,
+        'Eligible': toVerify.length,
+        'Verified': completed,
+        'Valid': stats.valid,
+        'Invalid': stats.invalid,
+        'Valid-Risky': stats['valid-risky'],
+        'Unknown': stats.unknown,
     };
 }

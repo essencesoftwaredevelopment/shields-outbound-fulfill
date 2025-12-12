@@ -7,7 +7,7 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-5-mini-2025-08-07';
+const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-5-nano';
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
@@ -124,13 +124,28 @@ async function aiFindFounder(searchResults, companyDomain, logger, openai) {
         searchString = searchString.slice(0, AI_TRUNCATE_CHARS) + '\n[TRUNCATED]';
     }
 
-    const promptInput = `From the first-page snippets only, extract the founder or CEO or owner **full name** for the domain below.
-Output rules:
-- Output ONLY the person's full name in the format: First Last
-- Do NOT include titles, commas, qualifiers, companies, or extra words
-- If multiple names appear, pick the one most clearly associated with founder, CEO, or owner
-- If no clear single person is identified, output exactly: Not found
-Search results (compressed JSON): ${searchString}\nCompany Domain: ${companyDomain}`;
+    const promptInput = `
+You are a precise extraction AI. You will receive a list of search results about a company, along with the company name. Your task is to return the full name (first and last) of the founder or CEO, based only on the provided information.
+
+Rules:
+
+Return only the person's full name.
+The name must be exactly two words: first name and last name.
+Do not return the company name, social handles, or extra words.
+If multiple names are mentioned, choose the most consistently associated with the role of founder or CEO.
+If a viable founder can't be determined, return "Not Found".
+If only a first name can be found, and you are sure it is the founder/CEO, return the first name as found, and the second name as "NoLast". Eg: "John NoLast"
+Never return anything other than the name or "Not Found". No explanation. No formatting.
+If it comes to an edge case or error outside of what is described, never give an explanation, just say "Not Found".
+Input will look like:
+Search results: [ { title: "...", snippet: "...", ... }, { ... } ]
+Company Domain: example.com
+
+Your only output should be like this:
+John Smith
+
+Search results (compressed JSON): ${searchString}
+Company Domain: ${companyDomain}`;
 
     await aiRateLimiter.acquire();
 
@@ -294,18 +309,12 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                     const progressPayload = {
                         progress: {
                             stage: 'founders',
-                            processed,
-                            total: domains.length,
-                            found: foundCount,
-                            notFound: notFoundCount,
-                            cost: costNumber,
                             stats: {
-                                found: foundCount,
-                                notFound: notFoundCount,
-                                processed,
-                                total: domains.length,
-                                cost: costNumber,
-                                costDisplay: `$${costNumber.toFixed(4)}`
+                                'Total': domains.length,
+                                'Processed': processed,
+                                'Found': foundCount,
+                                'Not Found': notFoundCount,
+                                'Cost': `$${costNumber}`
                             }
                         }
                     };
@@ -337,11 +346,10 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
     const summary = {
         total: domains.length,
-        processed,
-        found: foundCount,
-        notFound: notFoundCount,
-        cost: Number(stageCost.toFixed(6)),
-        costDisplay: `$${stageCost.toFixed(4)}`
+        processed: foundCount,
+        'Found': foundCount,
+        'Not Found': notFoundCount,
+        'Cost': `$${stageCost.toFixed(2)}`
     };
 
     log(`Founders: done. Results written to ${outputCsv}`);

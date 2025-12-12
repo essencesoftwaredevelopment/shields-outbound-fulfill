@@ -143,7 +143,7 @@ const extractStageSummary = (stage?: PipelineStageState) => {
     }
     const fallbackStats = stage.progress?.stats || {};
     const source = (stage.summary && Object.keys(stage.summary).length > 0) ? stage.summary : fallbackStats;
-    return Object.entries(source).slice(0, 4);
+    return Object.entries(source);
 };
 
 const formatSummaryValue = (value: unknown) => {
@@ -161,6 +161,42 @@ const formatSummaryValue = (value: unknown) => {
     } catch {
         return String(value);
     }
+};
+
+const extractNumberFrom = (source: Record<string, unknown> | null | undefined, keys: string[]) => {
+    if (!source) return null;
+    for (const key of keys) {
+        const value = source[key];
+        if (typeof value === "number" && Number.isFinite(value)) {
+            return value;
+        }
+    }
+    return null;
+};
+
+const deriveStageTotals = (stage?: PipelineStageState) => {
+    const stageName = stage?.progress?.stage;
+    const progress = stage?.progress;
+    const summary = stage?.summary as Record<string, unknown> | null;
+    const stats = progress?.stats as Record<string, unknown> | undefined;
+
+    // if it's the founders stage, or email find stage, use found
+    // if it's the verification stage, use verified/valid
+    const throughputNum =
+        stageName === "founders" || stageName === "emailDiscovery" ?
+            (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
+            ?? extractNumberFrom(stats, ["processed", "completed", "personalized"])
+            ?? extractNumberFrom(summary, ["processed", "completed", "personalized"])
+            : stageName === "verification" ?
+                (typeof summary?.valid === "number" && Number.isFinite(summary.valid) ? summary.valid : null) : stageName === "personalization" ?
+                    (typeof progress?.stats?.['personalized'] === "number" && Number.isFinite(progress.stats?.personalized) ? progress.stats.personalized : null) : null;
+
+    const total =
+        (typeof progress?.total === "number" && Number.isFinite(progress.total) ? progress.total : null)
+        ?? extractNumberFrom(stats, ["total", "queued", "attempted"])
+        ?? extractNumberFrom(summary, ["total", "queued", "attempted"]);
+
+    return { throughputNum, total };
 };
 
 export default function ClientPage() {
@@ -214,6 +250,8 @@ export default function ClientPage() {
     const [uploadMetrics, setUploadMetrics] = useState<{ count: number; total: number } | null>(null);
     const [instantlyUploadError, setInstantlyUploadError] = useState<string | null>(null);
     const [isSavingClient, setIsSavingClient] = useState(false);
+    const [isDeletingClient, setIsDeletingClient] = useState(false);
+    const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
 
     const createEmptyStageState = useCallback((): PipelineStageState => ({
         status: "pending",
@@ -369,8 +407,7 @@ export default function ClientPage() {
                 ?? jobState?.dedupeStats?.new
             );
             const totalCount = formatNumber(
-                jobState?.stages?.verification?.progress?.total
-                ?? jobState?.dedupeStats?.total
+                jobState?.dedupeStats?.total
             );
             const baseMessage = readyCount && totalCount
                 ? `Ready to upload ${readyCount} of ${totalCount} leads to Instantly.`
@@ -1324,6 +1361,34 @@ export default function ClientPage() {
         }
     };
 
+    const handleDeleteClient = async () => {
+        if (!user || !clientId) return;
+        const confirmed = window.confirm("Delete this client? This removes the client record and related leads.");
+        if (!confirmed) return;
+
+        setIsDeletingClient(true);
+        try {
+            const idToken = await getIdToken(user);
+            const resp = await fetch(`/api/clients/${encodeURIComponent(clientId)}/delete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ idToken })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to delete client (${resp.status})`);
+            }
+            setToastMessage('Client deleted');
+            setToastVisible(true);
+            router.push('/clients');
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to delete client');
+            setToastVisible(true);
+        } finally {
+            setIsDeletingClient(false);
+        }
+    };
+
     const handleLeadsScroll = (event: UIEvent<HTMLDivElement>) => {
         const target = event.currentTarget;
         if (target.scrollTop + target.clientHeight >= target.scrollHeight - 50) {
@@ -1449,6 +1514,38 @@ export default function ClientPage() {
             setJobState(null);
         } catch (error) {
             console.error('Failed to discard job:', error);
+        }
+    };
+
+    const handleDeleteJob = async (jobId: string) => {
+        if (!user || !clientId) return;
+        const confirmDelete = window.confirm("Delete this job? This removes the job record and cached files.");
+        if (!confirmDelete) return;
+
+        setDeletingJobId(jobId);
+        try {
+            const idToken = await getIdToken(user);
+            const resp = await fetch(`${getPipelineBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/delete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ idToken, clientId })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to delete job (${resp.status})`);
+            }
+            setJobHistory((prev) => prev.filter((job) => job.id !== jobId));
+            if (selectedJobId === jobId) {
+                setSelectedJobId(null);
+                setJobState(null);
+            }
+            setToastMessage('Job deleted');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to delete job');
+            setToastVisible(true);
+        } finally {
+            setDeletingJobId(null);
         }
     };
 
@@ -1732,8 +1829,7 @@ export default function ClientPage() {
                                             const stage = jobState.stages[stageKey];
                                             const meta = STAGE_METADATA[stageKey];
                                             const summaryEntries = extractStageSummary(stage);
-                                            const processed = typeof stage?.progress?.processed === "number" ? stage.progress.processed : null;
-                                            const total = typeof stage?.progress?.total === "number" ? stage.progress.total : null;
+                                            const { throughputNum, total } = deriveStageTotals(stage);
                                             return (
                                                 <article
                                                     key={stageKey}
@@ -1747,12 +1843,13 @@ export default function ClientPage() {
                                                         <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
                                                     </div>
                                                     <p className="stage-card__progress">
-                                                        {processed !== null && total ? (
+                                                        {throughputNum !== null && total !== null ? (
                                                             <span>
-                                                                <span className="stage-card__progress-number">{processed.toLocaleString()}</span>
+                                                                <span className="stage-card__progress-number">{throughputNum.toLocaleString()}</span>
                                                                 <span> / </span>
                                                                 <span className="stage-card__progress-number stage-card__progress-total">{total.toLocaleString()}</span>
-                                                                <span> processed</span>
+                                                                <span> throughput </span>
+                                                                <span className="stage-card__progress-percentage"> ・ {(throughputNum / total * 100).toFixed(2)}%</span>
                                                             </span>
                                                         ) : (
                                                             describeStageProgress(stage)
@@ -1804,14 +1901,20 @@ export default function ClientPage() {
                                                     || job.stages?.emailDiscovery?.summary?.found
                                                     || 0;
                                                 return (
-                                                    <button
+                                                    <div
                                                         key={job.id}
-                                                        type="button"
+                                                        role="button"
+                                                        tabIndex={0}
                                                         onClick={() => handleSelectJob(job)}
+                                                        onKeyDown={(event) => {
+                                                            if (event.key === 'Enter' || event.key === ' ') {
+                                                                event.preventDefault();
+                                                                handleSelectJob(job);
+                                                            }
+                                                        }}
                                                         style={{
-                                                            all: 'unset',
                                                             display: 'grid',
-                                                            gridTemplateColumns: 'minmax(0, 1fr) 120px 160px',
+                                                            gridTemplateColumns: 'minmax(0, 1fr) 120px 180px',
                                                             alignItems: 'center',
                                                             gap: '1rem',
                                                             padding: '1rem 1.25rem',
@@ -1820,6 +1923,7 @@ export default function ClientPage() {
                                                             background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
                                                             cursor: 'pointer',
                                                             transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.2s ease',
+                                                            position: 'relative'
                                                         }}
                                                         onMouseEnter={(event) => {
                                                             event.currentTarget.style.transform = 'translateY(-2px)';
@@ -1879,7 +1983,30 @@ export default function ClientPage() {
                                                                 color: 'rgba(255, 255, 255, 0.45)'
                                                             }}>{validLeads.toLocaleString()} valid · {totalProcessed.toLocaleString()} total</p>
                                                         </div>
-                                                    </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={(event) => {
+                                                                event.stopPropagation();
+                                                                handleDeleteJob(job.id);
+                                                            }}
+                                                            disabled={deletingJobId === job.id}
+                                                            className="destructive-button"
+                                                            style={{
+                                                                position: 'absolute',
+                                                                top: '10px',
+                                                                right: '10px',
+                                                                padding: '0.35rem 0.75rem',
+                                                                height: 'auto',
+                                                                minHeight: 'auto',
+                                                                fontSize: '0.75rem',
+                                                                borderRadius: '8px',
+                                                                boxShadow: 'none',
+                                                                flex: '0 0 auto'
+                                                            }}
+                                                        >
+                                                            {deletingJobId === job.id ? 'Deleting...' : 'Delete'}
+                                                        </button>
+                                                    </div>
                                                 );
                                             })}
                                         </div>
@@ -2122,9 +2249,17 @@ export default function ClientPage() {
                                     type="button"
                                     className="primary-button"
                                     onClick={handleSaveClientInfo}
-                                    disabled={isSavingClient}
+                                    disabled={isSavingClient || isDeletingClient}
                                 >
                                     {isSavingClient ? 'Saving...' : 'Save'}
+                                </button>
+                                <button
+                                    type="button"
+                                    className="destructive-button"
+                                    onClick={handleDeleteClient}
+                                    disabled={isDeletingClient || isSavingClient}
+                                >
+                                    {isDeletingClient ? 'Deleting...' : 'Delete client'}
                                 </button>
                             </div>
                         </div>

@@ -409,6 +409,12 @@ body {
   color: rgba(255, 255, 255, 0.7);
 }
 
+.stage-card__progress-percentage {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #008728;
+}
+
 .stage-card--running {
   border-color: rgba(96, 165, 250, 0.6);
 }

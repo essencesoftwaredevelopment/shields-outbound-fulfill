@@ -185,6 +185,73 @@ router.post('/jobs/:id/stop', async (req, res) => {
     }
 });
 
+// Delete a job (remove files, memory state, and Firestore record)
+router.post('/jobs/:id/delete', async (req, res) => {
+    try {
+        const jobId = req.params.id;
+        const { idToken, clientId } = req.body || {};
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
+        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        const job = jobs.get(jobId);
+        if (job && (job.uid !== uid || job.clientId !== clientId)) {
+            return res.status(403).json({ error: 'Unauthorized to delete this job.' });
+        }
+
+        if (job) {
+            if (!job.cancelled && job.status === 'running') {
+                markCancelled(job, 'Deleted by user');
+            }
+            closeStreams(job);
+            jobs.delete(jobId);
+        }
+
+        try {
+            const { jobDir } = resolveJobPaths(jobId);
+            if (jobDir && fs.existsSync(jobDir)) {
+                fs.rmSync(jobDir, { recursive: true, force: true });
+            }
+        } catch (err) {
+            console.warn(`[${jobId}] Failed to clean job files`, err?.message || err);
+        }
+
+        try {
+            const jobRef = firestore
+                .collection('users').doc(uid)
+                .collection('clients').doc(clientId)
+                .collection('jobs').doc(jobId);
+            await jobRef.delete();
+
+            const activeRef = firestore
+                .collection('users').doc(uid)
+                .collection('clients').doc(clientId)
+                .collection('activeJob').doc('current');
+            const activeSnap = await activeRef.get();
+            const isCurrent = activeSnap.exists && (activeSnap.data()?.jobId === jobId);
+            if (isCurrent) {
+                await activeRef.set({
+                    status: 'deleted',
+                    jobId: null,
+                    uploadError: null,
+                    uploadMetrics: null,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+            }
+        } catch (err) {
+            console.warn(`[${jobId}] Failed to delete Firestore job record`, err?.message || err);
+        }
+
+        return res.json({ status: 'deleted' });
+    } catch (error) {
+        console.error('Delete job error:', error);
+        return res.status(500).json({ error: 'Failed to delete job.' });
+    }
+});
+
 router.get('/jobs/:id/result', async (req, res) => {
     const jobId = req.params.id;
     const scopeParam = (req.query?.scope || '').toString() === 'valid' ? 'valid' : 'all';
