@@ -283,13 +283,7 @@ async function processJob(job) {
                 };
             });
 
-            job.status = 'completed';
-            job.completedAt = new Date().toISOString();
-            pushState(job);
-            log(job, 'Job completed: All domains were already processed (duplicates)');
-            return;
-        }
-
+        job.status = 'pending-upload';
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -424,7 +418,7 @@ async function processJob(job) {
             console.warn(`[${job.id}] Failed to build upload.csv`, err?.message || err);
         }
 
-        job.status = 'completed';
+        job.status = 'pending-upload';
         job.completedAt = new Date().toISOString();
         pushState(job);
         log(job, `Job completed. Final CSV ready at ${job.paths.final}`);
