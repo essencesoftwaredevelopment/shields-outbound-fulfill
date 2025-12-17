@@ -126,6 +126,30 @@ async function persistJobState(job) {
     }
 }
 
+async function updateActiveJob(job, status, additionalData = {}) {
+    if (!job?.uid || !job?.clientId) {
+        console.warn(`[${job?.id || 'unknown'}] Cannot update activeJob: missing uid (${job?.uid}) or clientId (${job?.clientId})`);
+        return;
+    }
+    try {
+        const activeJobRef = firestore
+            .collection('users').doc(job.uid)
+            .collection('clients').doc(job.clientId)
+            .collection('activeJob').doc('current');
+
+        console.log(`[${job.id}] Setting activeJob: users/${job.uid}/clients/${job.clientId}/activeJob/current`, { jobId: job.id, status, ...additionalData });
+        await activeJobRef.set({
+            jobId: job.id,
+            status,
+            ...additionalData,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        console.log(`[${job.id}] ActiveJob document updated successfully`);
+    } catch (error) {
+        console.error(`[${job?.id || 'unknown'}] Active job update error:`, error?.message || error);
+    }
+}
+
 async function runStage(job, stageKey, handler) {
     updateStage(job, stageKey, { status: 'running', startedAt: new Date().toISOString(), error: null });
     try {
@@ -286,6 +310,7 @@ async function processJob(job) {
             job.status = 'pending-upload';
             job.completedAt = new Date().toISOString();
             pushState(job);
+            await updateActiveJob(job, 'pending-upload', { uploadError: null, uploadMetrics: null });
             log(job, 'Job completed: All domains were already processed (duplicates)');
             return;
         }
@@ -427,6 +452,9 @@ async function processJob(job) {
         job.status = 'pending-upload';
         job.completedAt = new Date().toISOString();
         pushState(job);
+        console.log(`[${job.id}] Updating activeJob to pending-upload...`);
+        await updateActiveJob(job, 'pending-upload', { uploadError: null, uploadMetrics: null });
+        console.log(`[${job.id}] ActiveJob updated successfully`);
         log(job, `Job completed. Final CSV ready at ${job.paths.final}`);
     } catch (err) {
         if (job.cancelled) {
@@ -436,6 +464,7 @@ async function processJob(job) {
         job.status = 'error';
         job.error = err?.message || 'Unexpected pipeline error';
         pushState(job);
+        await updateActiveJob(job, 'error', { error: job.error, uploadError: null, uploadMetrics: null });
         log(job, `Job failed: ${job.error}`);
     }
 

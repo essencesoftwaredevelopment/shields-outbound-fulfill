@@ -260,7 +260,7 @@ router.get('/jobs/:id/result', async (req, res) => {
     if (!fs.existsSync(finalPath)) {
         return res.status(404).json({ error: 'Result file missing' });
     }
-    if (job && job.status !== 'completed') {
+    if (job && job.status !== 'completed' && job.status !== 'pending-upload') {
         return res.status(409).json({ error: 'Job not completed yet' });
     }
 

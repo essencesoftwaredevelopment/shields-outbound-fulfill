@@ -73,6 +73,9 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
     queued: "Queued",
     running: "Running",
     completed: "Completed",
+    "pending-upload": "Ready to Upload",
+    uploaded: "Uploaded",
+    discarded: "Discarded",
     error: "Error",
     cancelled: "Cancelled",
 };
@@ -88,6 +91,9 @@ const JOB_STATUS_COLORS: Record<JobStatus, string> = {
     queued: "#fbbf24",
     running: "#3b82f6",
     completed: "#22c55e",
+    "pending-upload": "#22c55e",
+    uploaded: "#10b981",
+    discarded: "#a1a1aa",
     error: "#f87171",
     cancelled: "#a1a1aa",
 };
@@ -371,7 +377,7 @@ export default function ClientPage() {
         if (activeJobStatus === "pending-upload") {
             return true;
         }
-        if (!activeJobStatus && jobState.status === "completed") {
+        if (!activeJobStatus && jobState.status === "completed" ) {
             return true;
         }
         return false;
@@ -1307,7 +1313,7 @@ export default function ClientPage() {
     }, [findFounder, skipFounderFinder]);
 
     const handleDownloadResults = (scope: 'all' | 'valid') => {
-        if (!jobState || jobState.status !== "completed") {
+        if (!jobState || (jobState.status !== "completed" && jobState.status !== "pending-upload")) {
             return;
         }
         const url = getJobResultUrl(jobState.id, scope);
@@ -1770,7 +1776,7 @@ export default function ClientPage() {
                                             </p>
                                         )}
                                     </div>
-                                    {jobState?.status === 'completed' && (
+                                    {(jobState?.status === 'completed' || jobState?.status === 'pending-upload' || canUploadToInstantly) && (
                                         <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
                                             <button
                                                 type="button"
@@ -2958,7 +2964,7 @@ export default function ClientPage() {
                             <button
                                 type="button"
                                 className="primary-button"
-                                disabled={!jobState || jobState.status !== 'completed'}
+                                disabled={!jobState || (jobState.status !== 'completed' && jobState.status !== 'pending-upload')}
                                 onClick={() => handleDownloadResults(downloadScope)}
                             >
                                 Download
