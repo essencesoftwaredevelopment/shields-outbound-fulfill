@@ -283,7 +283,13 @@ async function processJob(job) {
                 };
             });
 
-        job.status = 'pending-upload';
+            job.status = 'pending-upload';
+            job.completedAt = new Date().toISOString();
+            pushState(job);
+            log(job, 'Job completed: All domains were already processed (duplicates)');
+            return;
+        }
+
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -432,7 +438,9 @@ async function processJob(job) {
         pushState(job);
         log(job, `Job failed: ${job.error}`);
     }
+
 }
+
 
 function serializeJob(job) {
     return {
