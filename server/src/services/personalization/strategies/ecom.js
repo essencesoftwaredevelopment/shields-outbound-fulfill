@@ -80,7 +80,7 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
             .on('data', (row) => {
                 // Only process verified emails
                 const emailStatus = (row.email_status || '').toLowerCase();
-                if (emailStatus === 'valid' || emailStatus === 'verified') {
+                if (emailStatus === 'valid' || emailStatus === 'verified' || emailStatus === 'valid-risky') {
                     rows.push(row);
                 }
             })
