@@ -259,6 +259,12 @@ export default function ClientPage() {
     const [isDeletingClient, setIsDeletingClient] = useState(false);
     const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
 
+    const instantlyWebhookUrl = useMemo(() => {
+        if (!user || !clientId) return "";
+        return `https://api.shieldsoutboundserver.org/webhook/events/${user.uid}/${clientId}`;
+    }, [user, clientId]);
+    const [copiedWebhook, setCopiedWebhook] = useState(false);
+
     const createEmptyStageState = useCallback((): PipelineStageState => ({
         status: "pending",
         startedAt: null,
@@ -2249,6 +2255,44 @@ export default function ClientPage() {
                                     onChange={(e) => setClientInstantlyKey(e.target.value)}
                                     placeholder="Paste Instantly API key"
                                 />
+                            </label>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Instantly Webhook URL</span>
+                                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                                    <input
+                                        type="text"
+                                        value={instantlyWebhookUrl}
+                                        readOnly
+                                        placeholder="Webhook URL"
+                                        style={{ flex: 1 }}
+                                    />
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            navigator.clipboard?.writeText(instantlyWebhookUrl || '').then(() => {
+                                                setCopiedWebhook(true);
+                                                setTimeout(() => setCopiedWebhook(false), 1600);
+                                            }).catch(() => setCopiedWebhook(false));
+                                        }}
+                                        aria-label="Copy webhook URL"
+                                        title="Copy webhook URL"
+                                        style={{
+                                            cursor: 'pointer',
+                                            minWidth: '36px',
+                                            width: 'auto',
+                                            padding: '0.35rem 0.45rem',
+                                            borderRadius: '8px',
+                                            border: '1px solid rgba(255,255,255,0.15)',
+                                            background: 'rgba(255,255,255,0.05)',
+                                            color: '#fff'
+                                        }}
+                                    >
+                                        {copiedWebhook ? '✓' : '📋'}
+                                    </button>
+                                </div>
+                                <span className="settings-field__hint">
+                                    Paste this into Instantly events/webhook settings for this client.
+                                </span>
                             </label>
                             <div className="modal__actions" style={{ justifyContent: 'flex-start' }}>
                                 <button

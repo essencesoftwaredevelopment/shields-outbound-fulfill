@@ -40,6 +40,11 @@ export default function ClientsPage() {
         []
     );
 
+    const instantlyWebhookUrl = useMemo(() => {
+        if (!user || !selectedClientId) return "";
+        return `https://api.shieldsoutboundserver.org/webhook/events/${user.uid}/${selectedClientId}`;
+    }, [user, selectedClientId]);
+
     useEffect(() => {
         if (!loading && !user) {
             router.replace("/auth");
@@ -302,6 +307,18 @@ export default function ClientsPage() {
                                         value={(campaignCounts[selectedClient.id] ?? 0).toLocaleString()}
                                         readOnly
                                     />
+                                </label>
+                                <label className="label">
+                                    Instantly Webhook URL
+                                    <input
+                                        className="input"
+                                        type="text"
+                                        value={instantlyWebhookUrl}
+                                        readOnly
+                                    />
+                                    <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem' }}>
+                                        Paste this into Instantly to send events for this client.
+                                    </p>
                                 </label>
                                 <div className="modal__actions" style={{ gap: "0.75rem", marginTop: '0.5rem' }}>
                                     <button type="button" className="primary-button" onClick={() => setSelectedClientId("")}>Back to Clients</button>

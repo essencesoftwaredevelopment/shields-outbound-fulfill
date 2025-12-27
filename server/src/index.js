@@ -7,6 +7,7 @@ import { stripeClient, STRIPE_PRICE_ID, STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL, S
 import { TMP_ROOT } from './config/paths.js';
 import jobsRouter from './routes/jobs.js';
 import clientsRouter from './routes/clients.js';
+import webhooksRouter from './routes/webhooks.js';
 
 
 const PORT = env.PORT || 4000;
@@ -18,6 +19,7 @@ app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use('/api', jobsRouter);
 app.use('/api', clientsRouter);
+app.use('/', webhooksRouter);
 
 app.post('/api/stripe/checkout', async (req, res) => {
     try {
