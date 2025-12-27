@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { createPortal } from "react-dom";
 import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, onSnapshot } from "firebase/firestore";
 import { getIdToken, signOut } from "firebase/auth";
@@ -90,6 +90,8 @@ const readKeysFromSnapshot = (data: Record<string, unknown> | undefined): ApiKey
 
 function HomeContent() {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const { user, loading } = useAuth();
   const [apiKeys, setApiKeys] = useState<ApiKeyState>(() => createEmptyKeys());
   const [lastSavedKeys, setLastSavedKeys] = useState<ApiKeyState>(() => createEmptyKeys());
@@ -109,20 +111,30 @@ function HomeContent() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVisible, setToastVisible] = useState(false);
   const [clients, setClients] = useState<Array<{ id: string; name: string; totalLeads?: number }>>([]);
+  const shouldShowKeys = searchParams?.get("showKeys") === "1";
 
   const showToast = useCallback((message: string) => {
     setToastMessage(message);
     setToastVisible(true);
   }, [setToastMessage, setToastVisible]);
 
+  useEffect(() => {
+    setVaultModalOpen(shouldShowKeys);
+    if (!shouldShowKeys) {
+      setApiKeys(lastSavedKeys);
+      setVaultMessage({ tone: "idle", text: "" });
+    }
+  }, [shouldShowKeys, lastSavedKeys]);
 
-  const closeVaultModal = () => {
-    // set local state back to live saved keys in Firestore
-    // set status messages back to idle
-    setApiKeys(lastSavedKeys);
-    setVaultMessage({ tone: "idle", text: "" });
+  const closeVaultModal = useCallback(() => {
     setVaultModalOpen(false);
-  };
+    const params = new URLSearchParams(searchParams?.toString() ?? "");
+    if (params.has("showKeys")) {
+      params.delete("showKeys");
+      const queryString = params.toString();
+      router.replace(queryString ? `${pathname}?${queryString}` : pathname, { scroll: false });
+    }
+  }, [pathname, router, searchParams]);
 
   const handleKeyChange = (event: ChangeEvent<HTMLInputElement>, key: ApiKeyName) => {
     if (vaultMessage.tone !== "idle") {
