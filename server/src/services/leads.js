@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { parse as csvParse } from 'csv-parse';
-import { admin, firestore } from '../config/firebase.js';
+import { pool } from '../config/db.js';
 
 function getLeadRef(uid, clientId, domain) {
     return firestore
@@ -9,18 +9,89 @@ function getLeadRef(uid, clientId, domain) {
         .collection('leads').doc(domain.toLowerCase());
 }
 
-export async function upsertLead(uid, clientId, domain, data) {
-    if (!uid || !clientId || !domain) return;
-    const leadRef = getLeadRef(uid, clientId, domain);
-    await leadRef.set({
-        domain: domain.toLowerCase(),
-        ...data,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+async function ensureCompanyId(clientId, domain) {
+    const normalized = domain.toLowerCase();
+    const { rows } = await pool.query(
+        `insert into companies (client_id, domain_normalized)
+         values ($1, $2)
+         on conflict (client_id, domain_normalized)
+         do update set updated_at = now()
+         returning id`,
+        [clientId, normalized]
+    );
+    return rows[0].id;
 }
 
-export async function upsertLeadsFromCsv({ uid, clientId, csvPath, type, dedupeStrategy = 'skip' }) {
-    if (!fs.existsSync(csvPath)) return;
+async function upsertContact({ companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, lastVerifiedAt = null }) {
+    const params = [companyId, roleType, fullName, email, emailStatus, confidence, lastVerifiedAt];
+    const query = `
+        insert into contacts (company_id, role_type, full_name, email, email_status, confidence, last_verified_at)
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (company_id, role_type) do update set
+            full_name = coalesce(excluded.full_name, contacts.full_name),
+            email = coalesce(excluded.email, contacts.email),
+            email_status = coalesce(excluded.email_status, contacts.email_status),
+            confidence = coalesce(excluded.confidence, contacts.confidence),
+            last_verified_at = coalesce(excluded.last_verified_at, contacts.last_verified_at),
+            updated_at = now();
+    `;
+
+    try {
+        await pool.query(query, params);
+    } catch (err) {
+        // Handle unique(email) conflicts by updating the existing row keyed by email
+        if (err?.code === '23505' && email) {
+            await pool.query(
+                `update contacts
+                 set full_name = coalesce($1, full_name),
+                     email_status = coalesce($2, email_status),
+                     confidence = coalesce($3, confidence),
+                     last_verified_at = coalesce($4, last_verified_at),
+                     updated_at = now()
+                 where email = $5`,
+                [fullName, emailStatus, confidence, lastVerifiedAt, email]
+            );
+            return;
+        }
+        throw err;
+    }
+}
+
+function buildContactPayload(row, type) {
+    const domain = String(row.domain || '').trim().toLowerCase();
+    const founderName = String(row.founder_name || row.full_name || row.name || '').trim() || null;
+    const confidence = row.confidence ? Number(row.confidence) : null;
+    const email = String(row.email || '').trim() || null;
+    const lookupStatus = String(row.lookup_status || '').trim() || null;
+    const emailStatus = String(row.email_status || lookupStatus || '').trim() || null;
+
+    if (!domain) return null;
+
+    if (type === 'founders') {
+        return { domain, roleType: 'founder', fullName: founderName, confidence: Number.isFinite(confidence) ? confidence : null };
+    }
+    if (type === 'emails') {
+        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: lookupStatus || null, confidence: Number.isFinite(confidence) ? confidence : null };
+    }
+    if (type === 'verification') {
+        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus, lastVerifiedAt: emailStatus ? new Date().toISOString() : null };
+    }
+    if (type === 'personalization') {
+        return { domain, roleType: 'founder' }; // personalization does not mutate contact fields here
+    }
+    return { domain, roleType: 'founder', fullName: founderName };
+}
+
+export async function upsertLead(uid, clientId, domain, data) {
+    if (!clientId || !domain) return;
+    const companyId = await ensureCompanyId(clientId, domain);
+    const fullName = typeof data?.name === 'string' ? data.name : null;
+    const email = typeof data?.email === 'string' ? data.email : null;
+    await upsertContact({ companyId, roleType: 'founder', fullName, email });
+}
+
+export async function upsertLeadsFromCsv({ clientId, csvPath, type }) {
+    if (!fs.existsSync(csvPath) || !clientId) return;
     const rows = [];
     await new Promise((resolve, reject) => {
         fs.createReadStream(csvPath)
@@ -30,69 +101,35 @@ export async function upsertLeadsFromCsv({ uid, clientId, csvPath, type, dedupeS
             .on('error', reject);
     });
 
-    // Upsert all leads from CSV regardless of dedupeStrategy
-    // (dedupeStrategy only affects which domains make it into the CSV via filterAndWriteProcessedDomains)
-    const writer = firestore.bulkWriter();
-    writer.onWriteError((error) => {
-        const code = error?.code || '';
-        const willRetry = error?.failedAttempts < 3;
-        if (willRetry) return true;
-        console.warn('BulkWriter error (no retry):', code, error?.message);
-        return false;
-    });
-
     for (const row of rows) {
-        const domain = String(row.domain || '').trim();
-        if (!domain) continue;
-        const ref = getLeadRef(uid, clientId, domain);
-        let payload = {};
-        if (type === 'founders') {
-            payload = { founder_name: String(row.founder_name || '').trim() };
-        } else if (type === 'emails') {
-            payload = {
-                founder_name: String(row.founder_name || '').trim(),
-                email: String(row.email || '').trim(),
-                email_status: String(row.lookup_status || '').trim()
-            };
-        } else if (type === 'verification') {
-            payload = {
-                founder_name: String(row.founder_name || '').trim(),
-                email: String(row.email || '').trim(),
-                email_status: String(row.email_status || '').trim()
-            };
-        } else if (type === 'personalization') {
-            payload = {
-                personalization_url: String(row.url || '').trim(),
-                personalization_title: String(row.title || '').trim(),
-                personalization_first_line: String(row.first_line || '').trim()
-            };
-        }
-        writer.set(ref, {
-            domain: domain.toLowerCase(),
-            ...payload,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+        const payload = buildContactPayload(row, type);
+        if (!payload) continue;
+        const companyId = await ensureCompanyId(clientId, payload.domain);
+        await upsertContact({
+            companyId,
+            roleType: payload.roleType,
+            fullName: payload.fullName,
+            email: payload.email,
+            emailStatus: payload.emailStatus,
+            confidence: payload.confidence,
+            lastVerifiedAt: payload.lastVerifiedAt
+        });
     }
-
-    await writer.close();
 }
 
 export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain' }) {
-    if (!uid || !domainsCsvPath || !clientId) {
-        console.warn(`[${jobId}] Missing uid/clientId/domainsCsvPath. uid=${uid}, clientId=${clientId}, domainsCsvPath=${domainsCsvPath}`);
+    if (!clientId || !domainsCsvPath) {
+        console.warn(`[${jobId}] Missing clientId/domainsCsvPath. clientId=${clientId}, domainsCsvPath=${domainsCsvPath}`);
         return { filtered: domainsCsvPath, stats: { total: 0, skipped: 0, new: 0 } };
     }
-    const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
-    const subRef = clientRef.collection('processed-domains');
 
-    // Read all domains from CSV
     const domains = [];
     await new Promise((resolve, reject) => {
         fs.createReadStream(domainsCsvPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', (row) => {
                 const domain = String(row[domainColumn] || row.domain || '').trim();
-                if (domain) domains.push(domain);
+                if (domain) domains.push(domain.toLowerCase());
             })
             .on('end', resolve)
             .on('error', reject);
@@ -100,104 +137,62 @@ export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, dom
 
     const stats = { total: domains.length, skipped: 0, new: 0 };
 
-    // Build set of existing processed domains for uniqueness
-    const processedSet = new Set();
-    const existingSnap = await subRef.get();
-    existingSnap.forEach(doc => {
-        const domain = doc.data().domain || doc.id;
-        if (domain) processedSet.add(String(domain).toLowerCase());
-    });
+    if (domains.length === 0) {
+        return { filtered: domainsCsvPath, stats };
+    }
 
-    // Determine filtered list when skipping duplicates
+    const uniqueDomains = Array.from(new Set(domains));
+
+    // Fetch existing domains for this client from SQL
+    let existing = [];
+    try {
+        const { rows } = await pool.query(
+            'select domain_normalized from companies where client_id = $1 and domain_normalized = any($2)',
+            [clientId, uniqueDomains]
+        );
+        existing = rows.map((r) => r.domain_normalized.toLowerCase());
+    } catch (err) {
+        console.error(`[${jobId}] SQL dedupe query failed:`, err?.message || err);
+        // Fall back to no filtering if query fails
+        return { filtered: domainsCsvPath, stats };
+    }
+
+    const existingSet = new Set(existing);
+
     let filteredDomains = domains;
     if (dedupeStrategy === 'skip') {
-        filteredDomains = domains.filter(d => !processedSet.has(d.toLowerCase()));
+        filteredDomains = domains.filter((d) => !existingSet.has(d));
         stats.skipped = domains.length - filteredDomains.length;
         stats.new = filteredDomains.length;
     } else {
-        // include: process ALL domains (no filtering), just track new vs existing in stats
-        filteredDomains = domains; // Keep all domains for processing
-        const uniqueDomains = new Set(domains.map(d => d.toLowerCase()));
-        let newCount = 0;
-        uniqueDomains.forEach(d => { if (!processedSet.has(d)) newCount += 1; });
-        stats.new = newCount; // How many are truly new
-        stats.skipped = 0; // Don't skip any when strategy is 'include'
+        stats.skipped = 0;
+        stats.new = uniqueDomains.filter((d) => !existingSet.has(d)).length;
     }
 
-    // Write to processed-domains ensuring one doc per domain (unique key)
-    const writePromises = (dedupeStrategy === 'skip' ? filteredDomains : Array.from(new Set(domains.map(d => d.toLowerCase())))).map(async (domain) => {
-        const id = domain.toLowerCase();
-        const ref = subRef.doc(id);
-        try {
-            await ref.set({
-                domain: id,
-                lastJobId: jobId,
-                // optional list of jobs processed
-                jobs: admin.firestore.FieldValue.arrayUnion(jobId),
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        } catch (err) {
-            console.warn('processed-domains write error', err?.message);
-        }
-    });
-    await Promise.all(writePromises);
-
-    // Update client document with absolute total leads count based on processed-domains size
-    try {
-        const allProcessedSnap = await subRef.get();
-        const total = allProcessedSnap.size;
-        console.log(`[${jobId}] Updating client ${clientId} totalLeads=${total}`);
-        await clientRef.set({
-            totalLeads: total,
-            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-    } catch (err) {
-        console.warn(`[${jobId}] Failed to set client totalLeads count for clientId=${clientId}`, err?.message);
-    }
-
-    // Write filtered CSV if we filtered anything
     if (dedupeStrategy === 'skip' && stats.skipped > 0) {
         const filteredPath = domainsCsvPath.replace('.csv', '-filtered.csv');
         const writer = fs.createWriteStream(filteredPath);
         writer.write('domain\n');
-        filteredDomains.forEach(domain => writer.write(`${domain}\n`));
+        filteredDomains.forEach((domain) => writer.write(`${domain}\n`));
         writer.end();
-        await new Promise(resolve => writer.on('finish', resolve));
+        await new Promise((resolve) => writer.on('finish', resolve));
         return { filtered: filteredPath, stats };
     }
 
     return { filtered: domainsCsvPath, stats };
 }
 
-export async function attachCampaignToLeads({ uid, clientId, campaignId, rows }) {
-    if (!uid || !clientId || !campaignId || !Array.isArray(rows) || rows.length === 0) return;
-    const leadsCol = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('leads');
-    const writer = firestore.bulkWriter();
-    writer.onWriteError((error) => {
-        const willRetry = error?.failedAttempts < 3;
-        return willRetry;
-    });
-
-    rows.forEach((row) => {
-        const domain = String(row.domain || '').toLowerCase();
-        if (!domain) return;
-        const ref = leadsCol.doc(domain);
-        writer.set(ref, {
-            campaignId,
-            campaigns: admin.firestore.FieldValue.arrayUnion(campaignId),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-    });
-
-    await writer.close();
+export async function attachCampaignToLeads({ clientId, rows }) {
+    if (!clientId || !Array.isArray(rows) || rows.length === 0) return;
+    const emails = rows.map((r) => String(r.email || '').trim()).filter(Boolean);
+    if (!emails.length) return;
+    await pool.query(
+        'update contacts set last_contacted_at = now(), updated_at = now() where email = any($1)',
+        [emails]
+    );
 }
 
-export async function incrementCampaignLeadCount({ uid, clientId, campaignId, delta }) {
-    if (!uid || !clientId || !campaignId || !Number.isFinite(delta) || delta <= 0) return;
-    const campaignRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('campaigns').doc(campaignId);
-    await campaignRef.set({
-        totalLeads: admin.firestore.FieldValue.increment(delta),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+export async function incrementCampaignLeadCount() {
+    // No-op: Firestore aggregate counts removed in SQL version
+    return;
 }

@@ -380,7 +380,7 @@ async function processJob(job) {
                 })
             );
             // Upsert leads with founder info (only when actually found)
-            await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.founders, type: 'founders', dedupeStrategy: job.dedupeStrategy });
+            await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.founders, type: 'founders' });
         }
         computeJobCost(job);
 
@@ -433,7 +433,7 @@ async function processJob(job) {
                 })
             );
             // Upsert leads with email lookup results (only when actually found)
-            await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.emails, type: 'emails', dedupeStrategy: job.dedupeStrategy });
+            await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.emails, type: 'emails' });
         }
         computeJobCost(job);
 
@@ -491,7 +491,7 @@ async function processJob(job) {
         }
 
         // Upsert leads with verification status
-        await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.final, type: 'verification', dedupeStrategy: job.dedupeStrategy });
+        await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.final, type: 'verification' });
 
         if (job.cancelled) {
             markCancelled(job);
@@ -519,7 +519,7 @@ async function processJob(job) {
         }
 
         // Upsert leads with personalization data
-        await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.personalized, type: 'personalization', dedupeStrategy: job.dedupeStrategy });
+        await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.personalized, type: 'personalization' });
 
         // Build upload-ready CSV (complete leads with founder, email, and personalization)
         try {

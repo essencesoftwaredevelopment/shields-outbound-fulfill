@@ -612,8 +612,8 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
         // Persist campaign association and counts in Firestore
         try {
             if (uploaded > 0) {
-                await attachCampaignToLeads({ uid, clientId, campaignId, rows: verified.slice(0, uploaded) });
-                await incrementCampaignLeadCount({ uid, clientId, campaignId, delta: uploaded });
+                await attachCampaignToLeads({ clientId, rows: verified.slice(0, uploaded) });
+                await incrementCampaignLeadCount({ clientId, campaignId, delta: uploaded });
             }
         } catch (firestoreError) {
             console.warn('Failed to persist campaign lead linkage/counts:', firestoreError?.message || firestoreError);

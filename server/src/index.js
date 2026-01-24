@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { env } from './config/env.js';
+import { testConnection } from './config/db.js';
 import jobsRouter from './routes/jobs.js';
 import clientsRouter from './routes/clients.js';
 import webhooksRouter from './routes/webhooks.js';
@@ -24,6 +25,11 @@ app.get('/health', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+app.listen(PORT, async () => {
+    try {
+        const ok = await testConnection();
+        console.log(`Server running on port ${PORT} (db:${ok ? 'ok' : 'error'})`);
+    } catch (err) {
+        console.error('Database connectivity check failed:', err.message);
+    }
 });
