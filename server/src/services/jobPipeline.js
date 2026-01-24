@@ -4,7 +4,7 @@ import { env } from '../config/env.js';
 import { admin, firestore } from '../config/firebase.js';
 import { TMP_ROOT } from '../config/paths.js';
 import { DEFAULT_PRICING, loadPricing, computeJobCost } from '../utils/pricing.js';
-import { buildFoundersCsvFromInput, buildUnifiedRows, writeUploadCsv } from '../utils/csv.js';
+import { buildFoundersCsvFromInput, buildEmailsCsvFromInput, buildUnifiedRows, writeUploadCsv } from '../utils/csv.js';
 import { filterAndWriteProcessedDomains, upsertLeadsFromCsv } from './leads.js';
 import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
@@ -173,6 +173,22 @@ function markCancelled(job, reason = 'Cancelled by user') {
     closeStreams(job);
 }
 
+function markPaused(job, reason = 'Paused by user') {
+    job.paused = true;
+    job.status = 'paused';
+    job.pausedAt = new Date().toISOString();
+    log(job, reason);
+    pushState(job);
+}
+
+function markResumed(job) {
+    job.paused = false;
+    job.status = 'running';
+    job.resumedAt = new Date().toISOString();
+    log(job, 'Job resumed.');
+    pushState(job);
+}
+
 function resolveJobPaths(jobId) {
     const job = jobs.get(jobId);
     const jobDir = job?.paths?.dir || path.join(TMP_ROOT, jobId);
@@ -206,12 +222,16 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         clientId,
         dedupeStrategy,
         cancelled: false,
+        paused: false,
         skipFounderFinder: options.skipFounderFinder || false,
+        skipEmailFinder: options.skipEmailFinder || false,
+        skipVerification: options.skipVerification || false,
         findFounder: options.findFounder !== false,
         industry: options.industry || options.nicheId || null,
         nicheId: options.nicheId || null,
         nicheLabel: options.nicheLabel || null,
         personalizeFirstLine: options.personalizeFirstLine === true,
+        columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
         cost: 0,
         stages: {
             founders: initialStageState(),
@@ -223,6 +243,7 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         streams: [],
         paths: {
             dir,
+            tmpDir: dir,
             domains: inputPath,
             founders: path.join(dir, 'founders.csv'),
             emails: path.join(dir, 'emails.csv'),
@@ -263,7 +284,8 @@ async function processJob(job) {
                 clientId: job.clientId,
                 jobId: job.id,
                 domainsCsvPath: job.paths.domains,
-                dedupeStrategy: job.dedupeStrategy
+                dedupeStrategy: job.dedupeStrategy,
+                domainColumn: job.columnMapping?.domain || 'domain'
             });
             filteredDomainsPath = filtered;
             job.dedupeStats = dedupeStats;
@@ -325,7 +347,8 @@ async function processJob(job) {
                 await buildFoundersCsvFromInput({
                     filteredDomainsPath,
                     originalInputPath: job.paths.domains,
-                    outputPath: job.paths.founders
+                    outputPath: job.paths.founders,
+                    columnMapping: job.columnMapping
                 });
                 const processed = job.dedupeStats?.total || 0;
                 updateStage(job, 'founders', {
@@ -352,56 +375,114 @@ async function processJob(job) {
                     outputCsv: job.paths.founders,
                     apiKeys: job.apiKeys,
                     pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
+                    log: (message, meta) => log(job, message, meta),
+                    checkpointDir: job.tmpDir
+                })
+            );
+            // Upsert leads with founder info (only when actually found)
+            await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.founders, type: 'founders', dedupeStrategy: job.dedupeStrategy });
+        }
+        computeJobCost(job);
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
+
+        if (job.skipEmailFinder) {
+            try {
+                await buildEmailsCsvFromInput({
+                    filteredDomainsPath,
+                    originalInputPath: job.paths.domains,
+                    outputPath: job.paths.emails,
+                    columnMapping: job.columnMapping
+                });
+                const emailsContent = fs.readFileSync(job.paths.emails, 'utf-8');
+                const lines = emailsContent.split('\n').filter(line => line.trim());
+                const processed = Math.max(0, lines.length - 1);
+                
+                updateStage(job, 'emailDiscovery', {
+                    status: 'completed',
+                    completedAt: new Date().toISOString(),
+                    startedAt: job.stages.emailDiscovery.startedAt || new Date().toISOString(),
+                    summary: { processed, cost: 0, skipped: processed },
+                    progress: {
+                        stage: 'emailDiscovery',
+                        processed,
+                        total: processed,
+                        stats: { processed, total: processed, cost: 0 }
+                    }
+                });
+                log(job, `Email discovery skipped (CSV included email). Processed ${processed} rows.`);
+            } catch (err) {
+                console.error(`[${job.id}] Failed to build emails CSV from input:`, err?.message || err);
+                throw err;
+            }
+        } else {
+            await runStage(job, 'emailDiscovery', () =>
+                runEmailFinder({
+                    inputCsv: job.paths.founders,
+                    outputCsv: job.paths.emails,
+                    apiKeys: job.apiKeys,
+                    log: (message, meta) => log(job, message, meta)
+                })
+            );
+            // Upsert leads with email lookup results (only when actually found)
+            await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.emails, type: 'emails', dedupeStrategy: job.dedupeStrategy });
+        }
+        computeJobCost(job);
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
+
+        if (job.cancelled) {
+            markCancelled(job);
+            return;
+        }
+
+        if (job.skipVerification) {
+            try {
+                // Copy emails.csv to final.csv without verification
+                const emailsContent = fs.readFileSync(job.paths.emails, 'utf-8');
+                fs.writeFileSync(job.paths.final, emailsContent);
+                
+                const lines = emailsContent.split('\n').filter(line => line.trim());
+                const processed = Math.max(0, lines.length - 1); // Subtract header
+                
+                updateStage(job, 'verification', {
+                    status: 'completed',
+                    completedAt: new Date().toISOString(),
+                    startedAt: job.stages.verification.startedAt || new Date().toISOString(),
+                    summary: { processed, cost: 0, skipped: processed },
+                    progress: {
+                        stage: 'verification',
+                        processed,
+                        total: processed,
+                        stats: { processed, total: processed, cost: 0 }
+                    }
+                });
+                log(job, `Verification skipped. Processed ${processed} emails without verification.`);
+            } catch (err) {
+                console.error(`[${job.id}] Failed to skip verification:`, err?.message || err);
+                throw err;
+            }
+        } else {
+            await runStage(job, 'verification', () =>
+                runEmailVerifier({
+                    inputCsv: job.paths.emails,
+                    outputCsv: job.paths.final,
+                    apiKeys: job.apiKeys,
                     log: (message, meta) => log(job, message, meta)
                 })
             );
         }
-        computeJobCost(job);
-
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
-
-        // Upsert leads with founder info
-        await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.founders, type: 'founders', dedupeStrategy: job.dedupeStrategy });
-
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
-
-        await runStage(job, 'emailDiscovery', () =>
-            runEmailFinder({
-                inputCsv: job.paths.founders,
-                outputCsv: job.paths.emails,
-                apiKeys: job.apiKeys,
-                log: (message, meta) => log(job, message, meta)
-            })
-        );
-        computeJobCost(job);
-
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
-
-        // Upsert leads with email lookup results
-        await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.emails, type: 'emails', dedupeStrategy: job.dedupeStrategy });
-
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
-
-        await runStage(job, 'verification', () =>
-            runEmailVerifier({
-                inputCsv: job.paths.emails,
-                outputCsv: job.paths.final,
-                apiKeys: job.apiKeys,
-                log: (message, meta) => log(job, message, meta)
-            })
-        );
         computeJobCost(job);
 
         if (job.cancelled) {
@@ -440,9 +521,9 @@ async function processJob(job) {
         // Upsert leads with personalization data
         await upsertLeadsFromCsv({ uid: job.uid, clientId: job.clientId, csvPath: job.paths.personalized, type: 'personalization', dedupeStrategy: job.dedupeStrategy });
 
-        // Build upload-ready CSV (valid/verified/valid-risky only)
+        // Build upload-ready CSV (complete leads with founder, email, and personalization)
         try {
-            const uploadRows = await buildUnifiedRows({ jobId: job.id, scope: 'valid', resolveJobPaths });
+            const uploadRows = await buildUnifiedRows({ jobId: job.id, scope: 'complete', resolveJobPaths });
             await writeUploadCsv(job.paths.upload, uploadRows);
             log(job, `Upload CSV ready at ${job.paths.upload} (${uploadRows.length} rows)`);
         } catch (err) {
@@ -490,4 +571,4 @@ function serializeJob(job) {
     };
 }
 
-export { createJobRecord, resolveJobPaths, processJob, serializeJob, markCancelled, log as logJob };
+export { createJobRecord, resolveJobPaths, processJob, serializeJob, markCancelled, markPaused, markResumed, log as logJob };

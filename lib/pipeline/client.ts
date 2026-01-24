@@ -22,8 +22,13 @@ export interface CreatePipelineJobOptions {
     findFounder?: boolean;
     skipFounderFinder?: boolean;
     findEmail?: boolean;
+    skipEmailFinder?: boolean;
     verifyEmail?: boolean;
+    skipVerification?: boolean;
     personalizeFirstLine?: boolean;
+    domainColumn?: string;
+    founderColumn?: string;
+    emailColumn?: string;
     signal?: AbortSignal;
 }
 
@@ -50,8 +55,13 @@ export async function createPipelineJob({
     findFounder,
     skipFounderFinder,
     findEmail,
+    skipEmailFinder,
     verifyEmail,
+    skipVerification,
     personalizeFirstLine,
+    domainColumn,
+    founderColumn,
+    emailColumn,
     dedupeStrategy,
     signal,
 }: CreatePipelineJobOptions) {
@@ -80,11 +90,26 @@ export async function createPipelineJob({
     if (typeof findEmail === 'boolean') {
         formData.append("findEmail", String(findEmail));
     }
+    if (typeof skipEmailFinder === 'boolean') {
+        formData.append("skipEmailFinder", String(skipEmailFinder));
+    }
     if (typeof verifyEmail === 'boolean') {
         formData.append("verifyEmail", String(verifyEmail));
     }
+    if (typeof skipVerification === 'boolean') {
+        formData.append("skipVerification", String(skipVerification));
+    }
     if (typeof personalizeFirstLine === 'boolean') {
         formData.append("personalizeFirstLine", String(personalizeFirstLine));
+    }
+    if (domainColumn) {
+        formData.append("domainColumn", domainColumn);
+    }
+    if (founderColumn) {
+        formData.append("founderColumn", founderColumn);
+    }
+    if (emailColumn) {
+        formData.append("emailColumn", emailColumn);
     }
     if (typeof dedupeStrategy === 'string') {
         formData.append("dedupeStrategy", dedupeStrategy);

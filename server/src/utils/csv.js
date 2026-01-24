@@ -14,13 +14,16 @@ export async function readCsvToArray(filePath) {
     return rows;
 }
 
-export async function buildFoundersCsvFromInput({ filteredDomainsPath, originalInputPath, outputPath }) {
+export async function buildFoundersCsvFromInput({ filteredDomainsPath, originalInputPath, outputPath, columnMapping = {} }) {
+    const domainCol = columnMapping.domain || 'domain';
+    const founderCol = columnMapping.founder || 'founder_name';
+    
     const domainSet = new Set();
     await new Promise((resolve, reject) => {
         fs.createReadStream(filteredDomainsPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', row => {
-                const domain = String(row.domain || '').toLowerCase();
+                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
                 if (domain) domainSet.add(domain);
             })
             .on('end', resolve)
@@ -32,8 +35,8 @@ export async function buildFoundersCsvFromInput({ filteredDomainsPath, originalI
         fs.createReadStream(originalInputPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', row => {
-                const domain = String(row.domain || '').toLowerCase();
-                const founder = String(row.founder_name || row.founder || '').trim();
+                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                const founder = String(row[founderCol] || row.founder_name || row.founder || '').trim();
                 if (domain) domainToFounder.set(domain, founder);
             })
             .on('end', resolve)
@@ -45,6 +48,52 @@ export async function buildFoundersCsvFromInput({ filteredDomainsPath, originalI
     domainSet.forEach(domain => {
         const name = (domainToFounder.get(domain) || '').replace(/"/g, '""');
         writer.write(`${domain},"${name}"\n`);
+    });
+    writer.end();
+    await new Promise(resolve => writer.on('finish', resolve));
+}
+
+export async function buildEmailsCsvFromInput({ filteredDomainsPath, originalInputPath, outputPath, columnMapping = {} }) {
+    const domainCol = columnMapping.domain || 'domain';
+    const founderCol = columnMapping.founder || 'founder_name';
+    const emailCol = columnMapping.email || 'email';
+    
+    const domainSet = new Set();
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(filteredDomainsPath)
+            .pipe(csvParse({ columns: true, trim: true }))
+            .on('data', row => {
+                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                if (domain) domainSet.add(domain);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    const domainToData = new Map();
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(originalInputPath)
+            .pipe(csvParse({ columns: true, trim: true }))
+            .on('data', row => {
+                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                const founder = String(row[founderCol] || row.founder_name || row.founder || '').trim();
+                const email = String(row[emailCol] || row.email || row.email_address || row.contact_email || row.mail || '').trim();
+                if (domain) {
+                    domainToData.set(domain, { founder, email });
+                }
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    const writer = fs.createWriteStream(outputPath);
+    writer.write('domain,founder_name,email,lookup_status\n');
+    domainSet.forEach(domain => {
+        const data = domainToData.get(domain) || { founder: '', email: '' };
+        const founder = (data.founder || '').replace(/"/g, '""');
+        const email = (data.email || '').replace(/"/g, '""');
+        const status = email ? 'Found' : 'Not Found';
+        writer.write(`${domain},"${founder}","${email}",${status}\n`);
     });
     writer.end();
     await new Promise(resolve => writer.on('finish', resolve));
@@ -94,6 +143,19 @@ export async function buildUnifiedRows({ jobId, scope = 'all', resolveJobPaths }
 
     if (scope === 'valid') {
         return unified.filter(r => VALID_UPLOAD_STATUSES.has((r.email_status || '').toLowerCase()));
+    }
+    
+    if (scope === 'with-email') {
+        return unified.filter(r => r.email && r.email.trim() !== '');
+    }
+    
+    if (scope === 'complete') {
+        return unified.filter(r => {
+            const hasFounder = r.founder_name && r.founder_name.trim() !== '' && r.founder_name.toLowerCase() !== 'not found';
+            const hasValidEmail = r.email && r.email.includes('@');
+            const hasValidPersonalization = r.personalization && r.personalization.trim() !== '' && r.personalization.toLowerCase() !== 'invalid';
+            return hasFounder && hasValidEmail && hasValidPersonalization;
+        });
     }
 
     return unified;

@@ -5,14 +5,14 @@ import OpenAI from 'openai';
 import http from 'http';
 import https from 'https';
 
-async function readVerifiedRows(inputCsv) {
+async function readRowsWithEmail(inputCsv) {
     const rows = [];
     await new Promise((resolve, reject) => {
         fs.createReadStream(inputCsv)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', (row) => {
-                const emailStatus = (row.email_status || '').toLowerCase();
-                if (emailStatus === 'valid' || emailStatus === 'verified' || emailStatus === 'valid-risky') {
+                const email = (row.email || '').trim();
+                if (email) {
                     rows.push(row);
                 }
             })
@@ -170,16 +170,16 @@ One sentence under 220 characters starting with “I was looking around the site
 }
 
 export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log }) {
-    const verifiedRows = await readVerifiedRows(inputCsv);
+    const rowsWithEmail = await readRowsWithEmail(inputCsv);
 
-    if (!verifiedRows.length) {
-        log?.('No verified emails to personalize for agency.');
+    if (!rowsWithEmail.length) {
+        log?.('No emails to personalize for agency.');
         fs.writeFileSync(outputCsv, 'domain,url,title,description,date,first_line\n');
         return { personalized: 0, skipped: true };
     }
 
     const { rows: personalizedRows, totalInputTokens, totalOutputTokens } = await personalizeRows({
-        rows: verifiedRows,
+        rows: rowsWithEmail,
         apiKeys,
         log
     });

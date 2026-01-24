@@ -78,6 +78,7 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
     discarded: "Discarded",
     error: "Error",
     cancelled: "Cancelled",
+    paused: "Paused",
 };
 
 const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
@@ -96,6 +97,7 @@ const JOB_STATUS_COLORS: Record<JobStatus, string> = {
     discarded: "#a1a1aa",
     error: "#f87171",
     cancelled: "#a1a1aa",
+    paused: "#f59e0b",
 };
 
 const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
@@ -226,17 +228,20 @@ export default function ClientPage() {
     const [csvColumns, setCsvColumns] = useState<string[]>([]);
     const [domainColumn, setDomainColumn] = useState<string>("");
     const [founderColumn, setFounderColumn] = useState<string>("");
+    const [emailColumn, setEmailColumn] = useState<string>("");
 
     // Step 2: Processing options
     const [dedupeStrategy, setDedupeStrategy] = useState<'skip' | 'include'>('skip');
     const [findFounder, setFindFounder] = useState(true);
     const [findEmail, setFindEmail] = useState(true);
     const [verifyEmail, setVerifyEmail] = useState(true);
+    const [filterStats, setFilterStats] = useState<{ raw: number; normalized: number; inBatchDupes: number; crossRunDupes: number; willProcess: number } | null>(null);
 
     // Step 3: Personalization options
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
     const [personalizeFirstLine, setPersonalizeFirstLine] = useState(false);
     const [skipFounderFinder, setSkipFounderFinder] = useState(false);
+    const [skipEmailFinder, setSkipEmailFinder] = useState(false);
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState("");
     const [jobState, setJobState] = useState<PipelineJob | null>(null);
@@ -258,6 +263,7 @@ export default function ClientPage() {
     const [isSavingClient, setIsSavingClient] = useState(false);
     const [isDeletingClient, setIsDeletingClient] = useState(false);
     const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
+    const [pausingJob, setPausingJob] = useState(false);
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
@@ -325,6 +331,7 @@ export default function ClientPage() {
 
     // Leads state
     const [leads, setLeads] = useState<Lead[]>([]);
+    const [allLeadsCached, setAllLeadsCached] = useState(false); // Track if we've fetched all leads for filtering
     const [stats, setStats] = useState<{ total: number; verified: number; unverified: number }>(() => ({ total: 0, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
     const [leadsLoading, setLeadsLoading] = useState(false);
@@ -333,6 +340,10 @@ export default function ClientPage() {
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
     const [leadSearch, setLeadSearch] = useState<string>("");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
+    const [founderFilter, setFounderFilter] = useState<string>("");
+    const [emailFilter, setEmailFilter] = useState<string>("");
+    const [emailStatusFilter, setEmailStatusFilter] = useState<string>("");
+    const [exportingCsv, setExportingCsv] = useState(false);
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -544,12 +555,27 @@ export default function ClientPage() {
 
     useEffect(() => {
         if (!user || !clientId) return;
+        
+        // Only reset cache if campaign changes (different data set)
+        // Keep cache for search/founder/email filter changes (same data, just different client-side filtering)
         setLeads([]);
         setLeadsCursor(null);
         setLeadsHasMore(true);
+        setAllLeadsCached(false);
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, campaignFilterId, leadSearch]);
+    }, [user, clientId, campaignFilterId]);
+
+    // Trigger full data fetch when search or founder/email filters are first applied
+    useEffect(() => {
+        if (!user || !clientId) return;
+        
+        const needsFullFetch = Boolean(leadSearch || founderFilter || emailFilter);
+        if (needsFullFetch && !allLeadsCached && leads.length > 0) {
+            fetchLeads(false);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [founderFilter, emailFilter]);
 
     useEffect(() => {
         if (toastVisible) {
@@ -663,15 +689,12 @@ export default function ClientPage() {
                 constraints.push(where("campaigns", "array-contains", campaignFilterId));
             }
 
-            const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
-            if (!reset && leadsCursor) {
-                clauses.push(startAfter(leadsCursor));
+            // Add email status filter (most specific, works well with Firestore)
+            if (emailStatusFilter) {
+                constraints.push(where("email_status", "==", emailStatusFilter));
             }
-            clauses.push(limit(200));
-            const baseQuery = query(leadsCol, ...clauses);
 
-            const snap = await getDocs(baseQuery);
-            const mapped = snap.docs.map((d) => {
+            const mapDocToLead = (d: any): Lead => {
                 const data = d.data();
                 const emailStatus = (data.email_status as string) || "";
                 const isVerified = emailStatus === "valid" || emailStatus === "verified";
@@ -688,7 +711,73 @@ export default function ClientPage() {
                     updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
                     campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
                 } as Lead;
-            }).filter((lead) => {
+            };
+
+            // When filters are active, fetch ALL leads once and cache them for client-side filtering.
+            // This trades one larger initial fetch for instant subsequent filter changes.
+            const shouldFetchAll = Boolean(founderFilter || emailFilter);
+            if (shouldFetchAll && !allLeadsCached) {
+                const pageSize = 500;
+                let cursor: DocumentSnapshot | null = null;
+                const collected: Lead[] = [];
+                let pagesRead = 0;
+
+                // Fetch all leads in batches until we have everything
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
+                    if (cursor) {
+                        clauses.push(startAfter(cursor));
+                    }
+                    clauses.push(limit(pageSize));
+
+                    const snap = await getDocs(query(leadsCol, ...clauses));
+                    snap.docs.forEach((docSnap) => collected.push(mapDocToLead(docSnap)));
+                    pagesRead += 1;
+
+                    if (snap.size < pageSize) {
+                        // We've reached the end
+                        break;
+                    }
+                    cursor = snap.docs[snap.docs.length - 1];
+                    
+                    // Safety: stop after 100 pages (~50k leads)
+                    if (pagesRead >= 100) {
+                        console.warn('Reached max page limit while fetching all leads');
+                        break;
+                    }
+                }
+
+                console.log(`Fetched all ${collected.length} leads for filtering (${pagesRead} pages)`);
+                setLeads(collected);
+                setAllLeadsCached(true);
+                const totalFromData = collected.length;
+                const verifiedFromData = collected.filter((r) => r.verified).length;
+                setStats({
+                    total: totalFromData,
+                    verified: verifiedFromData,
+                    unverified: Math.max(0, totalFromData - verifiedFromData),
+                });
+                setLeadsCursor(null);
+                setLeadsHasMore(false);
+                return;
+            }
+
+            // If we already cached all leads for filtering, just return (filtering happens in useMemo)
+            if (shouldFetchAll && allLeadsCached) {
+                setLeadsLoading(false);
+                return;
+            }
+
+            const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
+            if (!reset && leadsCursor) {
+                clauses.push(startAfter(leadsCursor));
+            }
+            clauses.push(limit(200));
+            const baseQuery = query(leadsCol, ...clauses);
+
+            const snap = await getDocs(baseQuery);
+            const mapped = snap.docs.map(mapDocToLead).filter((lead) => {
                 if (!campaignFilterId) return true;
                 return Array.isArray(lead.campaigns) && lead.campaigns.includes(campaignFilterId);
             });
@@ -713,26 +802,115 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, campaignFilterId, clientTotalLeads, leadSearch, leadsCursor]);
+    }, [user, clientId, campaignFilterId, clientTotalLeads, leadSearch, leadsCursor, emailStatusFilter, founderFilter, emailFilter, allLeadsCached]);
 
     const loadMoreLeads = useCallback(() => {
+        const hasFilterMode = Boolean(founderFilter || emailFilter);
+        if (hasFilterMode) return; // when founder/email filters are active we already fetched full dataset
+        if (allLeadsCached) return; // all leads already cached
         if (leadsLoading || !leadsHasMore || leadSearch.trim()) return;
         fetchLeads(false);
-    }, [fetchLeads, leadsHasMore, leadsLoading, leadSearch]);
+    }, [allLeadsCached, emailFilter, fetchLeads, founderFilter, leadsHasMore, leadsLoading, leadSearch]);
 
     const filteredLeads = useMemo(() => {
-        if (!leadSearch.trim()) return leads;
-        const term = leadSearch.trim().toLowerCase();
-        return leads.filter((lead) => {
-            const domain = (lead.domain || "").toLowerCase();
-            const email = (lead.email || "").toLowerCase();
-            const founder = (lead.founderName || "").toLowerCase();
-            return domain.includes(term) || email.includes(term) || founder.includes(term);
-        });
-    }, [leadSearch, leads]);
+        let filtered = leads;
+
+        // Debug: log total leads and filter states
+        if (founderFilter || emailFilter || emailStatusFilter) {
+            const notFoundLeads = leads.filter(l => {
+                const founder = (l.founderName || "").trim().toLowerCase();
+                return founder.length === 0 || founder.includes("not found") || founder === "not_found";
+            });
+            console.log('Filter Debug:', {
+                totalLeads: leads.length,
+                founderFilter,
+                emailFilter,
+                emailStatusFilter,
+                notFoundCount: notFoundLeads.length,
+                notFoundSample: notFoundLeads.slice(0, 3).map(l => ({ 
+                    domain: l.domain, 
+                    founder: l.founderName
+                })),
+                sampleLeads: leads.slice(0, 3).map(l => ({ 
+                    domain: l.domain, 
+                    founder: l.founderName, 
+                    email: l.email,
+                    status: l.status 
+                }))
+            });
+        }
+
+        // Apply search filter
+        if (leadSearch.trim()) {
+            const term = leadSearch.trim().toLowerCase();
+            filtered = filtered.filter((lead) => {
+                const domain = (lead.domain || "").toLowerCase();
+                const email = (lead.email || "").toLowerCase();
+                const founder = (lead.founderName || "").toLowerCase();
+                return domain.includes(term) || email.includes(term) || founder.includes(term);
+            });
+        }
+
+        // Apply founder filter
+        if (founderFilter === "exists") {
+            filtered = filtered.filter((lead) => {
+                const founder = (lead.founderName || "").trim();
+                const founderLower = founder.toLowerCase();
+                return founder.length > 0 && !founderLower.includes("not found") && founderLower !== "not_found";
+            });
+        } else if (founderFilter === "not_found") {
+            const beforeCount = filtered.length;
+            filtered = filtered.filter((lead) => {
+                const founder = (lead.founderName || "").trim();
+                const founderLower = founder.toLowerCase();
+                const shouldInclude = founder.length === 0 || founderLower.includes("not found") || founderLower === "not_found";
+                return shouldInclude;
+            });
+            console.log('Founder filter result:', {
+                beforeCount,
+                afterCount: filtered.length,
+                sampleFiltered: filtered.slice(0, 5).map(l => ({ domain: l.domain, founder: l.founderName }))
+            });
+        } else if (founderFilter === "other") {
+            filtered = filtered.filter((lead) => {
+                const founder = (lead.founderName || "").trim();
+                const founderLower = founder.toLowerCase();
+                // "Other" means: has a value, but it's not a valid name and not "not found"
+                // This catches things like error messages, placeholders, etc.
+                const isNotFound = founder.length === 0 || founderLower.includes("not found") || founderLower === "not_found";
+                const isExists = founder.length > 0 && !founderLower.includes("not found") && founderLower !== "not_found";
+                return !isNotFound && !isExists;
+            });
+        }
+
+        // Apply email filter
+        if (emailFilter === "exists") {
+            filtered = filtered.filter((lead) => {
+                const email = (lead.email || "").trim();
+                const emailLower = email.toLowerCase();
+                return email.length > 0 && !emailLower.includes("not found") && emailLower !== "not_found";
+            });
+        } else if (emailFilter === "not_found") {
+            filtered = filtered.filter((lead) => {
+                const email = (lead.email || "").trim();
+                const emailLower = email.toLowerCase();
+                return email.length === 0 || emailLower.includes("not found") || emailLower === "not_found";
+            });
+        }
+
+        // Apply email status filter
+        if (emailStatusFilter) {
+            filtered = filtered.filter((lead) => {
+                const status = (lead.status || "").toLowerCase();
+                return status === emailStatusFilter.toLowerCase();
+            });
+        }
+
+        return filtered;
+    }, [leadSearch, leads, founderFilter, emailFilter, emailStatusFilter]);
 
     const displayedStats = useMemo(() => {
-        const hasFilters = Boolean(campaignFilterId) || Boolean(leadSearch.trim());
+        const hasFilters = Boolean(campaignFilterId) || Boolean(leadSearch.trim()) || Boolean(founderFilter) || Boolean(emailFilter) || Boolean(emailStatusFilter);
         if (hasFilters) {
             const total = filteredLeads.length;
             const verified = filteredLeads.filter((r) => r.verified).length;
@@ -743,7 +921,7 @@ export default function ClientPage() {
             verified: stats.verified,
             unverified: stats.unverified,
         };
-    }, [campaignFilterId, clientTotalLeads, filteredLeads, leadSearch, stats]);
+    }, [campaignFilterId, clientTotalLeads, filteredLeads, leadSearch, stats, founderFilter, emailFilter, emailStatusFilter]);
 
     useEffect(() => {
         return () => {
@@ -1159,6 +1337,7 @@ export default function ClientPage() {
         setCsvColumns([]);
         setDomainColumn("");
         setFounderColumn("");
+        setEmailColumn("");
 
         if (!file) return;
 
@@ -1174,11 +1353,15 @@ export default function ClientPage() {
 
             const detectedDomain = guessColumn(columns, ["domain", "website", "url", "company"]);
             const detectedFounder = guessColumn(columns, ["founder_name", "founder", "owner", "ceo", "name"]);
+            const detectedEmail = guessColumn(columns, ["email", "email_address", "contact_email", "mail"]);
             if (detectedDomain) {
                 setDomainColumn(detectedDomain);
             }
             if (detectedFounder) {
                 setFounderColumn(detectedFounder);
+            }
+            if (detectedEmail) {
+                setEmailColumn(detectedEmail);
             }
         } catch (error) {
             console.error("Failed to read CSV header", error);
@@ -1222,8 +1405,13 @@ export default function ClientPage() {
                 findFounder,
                 skipFounderFinder,
                 findEmail,
+                skipEmailFinder,
                 verifyEmail,
+                skipVerification: !verifyEmail, // Invert: unchecked verifyEmail means skip verification
                 personalizeFirstLine,
+                domainColumn,
+                founderColumn,
+                emailColumn,
             });
 
             const freshJob = response.job;
@@ -1249,25 +1437,36 @@ export default function ClientPage() {
                 if (dedupeStrategy === 'include') {
                     const existing = total - newCount;
                     if (existing > 0) {
-                        const msg = `Processing all ${total} domain${total !== 1 ? 's' : ''} (${newCount} new, ${existing} existing).`;
+                        const msg = `✓ Normalized & validated. Processing all ${total} domain${total !== 1 ? 's' : ''} (${newCount} new, ${existing} existing).`;
                         setToastMessage(msg);
                         setToastVisible(true);
                     } else {
-                        const msg = `Processing ${total} new domain${total !== 1 ? 's' : ''}.`;
+                        const msg = `✓ Normalized & validated. Processing ${total} new domain${total !== 1 ? 's' : ''}.`;
                         setToastMessage(msg);
                         setToastVisible(true);
                     }
                 } else {
                     if (skipped > 0) {
-                        const msg = `${skipped} duplicate domain${skipped !== 1 ? 's' : ''} removed. ${newCount} unique domain${newCount !== 1 ? 's' : ''} will be processed.`;
+                        const msg = `✓ Filtered ${skipped} duplicate${skipped !== 1 ? 's' : ''}. Processing ${newCount} unique domain${newCount !== 1 ? 's' : ''}.`;
                         setToastMessage(msg);
                         setToastVisible(true);
                     } else {
-                        const msg = `All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
+                        const msg = `✓ All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
                         setToastMessage(msg);
                         setToastVisible(true);
                     }
                 }
+
+                // Store filter stats for display
+                const inBatchDupes = 0; // Server now handles this internally
+                const crossRunDupes = skipped;
+                setFilterStats({
+                    raw: total + skipped,
+                    normalized: total,
+                    inBatchDupes,
+                    crossRunDupes,
+                    willProcess: newCount
+                });
             }
 
             const jobId = response.jobId || freshJob.id;
@@ -1310,13 +1509,25 @@ export default function ClientPage() {
         }
     }, [founderColumn]);
 
+    // Adjust email-related options based on mapped columns
+    useEffect(() => {
+        const hasEmailColumn = emailColumn.trim().length > 0;
+        if (hasEmailColumn) {
+            setSkipEmailFinder(true);
+            setFindEmail(false);
+        } else {
+            setSkipEmailFinder(false);
+            setFindEmail(true);
+        }
+    }, [emailColumn]);
+
     // Keep downstream steps coherent when founder finding is disabled
     useEffect(() => {
-        if (!findFounder && !skipFounderFinder) {
-            setFindEmail(false);
+        // Only disable verification if NO founder info AND NO email info
+        if (!findFounder && !skipFounderFinder && !findEmail && !skipEmailFinder) {
             setVerifyEmail(false);
         }
-    }, [findFounder, skipFounderFinder]);
+    }, [findFounder, skipFounderFinder, findEmail, skipEmailFinder]);
 
     const handleDownloadResults = (scope: 'all' | 'valid') => {
         if (!jobState || (jobState.status !== "completed" && jobState.status !== "pending-upload")) {
@@ -1350,6 +1561,35 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setStoppingJob(false);
+        }
+    };
+
+    const handlePauseResumeJob = async () => {
+        if (!user || !jobState?.id || !clientId) return;
+        
+        const isPaused = jobState.status === 'paused';
+        const endpoint = isPaused ? 'resume' : 'pause';
+        
+        setPausingJob(true);
+        try {
+            const idToken = await getIdToken(user);
+            const resp = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/${endpoint}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ idToken, clientId })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to ${endpoint} job (${resp.status})`);
+            }
+            const newStatus = isPaused ? 'running' : 'paused';
+            setJobState((prev) => prev ? { ...prev, status: newStatus as any } : prev);
+            setJobStatusMessage(isPaused ? 'Job resumed.' : 'Job paused.');
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : `Failed to ${endpoint} job`);
+            setToastVisible(true);
+        } finally {
+            setPausingJob(false);
         }
     };
 
@@ -1638,6 +1878,7 @@ export default function ClientPage() {
                                             setFindFounder(true);
                                             setFindEmail(true);
                                             setVerifyEmail(true);
+                                            setSkipEmailFinder(false);
                                             setPersonalizeFirstLine(false);
                                             setSelectedCampaignId("");
                                             setUploadError("");
@@ -1764,15 +2005,29 @@ export default function ClientPage() {
                                                 <p className="pipeline-panel__subtitle pipeline-panel__subtitle--status">
                                                     Viewing job: {jobState.fileName || jobState.id} · {JOB_STATUS_LABELS[jobState.status]}
                                                 </p>
-                                                {(jobState.status === 'running' || jobState.status === 'queued') && (
-                                                    <button
-                                                        type="button"
-                                                        className="destructive-button pipeline-status-action"
-                                                        onClick={handleStopJob}
-                                                        disabled={stoppingJob}
-                                                    >
-                                                        {stoppingJob ? 'Stopping...' : 'Stop run'}
-                                                    </button>
+                                                {(jobState.status === 'running' || jobState.status === 'queued' || jobState.status === 'paused') && (
+                                                    <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
+                                                        {(jobState.status === 'running' || jobState.status === 'paused') && (
+                                                            <button
+                                                                type="button"
+                                                                className="secondary-button secondary-button--active"
+                                                                onClick={handlePauseResumeJob}
+                                                                disabled={pausingJob}
+                                                                style={{ minWidth: '100px' }}
+                                                            >
+                                                                {pausingJob ? (jobState.status === 'paused' ? 'Resuming...' : 'Pausing...') : (jobState.status === 'paused' ? 'Resume' : 'Pause')}
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            type="button"
+                                                            className="destructive-button"
+                                                            onClick={handleStopJob}
+                                                            disabled={stoppingJob}
+                                                            style={{ minWidth: '100px' }}
+                                                        >
+                                                            {stoppingJob ? 'Stopping...' : 'Stop run'}
+                                                        </button>
+                                                    </div>
                                                 )}
                                             </div>
                                         )}
@@ -2094,8 +2349,275 @@ export default function ClientPage() {
                                 </label>
                             </div>
 
-                            <div style={{ marginTop: '1.5rem' }}>
-                                {filteredLeads.length === 0 ? (
+                            <div style={{
+                                marginTop: '0.75rem',
+                                display: 'flex',
+                                gap: '0.75rem',
+                                flexWrap: 'wrap',
+                                alignItems: 'flex-end'
+                            }}>
+                                <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
+                                    <span className="settings-field__label">Founder</span>
+                                    <select
+                                        value={founderFilter}
+                                        onChange={(e) => setFounderFilter(e.target.value)}
+                                    >
+                                        <option value="">All</option>
+                                        <option value="exists">Exists</option>
+                                        <option value="not_found">Not Found</option>
+                                        <option value="other">Other</option>
+                                    </select>
+                                </label>
+                                <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
+                                    <span className="settings-field__label">Email</span>
+                                    <select
+                                        value={emailFilter}
+                                        onChange={(e) => setEmailFilter(e.target.value)}
+                                    >
+                                        <option value="">All</option>
+                                        <option value="exists">Exists</option>
+                                        <option value="not_found">Not Found</option>
+                                    </select>
+                                </label>
+                                <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
+                                    <span className="settings-field__label">Email Status</span>
+                                    <select
+                                        value={emailStatusFilter}
+                                        onChange={(e) => setEmailStatusFilter(e.target.value)}
+                                    >
+                                        <option value="">All</option>
+                                        <option value="valid">Valid</option>
+                                        <option value="valid-risky">Valid-Risky</option>
+                                        <option value="not_found">Not Found</option>
+                                        <option value="invalid">Invalid</option>
+                                        <option value="skipped_no_founder">Skipped (No Founder)</option>
+                                    </select>
+                                </label>
+                                {leadsLoading && (
+                                    <div style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '0.5rem',
+                                        padding: '0.5rem 0.75rem',
+                                        fontSize: '0.875rem',
+                                        color: 'rgba(255, 255, 255, 0.7)'
+                                    }}>
+                                        <svg className="spinner" style={{ width: '16px', height: '16px' }} viewBox="0 0 24 24" fill="none">
+                                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                            <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                        </svg>
+                                        {allLeadsCached ? 'Filtering...' : 'Loading leads...'}
+                                    </div>
+                                )}
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={async () => {
+                                        setExportingCsv(true);
+                                        try {
+                                            let leadsToExport = leads;
+                                            
+                                            // If we haven't cached all leads yet, fetch them all now
+                                            if (!allLeadsCached && user && clientId) {
+                                                const leadsCol = collection(firestore, "users", user.uid, "clients", clientId, "leads");
+                                                const constraints: unknown[] = [];
+                                                if (campaignFilterId) {
+                                                    constraints.push(where("campaigns", "array-contains", campaignFilterId));
+                                                }
+                                                if (emailStatusFilter) {
+                                                    constraints.push(where("email_status", "==", emailStatusFilter));
+                                                }
+                                                
+                                                const mapDocToLead = (d: any): Lead => {
+                                                    const data = d.data();
+                                                    const emailStatus = (data.email_status as string) || "";
+                                                    const isVerified = emailStatus === "valid" || emailStatus === "verified";
+                                                    return {
+                                                        id: d.id,
+                                                        domain: (data.domain as string) || (data.website as string) || "",
+                                                        email: (data.email as string) || "",
+                                                        status: emailStatus,
+                                                        verified: isVerified,
+                                                        firstLine: (data.personalization_first_line as string) || "",
+                                                        founderName: (data.founder_name as string) || "",
+                                                        personalizationUrl: (data.personalization_url as string) || "",
+                                                        personalizationTitle: (data.personalization_title as string) || "",
+                                                        updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
+                                                        campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
+                                                    } as Lead;
+                                                };
+                                                
+                                                const pageSize = 500;
+                                                let cursor: DocumentSnapshot | null = null;
+                                                const collected: Lead[] = [];
+                                                let pagesRead = 0;
+                                                
+                                                // eslint-disable-next-line no-constant-condition
+                                                while (true) {
+                                                    const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
+                                                    if (cursor) {
+                                                        clauses.push(startAfter(cursor));
+                                                    }
+                                                    clauses.push(limit(pageSize));
+                                                    
+                                                    const snap = await getDocs(query(leadsCol, ...clauses));
+                                                    snap.docs.forEach((docSnap) => collected.push(mapDocToLead(docSnap)));
+                                                    pagesRead += 1;
+                                                    
+                                                    if (snap.size < pageSize) {
+                                                        break;
+                                                    }
+                                                    cursor = snap.docs[snap.docs.length - 1];
+                                                    
+                                                    if (pagesRead >= 100) {
+                                                        console.warn('Reached max page limit while exporting');
+                                                        break;
+                                                    }
+                                                }
+                                                
+                                                leadsToExport = collected;
+                                            }
+                                            
+                                            // Apply client-side filters to get final export set
+                                            let filtered = leadsToExport;
+                                            
+                                            // Search filter
+                                            if (leadSearch.trim()) {
+                                                const term = leadSearch.trim().toLowerCase();
+                                                filtered = filtered.filter((lead) => {
+                                                    const domain = (lead.domain || "").toLowerCase();
+                                                    const email = (lead.email || "").toLowerCase();
+                                                    const founder = (lead.founderName || "").toLowerCase();
+                                                    return domain.includes(term) || email.includes(term) || founder.includes(term);
+                                                });
+                                            }
+                                            
+                                            // Founder filter
+                                            if (founderFilter === "exists") {
+                                                filtered = filtered.filter((lead) => {
+                                                    const founder = (lead.founderName || "").trim();
+                                                    const founderLower = founder.toLowerCase();
+                                                    return founder.length > 0 && !founderLower.includes("not found") && founderLower !== "not_found";
+                                                });
+                                            } else if (founderFilter === "not_found") {
+                                                filtered = filtered.filter((lead) => {
+                                                    const founder = (lead.founderName || "").trim();
+                                                    const founderLower = founder.toLowerCase();
+                                                    return founder.length === 0 || founderLower.includes("not found") || founderLower === "not_found";
+                                                });
+                                            }
+                                            
+                                            // Email filter
+                                            if (emailFilter === "exists") {
+                                                filtered = filtered.filter((lead) => {
+                                                    const email = (lead.email || "").trim();
+                                                    const emailLower = email.toLowerCase();
+                                                    return email.length > 0 && !emailLower.includes("not found") && emailLower !== "not_found";
+                                                });
+                                            } else if (emailFilter === "not_found") {
+                                                filtered = filtered.filter((lead) => {
+                                                    const email = (lead.email || "").trim();
+                                                    const emailLower = email.toLowerCase();
+                                                    return email.length === 0 || emailLower.includes("not found") || emailLower === "not_found";
+                                                });
+                                            }
+                                            
+                                            // Email status filter (already applied in DB if used)
+                                            if (emailStatusFilter && allLeadsCached) {
+                                                filtered = filtered.filter((lead) => {
+                                                    const status = (lead.status || "").toLowerCase();
+                                                    return status === emailStatusFilter.toLowerCase();
+                                                });
+                                            }
+                                            
+                                            // Generate CSV
+                                            const headers = ['Founder Name', 'Email', 'Status', 'Domain', 'First Line', 'Personalization URL', 'Personalization Title', 'Campaigns', 'Updated At'];
+                                            const csvRows = [headers.join(',')];
+                                            
+                                            filtered.forEach((lead) => {
+                                                const row = [
+                                                    lead.founderName || '',
+                                                    lead.email || '',
+                                                    lead.status || '',
+                                                    lead.domain || '',
+                                                    (lead.firstLine || '').replace(/"/g, '""'),
+                                                    lead.personalizationUrl || '',
+                                                    (lead.personalizationTitle || '').replace(/"/g, '""'),
+                                                    getCampaignNamesForLead(lead).join('; '),
+                                                    lead.updatedAt || ''
+                                                ];
+                                                csvRows.push(row.map(val => `"${val}"`).join(','));
+                                            });
+                                            
+                                            const csvContent = csvRows.join('\n');
+                                            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                                            const link = document.createElement('a');
+                                            const url = URL.createObjectURL(blob);
+                                            link.setAttribute('href', url);
+                                            link.setAttribute('download', `${clientName}_leads_${new Date().toISOString().split('T')[0]}.csv`);
+                                            link.style.visibility = 'hidden';
+                                            document.body.appendChild(link);
+                                            link.click();
+                                            document.body.removeChild(link);
+                                        } catch (error) {
+                                            console.error('CSV export failed:', error);
+                                            setToastMessage('Failed to export CSV');
+                                            setToastVisible(true);
+                                        } finally {
+                                            setExportingCsv(false);
+                                        }
+                                    }}
+                                    style={{ flex: '0 0 auto' }}
+                                    disabled={leadsLoading || exportingCsv}
+                                >
+                                    {exportingCsv ? (
+                                        <>
+                                            <svg className="spinner" style={{ width: '14px', height: '14px', marginRight: '0.5rem' }} viewBox="0 0 24 24" fill="none">
+                                                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                            </svg>
+                                            Exporting...
+                                        </>
+                                    ) : (
+                                        `📥 Export CSV (${allLeadsCached ? filteredLeads.length : displayedStats.total})`
+                                    )}
+                                </button>
+                                {(founderFilter || emailFilter || emailStatusFilter || leadSearch.trim() || campaignFilterId) && (
+                                    <button
+                                        type="button"
+                                        className="secondary-button secondary-button--active"
+                                        onClick={() => {
+                                            setFounderFilter("");
+                                            setEmailFilter("");
+                                            setEmailStatusFilter("");
+                                            setLeadSearch("");
+                                            setCampaignFilterId("");
+                                        }}
+                                        style={{ flex: '0 0 auto' }}
+                                        disabled={leadsLoading}
+                                    >
+                                        Clear Filters
+                                    </button>
+                                )}
+                            </div>
+
+                            <div style={{ marginTop: '1.5rem', position: 'relative' }}>
+                                {leadsLoading && filteredLeads.length === 0 ? (
+                                    <div className="pipeline-panel__empty">
+                                        <div style={{
+                                            display: 'flex',
+                                            flexDirection: 'column',
+                                            alignItems: 'center',
+                                            gap: '1rem'
+                                        }}>
+                                            <svg className="spinner" style={{ width: '32px', height: '32px' }} viewBox="0 0 24 24" fill="none">
+                                                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                            </svg>
+                                            <p>Loading leads...</p>
+                                        </div>
+                                    </div>
+                                ) : filteredLeads.length === 0 ? (
                                     <div className="pipeline-panel__empty">
                                         <p>No leads yet.</p>
                                         <p className="pipeline-panel__subtitle">Upload leads to start seeing them here.</p>
@@ -2107,8 +2629,41 @@ export default function ClientPage() {
                                         borderRadius: '8px',
                                         backgroundColor: 'rgba(0, 0, 0, 0.2)',
                                         maxHeight: '520px',
-                                        overflowY: 'auto'
+                                        overflowY: 'auto',
+                                        position: 'relative'
                                     }}>
+                                        {leadsLoading && filteredLeads.length > 0 && (
+                                            <div style={{
+                                                position: 'absolute',
+                                                top: 0,
+                                                left: 0,
+                                                right: 0,
+                                                bottom: 0,
+                                                background: 'rgba(0, 0, 0, 0.7)',
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                justifyContent: 'center',
+                                                zIndex: 10,
+                                                borderRadius: '8px'
+                                            }}>
+                                                <div style={{
+                                                    display: 'flex',
+                                                    flexDirection: 'column',
+                                                    alignItems: 'center',
+                                                    gap: '0.75rem',
+                                                    padding: '1.5rem',
+                                                    background: 'rgba(0, 0, 0, 0.8)',
+                                                    borderRadius: '12px',
+                                                    border: '1px solid rgba(255, 255, 255, 0.1)'
+                                                }}>
+                                                    <svg className="spinner" style={{ width: '32px', height: '32px', color: '#3b82f6' }} viewBox="0 0 24 24" fill="none">
+                                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                                        <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                                    </svg>
+                                                    <p style={{ margin: 0, fontSize: '0.95rem', fontWeight: 500 }}>Loading leads...</p>
+                                                </div>
+                                            </div>
+                                        )}
                                         <div
                                             ref={leadsContainerRef}
                                             onScroll={handleLeadsScroll}
@@ -2433,6 +2988,25 @@ export default function ClientPage() {
                                                 : 'Auto-detects columns like founder_name, founder, owner, ceo. Leave blank to run founder finder.'}
                                         </span>
                                     </label>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Email column (optional)</span>
+                                        <select
+                                            value={emailColumn}
+                                            onChange={(e) => setEmailColumn(e.target.value)}
+                                            disabled={!csvColumns.length}
+                                        >
+                                            <option value="">Select column (or none)</option>
+                                            {csvColumns.map((col) => (
+                                                <option key={col} value={col}>{col}</option>
+                                            ))}
+                                        </select>
+                                        <span className="settings-field__hint">
+                                            {emailColumn
+                                                ? `Using "${emailColumn}" for email addresses. Email discovery will be skipped.`
+                                                : 'Auto-detects columns like email, email_address. Leave blank to run email discovery.'}
+                                        </span>
+                                    </label>
                                 </div>
                             )}
 
@@ -2519,63 +3093,9 @@ export default function ClientPage() {
                                                     Find Founder
                                                 </div>
                                                 <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
-                                                    Search for founder names using Serper + OpenAI
-                                                </div>
-                                            </div>
-                                        </label>
-
-                                        <label style={{
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            gap: '0.75rem',
-                                            cursor: founderColumn ? 'pointer' : 'not-allowed',
-                                            padding: '0.5rem',
-                                            opacity: founderColumn ? 1 : 0.6
-                                        }}>
-                                            <input
-                                                type="checkbox"
-                                                checked={skipFounderFinder}
-                                                disabled={!founderColumn}
-                                                onChange={(e) => setSkipFounderFinder(e.target.checked)}
-                                                style={{
-                                                    width: '18px',
-                                                    height: '18px',
-                                                    cursor: 'pointer',
-                                                    borderRadius: '4px',
-                                                    appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${skipFounderFinder ? '0.3' : '0.15'})`,
-                                                    background: skipFounderFinder ? '#3b82f6' : 'transparent',
-                                                    position: 'relative',
-                                                    flexShrink: 0
-                                                }}
-                                            />
-                                            {skipFounderFinder && (
-                                                <svg
-                                                    style={{
-                                                        position: 'absolute',
-                                                        width: '18px',
-                                                        height: '18px',
-                                                        pointerEvents: 'none',
-                                                        marginLeft: '0px'
-                                                    }}
-                                                    viewBox="0 0 18 18"
-                                                    fill="none"
-                                                >
-                                                    <path
-                                                        d="M14 6L7.5 12.5L4 9"
-                                                        stroke="white"
-                                                        strokeWidth="2"
-                                                        strokeLinecap="round"
-                                                        strokeLinejoin="round"
-                                                    />
-                                                </svg>
-                                            )}
-                                            <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
-                                                    CSV already has founders
-                                                </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
-                                                    Skip founder finder when CSV includes a founder_name column
+                                                    {skipFounderFinder
+                                                        ? 'Skipped - using founder names from your CSV'
+                                                        : 'Search for founder names using Serper + OpenAI'}
                                                 </div>
                                             </div>
                                         </label>
@@ -2638,7 +3158,9 @@ export default function ClientPage() {
                                                     Find Email
                                                 </div>
                                                 <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
-                                                    Discover email addresses with TryKitt
+                                                    {skipEmailFinder 
+                                                        ? 'Skipped - using emails from your CSV' 
+                                                        : 'Discover email addresses with TryKitt'}
                                                 </div>
                                             </div>
                                         </label>
@@ -2647,22 +3169,22 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: ((findFounder || skipFounderFinder) && findEmail) ? 'pointer' : 'not-allowed',
+                                            cursor: (findEmail || skipEmailFinder) ? 'pointer' : 'not-allowed',
                                             padding: '0.5rem',
-                                            opacity: ((findFounder || skipFounderFinder) && findEmail) ? 1 : 0.5
+                                            opacity: (findEmail || skipEmailFinder) ? 1 : 0.5
                                         }}>
                                             <input
                                                 type="checkbox"
                                                 checked={verifyEmail}
-                                                disabled={!(findFounder || skipFounderFinder) || !findEmail}
+                                                disabled={!findEmail && !skipEmailFinder}
                                                 onChange={(e) => setVerifyEmail(e.target.checked)}
                                                 style={{
                                                     width: '18px',
                                                     height: '18px',
-                                                    cursor: ((findFounder || skipFounderFinder) && findEmail) ? 'pointer' : 'not-allowed',
+                                                    cursor: (findEmail || skipEmailFinder) ? 'pointer' : 'not-allowed',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${((findFounder || skipFounderFinder) && findEmail) ? '0.3' : '0.15'})`,
+                                                    border: `2px solid rgba(255, 255, 255, ${(findEmail || skipEmailFinder) ? '0.3' : '0.15'})`,
                                                     background: verifyEmail ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
@@ -2694,7 +3216,9 @@ export default function ClientPage() {
                                                     Verify Email
                                                 </div>
                                                 <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
-                                                    Validate email deliverability with TryKitt
+                                                    {skipEmailFinder 
+                                                        ? 'Validate emails from your CSV with TryKitt'
+                                                        : 'Validate discovered email addresses with TryKitt'}
                                                 </div>
                                             </div>
                                         </label>

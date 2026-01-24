@@ -77,7 +77,7 @@ export async function upsertLeadsFromCsv({ uid, clientId, csvPath, type, dedupeS
     await writer.close();
 }
 
-export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip' }) {
+export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain' }) {
     if (!uid || !domainsCsvPath || !clientId) {
         console.warn(`[${jobId}] Missing uid/clientId/domainsCsvPath. uid=${uid}, clientId=${clientId}, domainsCsvPath=${domainsCsvPath}`);
         return { filtered: domainsCsvPath, stats: { total: 0, skipped: 0, new: 0 } };
@@ -91,7 +91,7 @@ export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, dom
         fs.createReadStream(domainsCsvPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', (row) => {
-                const domain = String(row.domain || '').trim();
+                const domain = String(row[domainColumn] || row.domain || '').trim();
                 if (domain) domains.push(domain);
             })
             .on('end', resolve)

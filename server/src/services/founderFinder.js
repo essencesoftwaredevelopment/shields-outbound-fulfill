@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import axios from 'axios';
 import fs from 'fs';
+import path from 'path';
 import csv from 'csv-parser';
 import { OpenAI } from 'openai';
 import pLimit from 'p-limit';
@@ -13,9 +14,9 @@ const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
 const SERPER_CONCURRENCY = 8;
 
-const AI_CONCURRENCY_LIMIT = 10;
-const AI_MAX_RPS = 3;
-const AI_MAX_RPM = 180;
+const AI_CONCURRENCY_LIMIT = 8;
+const AI_MAX_RPS = 8;
+const AI_MAX_RPM = 480;
 const AI_TRUNCATE_CHARS = 900;
 const AI_TOP_ORGANIC = 10;
 
@@ -36,34 +37,71 @@ function chunkWithIndex(arr, size) {
     return chunks;
 }
 
-class RateLimiter {
-    constructor(maxRps, maxRpm) {
-        this.maxRps = maxRps;
+class AdaptiveRateLimiter {
+    constructor(minRpm, maxRpm, initialRpm = null) {
+        this.minRpm = minRpm;
         this.maxRpm = maxRpm;
-        this.secTimestamps = [];
-        this.minTimestamps = [];
+        this.currentRpm = initialRpm || maxRpm;
+        this.timestamps = [];
+        this.recentSuccesses = 0;
+        this.successThreshold = 50; // successful requests before trying to increase
+        this.backoffFactor = 0.7; // reduce to 70% on 429
+        this.recoveryFactor = 1.1; // increase to 110% on success streak
     }
+
+    getCurrentRpm() {
+        return Math.round(this.currentRpm);
+    }
+
     async acquire() {
         while (true) {
             const now = Date.now();
-            this.secTimestamps = this.secTimestamps.filter(t => now - t < 1000);
-            this.minTimestamps = this.minTimestamps.filter(t => now - t < 60000);
+            // Clean old timestamps (older than 1 minute)
+            this.timestamps = this.timestamps.filter(t => now - t < 60000);
 
-            if (this.secTimestamps.length < this.maxRps && this.minTimestamps.length < this.maxRpm) {
-                this.secTimestamps.push(now);
-                this.minTimestamps.push(now);
+            const currentRps = this.currentRpm / 60;
+            const allowedInLastMinute = Math.floor(this.currentRpm);
+
+            if (this.timestamps.length < allowedInLastMinute) {
+                this.timestamps.push(now);
                 return;
             }
 
-            const nextSec = this.secTimestamps.length ? 1000 - (now - this.secTimestamps[0]) : 0;
-            const nextMin = this.minTimestamps.length ? 60000 - (now - this.minTimestamps[0]) : 0;
-            const waitMs = Math.max(10, Math.min(nextSec || 0, nextMin || 0));
-            await sleep(waitMs);
+            // Calculate wait time based on oldest timestamp
+            const oldestInWindow = this.timestamps[0];
+            const timeToWait = 60000 - (now - oldestInWindow) + 10; // +10ms buffer
+            await sleep(Math.max(10, timeToWait));
         }
+    }
+
+    onRateLimitHit() {
+        const oldRpm = this.currentRpm;
+        this.currentRpm = Math.max(this.minRpm, this.currentRpm * this.backoffFactor);
+        this.recentSuccesses = 0;
+        return {
+            reduced: true,
+            oldRpm: Math.round(oldRpm),
+            newRpm: Math.round(this.currentRpm)
+        };
+    }
+
+    onSuccess() {
+        this.recentSuccesses++;
+        if (this.recentSuccesses >= this.successThreshold && this.currentRpm < this.maxRpm) {
+            const oldRpm = this.currentRpm;
+            this.currentRpm = Math.min(this.maxRpm, this.currentRpm * this.recoveryFactor);
+            this.recentSuccesses = 0;
+            return {
+                increased: true,
+                oldRpm: Math.round(oldRpm),
+                newRpm: Math.round(this.currentRpm)
+            };
+        }
+        return null;
     }
 }
 
-const aiRateLimiter = new RateLimiter(AI_MAX_RPS, AI_MAX_RPM);
+let aiRateLimiter = null; // Will be initialized in runFounderFinder
 
 async function withRetry(fn, label, shouldBackoff = () => true, logger = () => { }) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -113,7 +151,7 @@ async function readDomains(filePath) {
     return domains;
 }
 
-async function aiFindFounder(searchResults, companyDomain, logger, openai) {
+async function aiFindFounder(searchResults, companyDomain, logger, openai, rateLimiter) {
     const slim = searchResults.slice(0, AI_TOP_ORGANIC).map(r => ({
         t: r.title || '',
         u: r.link || '',
@@ -147,19 +185,42 @@ John Smith
 Search results (compressed JSON): ${searchString}
 Company Domain: ${companyDomain}`;
 
-    await aiRateLimiter.acquire();
+    await rateLimiter.acquire();
 
-    const res = await withRetry(
-        () =>
-            openai.responses.create({
-                model: FOUNDER_MODEL,
-                input: promptInput,
-                text: { format: { type: 'text' } }
-            }),
-        `OpenAI for ${companyDomain}`,
-        status => status === 429 || (status >= 500 && status < 600),
-        logger
-    );
+    let res;
+    let hit429 = false;
+    try {
+        res = await withRetry(
+            () =>
+                openai.responses.create({
+                    model: FOUNDER_MODEL,
+                    input: promptInput,
+                    text: { format: { type: 'text' } }
+                }),
+            `OpenAI for ${companyDomain}`,
+            status => status === 429 || (status >= 500 && status < 600),
+            logger
+        );
+    } catch (err) {
+        // Check if we hit a 429 rate limit
+        const status = err?.response?.status ?? err?.status ?? err?.statusCode;
+        if (status === 429) {
+            hit429 = true;
+            const adjustment = rateLimiter.onRateLimitHit();
+            if (adjustment.reduced) {
+                logger(`Rate limit hit! Reduced RPM: ${adjustment.oldRpm} → ${adjustment.newRpm}`);
+            }
+        }
+        throw err;
+    }
+
+    // Track success
+    if (!hit429) {
+        const adjustment = rateLimiter.onSuccess();
+        if (adjustment?.increased) {
+            logger(`Performance optimized! Increased RPM: ${adjustment.oldRpm} → ${adjustment.newRpm}`);
+        }
+    }
 
     const usage = res?.usage || {};
     const inputTokens = usage.input_tokens ?? usage.input_tokens_text ?? usage.prompt_tokens ?? 0;
@@ -178,7 +239,7 @@ function computeFounderCost({ tokensIn = 0, tokensOut = 0, pricing }) {
     return { serperCost, openaiCost, leadCost };
 }
 
-export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, log = () => { } }) {
+export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, log = () => { }, checkpointDir = null }) {
     const OPENAI_API_KEY = apiKeys.openai;
     const SERPER_API_KEY = apiKeys.serper;
 
@@ -191,7 +252,41 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    if (fs.existsSync(outputCsv)) {
+    // Setup checkpoint files
+    const serperCheckpointFile = checkpointDir ? path.join(checkpointDir, 'serper-results.json') : null;
+    const progressCheckpointFile = checkpointDir ? path.join(checkpointDir, 'founders-progress.json') : null;
+    
+    // Load existing checkpoint data if resuming
+    let serperCache = {};
+    let processedDomains = new Set();
+    let savedRpm = null;
+    
+    if (serperCheckpointFile && fs.existsSync(serperCheckpointFile)) {
+        try {
+            serperCache = JSON.parse(fs.readFileSync(serperCheckpointFile, 'utf-8'));
+            log(`Founders: loaded ${Object.keys(serperCache).length} cached Serper results`);
+        } catch (err) {
+            log(`Founders: failed to load Serper cache: ${err.message}`);
+        }
+    }
+    
+    if (progressCheckpointFile && fs.existsSync(progressCheckpointFile)) {
+        try {
+            const progress = JSON.parse(fs.readFileSync(progressCheckpointFile, 'utf-8'));
+            processedDomains = new Set(progress.processedDomains || []);
+            savedRpm = progress.currentRpm;
+            log(`Founders: resuming from checkpoint with ${processedDomains.size} already processed${savedRpm ? ` at ${savedRpm} RPM` : ''}`);
+        } catch (err) {
+            log(`Founders: failed to load progress checkpoint: ${err.message}`);
+        }
+    }
+    
+    // Initialize adaptive rate limiter with saved RPM if available
+    aiRateLimiter = new AdaptiveRateLimiter(120, AI_MAX_RPM, savedRpm);
+    log(`Founders: initialized adaptive rate limiter at ${aiRateLimiter.getCurrentRpm()} RPM`);
+
+    // Only delete output if starting fresh
+    if (fs.existsSync(outputCsv) && processedDomains.size === 0) {
         fs.unlinkSync(outputCsv);
         log('Founders: existing output file deleted.');
     }
@@ -205,10 +300,38 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
     }
 
     const writer = fs.createWriteStream(outputCsv, { flags: 'a' });
-    writer.write('domain,founder_name\n');
+    if (processedDomains.size === 0) {
+        writer.write('domain,founder_name\n');
+    }
 
     const serperLimit = pLimit(SERPER_CONCURRENCY);
     const aiLimit = pLimit(AI_CONCURRENCY_LIMIT);
+    
+    // Helper to save Serper results to checkpoint
+    const saveSerperCheckpoint = () => {
+        if (serperCheckpointFile) {
+            try {
+                fs.writeFileSync(serperCheckpointFile, JSON.stringify(serperCache, null, 2));
+            } catch (err) {
+                log(`Failed to save Serper checkpoint: ${err.message}`);
+            }
+        }
+    };
+    
+    // Helper to save progress checkpoint
+    const saveProgressCheckpoint = () => {
+        if (progressCheckpointFile) {
+            try {
+                fs.writeFileSync(progressCheckpointFile, JSON.stringify({
+                    processedDomains: Array.from(processedDomains),
+                    currentRpm: aiRateLimiter ? aiRateLimiter.getCurrentRpm() : AI_MAX_RPM,
+                    timestamp: new Date().toISOString()
+                }));
+            } catch (err) {
+                log(`Failed to save progress checkpoint: ${err.message}`);
+            }
+        }
+    };
 
     let processed = 0;
     let fatalQuotaError = null;
@@ -243,20 +366,67 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                 data: JSON.stringify(payload)
             };
 
-            const res = await withRetry(
-                () => axios.request(config),
-                `Serper batch ${batchIdx + 1}`,
-                status => status === 429 || (status >= 500 && status < 600),
-                log
-            );
-
-            const rows = Array.isArray(res.data) ? res.data : [];
-            log(`Founders: fetched Serper batch ${batchIdx + 1}/${chunks.length} with ${chunk.items.length} queries`);
+            // Check which domains in this batch need Serper requests
+            const domainsToFetch = [];
+            const domainIndices = [];
+            
+            for (let k = 0; k < chunk.items.length; k++) {
+                const absoluteIndex = chunk.start + k;
+                const domain = domains[absoluteIndex];
+                
+                if (!serperCache[domain]) {
+                    domainsToFetch.push(chunk.items[k]);
+                    domainIndices.push(absoluteIndex);
+                }
+            }
+            
+            let rows = [];
+            
+            // Only make Serper request if we have uncached domains
+            if (domainsToFetch.length > 0) {
+                const fetchPayload = domainsToFetch.map(q => ({ q }));
+                const fetchConfig = {
+                    method: 'post',
+                    maxBodyLength: Infinity,
+                    url: SERPER_URL,
+                    headers: {
+                        'X-API-KEY': SERPER_API_KEY,
+                        'Content-Type': 'application/json'
+                    },
+                    data: JSON.stringify(fetchPayload)
+                };
+                
+                const res = await withRetry(
+                    () => axios.request(fetchConfig),
+                    `Serper batch ${batchIdx + 1}`,
+                    status => status === 429 || (status >= 500 && status < 600),
+                    log
+                );
+                
+                rows = Array.isArray(res.data) ? res.data : [];
+                
+                // Cache the results
+                for (let i = 0; i < domainsToFetch.length; i++) {
+                    const domain = domains[domainIndices[i]];
+                    serperCache[domain] = rows[i] || {};
+                }
+                
+                saveSerperCheckpoint();
+                log(`Founders: fetched and cached Serper batch ${batchIdx + 1}/${chunks.length} with ${domainsToFetch.length} new queries`);
+            } else {
+                log(`Founders: using cached results for batch ${batchIdx + 1}/${chunks.length}`);
+            }
 
             for (let k = 0; k < chunk.items.length; k++) {
                 const absoluteIndex = chunk.start + k;
                 const domain = domains[absoluteIndex];
-                const row = rows[k] || {};
+                
+                // Skip if already processed
+                if (processedDomains.has(domain)) {
+                    continue;
+                }
+                
+                const row = serperCache[domain] || {};
                 const organic = Array.isArray(row.organic) ? row.organic : [];
                 const searchResults = organic.map((item, idx) => ({
                     position: idx + 1,
@@ -276,7 +446,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
                     if (searchResults.length > 0) {
                         try {
-                            const result = await aiFindFounder(searchResults, domain, log, openai);
+                            const result = await aiFindFounder(searchResults, domain, log, openai, aiRateLimiter);
                             name = result?.name || 'Not Found';
                             tokensIn = result?.tokensIn || 0;
                             tokensOut = result?.tokensOut || 0;
@@ -306,6 +476,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
                     processed++;
                     const costNumber = Number(stageCost.toFixed(6));
+                    const currentRpm = aiRateLimiter ? aiRateLimiter.getCurrentRpm() : AI_MAX_RPM;
                     const progressPayload = {
                         progress: {
                             stage: 'founders',
@@ -314,6 +485,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                                 'Processed': processed,
                                 'Found': foundCount,
                                 'Not Found': notFoundCount,
+                                'RPM': currentRpm,
                                 'Cost': `$${costNumber}`
                             }
                         }
@@ -327,6 +499,12 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
                     const safe = (name || '').replace(/"/g, '""');
                     writer.write(`${domain},"${safe}"\n`);
+                    
+                    // Mark as processed and save checkpoint
+                    processedDomains.add(domain);
+                    if (processed % 10 === 0) {
+                        saveProgressCheckpoint();
+                    }
                 });
 
                 aiTasks.push(task);
@@ -339,6 +517,10 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
     writer.end();
     await new Promise(res => writer.on('finish', res));
+    
+    // Save final checkpoint
+    saveProgressCheckpoint();
+    saveSerperCheckpoint();
 
     if (fatalQuotaError) {
         throw fatalQuotaError;

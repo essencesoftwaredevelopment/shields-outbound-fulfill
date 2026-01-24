@@ -4,7 +4,7 @@ import fs from 'fs';
 import { admin, firestore } from '../config/firebase.js';
 import { buildUnifiedRows } from '../utils/csv.js';
 import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaignLeadCount } from '../services/leads.js';
-import { createJobRecord, jobs, logJob, markCancelled, processJob, resolveJobPaths, serializeJob } from '../services/jobPipeline.js';
+import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, processJob, resolveJobPaths, serializeJob } from '../services/jobPipeline.js';
 
 const router = express.Router();
 
@@ -20,8 +20,13 @@ const uploadFields = upload.fields([
     { name: 'nicheId', maxCount: 1 },
     { name: 'nicheLabel', maxCount: 1 },
     { name: 'skipFounderFinder', maxCount: 1 },
+    { name: 'skipEmailFinder', maxCount: 1 },
+    { name: 'skipVerification', maxCount: 1 },
     { name: 'industry', maxCount: 1 },
-    { name: 'personalizeFirstLine', maxCount: 1 }
+    { name: 'personalizeFirstLine', maxCount: 1 },
+    { name: 'domainColumn', maxCount: 1 },
+    { name: 'founderColumn', maxCount: 1 },
+    { name: 'emailColumn', maxCount: 1 }
 ]);
 
 // Get CSV preview for column mapping
@@ -95,13 +100,25 @@ router.post('/jobs', uploadFields, async (req, res) => {
         const nicheId = (req.body.nicheId || '').toString().trim();
         const nicheLabel = (req.body.nicheLabel || '').toString().trim();
         const personalizeFirstLine = String(req.body.personalizeFirstLine || '').toLowerCase() === 'true';
+        const skipVerification = String(req.body.skipVerification || '').toLowerCase() === 'true';
+        const skipEmailFinder = String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
+        const domainColumn = (req.body.domainColumn || 'domain').toString().trim();
+        const founderColumn = (req.body.founderColumn || '').toString().trim();
+        const emailColumn = (req.body.emailColumn || '').toString().trim();
         const job = createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientId, dedupeStrategy, {
             skipFounderFinder,
+            skipEmailFinder,
+            skipVerification,
             findFounder: rawFindFounder,
             industry,
             nicheId,
             nicheLabel,
             personalizeFirstLine,
+            columnMapping: {
+                domain: domainColumn,
+                founder: founderColumn,
+                email: emailColumn
+            }
         });
         logJob(job, `Job queued with file ${job.fileName} for user ${uid}`);
 
@@ -112,7 +129,8 @@ router.post('/jobs', uploadFields, async (req, res) => {
                 clientId: job.clientId,
                 jobId: job.id,
                 domainsCsvPath: job.paths.domains,
-                dedupeStrategy: job.dedupeStrategy
+                dedupeStrategy: job.dedupeStrategy,
+                domainColumn: domainColumn
             });
             job.dedupeStats = dedupeStats;
             job.paths.filtered = filteredDomainsPath; // Store filtered path for processJob to use
@@ -182,6 +200,107 @@ router.post('/jobs/:id/stop', async (req, res) => {
     } catch (error) {
         console.error('Stop job error:', error);
         return res.status(500).json({ error: 'Failed to cancel job.' });
+    }
+});
+
+// Pause a running job
+router.post('/jobs/:id/pause', async (req, res) => {
+    try {
+        const jobId = req.params.id;
+        const { idToken, clientId } = req.body || {};
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
+        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        const job = jobs.get(jobId);
+        if (!job) {
+            return res.status(404).json({ error: 'Job not found.' });
+        }
+        if (job.uid !== uid || job.clientId !== clientId) {
+            return res.status(403).json({ error: 'Unauthorized to pause this job.' });
+        }
+        if (job.cancelled || job.status === 'cancelled') {
+            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot pause.' });
+        }
+        if (job.paused || job.status === 'paused') {
+            return res.json({ status: 'paused', message: 'Job already paused.' });
+        }
+
+        markPaused(job, 'Paused by user');
+
+        // Update activeJob doc
+        try {
+            const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
+            await activeJobRef.set({
+                jobId,
+                status: 'paused',
+                pausedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        } catch (err) {
+            console.warn('Failed to persist paused status to Firestore', err?.message || err);
+        }
+
+        return res.json({ status: 'paused' });
+    } catch (error) {
+        console.error('Pause job error:', error);
+        return res.status(500).json({ error: 'Failed to pause job.' });
+    }
+});
+
+// Resume a paused job
+router.post('/jobs/:id/resume', async (req, res) => {
+    try {
+        const jobId = req.params.id;
+        const { idToken, clientId } = req.body || {};
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
+        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        const job = jobs.get(jobId);
+        if (!job) {
+            return res.status(404).json({ error: 'Job not found.' });
+        }
+        if (job.uid !== uid || job.clientId !== clientId) {
+            return res.status(403).json({ error: 'Unauthorized to resume this job.' });
+        }
+        if (job.cancelled || job.status === 'cancelled') {
+            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
+        }
+        if (!job.paused && job.status !== 'paused') {
+            return res.json({ status: job.status, message: 'Job is not paused.' });
+        }
+
+        markResumed(job);
+
+        // Resume processing (it will continue from checkpoints)
+        processJob(job).catch((err) => {
+            console.error(`[${job.id}] Resume job error:`, err);
+        });
+
+        // Update activeJob doc
+        try {
+            const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
+            await activeJobRef.set({
+                jobId,
+                status: 'running',
+                resumedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        } catch (err) {
+            console.warn('Failed to persist resumed status to Firestore', err?.message || err);
+        }
+
+        return res.json({ status: 'running' });
+    } catch (error) {
+        console.error('Resume job error:', error);
+        return res.status(500).json({ error: 'Failed to resume job.' });
     }
 });
 
