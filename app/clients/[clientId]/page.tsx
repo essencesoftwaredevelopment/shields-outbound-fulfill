@@ -613,196 +613,67 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         setLeadsLoading(true);
         try {
-            const leadsCol = collection(firestore, "users", user.uid, "clients", clientId, "leads");
             const rawSearch = leadSearch.trim();
             const isSearchMode = Boolean(rawSearch);
-            const searchTerms = isSearchMode
-                ? Array.from(new Set([rawSearch, rawSearch.toLowerCase(), rawSearch.toUpperCase()])).filter(Boolean)
-                : [];
+            
+            // Build query parameters
+            const params = new URLSearchParams();
+            params.append('clientId', clientId);
+            params.append('limit', '500'); // Fetch more for better search results
 
-            if (isSearchMode) {
-                const searchFields: Array<keyof Lead> = ["domain", "email", "founderName"];
-                const snapshots = await Promise.allSettled(
-                    searchFields.flatMap((field) => {
-                        const fieldKey = field === "founderName" ? "founder_name" : field;
-                        return searchTerms.map((term) => {
-                            const clauses: any[] = [];
-                            if (campaignFilterId) {
-                                clauses.push(where("campaigns", "array-contains", campaignFilterId));
-                            }
-                            clauses.push(
-                                orderBy(fieldKey),
-                                startAt(term),
-                                endAt(`${term}\uf8ff`),
-                                limit(200)
-                            );
-                            return getDocs(query(leadsCol, ...clauses));
-                        });
-                    })
-                );
-
-                const mapped: Lead[] = [];
-                const seen = new Set<string>();
-                snapshots.forEach((result) => {
-                    if (result.status !== "fulfilled") return;
-                    result.value.docs.forEach((d) => {
-                        if (seen.has(d.id)) return;
-                        const data = d.data();
-                        const emailStatus = (data.email_status as string) || "";
-                        const isVerified = emailStatus === "valid" || emailStatus === "verified";
-                        const lead: Lead = {
-                            id: d.id,
-                            domain: (data.domain as string) || (data.website as string) || "",
-                            email: (data.email as string) || "",
-                            status: emailStatus,
-                            verified: isVerified,
-                            firstLine: (data.personalization_first_line as string) || "",
-                            founderName: (data.founder_name as string) || "",
-                            personalizationUrl: (data.personalization_url as string) || "",
-                            personalizationTitle: (data.personalization_title as string) || "",
-                            updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
-                            campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
-                        };
-                        if (campaignFilterId && (!lead.campaigns || !lead.campaigns.includes(campaignFilterId))) {
-                            return;
-                        }
-                        seen.add(d.id);
-                        mapped.push(lead);
-                    });
-                });
-
-                setLeads(mapped);
-                const totalFromData = mapped.length;
-                const verifiedFromData = mapped.filter((r) => r.verified).length;
-                setStats({
-                    total: totalFromData,
-                    verified: verifiedFromData,
-                    unverified: Math.max(0, totalFromData - verifiedFromData),
-                });
-                setLeadsCursor(null);
-                setLeadsHasMore(false);
-                return;
-            }
-
-            const constraints: unknown[] = [];
-            if (campaignFilterId) {
-                constraints.push(where("campaigns", "array-contains", campaignFilterId));
-            }
-
-            // Add email status filter (most specific, works well with Firestore)
             if (emailStatusFilter) {
-                constraints.push(where("email_status", "==", emailStatusFilter));
+                params.append('emailStatus', emailStatusFilter);
             }
 
-            const mapDocToLead = (d: any): Lead => {
-                const data = d.data();
-                const emailStatus = (data.email_status as string) || "";
-                const isVerified = emailStatus === "valid" || emailStatus === "verified";
-                return {
-                    id: d.id,
-                    domain: (data.domain as string) || (data.website as string) || "",
-                    email: (data.email as string) || "",
-                    status: emailStatus,
-                    verified: isVerified,
-                    firstLine: (data.personalization_first_line as string) || "",
-                    founderName: (data.founder_name as string) || "",
-                    personalizationUrl: (data.personalization_url as string) || "",
-                    personalizationTitle: (data.personalization_title as string) || "",
-                    updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
-                    campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
-                } as Lead;
-            };
-
-            // When filters are active, fetch ALL leads once and cache them for client-side filtering.
-            // This trades one larger initial fetch for instant subsequent filter changes.
-            const shouldFetchAll = Boolean(founderFilter || emailFilter);
-            if (shouldFetchAll && !allLeadsCached) {
-                const pageSize = 500;
-                let cursor: DocumentSnapshot | null = null;
-                const collected: Lead[] = [];
-                let pagesRead = 0;
-
-                // Fetch all leads in batches until we have everything
-                // eslint-disable-next-line no-constant-condition
-                while (true) {
-                    const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
-                    if (cursor) {
-                        clauses.push(startAfter(cursor));
-                    }
-                    clauses.push(limit(pageSize));
-
-                    const snap = await getDocs(query(leadsCol, ...clauses));
-                    snap.docs.forEach((docSnap) => collected.push(mapDocToLead(docSnap)));
-                    pagesRead += 1;
-
-                    if (snap.size < pageSize) {
-                        // We've reached the end
-                        break;
-                    }
-                    cursor = snap.docs[snap.docs.length - 1];
-                    
-                    // Safety: stop after 100 pages (~50k leads)
-                    if (pagesRead >= 100) {
-                        console.warn('Reached max page limit while fetching all leads');
-                        break;
-                    }
-                }
-
-                console.log(`Fetched all ${collected.length} leads for filtering (${pagesRead} pages)`);
-                setLeads(collected);
-                setAllLeadsCached(true);
-                const totalFromData = collected.length;
-                const verifiedFromData = collected.filter((r) => r.verified).length;
-                setStats({
-                    total: totalFromData,
-                    verified: verifiedFromData,
-                    unverified: Math.max(0, totalFromData - verifiedFromData),
-                });
-                setLeadsCursor(null);
-                setLeadsHasMore(false);
-                return;
-            }
-
-            // If we already cached all leads for filtering, just return (filtering happens in useMemo)
-            if (shouldFetchAll && allLeadsCached) {
-                setLeadsLoading(false);
-                return;
-            }
-
-            const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
             if (!reset && leadsCursor) {
-                clauses.push(startAfter(leadsCursor));
+                params.append('offset', String(leadsCursor));
             }
-            clauses.push(limit(200));
-            const baseQuery = query(leadsCol, ...clauses);
 
-            const snap = await getDocs(baseQuery);
-            const mapped = snap.docs.map(mapDocToLead).filter((lead) => {
-                if (!campaignFilterId) return true;
-                return Array.isArray(lead.campaigns) && lead.campaigns.includes(campaignFilterId);
-            });
+            const response = await fetch(`http://localhost:4000/api/leads?${params.toString()}`);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch leads: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            const { leads: apiLeads, total, hasMore } = data;
+
+            // Map API response to Lead type
+            const mapped: Lead[] = apiLeads.map((row: any) => ({
+                id: row.id,
+                domain: row.domain || "",
+                email: row.email || "",
+                status: row.status || "",
+                verified: row.verified,
+                firstLine: row.firstLine || "",
+                founderName: row.founderName || "",
+                personalizationUrl: row.personalizationUrl || "",
+                personalizationTitle: row.personalizationTitle || "",
+                updatedAt: row.updatedAt || "",
+                campaigns: row.campaigns || []
+            }));
 
             setLeads((prev) => {
                 const next = reset ? mapped : [...prev, ...mapped];
-                const totalFromData = next.length;
+                const totalFromData = total || next.length;
                 const verifiedFromData = next.filter((r) => r.verified).length;
-                const total = campaignFilterId ? totalFromData : (clientTotalLeads || totalFromData);
                 setStats({
-                    total,
+                    total: totalFromData,
                     verified: verifiedFromData,
                     unverified: Math.max(0, totalFromData - verifiedFromData),
                 });
                 return next;
             });
-            setLeadsCursor(snap.docs[snap.docs.length - 1] || null);
-            setLeadsHasMore(snap.size === 200);
+
+            // Set cursor for pagination (use count of loaded items as offset)
+            setLeadsCursor(reset ? mapped.length : (leadsCursor || 0) + mapped.length);
+            setLeadsHasMore(hasMore || false);
         } catch (error) {
             console.error('Failed to fetch leads:', error);
             setLeadsHasMore(false);
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, campaignFilterId, clientTotalLeads, leadSearch, leadsCursor, emailStatusFilter, founderFilter, emailFilter, allLeadsCached]);
+    }, [user, clientId, leadSearch, leadsCursor, emailStatusFilter]);
 
     const loadMoreLeads = useCallback(() => {
         const hasFilterMode = Boolean(founderFilter || emailFilter);

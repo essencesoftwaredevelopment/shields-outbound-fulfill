@@ -57,6 +57,26 @@ async function upsertContact({ companyId, roleType = 'founder', fullName = null,
     }
 }
 
+// Map lookup statuses from email finder to valid database email_status values
+function normalizeEmailStatus(rawStatus) {
+    if (!rawStatus) return null;
+    const status = String(rawStatus).toLowerCase().trim();
+    
+    // If already a valid status, keep it
+    if (['valid', 'risky', 'invalid', 'unknown'].includes(status)) {
+        return status;
+    }
+    
+    // Map email finder statuses to database constraints
+    if (status === 'found') return 'valid'; // found emails are assumed valid
+    if (status === 'not_found') return 'invalid'; // not found means invalid
+    if (status.startsWith('error')) return 'unknown'; // errors are unknown
+    if (status === 'skipped_no_founder') return null; // skip rows without founder
+    
+    // Default unknown for anything else
+    return 'unknown';
+}
+
 function buildContactPayload(row, type) {
     const domain = String(row.domain || '').trim().toLowerCase();
     const founderName = String(row.founder_name || row.full_name || row.name || '').trim() || null;
@@ -71,10 +91,10 @@ function buildContactPayload(row, type) {
         return { domain, roleType: 'founder', fullName: founderName, confidence: Number.isFinite(confidence) ? confidence : null };
     }
     if (type === 'emails') {
-        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: lookupStatus || null, confidence: Number.isFinite(confidence) ? confidence : null };
+        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: normalizeEmailStatus(lookupStatus), confidence: Number.isFinite(confidence) ? confidence : null };
     }
     if (type === 'verification') {
-        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus, lastVerifiedAt: emailStatus ? new Date().toISOString() : null };
+        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: normalizeEmailStatus(emailStatus), lastVerifiedAt: emailStatus ? new Date().toISOString() : null };
     }
     if (type === 'personalization') {
         return { domain, roleType: 'founder' }; // personalization does not mutate contact fields here

@@ -4,6 +4,7 @@ import { env } from './config/env.js';
 import { testConnection } from './config/db.js';
 import jobsRouter from './routes/jobs.js';
 import clientsRouter from './routes/clients.js';
+import leadsRouter from './routes/leads.js';
 import webhooksRouter from './routes/webhooks.js';
 
 const app = express();
@@ -17,6 +18,7 @@ app.use(express.urlencoded({ extended: true }));
 // Routes
 app.use('/api', jobsRouter);
 app.use('/api', clientsRouter);
+app.use('/api', leadsRouter);
 app.use('/webhook', webhooksRouter);
 
 // Health check
