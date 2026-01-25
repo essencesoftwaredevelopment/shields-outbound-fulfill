@@ -1,82 +1,51 @@
+/**
+ * Lead/contact database operations service (SQL-only)
+ *
+ * Canonical Agency Identifier Rule:
+ * Firebase uid = agency_id directly, no mapping table.
+ * Agency_id is ALWAYS the auth boundary, derived from verified token.
+ * Client_id (if present) is a product concern, resolved per-request.
+ *
+ * This service handles:
+ * - Batch company (domain) upsertion with idempotency
+ * - Batch contact upsertion with email deduplication
+ * - Pipeline stage persistence with checkpoints (crash-safe)
+ * - Send-safety: marking contacts as contacted to prevent resends
+ * - Domain deduplication for new job runs
+ *
+ * All operations are scoped by agency_id (and client_id if present).
+ * NO Firestore usage. Cloud SQL is the single source of truth.
+ */
+
 import fs from 'fs';
 import { parse as csvParse } from 'csv-parse';
-import { pool } from '../config/db.js';
+import { pool, withTx, batchUpsertCompanies, batchUpsertContacts, writeCheckpoint, getExistingDomainsSet, markEmailsContacted } from '../lib/db.js';
+import * as queries from './db/queries.js';
 
-function getLeadRef(uid, clientId, domain) {
-    return firestore
-        .collection('users').doc(uid)
-        .collection('clients').doc(clientId)
-        .collection('leads').doc(domain.toLowerCase());
-}
-
-async function ensureCompanyId(clientId, domain) {
-    const normalized = domain.toLowerCase();
-    const { rows } = await pool.query(
-        `insert into companies (client_id, domain_normalized)
-         values ($1, $2)
-         on conflict (client_id, domain_normalized)
-         do update set updated_at = now()
-         returning id`,
-        [clientId, normalized]
-    );
-    return rows[0].id;
-}
-
-async function upsertContact({ companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, lastVerifiedAt = null }) {
-    const params = [companyId, roleType, fullName, email, emailStatus, confidence, lastVerifiedAt];
-    const query = `
-        insert into contacts (company_id, role_type, full_name, email, email_status, confidence, last_verified_at)
-        values ($1, $2, $3, $4, $5, $6, $7)
-        on conflict (company_id, role_type) do update set
-            full_name = coalesce(excluded.full_name, contacts.full_name),
-            email = coalesce(excluded.email, contacts.email),
-            email_status = coalesce(excluded.email_status, contacts.email_status),
-            confidence = coalesce(excluded.confidence, contacts.confidence),
-            last_verified_at = coalesce(excluded.last_verified_at, contacts.last_verified_at),
-            updated_at = now();
-    `;
-
-    try {
-        await pool.query(query, params);
-    } catch (err) {
-        // Handle unique(email) conflicts by updating the existing row keyed by email
-        if (err?.code === '23505' && email) {
-            await pool.query(
-                `update contacts
-                 set full_name = coalesce($1, full_name),
-                     email_status = coalesce($2, email_status),
-                     confidence = coalesce($3, confidence),
-                     last_verified_at = coalesce($4, last_verified_at),
-                     updated_at = now()
-                 where email = $5`,
-                [fullName, emailStatus, confidence, lastVerifiedAt, email]
-            );
-            return;
-        }
-        throw err;
-    }
-}
-
-// Map lookup statuses from email finder to valid database email_status values
+/**
+ * Parse and normalize email status from various sources
+ * Maps email finder statuses to database valid values
+ */
 function normalizeEmailStatus(rawStatus) {
     if (!rawStatus) return null;
     const status = String(rawStatus).toLowerCase().trim();
-    
-    // If already a valid status, keep it
-    if (['valid', 'risky', 'invalid', 'unknown'].includes(status)) {
-        return status;
-    }
-    
-    // Map email finder statuses to database constraints
-    if (status === 'found') return 'valid'; // found emails are assumed valid
-    if (status === 'not_found') return 'invalid'; // not found means invalid
-    if (status.startsWith('error')) return 'unknown'; // errors are unknown
-    if (status === 'skipped_no_founder') return null; // skip rows without founder
-    
-    // Default unknown for anything else
+
+    // Already valid
+    if (['valid', 'risky', 'invalid', 'unknown'].includes(status)) return status;
+
+    // Map email finder statuses
+    if (status === 'found') return 'valid';
+    if (status === 'not_found') return 'invalid';
+    if (status.startsWith('error')) return 'unknown';
+    if (status === 'skipped_no_founder') return null;
+
     return 'unknown';
 }
 
+/**
+ * Build a standardized contact payload from a CSV row
+ * Handles multiple CSV formats (founders, emails, verification, personalization)
+ */
 function buildContactPayload(row, type) {
     const domain = String(row.domain || '').trim().toLowerCase();
     const founderName = String(row.founder_name || row.full_name || row.name || '').trim() || null;
@@ -97,21 +66,94 @@ function buildContactPayload(row, type) {
         return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: normalizeEmailStatus(emailStatus), lastVerifiedAt: emailStatus ? new Date().toISOString() : null };
     }
     if (type === 'personalization') {
-        return { domain, roleType: 'founder' }; // personalization does not mutate contact fields here
+        const firstLine = String(row.personalization_first_line || row.first_line || row.personalization || '').trim() || null;
+        return { domain, roleType: 'founder', fullName: founderName, email, personalizationFirstLine: firstLine };
     }
     return { domain, roleType: 'founder', fullName: founderName };
 }
 
-export async function upsertLead(uid, clientId, domain, data) {
-    if (!clientId || !domain) return;
-    const companyId = await ensureCompanyId(clientId, domain);
-    const fullName = typeof data?.name === 'string' ? data.name : null;
-    const email = typeof data?.email === 'string' ? data.email : null;
-    await upsertContact({ companyId, roleType: 'founder', fullName, email });
+/**
+ * Fetch all contacts for an agency from SQL with optional filters
+ * Used by frontend to display leads
+ */
+export async function getContactsForAgency(agencyId, { emailStatus, roleType, limit = 500, offset = 0 } = {}) {
+    return queries.getContactsByAgency(agencyId, { emailStatus, roleType, limit, offset });
 }
 
-export async function upsertLeadsFromCsv({ clientId, csvPath, type }) {
-    if (!fs.existsSync(csvPath) || !clientId) return;
+/**
+ * Get company (domain) list with contact counts
+ */
+export async function getCompaniesForAgency(agencyId, { limit = 500, offset = 0 } = {}) {
+    const query = `
+        SELECT
+            c.id,
+            c.domain_normalized as domain,
+            COUNT(ct.id) as contact_count,
+            COUNT(CASE WHEN ct.email_status = 'valid' THEN 1 END) as verified_count,
+            c.created_at,
+            c.updated_at
+        FROM companies c
+        LEFT JOIN contacts ct ON ct.company_id = c.id
+        WHERE c.agency_id = $1
+        GROUP BY c.id, c.domain_normalized, c.created_at, c.updated_at
+        ORDER BY c.updated_at DESC
+        LIMIT $2 OFFSET $3
+    `;
+    const result = await pool.query(query, [agencyId, limit, offset]);
+    return result.rows;
+}
+
+/**
+ * Get summary statistics for agency leads
+ */
+export async function getLeadStats(agencyId) {
+    const query = `
+        SELECT
+            COUNT(DISTINCT c.id) as total_contacts,
+            COUNT(DISTINCT c.company_id) as total_companies,
+            COUNT(CASE WHEN c.email_status = 'valid' THEN 1 END) as verified_emails,
+            COUNT(CASE WHEN c.last_contacted_at IS NOT NULL THEN 1 END) as contacted_count,
+            COUNT(CASE WHEN c.last_contacted_at IS NULL THEN 1 END) as untouched_count
+        FROM contacts c
+        WHERE c.agency_id = $1
+    `;
+    const result = await pool.query(query, [agencyId]);
+    return result.rows[0] || {};
+}
+
+async function upsertContact({ agencyId, companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, lastVerifiedAt = null }) {
+    try {
+        await queries.upsertContact(agencyId, companyId, roleType, {
+            full_name: fullName,
+            email,
+            email_status: emailStatus,
+            confidence
+        });
+    } catch (err) {
+        console.error('Contact upsert error:', err?.message || err);
+        throw err;
+    }
+}
+
+/**
+ * Upsert a single lead (contact) scoped by agency_id
+ * Legacy function kept for backward compatibility
+ */
+export async function upsertLead(agencyId, domain, data) {
+    if (!agencyId || !domain) return;
+    const company = await queries.upsertCompany(agencyId, domain.toLowerCase());
+    const fullName = typeof data?.name === 'string' ? data.name : null;
+    const email = typeof data?.email === 'string' ? data.email : null;
+    await upsertContact({ agencyId, companyId: company.id, roleType: 'founder', fullName, email });
+}
+
+/**
+ * Upsert leads from a CSV file, scoped by agency_id and client_id
+ * Legacy function kept for backward compatibility
+ * Use processCsvWithCheckpoints for crash-safe processing
+ */
+export async function upsertLeadsFromCsv({ agencyId, clientId, csvPath, type }) {
+    if (!fs.existsSync(csvPath) || !agencyId || !clientId) return;
     const rows = [];
     await new Promise((resolve, reject) => {
         fs.createReadStream(csvPath)
@@ -121,28 +163,150 @@ export async function upsertLeadsFromCsv({ clientId, csvPath, type }) {
             .on('error', reject);
     });
 
-    for (const row of rows) {
-        const payload = buildContactPayload(row, type);
-        if (!payload) continue;
-        const companyId = await ensureCompanyId(clientId, payload.domain);
-        await upsertContact({
-            companyId,
-            roleType: payload.roleType,
-            fullName: payload.fullName,
-            email: payload.email,
-            emailStatus: payload.emailStatus,
-            confidence: payload.confidence,
-            lastVerifiedAt: payload.lastVerifiedAt
+    // Process in batches for better performance
+    const batchSize = 100;
+    for (let i = 0; i < rows.length; i += batchSize) {
+        const batch = rows.slice(i, i + batchSize);
+        
+        await withTx(async (client) => {
+            // Build payloads
+            const payloads = batch.map((r) => buildContactPayload(r, type)).filter(Boolean);
+            if (!payloads.length) return;
+
+            // Upsert companies (domains)
+            const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
+
+            // Upsert contacts with company_id from domainMap
+            const contactRows = payloads.map((p) => ({
+                company_id: domainMap.get(p.domain),
+                role_type: p.roleType,
+                full_name: p.fullName || null,
+                email: p.email || null,
+                email_status: p.emailStatus || null,
+                confidence: p.confidence || null,
+                personalization_first_line: p.personalizationFirstLine || null
+            })).filter((r) => r.company_id);
+
+            if (contactRows.length > 0) {
+                await batchUpsertContacts(client, agencyId, clientId, contactRows);
+            }
         });
     }
 }
 
-export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain' }) {
-    if (!clientId || !domainsCsvPath) {
-        console.warn(`[${jobId}] Missing clientId/domainsCsvPath. clientId=${clientId}, domainsCsvPath=${domainsCsvPath}`);
+/**
+ * Batch process a CSV file with transactional checkpoint support
+ * Reads CSV in chunks, batches upserts, writes checkpoint
+ * Crash-safe: can resume from last checkpoint
+ */
+export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, stage, csvPath, type, chunkSize = 100 }) {
+    if (!agencyId || !clientId || !jobId || !csvPath || !fs.existsSync(csvPath)) {
+        console.error(`[${jobId}] Invalid inputs for CSV processing`);
+        return { processed: 0, checkpoint: null };
+    }
+
+    // Get last checkpoint
+    const lastCheckpoint = await queries.getOrCreateCheckpoint(agencyId, jobId, stage, '');
+
+    const rows = [];
+    let processedCount = 0;
+
+    try {
+        // Read CSV and process in chunks
+        await new Promise((resolve, reject) => {
+            fs.createReadStream(csvPath)
+                .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
+                .on('data', async (row) => {
+                    rows.push(row);
+
+                    if (rows.length >= chunkSize) {
+                        const chunk = rows.splice(0, chunkSize);
+
+                        // Process chunk within transaction
+                        await withTx(async (client) => {
+                            // Build payloads
+                            const payloads = chunk.map((r) => buildContactPayload(r, type)).filter(Boolean);
+
+                            // Upsert companies
+                            const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
+
+                            // Upsert contacts with company_id from domainMap
+                            const contactRows = payloads.map((p) => ({
+                                company_id: domainMap.get(p.domain),
+                                role_type: p.roleType,
+                                full_name: p.fullName || null,
+                                email: p.email || null,
+                                email_status: p.emailStatus || null,
+                                confidence: p.confidence || null
+                            })).filter((r) => r.company_id);
+
+                            if (contactRows.length > 0) {
+                                await batchUpsertContacts(client, agencyId, clientId, contactRows);
+                            }
+
+                            // Write checkpoint
+                            const cursorValue = `${processedCount + chunk.length}`;
+                            await writeCheckpoint(client, agencyId, clientId, jobId, stage, cursorValue);
+                        });
+
+                        processedCount += chunk.length;
+                        console.log(`[${jobId}/${stage}] Processed ${processedCount} rows`);
+                    }
+                })
+                .on('end', resolve)
+                .on('error', reject);
+        });
+
+        // Process remaining rows
+        if (rows.length > 0) {
+            await withTx(async (client) => {
+                const payloads = rows.map((r) => buildContactPayload(r, type)).filter(Boolean);
+                const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
+
+                const contactRows = payloads.map((p) => ({
+                    company_id: domainMap.get(p.domain),
+                    role_type: p.roleType,
+                    full_name: p.fullName || null,
+                    email: p.email || null,
+                    email_status: p.emailStatus || null,
+                    confidence: p.confidence || null
+                })).filter((r) => r.company_id);
+
+                if (contactRows.length > 0) {
+                    await batchUpsertContacts(client, agencyId, clientId, contactRows);
+                }
+
+                const cursorValue = `${processedCount + rows.length}`;
+                await writeCheckpoint(client, agencyId, clientId, jobId, stage, cursorValue);
+            });
+
+            processedCount += rows.length;
+        }
+
+        const checkpoint = await queries.getOrCreateCheckpoint(agencyId, jobId, stage);
+        return { processed: processedCount, checkpoint };
+    } catch (error) {
+        console.error(`[${jobId}/${stage}] Processing failed:`, error);
+        throw error;
+    }
+}
+
+/**
+ * Filter domains to exclude already-processed ones (deduplication)
+ * Returns filtered CSV path and statistics
+ */
+export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain' }) {
+    if (!agencyId || !clientId || !domainsCsvPath) {
+        console.warn(`[${jobId}] Missing agencyId/clientId/domainsCsvPath`);
         return { filtered: domainsCsvPath, stats: { total: 0, skipped: 0, new: 0 } };
     }
 
+    if (!fs.existsSync(domainsCsvPath)) {
+        console.warn(`[${jobId}] CSV file not found: ${domainsCsvPath}`);
+        return { filtered: domainsCsvPath, stats: { total: 0, skipped: 0, new: 0 } };
+    }
+
+    // Read domains from CSV
     const domains = [];
     await new Promise((resolve, reject) => {
         fs.createReadStream(domainsCsvPath)
@@ -157,27 +321,10 @@ export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, dom
 
     const stats = { total: domains.length, skipped: 0, new: 0 };
 
-    if (domains.length === 0) {
-        return { filtered: domainsCsvPath, stats };
-    }
+    if (domains.length === 0) return { filtered: domainsCsvPath, stats };
 
-    const uniqueDomains = Array.from(new Set(domains));
-
-    // Fetch existing domains for this client from SQL
-    let existing = [];
-    try {
-        const { rows } = await pool.query(
-            'select domain_normalized from companies where client_id = $1 and domain_normalized = any($2)',
-            [clientId, uniqueDomains]
-        );
-        existing = rows.map((r) => r.domain_normalized.toLowerCase());
-    } catch (err) {
-        console.error(`[${jobId}] SQL dedupe query failed:`, err?.message || err);
-        // Fall back to no filtering if query fails
-        return { filtered: domainsCsvPath, stats };
-    }
-
-    const existingSet = new Set(existing);
+    // Get existing domains from SQL
+    const existingSet = await getExistingDomainsSet(clientId, domains);
 
     let filteredDomains = domains;
     if (dedupeStrategy === 'skip') {
@@ -185,10 +332,12 @@ export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, dom
         stats.skipped = domains.length - filteredDomains.length;
         stats.new = filteredDomains.length;
     } else {
+        const uniqueDomains = Array.from(new Set(domains));
         stats.skipped = 0;
         stats.new = uniqueDomains.filter((d) => !existingSet.has(d)).length;
     }
 
+    // Write filtered CSV if skipping and has results
     if (dedupeStrategy === 'skip' && stats.skipped > 0) {
         const filteredPath = domainsCsvPath.replace('.csv', '-filtered.csv');
         const writer = fs.createWriteStream(filteredPath);
@@ -202,17 +351,57 @@ export async function filterAndWriteProcessedDomains({ uid, clientId, jobId, dom
     return { filtered: domainsCsvPath, stats };
 }
 
-export async function attachCampaignToLeads({ clientId, rows }) {
-    if (!clientId || !Array.isArray(rows) || rows.length === 0) return;
-    const emails = rows.map((r) => String(r.email || '').trim()).filter(Boolean);
-    if (!emails.length) return;
-    await pool.query(
-        'update contacts set last_contacted_at = now(), updated_at = now() where email = any($1)',
-        [emails]
-    );
+/**
+ * Mark contacts as contacted (send-safety guardrail)
+ * Updates last_contacted_at to prevent accidental resends
+ */
+export async function markContactsAsSent(agencyId, contactIds) {
+    if (!Array.isArray(contactIds) || contactIds.length === 0) return [];
+    return queries.markContactsAsSent(agencyId, contactIds);
 }
 
+/**
+ * Mark contacts as contacted by email list
+ * Useful for campaign export workflows
+ */
+export async function markEmailsAsSent(agencyId, emails) {
+    if (!Array.isArray(emails) || emails.length === 0) return [];
+    return markEmailsContacted(agencyId, emails);
+}
+
+/**
+ * Legacy function for backward compatibility
+ * Marks emails as contacted using email list from row array
+ */
+export async function attachCampaignToLeads({ agencyId, rows }) {
+    if (!agencyId || !Array.isArray(rows) || rows.length === 0) return;
+
+    const emails = rows
+        .map((r) => String(r.email || '').trim())
+        .filter(Boolean);
+
+    if (emails.length === 0) return;
+
+    return markEmailsContacted(agencyId, emails);
+}
+
+/**
+ * Legacy function for backward compatibility
+ */
 export async function incrementCampaignLeadCount() {
-    // No-op: Firestore aggregate counts removed in SQL version
+    // No-op: aggregates now computed on-demand in getLeadStats
     return;
 }
+
+export default {
+    getContactsForAgency,
+    getCompaniesForAgency,
+    getLeadStats,
+    filterAndWriteProcessedDomains,
+    processCsvWithCheckpoints,
+    markContactsAsSent,
+    markEmailsAsSent,
+    attachCampaignToLeads,
+    incrementCampaignLeadCount
+};
+

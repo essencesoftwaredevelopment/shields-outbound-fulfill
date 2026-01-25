@@ -10,6 +10,14 @@ const CONCURRENCY = 10;
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
 
+// Email finding providers
+const PROVIDERS = {
+    TRYKITT: 'trykitt',
+    SELF_HOSTED: 'self_hosted'
+};
+
+const SELF_HOSTED_VERIFY_URL = 'http://193.181.209.186:8080/v0/check_email';
+
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const shouldRetry = status => status === 402 || status === 429 || status >= 500;
 
@@ -20,6 +28,47 @@ function normalize(value) {
 function needsSkip(name) {
     const lower = (name || '').toLowerCase();
     return !lower || lower === 'not found';
+}
+
+/**
+ * Generate common email pattern variations
+ * @param {string} firstName - e.g., "John"
+ * @param {string} lastName - e.g., "Doe"
+ * @param {string} domain - e.g., "example.com"
+ * @returns {string[]} - Array of email variations to try
+ */
+function generateEmailVariations(firstName, lastName, domain) {
+    const f = firstName.toLowerCase().trim();
+    const l = lastName.toLowerCase().trim();
+    const fInitial = f.charAt(0);
+    const lInitial = l.charAt(0);
+    
+    // Common patterns from most to least common
+    return [
+        `${f}.${l}@${domain}`,           // john.doe@example.com (most common)
+        `${f}${l}@${domain}`,             // johndoe@example.com
+        `${fInitial}${l}@${domain}`,      // jdoe@example.com
+        `${f}@${domain}`,                 // john@example.com
+        `${l}@${domain}`,                 // doe@example.com
+        `${f}_${l}@${domain}`,            // john_doe@example.com
+        `${f}-${l}@${domain}`,            // john-doe@example.com
+        `${l}.${f}@${domain}`,            // doe.john@example.com
+        `${fInitial}.${l}@${domain}`,     // j.doe@example.com
+        `${f}${lInitial}@${domain}`,      // johnd@example.com
+    ].filter(email => email.includes('@')); // Safety check
+}
+
+/**
+ * Parse full name into first and last name
+ */
+function parseFullName(fullName) {
+    const parts = (fullName || '').trim().split(/\s+/);
+    if (parts.length === 0) return { firstName: '', lastName: '' };
+    if (parts.length === 1) return { firstName: parts[0], lastName: parts[0] };
+    
+    const firstName = parts[0];
+    const lastName = parts[parts.length - 1];
+    return { firstName, lastName };
 }
 
 async function readFounders(filePath) {
@@ -143,16 +192,102 @@ async function lookupEmail(fullName, domain, apiKey) {
     };
 }
 
+/**
+ * Verify email using self-hosted service
+ * Used for pattern enumeration approach
+ */
+async function verifyEmailWithSelfHosted(email) {
+    let attempt = 0;
+    let backoff = INITIAL_BACKOFF_MS;
+
+    while (attempt < MAX_RETRIES) {
+        attempt += 1;
+
+        try {
+            const res = await fetch(SELF_HOSTED_VERIFY_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ to_email: email }),
+                timeout: 10000
+            });
+
+            if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
+                await wait(backoff);
+                backoff *= 2;
+                continue;
+            }
+
+            const data = await res.json();
+            const { is_reachable, smtp, misc } = data;
+
+            // Check if email is valid
+            const isValid = (is_reachable === 'safe' || is_reachable === 'risky') && smtp?.is_deliverable;
+            const isDisposable = misc?.is_disposable;
+
+            return {
+                isValid: isValid && !isDisposable,
+                isReachable: is_reachable,
+                isDeliverable: smtp?.is_deliverable
+            };
+        } catch (error) {
+            if (attempt >= MAX_RETRIES) {
+                return { isValid: false, error: error.message };
+            }
+        }
+
+        await wait(backoff);
+        backoff *= 2;
+    }
+
+    return { isValid: false, error: 'max_retries_exceeded' };
+}
+
+/**
+ * Find email using self-hosted pattern enumeration + verification
+ */
+async function findEmailSelfHosted(fullName, domain) {
+    const { firstName, lastName } = parseFullName(fullName);
+    
+    if (!firstName || !lastName) {
+        return {
+            email: null,
+            status: 'error: invalid_name_format'
+        };
+    }
+
+    const variations = generateEmailVariations(firstName, lastName, domain);
+    
+    // Try each pattern and verify
+    for (const emailCandidate of variations) {
+        const verification = await verifyEmailWithSelfHosted(emailCandidate);
+        
+        if (verification.isValid) {
+            return {
+                email: emailCandidate,
+                status: 'found'
+            };
+        }
+    }
+    
+    return {
+        email: null,
+        status: 'not_found'
+    };
+}
+
 function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () => { } }) {
+export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { } }) {
     const API_KEY = apiKeys.kitt;
 
-    if (!API_KEY) {
-        throw new Error('Missing Kitt API key');
+    // Validate based on provider
+    if (provider === PROVIDERS.TRYKITT && !API_KEY) {
+        throw new Error('Missing Kitt API key for TryKitt provider');
     }
+
+    log(`Using email finding provider: ${provider}`);
     const founders = await readFounders(inputCsv);
     const totalRows = founders.length;
 
@@ -200,7 +335,14 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
             let email = '';
             let status = 'not_started';
 
-            const lookup = await lookupEmail(founderName, domain, API_KEY);
+            // Use appropriate provider
+            let lookup;
+            if (provider === PROVIDERS.SELF_HOSTED) {
+                lookup = await findEmailSelfHosted(founderName, domain);
+            } else {
+                lookup = await lookupEmail(founderName, domain, API_KEY);
+            }
+            
             email = lookup.email || '';
             status = lookup.status || (email ? 'found' : 'not_found');
 
@@ -223,6 +365,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
                     stage: 'emailDiscovery',
                     processed: completedEligible,
                     total: eligibleTotal,
+                    found: stats['Found'],
                     stats
                 }
             };
@@ -247,6 +390,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
                 stage: 'emailDiscovery',
                 processed: 0,
                 total: 0,
+                found: 0,
                 stats
             }
         });
@@ -284,3 +428,6 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, log = () =>
         ...stats
     };
 }
+
+// Export providers for use in other modules
+export { PROVIDERS };

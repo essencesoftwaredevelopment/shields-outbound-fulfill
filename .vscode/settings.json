@@ -1,5 +1,11 @@
 {
     "chat.tools.terminal.autoApprove": {
-        "cloud-sql-proxy": true
+        "cloud-sql-proxy": true,
+        "pgrep": true,
+        "/^cd /Users/jacques/Documents/ESSENCE/Service\\\\ Delivery/Projects/shields-outbound/server && node test-refactor\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "psql": true
     }
 }

@@ -473,7 +473,23 @@ Description: ${description}
 
                     if (processed % 5 === 0) {
                         const avgTokens = processed > 0 ? Math.round((totalInputTokens + totalOutputTokens) / processed) : 0;
-                        log?.(`Personalization progress: ${processed}/${rows.length} (avg ${avgTokens} tokens/request)`);
+                        log?.(`Personalization progress: ${processed}/${rows.length} (avg ${avgTokens} tokens/request)`, {
+                            progress: {
+                                stage: 'personalization',
+                                processed,
+                                total: rows.length,
+                                stats: { personalized: processed }
+                            }
+                        });
+                    } else {
+                        log?.(null, {
+                            progress: {
+                                stage: 'personalization',
+                                processed,
+                                total: rows.length,
+                                stats: { personalized: processed }
+                            }
+                        });
                     }
 
                     return {

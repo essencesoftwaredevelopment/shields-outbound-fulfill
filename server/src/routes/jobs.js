@@ -1,10 +1,27 @@
+/**
+ * Jobs API endpoints (Pipeline orchestration)
+ *
+ * CANONICAL AGENCY IDENTIFIER RULE:
+ * The Firestore users/{uid} document ID is the canonical agency identifier.
+ * This same Firebase Auth uid is used directly as agency_id in all Cloud SQL tables.
+ * No reconciliation or mapping is required.
+ *
+ * This route manages:
+ * 1. Firestore orchestration (job state, status, client metadata)
+ * 2. CSV file uploads and processing
+ * 3. Integration with Cloud SQL via the leads service (see services/leads.js)
+ *
+ * All Cloud SQL operations are scoped by agency_id derived from the verified Firebase token.
+ */
+
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
 import { admin, firestore } from '../config/firebase.js';
 import { buildUnifiedRows } from '../utils/csv.js';
 import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaignLeadCount } from '../services/leads.js';
-import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, processJob, resolveJobPaths, serializeJob } from '../services/jobPipeline.js';
+import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, processJob, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
+import { getOrCreateClient } from '../services/db/queries.js';
 
 const router = express.Router();
 
@@ -86,12 +103,30 @@ router.post('/jobs', uploadFields, async (req, res) => {
             kitt: userData?.trykitt_key || ''
         };
 
-        if (!apiKeys.openai || !apiKeys.serper || !apiKeys.kitt) {
-            return res.status(400).json({ error: 'Missing API keys in user vault.' });
+        // Get email verification provider preference (default to trykitt)
+        const emailVerificationProvider = userData?.email_verification_provider || 'trykitt';
+
+        if (!apiKeys.openai || !apiKeys.serper) {
+            return res.status(400).json({ error: 'Missing required API keys (OpenAI, Serper) in user vault.' });
+        }
+
+        // Only require Kitt key if using trykitt provider
+        if (emailVerificationProvider === 'trykitt' && !apiKeys.kitt) {
+            return res.status(400).json({ error: 'Missing Kitt API key for TryKitt provider.' });
         }
 
         const file = req.files.file[0];
-        const clientId = (req.body.clientId || '').toString().trim();
+        const clientSlug = (req.body.clientId || '').toString().trim();
+        
+        // Resolve client slug to numeric ID for SQL operations (get or create client)
+        let sqlClientId;
+        try {
+            sqlClientId = await getOrCreateClient(uid, clientSlug);
+        } catch (error) {
+            console.error('Failed to resolve client ID:', error);
+            return res.status(500).json({ error: 'Failed to resolve client ID.' });
+        }
+        
         const dedupeStrategy = (req.body.dedupeStrategy || 'skip').toString(); // 'skip' | 'include'
         const rawSkipFounder = String(req.body.skipFounderFinder || '').toLowerCase() === 'true';
         const rawFindFounder = String(req.body.findFounder ?? 'true').toLowerCase() !== 'false';
@@ -100,12 +135,18 @@ router.post('/jobs', uploadFields, async (req, res) => {
         const nicheId = (req.body.nicheId || '').toString().trim();
         const nicheLabel = (req.body.nicheLabel || '').toString().trim();
         const personalizeFirstLine = String(req.body.personalizeFirstLine || '').toLowerCase() === 'true';
-        const skipVerification = String(req.body.skipVerification || '').toLowerCase() === 'true';
+        let skipVerification = String(req.body.skipVerification || '').toLowerCase() === 'true';
+        
+        // Auto-skip verification when using self-hosted email finding (emails are already verified)
+        if (emailVerificationProvider === 'self_hosted') {
+            skipVerification = true;
+        }
+        
         const skipEmailFinder = String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
         const domainColumn = (req.body.domainColumn || 'domain').toString().trim();
         const founderColumn = (req.body.founderColumn || '').toString().trim();
         const emailColumn = (req.body.emailColumn || '').toString().trim();
-        const job = createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientId, dedupeStrategy, {
+        const job = createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientSlug, dedupeStrategy, {
             skipFounderFinder,
             skipEmailFinder,
             skipVerification,
@@ -114,6 +155,8 @@ router.post('/jobs', uploadFields, async (req, res) => {
             nicheId,
             nicheLabel,
             personalizeFirstLine,
+            emailVerificationProvider,
+            sqlClientId,
             columnMapping: {
                 domain: domainColumn,
                 founder: founderColumn,
@@ -125,8 +168,8 @@ router.post('/jobs', uploadFields, async (req, res) => {
         // Calculate dedupe stats synchronously before responding
         try {
             const { filtered: filteredDomainsPath, stats: dedupeStats } = await filterAndWriteProcessedDomains({
-                uid: job.uid,
-                clientId: job.clientId,
+                agencyId: job.uid,
+                clientId: job.sqlClientId,
                 jobId: job.id,
                 domainsCsvPath: job.paths.domains,
                 dedupeStrategy: job.dedupeStrategy,
@@ -148,12 +191,45 @@ router.post('/jobs', uploadFields, async (req, res) => {
     }
 });
 
-router.get('/jobs/:id', (req, res) => {
-    const job = jobs.get(req.params.id);
-    if (!job) {
+router.get('/jobs/:id', async (req, res) => {
+    const jobId = req.params.id;
+    
+    // First check in-memory jobs (active/running jobs)
+    const job = jobs.get(jobId);
+    if (job) {
+        return res.json({ job: serializeJob(job) });
+    }
+    
+    // If not in memory, try to fetch from Firestore (completed jobs)
+    try {
+        const idToken = req.headers.authorization?.replace('Bearer ', '');
+        if (!idToken) {
+            return res.status(404).json({ error: 'Job not found in memory and no auth token provided' });
+        }
+        
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+        const clientId = req.query.clientId;
+        
+        if (!clientId) {
+            return res.status(404).json({ error: 'Job not found in memory and no clientId provided' });
+        }
+        
+        const jobRef = firestore
+            .collection('users').doc(uid)
+            .collection('clients').doc(clientId)
+            .collection('jobs').doc(jobId);
+        
+        const snapshot = await jobRef.get();
+        if (!snapshot.exists) {
+            return res.status(404).json({ error: 'Job not found' });
+        }
+        
+        return res.json({ job: snapshot.data() });
+    } catch (error) {
+        console.error(`Failed to fetch job ${jobId} from Firestore:`, error);
         return res.status(404).json({ error: 'Job not found' });
     }
-    res.json({ job: serializeJob(job) });
 });
 
 // Stop a running job

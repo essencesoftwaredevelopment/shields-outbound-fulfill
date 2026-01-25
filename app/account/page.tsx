@@ -2,18 +2,61 @@
 
 import AppShell from "@/components/app-shell";
 import { useAuth } from "@/hooks/use-auth";
-import { useMemo, useState } from "react";
+import { doc, getDoc, updateDoc } from "firebase/firestore";
+import { firestore } from "@/lib/firebase/firestore";
+import { useMemo, useState, useEffect } from "react";
 
 export default function AccountPage() {
     const { user } = useAuth();
     const [checkoutLoading, setCheckoutLoading] = useState(false);
     const [checkoutError, setCheckoutError] = useState<string | null>(null);
+    const [emailProvider, setEmailProvider] = useState<string>("trykitt");
+    const [providerLoading, setProviderLoading] = useState(false);
+    const [providerSaved, setProviderSaved] = useState(false);
+    
     const checkoutBaseUrl = useMemo(() => {
         if (typeof window === "undefined") return "";
         const base = process.env.NEXT_PUBLIC_PIPELINE_URL || "";
         if (!base) return "";
         return base.endsWith("/") ? base.slice(0, -1) : base;
     }, []);
+
+    // Load email provider preference on mount
+    useEffect(() => {
+        async function loadProvider() {
+            if (!user) return;
+            try {
+                const userDocRef = doc(firestore, "users", user.uid);
+                const userDoc = await getDoc(userDocRef);
+                if (userDoc.exists()) {
+                    const data = userDoc.data();
+                    setEmailProvider(data?.email_verification_provider || "trykitt");
+                }
+            } catch (error) {
+                console.error("Failed to load email provider preference:", error);
+            }
+        }
+        loadProvider();
+    }, [user]);
+
+    const handleSaveProvider = async () => {
+        if (!user) return;
+        setProviderLoading(true);
+        setProviderSaved(false);
+        try {
+            const userDocRef = doc(firestore, "users", user.uid);
+            await updateDoc(userDocRef, {
+                email_verification_provider: emailProvider
+            });
+            setProviderSaved(true);
+            setTimeout(() => setProviderSaved(false), 3000);
+        } catch (error) {
+            console.error("Failed to save email provider preference:", error);
+            alert("Failed to save preference. Please try again.");
+        } finally {
+            setProviderLoading(false);
+        }
+    };
 
     const handleSubscribe = async () => {
         if (checkoutLoading) return; // prevent accidental double submission
@@ -65,6 +108,69 @@ export default function AccountPage() {
                                 </span>
                             </div>
                         </div>
+                        
+                        {/* Email Verification Provider Selection */}
+                        <div style={{ marginTop: '3rem', paddingTop: '2rem', borderTop: '1px solid var(--border-color, #e5e7eb)' }}>
+                            <h2 style={{ fontSize: '1.5rem', fontWeight: '600', marginBottom: '0.5rem' }}>
+                                Email Verification Provider
+                            </h2>
+                            <p style={{ color: 'var(--text-secondary, #6b7280)', marginBottom: '1.5rem' }}>
+                                Choose which service to use for email verification during pipeline runs.
+                            </p>
+                            
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxWidth: '520px' }}>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer' }}>
+                                    <input
+                                        type="radio"
+                                        name="emailProvider"
+                                        value="trykitt"
+                                        checked={emailProvider === "trykitt"}
+                                        onChange={(e) => setEmailProvider(e.target.value)}
+                                        style={{ width: '18px', height: '18px' }}
+                                    />
+                                    <div>
+                                        <div style={{ fontWeight: '500' }}>TryKitt</div>
+                                        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary, #6b7280)' }}>
+                                            Cloud-based email verification service (requires API key in vault)
+                                        </div>
+                                    </div>
+                                </label>
+                                
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer' }}>
+                                    <input
+                                        type="radio"
+                                        name="emailProvider"
+                                        value="self_hosted"
+                                        checked={emailProvider === "self_hosted"}
+                                        onChange={(e) => setEmailProvider(e.target.value)}
+                                        style={{ width: '18px', height: '18px' }}
+                                    />
+                                    <div>
+                                        <div style={{ fontWeight: '500' }}>Self-Hosted Verifier</div>
+                                        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary, #6b7280)' }}>
+                                            Use the self-hosted email verification service (no API key required)
+                                        </div>
+                                    </div>
+                                </label>
+                                
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={handleSaveProvider}
+                                    disabled={providerLoading}
+                                    style={{ alignSelf: 'flex-start', marginTop: '0.5rem' }}
+                                >
+                                    {providerLoading ? "Saving..." : "Save Preference"}
+                                </button>
+                                
+                                {providerSaved && (
+                                    <p className="vault-status vault-status--success" aria-live="polite">
+                                        ✓ Email verification provider saved successfully
+                                    </p>
+                                )}
+                            </div>
+                        </div>
+                        
                         <div style={{ marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                             <button
                                 type="button"

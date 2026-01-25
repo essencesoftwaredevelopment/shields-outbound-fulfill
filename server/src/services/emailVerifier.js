@@ -10,6 +10,14 @@ const CONCURRENCY = 15;
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
 
+// Email verification providers
+const PROVIDERS = {
+    TRYKITT: 'trykitt',
+    SELF_HOSTED: 'self_hosted'
+};
+
+const SELF_HOSTED_URL = 'http://193.181.209.186:8080/v0/check_email';
+
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const shouldRetry = status => status === 402 || status === 429 || status >= 500;
 
@@ -35,7 +43,10 @@ async function readEmailCandidates(filePath) {
     });
 }
 
-async function verifyEmail(email, apiKey) {
+/**
+ * Verify email using TryKitt API
+ */
+async function verifyEmailWithTryKitt(email, apiKey) {
     let attempt = 0;
     let backoff = INITIAL_BACKOFF_MS;
 
@@ -99,16 +110,104 @@ async function verifyEmail(email, apiKey) {
     };
 }
 
+/**
+ * Verify email using self-hosted service
+ * Maps response format to match TryKitt format for consistency
+ */
+async function verifyEmailWithSelfHosted(email) {
+    let attempt = 0;
+    let backoff = INITIAL_BACKOFF_MS;
+
+    while (attempt < MAX_RETRIES) {
+        attempt += 1;
+
+        try {
+            const res = await fetch(SELF_HOSTED_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    to_email: email
+                }),
+                timeout: 10000 // 10 second timeout
+            });
+
+            if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
+                await wait(backoff);
+                backoff *= 2;
+                continue;
+            }
+
+            const data = await res.json();
+            const { is_reachable, smtp, misc } = data;
+
+            // Map self-hosted response to TryKitt format
+            let validity = 'unknown';
+            
+            if (is_reachable === 'safe' && smtp?.is_deliverable) {
+                validity = 'valid';
+            } else if (is_reachable === 'risky' && smtp?.is_deliverable) {
+                validity = 'valid-risky';
+            } else if (smtp?.is_deliverable === false || misc?.is_disposable) {
+                validity = 'invalid';
+            }
+
+            return {
+                email,
+                status: res.status,
+                validity,
+                raw: data
+            };
+        } catch (error) {
+            if (attempt >= MAX_RETRIES) {
+                return {
+                    email,
+                    status: 'ERROR',
+                    validity: `error: ${error.message}`
+                };
+            }
+        }
+
+        await wait(backoff);
+        backoff *= 2;
+    }
+
+    return {
+        email,
+        status: 'ERROR',
+        validity: 'max_retries_exceeded'
+    };
+}
+
+/**
+ * Verify email using the selected provider
+ */
+async function verifyEmail(email, provider, apiKey = null) {
+    if (provider === PROVIDERS.SELF_HOSTED) {
+        return verifyEmailWithSelfHosted(email);
+    } else {
+        // Default to TryKitt
+        if (!apiKey) {
+            throw new Error('TryKitt API key required for trykitt provider');
+        }
+        return verifyEmailWithTryKitt(email, apiKey);
+    }
+}
+
 function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, log = () => { } }) {
+export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { } }) {
     const API_KEY = apiKeys.kitt;
 
-    if (!API_KEY) {
-        throw new Error('Missing Kitt API key');
+    // Validate based on provider
+    if (provider === PROVIDERS.TRYKITT && !API_KEY) {
+        throw new Error('Missing Kitt API key for TryKitt provider');
     }
+
+    log(`Using email verification provider: ${provider}`);
     const candidates = await readEmailCandidates(inputCsv);
 
     const rows = candidates.map(row => ({
@@ -141,7 +240,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, log = () 
 
     const tasks = toVerify.map(item =>
         limit(async () => {
-            const result = await verifyEmail(item.row.email, API_KEY);
+            const result = await verifyEmail(item.row.email, provider, API_KEY);
             const status = result.validity || 'unknown';
             rows[item.index].email_status = status;
 
@@ -198,3 +297,6 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, log = () 
         'Unknown': stats.unknown,
     };
 }
+
+// Export providers for use in other modules
+export { PROVIDERS };

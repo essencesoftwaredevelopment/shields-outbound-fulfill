@@ -1,71 +1,138 @@
+/**
+ * Leads API endpoints (SQL-only, no Firestore)
+ *
+ * CANONICAL AGENCY IDENTIFIER RULE:
+ * Firebase uid = agency_id directly, no mapping table.
+ * All endpoints require Firebase ID token authentication.
+ * agency_id is ALWAYS derived from verified token, never from client input.
+ *
+ * All data operations use Cloud SQL (Postgres) as the single source of truth.
+ * No Firestore lead storage.
+ */
+
 import express from 'express';
-import { pool } from '../config/db.js';
+import { verifyFirebaseToken } from '../middleware/auth.js';
+import * as leadsService from '../services/leads.js';
+import * as queries from '../services/db/queries.js';
+import { pool } from '../lib/db.js';
 
 const router = express.Router();
 
-// GET /leads?clientId=X&limit=200&offset=0&emailStatus=valid
-// Returns leads for a specific client with optional pagination and filtering
-router.get('/leads', async (req, res) => {
+/**
+ * GET /leads
+ *
+ * Fetch contacts (leads) for the authenticated agency with optional filtering.
+ *
+ * Query parameters:
+ *   - clientId: Client slug to resolve to numeric SQL client_id (required)
+ *   - emailStatus: Filter by email_status (valid, risky, invalid, unknown)
+ *   - roleType: Filter by role type (founder, dm, etc.)
+ *   - search: Search term for domain, email, or founder name
+ *   - limit: Max results (default 200, max 500)
+ *   - offset: Pagination offset (default 0)
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.get('/leads', verifyFirebaseToken, async (req, res) => {
     try {
-        const { clientId, limit = 200, offset = 0, emailStatus } = req.query;
+        const agencyId = req.agencyId;
+        const { clientId: clientSlug, emailStatus, roleType, search, limit = 200, offset = 0 } = req.query;
 
-        if (!clientId) {
-            return res.status(400).json({ error: 'Missing clientId' });
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId parameter is required' });
+        }
+
+        // Resolve client slug to numeric SQL ID
+        let clientId;
+        try {
+            clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        } catch (error) {
+            console.error('Failed to resolve client ID:', error);
+            return res.status(500).json({ error: 'Failed to resolve client ID' });
         }
 
         const parsedLimit = Math.min(parseInt(limit, 10) || 200, 500);
         const parsedOffset = parseInt(offset, 10) || 0;
 
-        let query = `
-            SELECT 
-                c.id,
-                c.email,
-                c.full_name as founder_name,
-                c.email_status,
-                c.confidence,
-                c.last_verified_at,
-                c.created_at,
-                c.updated_at,
-                co.domain_normalized as domain
-            FROM contacts c
-            JOIN companies co ON c.company_id = co.id
-            WHERE co.client_id = $1 AND c.role_type = 'founder'
-        `;
-
-        const params = [clientId];
-        let paramIndex = 2;
+        // Build WHERE clause with filters
+        let whereClause = 'c.agency_id = $1 AND co.client_id = $2';
+        const params = [agencyId, clientId];
+        let paramIndex = 3;
 
         if (emailStatus) {
-            query += ` AND c.email_status = $${paramIndex}`;
+            whereClause += ` AND c.email_status = $${paramIndex}`;
             params.push(emailStatus);
             paramIndex++;
         }
 
-        // Get total count
-        const countQuery = query.replace(
-            /SELECT.*FROM/s,
-            'SELECT COUNT(*) as count FROM'
-        ).replace(/ORDER BY.*/, '').replace(/LIMIT.*/, '').replace(/OFFSET.*/, '');
+        if (roleType) {
+            whereClause += ` AND c.role_type = $${paramIndex}`;
+            params.push(roleType);
+            paramIndex++;
+        }
 
-        const countResult = await pool.query(countQuery, params.slice(0, paramIndex - 1));
-        const total = parseInt(countResult.rows[0].count, 10);
+        if (search) {
+            const searchTerm = `%${search.toLowerCase()}%`;
+            whereClause += ` AND (
+                LOWER(co.domain_normalized) LIKE $${paramIndex}
+                OR LOWER(c.email) LIKE $${paramIndex}
+                OR LOWER(c.full_name) LIKE $${paramIndex}
+            )`;
+            params.push(searchTerm);
+            paramIndex++;
+        }
 
-        // Get paginated results
-        query += ` ORDER BY c.updated_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        // Get total count with filters applied
+        const countQuery = `
+            SELECT COUNT(*) as count
+            FROM contacts c
+            JOIN companies co ON c.company_id = co.id
+            WHERE ${whereClause}
+        `;
+        const countResult = await pool.query(countQuery, params);
+        const total = parseInt(countResult.rows[0]?.count || 0, 10);
+
+        // Fetch contacts with pagination
+        const contactsQuery = `
+            SELECT
+                c.id,
+                c.agency_id,
+                c.company_id,
+                c.role_type,
+                c.full_name,
+                c.email,
+                c.email_status,
+                c.last_verified_at,
+                c.last_contacted_at,
+                c.confidence,
+                c.personalization_first_line,
+                c.created_at,
+                c.updated_at,
+                co.domain_normalized
+            FROM contacts c
+            JOIN companies co ON c.company_id = co.id
+            WHERE ${whereClause}
+            ORDER BY c.created_at DESC
+            LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+        `;
         params.push(parsedLimit, parsedOffset);
 
-        const result = await pool.query(query, params);
+        const result = await pool.query(contactsQuery, params);
 
         const leads = result.rows.map((row) => ({
-            id: row.email || row.domain, // Use email as ID if available, otherwise domain
-            domain: row.domain,
+            id: row.id,
+            domain: row.domain_normalized,
             email: row.email,
-            founderName: row.founder_name,
+            founderName: row.full_name,
+            roleType: row.role_type,
             status: row.email_status,
             verified: row.email_status === 'valid',
             confidence: row.confidence,
-            updatedAt: row.updated_at ? new Date(row.updated_at).toLocaleString() : '',
-            campaigns: [] // Campaigns relationship would need to be stored separately
+            lastVerifiedAt: row.last_verified_at,
+            lastContactedAt: row.last_contacted_at,
+            firstLine: row.personalization_first_line,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at
         }));
 
         res.json({
@@ -78,6 +145,119 @@ router.get('/leads', async (req, res) => {
     } catch (error) {
         console.error('Error fetching leads:', error);
         res.status(500).json({ error: 'Failed to fetch leads' });
+    }
+});
+
+/**
+ * POST /leads/mark-sent
+ *
+ * Mark contacts as sent/exported by updating last_contacted_at.
+ * This is the send-safety guardrail to prevent accidental resends.
+ *
+ * Request body:
+ *   - contactIds: Array of contact IDs to mark as sent
+ *   - emails: Array of email addresses to mark as sent (alternative)
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.post('/leads/mark-sent', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { contactIds, emails } = req.body || {};
+
+        if (contactIds && Array.isArray(contactIds) && contactIds.length > 0) {
+            const updated = await leadsService.markContactsAsSent(agencyId, contactIds);
+            return res.json({
+                count: updated.length,
+                contacts: updated,
+                method: 'contact_ids'
+            });
+        }
+
+        if (emails && Array.isArray(emails) && emails.length > 0) {
+            const updated = await leadsService.markEmailsAsSent(agencyId, emails);
+            return res.json({
+                count: updated.length,
+                contacts: updated,
+                method: 'emails'
+            });
+        }
+
+        res.status(400).json({ error: 'contactIds or emails must be provided as non-empty arrays' });
+    } catch (error) {
+        console.error('Error marking contacts as sent:', error);
+        res.status(500).json({ error: 'Failed to mark contacts as sent' });
+    }
+});
+
+/**
+ * GET /leads/companies
+ *
+ * Fetch companies (domains) for the authenticated agency with contact counts.
+ *
+ * Query parameters:
+ *   - limit: Max results (default 500, max 1000)
+ *   - offset: Pagination offset (default 0)
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.get('/leads/companies', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { limit = 500, offset = 0 } = req.query;
+
+        const parsedLimit = Math.min(parseInt(limit, 10) || 500, 1000);
+        const parsedOffset = parseInt(offset, 10) || 0;
+
+        const companies = await leadsService.getCompaniesForAgency(agencyId, { limit: parsedLimit, offset: parsedOffset });
+
+        // Get total count
+        const countResult = await queries.pool.query(
+            `SELECT COUNT(*) as count FROM companies WHERE agency_id = $1`,
+            [agencyId]
+        );
+        const total = parseInt(countResult.rows[0]?.count || 0, 10);
+
+        res.json({
+            companies,
+            total,
+            limit: parsedLimit,
+            offset: parsedOffset,
+            hasMore: parsedOffset + parsedLimit < total
+        });
+    } catch (error) {
+        console.error('Error fetching companies:', error);
+        res.status(500).json({ error: 'Failed to fetch companies' });
+    }
+});
+
+/**
+ * GET /leads/stats
+ *
+ * Get summary statistics for authenticated agency's leads.
+ *
+ * Returns:
+ *   - total_contacts: Total number of contacts
+ *   - total_companies: Total number of unique companies
+ *   - verified_emails: Contacts with valid email status
+ *   - contacted_count: Contacts that have been sent to
+ *   - untouched_count: Contacts never sent to
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.get('/leads/stats', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const stats = await leadsService.getLeadStats(agencyId);
+
+        res.json({
+            stats,
+            agencyId: req.auth.agencyId,
+            email: req.auth.email
+        });
+    } catch (error) {
+        console.error('Error fetching lead stats:', error);
+        res.status(500).json({ error: 'Failed to fetch lead stats' });
     }
 });
 

@@ -193,11 +193,14 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
     const throughputNum =
         stageName === "founders" || stageName === "emailDiscovery" ?
             (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
-            ?? extractNumberFrom(stats, ["processed", "completed", "personalized"])
-            ?? extractNumberFrom(summary, ["processed", "completed", "personalized"])
+            ?? extractNumberFrom(stats, ["Found", "processed", "completed", "personalized"])
+            ?? extractNumberFrom(summary, ["Found", "processed", "completed", "personalized"])
             : stageName === "verification" ?
-                (typeof summary?.valid === "number" && Number.isFinite(summary.valid) ? summary.valid : null) : stageName === "personalization" ?
-                    (typeof progress?.stats?.['personalized'] === "number" && Number.isFinite(progress.stats?.personalized) ? progress.stats.personalized : null) : null;
+                extractNumberFrom(summary, ["Valid", "valid"])
+                ?? extractNumberFrom(stats, ["valid"])
+                : stageName === "personalization" ?
+                    extractNumberFrom(summary, ["personalized", "Personalized"])
+                    ?? (typeof progress?.stats?.['personalized'] === "number" && Number.isFinite(progress.stats?.personalized) ? progress.stats.personalized : null) : null;
 
     const total =
         (typeof progress?.total === "number" && Number.isFinite(progress.total) ? progress.total : null)
@@ -220,6 +223,7 @@ export default function ClientPage() {
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
     const [clientInstantlyKey, setClientInstantlyKey] = useState<string>("");
+    const [emailProvider, setEmailProvider] = useState<'trykitt' | 'self_hosted'>('trykitt');
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -336,7 +340,7 @@ export default function ClientPage() {
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
-    const [leadsCursor, setLeadsCursor] = useState<DocumentSnapshot | null>(null);
+    const [leadsCursor, setLeadsCursor] = useState<number>(0);
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
     const [leadSearch, setLeadSearch] = useState<string>("");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
@@ -408,10 +412,26 @@ export default function ClientPage() {
     }, [jobState?.stages]);
 
     const validLeadsCompleted = useMemo(() => {
-        const verValid = jobState?.stages?.verification?.summary?.valid;
-        const emailFound = jobState?.stages?.emailDiscovery?.summary?.found;
-        if (typeof verValid === 'number') return verValid;
+        if (!jobState?.stages) return 0;
+        
+        // Check final pipeline stage in reverse order
+        const personalizationProcessed = jobState.stages.personalization?.summary?.processed;
+        if (typeof personalizationProcessed === 'number' && personalizationProcessed > 0) {
+            return personalizationProcessed;
+        }
+        
+        // Check verification stage for valid + valid-risky
+        const verValid = jobState.stages.verification?.summary?.valid || 0;
+        const verValidRisky = jobState.stages.verification?.summary?.['valid-risky'] || 0;
+        const verificationTotal = verValid + verValidRisky;
+        if (verificationTotal > 0) {
+            return verificationTotal;
+        }
+        
+        // Fallback to email discovery found count
+        const emailFound = jobState.stages.emailDiscovery?.summary?.found;
         if (typeof emailFound === 'number') return emailFound;
+        
         return 0;
     }, [jobState?.stages]);
 
@@ -496,6 +516,26 @@ export default function ClientPage() {
     const canDiscardJob = activeJobStatus === "pending-upload";
 
     useEffect(() => {
+        if (user?.uid) {
+            const userDocRef = doc(firestore, "users", user.uid);
+            const unsubscribe = onSnapshot(userDocRef, (snapshot) => {
+                if (snapshot.exists()) {
+                    const data = snapshot.data();
+                    setEmailProvider(data?.email_verification_provider || "trykitt");
+                }
+            });
+            return () => unsubscribe();
+        }
+    }, [user]);
+
+    // Auto-disable verification when using self-hosted (emails are already verified during finding)
+    useEffect(() => {
+        if (emailProvider === 'self_hosted') {
+            setVerifyEmail(false);
+        }
+    }, [emailProvider]);
+
+    useEffect(() => {
         if (!loading && !user) {
             router.replace("/auth");
         }
@@ -556,15 +596,13 @@ export default function ClientPage() {
     useEffect(() => {
         if (!user || !clientId) return;
         
-        // Only reset cache if campaign changes (different data set)
-        // Keep cache for search/founder/email filter changes (same data, just different client-side filtering)
+        // Reset and refetch when search, email status filter, or campaign changes
         setLeads([]);
-        setLeadsCursor(null);
+        setLeadsCursor(0);
         setLeadsHasMore(true);
-        setAllLeadsCached(false);
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, campaignFilterId]);
+    }, [user, clientId, leadSearch, emailStatusFilter, campaignFilterId]);
 
     // Trigger full data fetch when search or founder/email filters are first applied
     useEffect(() => {
@@ -613,23 +651,32 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         setLeadsLoading(true);
         try {
-            const rawSearch = leadSearch.trim();
-            const isSearchMode = Boolean(rawSearch);
+            // Get Firebase ID token for authentication
+            const idToken = await getIdToken(user);
             
             // Build query parameters
             const params = new URLSearchParams();
             params.append('clientId', clientId);
-            params.append('limit', '500'); // Fetch more for better search results
+            params.append('limit', '100'); // Reasonable page size
 
             if (emailStatusFilter) {
                 params.append('emailStatus', emailStatusFilter);
+            }
+
+            // Send search term to backend for SQL filtering
+            if (leadSearch.trim()) {
+                params.append('search', leadSearch.trim());
             }
 
             if (!reset && leadsCursor) {
                 params.append('offset', String(leadsCursor));
             }
 
-            const response = await fetch(`http://localhost:4000/api/leads?${params.toString()}`);
+            const response = await fetch(`http://localhost:4000/api/leads?${params.toString()}`, {
+                headers: {
+                    'Authorization': `Bearer ${idToken}`
+                }
+            });
             if (!response.ok) {
                 throw new Error(`Failed to fetch leads: ${response.statusText}`);
             }
@@ -652,16 +699,14 @@ export default function ClientPage() {
                 campaigns: row.campaigns || []
             }));
 
-            setLeads((prev) => {
-                const next = reset ? mapped : [...prev, ...mapped];
-                const totalFromData = total || next.length;
-                const verifiedFromData = next.filter((r) => r.verified).length;
-                setStats({
-                    total: totalFromData,
-                    verified: verifiedFromData,
-                    unverified: Math.max(0, totalFromData - verifiedFromData),
-                });
-                return next;
+            setLeads(reset ? mapped : (prev) => [...prev, ...mapped]);
+            
+            // Use server-provided total count
+            const verifiedCount = apiLeads.filter((r: any) => r.verified).length;
+            setStats({
+                total: total,
+                verified: verifiedCount,
+                unverified: Math.max(0, total - verifiedCount),
             });
 
             // Set cursor for pagination (use count of loaded items as offset)
@@ -676,123 +721,17 @@ export default function ClientPage() {
     }, [user, clientId, leadSearch, leadsCursor, emailStatusFilter]);
 
     const loadMoreLeads = useCallback(() => {
-        const hasFilterMode = Boolean(founderFilter || emailFilter);
-        if (hasFilterMode) return; // when founder/email filters are active we already fetched full dataset
-        if (allLeadsCached) return; // all leads already cached
-        if (leadsLoading || !leadsHasMore || leadSearch.trim()) return;
+        if (leadsLoading || !leadsHasMore) return;
         fetchLeads(false);
-    }, [allLeadsCached, emailFilter, fetchLeads, founderFilter, leadsHasMore, leadsLoading, leadSearch]);
+    }, [fetchLeads, leadsHasMore, leadsLoading]);
 
-    const filteredLeads = useMemo(() => {
-        let filtered = leads;
-
-        // Debug: log total leads and filter states
-        if (founderFilter || emailFilter || emailStatusFilter) {
-            const notFoundLeads = leads.filter(l => {
-                const founder = (l.founderName || "").trim().toLowerCase();
-                return founder.length === 0 || founder.includes("not found") || founder === "not_found";
-            });
-            console.log('Filter Debug:', {
-                totalLeads: leads.length,
-                founderFilter,
-                emailFilter,
-                emailStatusFilter,
-                notFoundCount: notFoundLeads.length,
-                notFoundSample: notFoundLeads.slice(0, 3).map(l => ({ 
-                    domain: l.domain, 
-                    founder: l.founderName
-                })),
-                sampleLeads: leads.slice(0, 3).map(l => ({ 
-                    domain: l.domain, 
-                    founder: l.founderName, 
-                    email: l.email,
-                    status: l.status 
-                }))
-            });
-        }
-
-        // Apply search filter
-        if (leadSearch.trim()) {
-            const term = leadSearch.trim().toLowerCase();
-            filtered = filtered.filter((lead) => {
-                const domain = (lead.domain || "").toLowerCase();
-                const email = (lead.email || "").toLowerCase();
-                const founder = (lead.founderName || "").toLowerCase();
-                return domain.includes(term) || email.includes(term) || founder.includes(term);
-            });
-        }
-
-        // Apply founder filter
-        if (founderFilter === "exists") {
-            filtered = filtered.filter((lead) => {
-                const founder = (lead.founderName || "").trim();
-                const founderLower = founder.toLowerCase();
-                return founder.length > 0 && !founderLower.includes("not found") && founderLower !== "not_found";
-            });
-        } else if (founderFilter === "not_found") {
-            const beforeCount = filtered.length;
-            filtered = filtered.filter((lead) => {
-                const founder = (lead.founderName || "").trim();
-                const founderLower = founder.toLowerCase();
-                const shouldInclude = founder.length === 0 || founderLower.includes("not found") || founderLower === "not_found";
-                return shouldInclude;
-            });
-            console.log('Founder filter result:', {
-                beforeCount,
-                afterCount: filtered.length,
-                sampleFiltered: filtered.slice(0, 5).map(l => ({ domain: l.domain, founder: l.founderName }))
-            });
-        } else if (founderFilter === "other") {
-            filtered = filtered.filter((lead) => {
-                const founder = (lead.founderName || "").trim();
-                const founderLower = founder.toLowerCase();
-                // "Other" means: has a value, but it's not a valid name and not "not found"
-                // This catches things like error messages, placeholders, etc.
-                const isNotFound = founder.length === 0 || founderLower.includes("not found") || founderLower === "not_found";
-                const isExists = founder.length > 0 && !founderLower.includes("not found") && founderLower !== "not_found";
-                return !isNotFound && !isExists;
-            });
-        }
-
-        // Apply email filter
-        if (emailFilter === "exists") {
-            filtered = filtered.filter((lead) => {
-                const email = (lead.email || "").trim();
-                const emailLower = email.toLowerCase();
-                return email.length > 0 && !emailLower.includes("not found") && emailLower !== "not_found";
-            });
-        } else if (emailFilter === "not_found") {
-            filtered = filtered.filter((lead) => {
-                const email = (lead.email || "").trim();
-                const emailLower = email.toLowerCase();
-                return email.length === 0 || emailLower.includes("not found") || emailLower === "not_found";
-            });
-        }
-
-        // Apply email status filter
-        if (emailStatusFilter) {
-            filtered = filtered.filter((lead) => {
-                const status = (lead.status || "").toLowerCase();
-                return status === emailStatusFilter.toLowerCase();
-            });
-        }
-
-        return filtered;
-    }, [leadSearch, leads, founderFilter, emailFilter, emailStatusFilter]);
+    // Leads are already filtered server-side, no need for client-side filtering
+    const filteredLeads = useMemo(() => leads, [leads]);
 
     const displayedStats = useMemo(() => {
-        const hasFilters = Boolean(campaignFilterId) || Boolean(leadSearch.trim()) || Boolean(founderFilter) || Boolean(emailFilter) || Boolean(emailStatusFilter);
-        if (hasFilters) {
-            const total = filteredLeads.length;
-            const verified = filteredLeads.filter((r) => r.verified).length;
-            return { total, verified, unverified: Math.max(0, total - verified) };
-        }
-        return {
-            total: clientTotalLeads || stats.total,
-            verified: stats.verified,
-            unverified: stats.unverified,
-        };
-    }, [campaignFilterId, clientTotalLeads, filteredLeads, leadSearch, stats, founderFilter, emailFilter, emailStatusFilter]);
+        // Stats come from server with filters applied
+        return stats;
+    }, [stats]);
 
     useEffect(() => {
         return () => {
@@ -805,9 +744,14 @@ export default function ClientPage() {
     }, [jobState]);
 
     const fetchJobSnapshot = useCallback(async (jobId: string) => {
-        if (!jobId) return;
+        if (!jobId || !user || !clientId) return;
         try {
-            const response = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobId}`);
+            const idToken = await getIdToken(user);
+            const response = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobId}?clientId=${clientId}`, {
+                headers: {
+                    'Authorization': `Bearer ${idToken}`
+                }
+            });
             if (!response.ok) return;
             const payload = await response.json();
             if (payload?.job) {
@@ -816,7 +760,7 @@ export default function ClientPage() {
         } catch (error) {
             console.error('Failed to fetch job snapshot:', error);
         }
-    }, []);
+    }, [user, clientId]);
 
     const handleServerEvent = useCallback((payload: PipelineServerEvent) => {
         if (payload.type === "state" && payload.state) {
@@ -1017,6 +961,7 @@ export default function ClientPage() {
         const jobsRef = collection(firestore, "users", user.uid, "clients", clientId, "jobs");
         const jobsQuery = query(jobsRef, orderBy("createdAt", "desc"));
         const unsubscribe = onSnapshot(jobsQuery, (snap) => {
+            console.log(`[Job History] Received ${snap.docs.length} jobs from Firestore`);
             const rows = snap.docs.map((docSnap) => {
                 const data = docSnap.data() as Record<string, unknown>;
                 const id = (data.id as string) || docSnap.id;
@@ -1046,6 +991,7 @@ export default function ClientPage() {
                 };
                 return jobObj;
             });
+            console.log(`[Job History] Parsed jobs:`, rows.map(j => ({ id: j.id, status: j.status, fileName: j.fileName })));
             setJobHistory(rows);
         }, (error) => {
             console.error('Job history subscription error:', error);
@@ -1069,6 +1015,13 @@ export default function ClientPage() {
             : null;
 
         const streamingSelected = (jobStreamConnected || jobState?.status === "running") && jobState && selectedJobId === jobState.id;
+
+        // If we have an active job from the activeJob document that's not in history yet,
+        // keep showing that instead of switching to history
+        if (jobState && !jobHistory.find(j => j.id === jobState.id)) {
+            // Active job exists but isn't in Firestore history yet - keep using it
+            return;
+        }
 
         if (selectedFromHistory && streamingSelected) {
             const statusChanged = jobState?.status !== selectedFromHistory.status;
@@ -1367,6 +1320,13 @@ export default function ClientPage() {
             setUploading(false);
         }
     };
+
+    // Auto-disable verification when using self-hosted (emails are already verified during finding)
+    useEffect(() => {
+        if (emailProvider === 'self-hosted') {
+            setVerifyEmail(false);
+        }
+    }, [emailProvider]);
 
     // Adjust founder-related options based on mapped columns
     useEffect(() => {
@@ -1962,12 +1922,88 @@ export default function ClientPage() {
                                 </div>
 
                                 {jobState ? (
-                                    <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
+                                    <>
+                                        {/* Pipeline flow summary */}
+                                        {(() => {
+                                            const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
+                                            const foundersProcessed = deriveStageTotals(jobState.stages.founders).total ?? 0;
+                                            const emailsFound = (jobState.stages.emailDiscovery?.summary as any)?.Found ?? (jobState.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(jobState.stages.emailDiscovery).throughputNum ?? 0;
+                                            const safe = (jobState.stages.verification?.summary as any)?.Valid ?? (jobState.stages.verification?.summary as any)?.valid ?? 0;
+                                            const personalized = (jobState.stages.personalization?.summary as any)?.Personalized ?? (jobState.stages.personalization?.summary as any)?.personalized ?? (jobState.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
+                                            
+                                            return (
+                                                <div style={{ 
+                                                    display: 'flex', 
+                                                    alignItems: 'center', 
+                                                    gap: '0.75rem',
+                                                    padding: '1rem 1.5rem',
+                                                    background: 'rgba(255, 255, 255, 0.03)',
+                                                    borderRadius: '8px',
+                                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                    marginTop: '1.5rem',
+                                                    fontSize: '0.875rem',
+                                                    fontVariantNumeric: 'tabular-nums'
+                                                }}>
+                                                    <span style={{ opacity: 0.5, fontSize: '0.75rem' }}>Pipeline flow:</span>
+                                                    <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600' }}>{foundersFound.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600', color: '#22c55e' }}>{safe.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600', color: '#3b82f6' }}>{personalized.toLocaleString()}</span>
+                                                </div>
+                                            );
+                                        })()}
+                                        
+                                        <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
                                         {[...STAGE_ORDER].map((stageKey) => {
                                             const stage = jobState.stages[stageKey];
                                             const meta = STAGE_METADATA[stageKey];
-                                            const summaryEntries = extractStageSummary(stage);
                                             const { throughputNum, total } = deriveStageTotals(stage);
+                                            const summary = stage?.summary as Record<string, unknown> | null;
+                                            const stats = stage?.progress?.stats as Record<string, unknown> | undefined;
+                                            
+                                            // Simplified metrics based on stage type
+                                            let heroNumber = null;
+                                            let heroLabel = "";
+                                            let subtext = "";
+                                            let costFooter = "";
+                                            
+                                            if (stageKey === "founders") {
+                                                const found = throughputNum ?? 0;
+                                                const processed = total ?? 0;
+                                                const cost = summary?.cost || stats?.cost;
+                                                heroNumber = found;
+                                                heroLabel = "Found";
+                                                subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
+                                                if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
+                                            } else if (stageKey === "emailDiscovery") {
+                                                const found = summary?.Found ?? summary?.found ?? throughputNum ?? 0;
+                                                const attempted = total ?? 0;
+                                                heroNumber = found;
+                                                heroLabel = "Emails Found";
+                                                subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
+                                            } else if (stageKey === "verification") {
+                                                const safe = summary?.Valid ?? summary?.valid ?? 0;
+                                                const risky = summary?.["Valid-Risky"] ?? summary?.["valid-risky"] ?? 0;
+                                                const verified = total ?? 0;
+                                                heroNumber = safe;
+                                                heroLabel = "Safe";
+                                                const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
+                                                subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
+                                            } else if (stageKey === "personalization") {
+                                                const personalized = summary?.Personalized ?? summary?.personalized ?? stats?.personalized ?? throughputNum ?? 0;
+                                                const candidates = total ?? 0;
+                                                const failed = summary?.failed ?? stats?.failed ?? 0;
+                                                heroNumber = personalized;
+                                                heroLabel = "Ready";
+                                                subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
+                                                if (failed > 0) subtext += ` • ${failed} failed`;
+                                            }
+                                            
                                             return (
                                                 <article
                                                     key={stageKey}
@@ -1976,38 +2012,39 @@ export default function ClientPage() {
                                                     <div className="stage-card__head">
                                                         <div>
                                                             <p className="stage-card__label">{meta.title}</p>
-                                                            <p className="stage-card__detail">{meta.detail}</p>
                                                         </div>
                                                         <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
                                                     </div>
-                                                    <p className="stage-card__progress">
-                                                        {throughputNum !== null && total !== null ? (
-                                                            <span>
-                                                                <span className="stage-card__progress-number">{throughputNum.toLocaleString()}</span>
-                                                                <span> / </span>
-                                                                <span className="stage-card__progress-number stage-card__progress-total">{total.toLocaleString()}</span>
-                                                                <span> throughput </span>
-                                                                <span className="stage-card__progress-percentage"> ・ {(throughputNum / total * 100).toFixed(2)}%</span>
-                                                            </span>
-                                                        ) : (
-                                                            describeStageProgress(stage)
-                                                        )}
-                                                    </p>
-                                                    {stage?.error && <p className="stage-card__error">{stage.error}</p>}
-                                                    {summaryEntries.length > 0 && (
-                                                        <dl className="stage-card__summary">
-                                                            {summaryEntries.map(([key, value]) => (
-                                                                <div key={key} className="stage-card__summary-row">
-                                                                    <dt>{humanizeKey(key)}</dt>
-                                                                    <dd>{formatSummaryValue(value)}</dd>
+                                                    
+                                                    {stage?.error ? (
+                                                        <p className="stage-card__error">{stage.error}</p>
+                                                    ) : heroNumber !== null ? (
+                                                        <>
+                                                            <div style={{ marginTop: '0.75rem' }}>
+                                                                <div style={{ fontSize: '2.25rem', fontWeight: '700', lineHeight: '1' }}>
+                                                                    {heroNumber.toLocaleString()}
+                                                                    <span style={{ fontSize: '1rem', fontWeight: '500', marginLeft: '0.5rem', opacity: 0.7 }}>{heroLabel}</span>
                                                                 </div>
-                                                            ))}
-                                                        </dl>
+                                                                <div style={{ fontSize: '0.875rem', marginTop: '0.5rem', opacity: 0.65 }}>
+                                                                    {subtext}
+                                                                </div>
+                                                            </div>
+                                                            {costFooter && (
+                                                                <div style={{ fontSize: '0.75rem', marginTop: '0.75rem', opacity: 0.5 }}>
+                                                                    {costFooter}
+                                                                </div>
+                                                            )}
+                                                        </>
+                                                    ) : (
+                                                        <p className="stage-card__progress" style={{ marginTop: '0.75rem', opacity: 0.6 }}>
+                                                            {describeStageProgress(stage)}
+                                                        </p>
                                                     )}
                                                 </article>
                                             );
                                         })}
                                     </div>
+                                    </>
                                 ) : (
                                     <div className="pipeline-panel__empty" style={{ marginTop: '1.5rem' }}>
                                         <p>No pipeline runs yet.</p>
@@ -3031,7 +3068,7 @@ export default function ClientPage() {
                                                 <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
                                                     {skipEmailFinder 
                                                         ? 'Skipped - using emails from your CSV' 
-                                                        : 'Discover email addresses with TryKitt'}
+                                                        : `Discover email addresses with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`}
                                                 </div>
                                             </div>
                                         </label>
@@ -3040,28 +3077,28 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: (findEmail || skipEmailFinder) ? 'pointer' : 'not-allowed',
+                                            cursor: (findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? 'pointer' : 'not-allowed',
                                             padding: '0.5rem',
-                                            opacity: (findEmail || skipEmailFinder) ? 1 : 0.5
+                                            opacity: (findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? 1 : 0.5
                                         }}>
                                             <input
                                                 type="checkbox"
-                                                checked={verifyEmail}
-                                                disabled={!findEmail && !skipEmailFinder}
+                                                checked={verifyEmail && emailProvider !== 'self_hosted'}
+                                                disabled={(!findEmail && !skipEmailFinder) || emailProvider === 'self_hosted'}
                                                 onChange={(e) => setVerifyEmail(e.target.checked)}
                                                 style={{
                                                     width: '18px',
                                                     height: '18px',
-                                                    cursor: (findEmail || skipEmailFinder) ? 'pointer' : 'not-allowed',
+                                                    cursor: (findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? 'pointer' : 'not-allowed',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${(findEmail || skipEmailFinder) ? '0.3' : '0.15'})`,
-                                                    background: verifyEmail ? '#3b82f6' : 'transparent',
+                                                    border: `2px solid rgba(255, 255, 255, ${(findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? '0.3' : '0.15'})`,
+                                                    background: (verifyEmail && emailProvider !== 'self_hosted') ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
                                                 }}
                                             />
-                                            {verifyEmail && (
+                                            {(verifyEmail && emailProvider !== 'self_hosted') && (
                                                 <svg
                                                     style={{
                                                         position: 'absolute',
@@ -3087,9 +3124,11 @@ export default function ClientPage() {
                                                     Verify Email
                                                 </div>
                                                 <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
-                                                    {skipEmailFinder 
-                                                        ? 'Validate emails from your CSV with TryKitt'
-                                                        : 'Validate discovered email addresses with TryKitt'}
+                                                    {emailProvider === 'self_hosted'
+                                                        ? 'Automatically skipped - self-hosted finding already verifies emails'
+                                                        : skipEmailFinder 
+                                                            ? `Validate emails from your CSV with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`
+                                                            : `Validate discovered email addresses with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`}
                                                 </div>
                                             </div>
                                         </label>

@@ -1,3 +1,16 @@
+/**
+ * Clients/Agency API endpoints (Firestore-based orchestration layer)
+ *
+ * CANONICAL AGENCY IDENTIFIER RULE:
+ * The Firestore users/{uid} document ID is the canonical agency identifier.
+ * This same Firebase Auth uid is used directly as agency_id in all Cloud SQL tables.
+ * No reconciliation or mapping is required.
+ *
+ * Note: This route manages Firestore collections (orchestration and UI state).
+ * Cloud SQL tables are managed by the jobs service and are scoped by agency_id derived from
+ * the verified Firebase token.
+ */
+
 import express from 'express';
 import { admin, firestore } from '../config/firebase.js';
 

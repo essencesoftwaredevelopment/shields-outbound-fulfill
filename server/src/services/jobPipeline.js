@@ -13,6 +13,47 @@ import { runPersonalization } from './personalization/index.js';
 
 export const jobs = new Map();
 
+// ============================================================================
+// FIRESTORE WRITE THROTTLING
+// ============================================================================
+// To reduce Firestore costs and improve performance, we throttle persistence:
+// - SSE broadcasts happen on EVERY update for real-time UI
+// - Firestore writes happen every N leads (default: 5) or 2+ seconds apart
+// - Status changes (completed, error, stage transitions) ALWAYS trigger writes
+// - This reduces 10,000 writes/job → ~2,000 writes/job for large datasets
+// ============================================================================
+
+const FIRESTORE_UPDATE_INTERVAL = 5; // Update every N processed items
+const FIRESTORE_MIN_INTERVAL_MS = 2000; // Minimum 2 seconds between updates
+
+function shouldUpdateFirestore(job) {
+    // Always update on status changes or completion
+    if (job.__lastStatus !== job.status || job.status === 'completed' || job.status === 'error') {
+        job.__lastStatus = job.status;
+        job.__lastFirestoreUpdate = Date.now();
+        return true;
+    }
+    
+    // Throttle progress updates
+    const now = Date.now();
+    const timeSinceLastUpdate = now - (job.__lastFirestoreUpdate || 0);
+    
+    // Ensure minimum time interval
+    if (timeSinceLastUpdate < FIRESTORE_MIN_INTERVAL_MS) {
+        return false;
+    }
+    
+    // Check if we've processed enough items
+    const currentCount = job.__updateCounter || 0;
+    if (currentCount >= FIRESTORE_UPDATE_INTERVAL) {
+        job.__updateCounter = 0;
+        job.__lastFirestoreUpdate = now;
+        return true;
+    }
+    
+    return false;
+}
+
 const initialStageState = () => ({
     status: 'pending',
     startedAt: null,
@@ -43,7 +84,7 @@ function closeStreams(job) {
     job.streams = [];
 }
 
-function pushState(job) {
+function pushState(job, forceFirestoreUpdate = false) {
     const state = {
         id: job.id,
         status: job.status,
@@ -56,10 +97,16 @@ function pushState(job) {
         cost: typeof job.cost === 'number' ? job.cost : 0,
         fileName: job.fileName
     };
+    
+    // Always broadcast to SSE streams for real-time updates
     broadcast(job, { type: 'state', state });
-    persistJobState(job).catch(() => {
-        /* already handled */
-    });
+    
+    // Throttle Firestore updates unless forced or criteria met
+    if (forceFirestoreUpdate || shouldUpdateFirestore(job)) {
+        persistJobState(job).catch(() => {
+            /* already handled */
+        });
+    }
 }
 
 function log(job, message = null, meta = {}) {
@@ -83,6 +130,10 @@ function log(job, message = null, meta = {}) {
                 ...rest
             }
         };
+        
+        // Increment update counter for throttling
+        job.__updateCounter = (job.__updateCounter || 0) + 1;
+        
         pushState(job);
     } else if (message) {
         pushState(job);
@@ -94,14 +145,18 @@ function updateStage(job, stageKey, updates) {
         ...job.stages[stageKey],
         ...updates
     };
-    pushState(job);
+    // Force Firestore update on stage transitions
+    const forceUpdate = updates.status !== undefined;
+    pushState(job, forceUpdate);
 }
 
 async function persistJobState(job) {
     if (!job?.uid || !job?.clientId) {
+        console.error(`[${job?.id || 'unknown'}] Cannot persist: missing uid or clientId`, { uid: job?.uid, clientId: job?.clientId });
         return;
     }
     try {
+        console.log(`[${job.id}] Persisting job state to Firestore...`);
         const jobRef = firestore
             .collection('users').doc(job.uid)
             .collection('clients').doc(job.clientId)
@@ -118,8 +173,10 @@ async function persistJobState(job) {
                 createdAtServer: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
             job.__persistedOnce = true;
+            console.log(`[${job.id}] Job persisted to Firestore (first time)`);
         } else {
             await jobRef.set(payload, { merge: true });
+            console.log(`[${job.id}] Job updated in Firestore`);
         }
     } catch (error) {
         console.error(`[${job?.id || 'unknown'}] Job persistence error:`, error?.message || error);
@@ -220,6 +277,7 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         apiKeys,
         uid,
         clientId,
+        sqlClientId: options.sqlClientId || null,
         dedupeStrategy,
         cancelled: false,
         paused: false,
@@ -231,6 +289,7 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         nicheId: options.nicheId || null,
         nicheLabel: options.nicheLabel || null,
         personalizeFirstLine: options.personalizeFirstLine === true,
+        emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
         columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
         cost: 0,
         stages: {
@@ -280,8 +339,8 @@ async function processJob(job) {
         let filteredDomainsPath = job.paths.filtered;
         if (!filteredDomainsPath) {
             const { filtered, stats: dedupeStats } = await filterAndWriteProcessedDomains({
-                uid: job.uid,
-                clientId: job.clientId,
+                agencyId: job.uid,
+                clientId: job.sqlClientId,
                 jobId: job.id,
                 domainsCsvPath: job.paths.domains,
                 dedupeStrategy: job.dedupeStrategy,
@@ -380,7 +439,7 @@ async function processJob(job) {
                 })
             );
             // Upsert leads with founder info (only when actually found)
-            await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.founders, type: 'founders' });
+            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.founders, type: 'founders' });
         }
         computeJobCost(job);
 
@@ -429,11 +488,12 @@ async function processJob(job) {
                     inputCsv: job.paths.founders,
                     outputCsv: job.paths.emails,
                     apiKeys: job.apiKeys,
+                    provider: job.emailVerificationProvider,
                     log: (message, meta) => log(job, message, meta)
                 })
             );
             // Upsert leads with email lookup results (only when actually found)
-            await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.emails, type: 'emails' });
+            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.emails, type: 'emails' });
         }
         computeJobCost(job);
 
@@ -456,19 +516,51 @@ async function processJob(job) {
                 const lines = emailsContent.split('\n').filter(line => line.trim());
                 const processed = Math.max(0, lines.length - 1); // Subtract header
                 
+                // Count email statuses from self-hosted finding (already verified)
+                let valid = 0;
+                let invalid = 0;
+                let validRisky = 0;
+                let unknown = 0;
+                
+                const rows = emailsContent.split('\n').slice(1); // Skip header
+                for (const row of rows) {
+                    if (!row.trim()) continue;
+                    const parts = row.split(',');
+                    // Status is in the last column (lookup_status or email_status)
+                    const status = parts[parts.length - 1]?.replace(/^"|"$/g, '').trim().toLowerCase();
+                    
+                    if (status === 'valid') {
+                        valid++;
+                    } else if (status === 'invalid') {
+                        invalid++;
+                    } else if (status === 'valid-risky') {
+                        validRisky++;
+                    } else if (status && status !== 'not_found' && status !== 'not_processed') {
+                        unknown++;
+                    }
+                }
+                
                 updateStage(job, 'verification', {
                     status: 'completed',
                     completedAt: new Date().toISOString(),
                     startedAt: job.stages.verification.startedAt || new Date().toISOString(),
-                    summary: { processed, cost: 0, skipped: processed },
+                    summary: { 
+                        processed, 
+                        cost: 0, 
+                        skipped: processed,
+                        valid,
+                        invalid,
+                        'valid-risky': validRisky,
+                        unknown
+                    },
                     progress: {
                         stage: 'verification',
                         processed,
                         total: processed,
-                        stats: { processed, total: processed, cost: 0 }
+                        stats: { processed, total: processed, cost: 0, valid, invalid, 'valid-risky': validRisky, unknown }
                     }
                 });
-                log(job, `Verification skipped. Processed ${processed} emails without verification.`);
+                log(job, `Verification skipped (self-hosted already verified). ${valid} valid, ${validRisky} valid-risky, ${invalid} invalid.`);
             } catch (err) {
                 console.error(`[${job.id}] Failed to skip verification:`, err?.message || err);
                 throw err;
@@ -479,6 +571,7 @@ async function processJob(job) {
                     inputCsv: job.paths.emails,
                     outputCsv: job.paths.final,
                     apiKeys: job.apiKeys,
+                    provider: job.emailVerificationProvider,
                     log: (message, meta) => log(job, message, meta)
                 })
             );
@@ -491,7 +584,7 @@ async function processJob(job) {
         }
 
         // Upsert leads with verification status
-        await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.final, type: 'verification' });
+        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.final, type: 'verification' });
 
         if (job.cancelled) {
             markCancelled(job);
@@ -504,7 +597,7 @@ async function processJob(job) {
                 outputCsv: job.paths.personalized,
                 apiKeys: job.apiKeys,
                 log: (message, meta) => log(job, message, meta),
-                removeB2B: env.PERSONALIZATION_FILTER_B2B !== 'false',
+                removeB2B: false, // Disabled B2B filtering
                 industry: job.industry || job.nicheId || null,
                 nicheId: job.nicheId || null,
                 nicheLabel: job.nicheLabel || null,
@@ -519,7 +612,7 @@ async function processJob(job) {
         }
 
         // Upsert leads with personalization data
-        await upsertLeadsFromCsv({ clientId: job.clientId, csvPath: job.paths.personalized, type: 'personalization' });
+        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.personalized, type: 'personalization' });
 
         // Build upload-ready CSV (complete leads with founder, email, and personalization)
         try {
@@ -571,4 +664,4 @@ function serializeJob(job) {
     };
 }
 
-export { createJobRecord, resolveJobPaths, processJob, serializeJob, markCancelled, markPaused, markResumed, log as logJob };
+export { createJobRecord, resolveJobPaths, processJob, serializeJob, markCancelled, markPaused, markResumed, closeStreams, log as logJob };
