@@ -1981,23 +1981,23 @@ export default function ClientPage() {
                                                 subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
                                                 if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
                                             } else if (stageKey === "emailDiscovery") {
-                                                const found = summary?.Found ?? summary?.found ?? throughputNum ?? 0;
+                                                const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
                                                 const attempted = total ?? 0;
                                                 heroNumber = found;
                                                 heroLabel = "Emails Found";
                                                 subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
                                             } else if (stageKey === "verification") {
-                                                const safe = summary?.Valid ?? summary?.valid ?? 0;
-                                                const risky = summary?.["Valid-Risky"] ?? summary?.["valid-risky"] ?? 0;
+                                                const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
+                                                const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
                                                 const verified = total ?? 0;
                                                 heroNumber = safe;
                                                 heroLabel = "Safe";
                                                 const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
                                                 subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
                                             } else if (stageKey === "personalization") {
-                                                const personalized = summary?.Personalized ?? summary?.personalized ?? stats?.personalized ?? throughputNum ?? 0;
+                                                const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
                                                 const candidates = total ?? 0;
-                                                const failed = summary?.failed ?? stats?.failed ?? 0;
+                                                const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
                                                 heroNumber = personalized;
                                                 heroLabel = "Ready";
                                                 subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
@@ -3127,8 +3127,8 @@ export default function ClientPage() {
                                                     {emailProvider === 'self_hosted'
                                                         ? 'Automatically skipped - self-hosted finding already verifies emails'
                                                         : skipEmailFinder 
-                                                            ? `Validate emails from your CSV with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`
-                                                            : `Validate discovered email addresses with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`}
+                                                            ? 'Validate emails from your CSV with TryKitt'
+                                                            : 'Validate discovered email addresses with TryKitt'}
                                                 </div>
                                             </div>
                                         </label>
