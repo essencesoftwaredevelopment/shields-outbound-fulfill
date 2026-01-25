@@ -421,8 +421,8 @@ export default function ClientPage() {
         }
         
         // Check verification stage for valid + valid-risky
-        const verValid = jobState.stages.verification?.summary?.valid || 0;
-        const verValidRisky = jobState.stages.verification?.summary?.['valid-risky'] || 0;
+        const verValid = (jobState.stages.verification?.summary?.valid as number) || 0;
+        const verValidRisky = (jobState.stages.verification?.summary?.['valid-risky'] as number) || 0;
         const verificationTotal = verValid + verValidRisky;
         if (verificationTotal > 0) {
             return verificationTotal;
