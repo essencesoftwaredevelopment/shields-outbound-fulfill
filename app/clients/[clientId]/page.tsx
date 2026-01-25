@@ -1323,7 +1323,7 @@ export default function ClientPage() {
 
     // Auto-disable verification when using self-hosted (emails are already verified during finding)
     useEffect(() => {
-        if (emailProvider === 'self-hosted') {
+        if (emailProvider === 'self_hosted') {
             setVerifyEmail(false);
         }
     }, [emailProvider]);
