@@ -7,10 +7,8 @@ const nextConfig: NextConfig = {
       bodySizeLimit: '10mb',
     },
   },
-  // Increase HTTP timeout
   httpAgentOptions: {
     keepAlive: true,
-    keepAliveMsecs: 30000,
   },
   async rewrites() {
     // Proxy API calls to the Express server during dev
