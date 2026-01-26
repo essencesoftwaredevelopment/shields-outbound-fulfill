@@ -134,10 +134,11 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
     const query = `
         INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
         VALUES ${valuesList.join(', ')}
-        ON CONFLICT (company_id, role_type)
+        ON CONFLICT (client_id, email)
         DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
+            role_type = COALESCE(EXCLUDED.role_type, contacts.role_type),
             full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
-            email = COALESCE(EXCLUDED.email, contacts.email),
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),

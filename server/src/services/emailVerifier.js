@@ -199,7 +199,7 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { } }) {
+export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkPaused = null } = {}) {
     const API_KEY = apiKeys.kitt;
 
     // Validate based on provider
@@ -222,6 +222,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
     const limit = pLimit(Math.min(CONCURRENCY, Math.max(1, toVerify.length)));
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
+    const controller = new AbortController();
 
     log(`Verify: ${candidates.length} rows loaded | ${toVerify.length} eligible emails.`);
 
@@ -240,6 +241,17 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
 
     const tasks = toVerify.map(item =>
         limit(async () => {
+            // Check if already aborted
+            if (controller.signal.aborted) {
+                return;
+            }
+            // Check if paused and abort if so
+            if (checkPaused && checkPaused()) {
+                log(`Verify: paused by user at ${completed}/${toVerify.length}`);
+                controller.abort();
+                return;
+            }
+
             const result = await verifyEmail(item.row.email, provider, API_KEY);
             const status = result.validity || 'unknown';
             rows[item.index].email_status = status;
@@ -268,7 +280,19 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
         })
     );
 
-    await Promise.all(tasks);
+    // Check for pause every 100ms and abort if paused
+    const pauseCheckInterval = setInterval(() => {
+        if (checkPaused && checkPaused() && !controller.signal.aborted) {
+            log(`Verify: aborting due to pause`);
+            controller.abort();
+        }
+    }, 100);
+
+    try {
+        await Promise.all(tasks);
+    } finally {
+        clearInterval(pauseCheckInterval);
+    }
 
     const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
     writer.write('domain,founder_name,email,email_status\n');

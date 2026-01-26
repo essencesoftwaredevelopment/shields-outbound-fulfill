@@ -197,21 +197,27 @@ async function lookupEmail(fullName, domain, apiKey) {
  * Used for pattern enumeration approach
  */
 async function verifyEmailWithSelfHosted(email) {
+    const startTime = Date.now();
     let attempt = 0;
     let backoff = INITIAL_BACKOFF_MS;
 
     while (attempt < MAX_RETRIES) {
         attempt += 1;
+        const attemptStart = Date.now();
 
         try {
+            console.log(`[VERIFY] Email: ${email}, Attempt: ${attempt}/${MAX_RETRIES}, Elapsed: ${Date.now() - startTime}ms`);
             const res = await fetch(SELF_HOSTED_VERIFY_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ to_email: email }),
                 timeout: 10000
             });
+            const fetchTime = Date.now() - attemptStart;
+            console.log(`[VERIFY] Request completed for ${email} in ${fetchTime}ms, status: ${res.status}`);
 
             if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
+                console.log(`[VERIFY] Retryable error ${res.status} for ${email}, backing off ${backoff}ms`);
                 await wait(backoff);
                 backoff *= 2;
                 continue;
@@ -220,17 +226,19 @@ async function verifyEmailWithSelfHosted(email) {
             const data = await res.json();
             const { is_reachable, smtp, misc } = data;
 
-            // Check if email is valid
             const isValid = (is_reachable === 'safe' || is_reachable === 'risky') && smtp?.is_deliverable;
             const isDisposable = misc?.is_disposable;
 
+            console.log(`[VERIFY] Result for ${email}: valid=${isValid}, reachable=${is_reachable}, disposable=${isDisposable}, totalTime=${Date.now() - startTime}ms`);
             return {
                 isValid: isValid && !isDisposable,
                 isReachable: is_reachable,
                 isDeliverable: smtp?.is_deliverable
             };
         } catch (error) {
+            console.log(`[VERIFY] Exception on attempt ${attempt} for ${email}: ${error.message}, elapsed=${Date.now() - startTime}ms`);
             if (attempt >= MAX_RETRIES) {
+                console.log(`[VERIFY] Max retries exceeded for ${email}`);
                 return { isValid: false, error: error.message };
             }
         }
@@ -239,6 +247,7 @@ async function verifyEmailWithSelfHosted(email) {
         backoff *= 2;
     }
 
+    console.log(`[VERIFY] Complete failure for ${email} after max retries, totalTime=${Date.now() - startTime}ms`);
     return { isValid: false, error: 'max_retries_exceeded' };
 }
 
@@ -259,7 +268,9 @@ async function findEmailSelfHosted(fullName, domain) {
     
     // Try each pattern and verify
     for (const emailCandidate of variations) {
+        const varStart = Date.now();
         const verification = await verifyEmailWithSelfHosted(emailCandidate);
+        console.log(`[FIND] Tried ${emailCandidate} (${Date.now() - varStart}ms): ${verification.isValid ? 'FOUND' : verification.error || 'not_found'}`);
         
         if (verification.isValid) {
             return {
@@ -279,7 +290,7 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { } }) {
+export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkPaused = null, onBatch = null } = {}) {
     const API_KEY = apiKeys.kitt;
 
     // Validate based on provider
@@ -303,6 +314,23 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
     let completedEligible = 0;
     const stats = { Found: 0, 'Not Found': 0, Skipped: 0, errors: 0 };
     const results = new Array(totalRows);
+    const controller = new AbortController();
+
+    // In-flight batch for incremental upserts
+    const pendingBatch = [];
+    let flushPromise = Promise.resolve();
+    const BATCH_SIZE = 100;
+
+    const flushBatch = async (force = false) => {
+        if (!onBatch) return;
+        if (!force && pendingBatch.length < BATCH_SIZE) return;
+        const batch = pendingBatch.splice(0, pendingBatch.length);
+        if (batch.length === 0) return;
+        flushPromise = flushPromise.then(() => onBatch(batch)).catch((err) => {
+            console.error('[EMAIL_FINDER] onBatch error:', err?.message || err);
+        });
+        await flushPromise;
+    };
 
     // Pre-fill rows that should be skipped or error out without hitting the API
     indexedFounders.forEach(row => {
@@ -329,6 +357,17 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
 
     const tasks = eligibleFounders.map(row =>
         limit(async () => {
+            // Check if already aborted
+            if (controller.signal.aborted) {
+                return;
+            }
+            // Check if paused and abort if so
+            if (checkPaused && checkPaused()) {
+                log(`Emails: paused by user at ${completedEligible}/${eligibleTotal}`);
+                controller.abort();
+                return;
+            }
+
             const domain = row.domain;
             const founderName = row.founder_name;
 
@@ -336,9 +375,12 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
             let status = 'not_started';
 
             // Use appropriate provider
+                const lookupStart = Date.now();
             let lookup;
             if (provider === PROVIDERS.SELF_HOSTED) {
+                    console.log(`[EMAIL_FINDER] Starting self-hosted lookup for ${founderName} @ ${domain}`);
                 lookup = await findEmailSelfHosted(founderName, domain);
+                    console.log(`[EMAIL_FINDER] Self-hosted lookup completed for ${founderName} @ ${domain} in ${Date.now() - lookupStart}ms, result: ${lookup.status}`);
             } else {
                 lookup = await lookupEmail(founderName, domain, API_KEY);
             }
@@ -381,6 +423,12 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
                 email,
                 status
             };
+
+            // Queue incremental upsert batch
+            if (onBatch) {
+                pendingBatch.push({ domain, founder_name: founderName, email, lookup_status: status, confidence: row.confidence });
+                await flushBatch(false);
+            }
         })
     );
 
@@ -395,7 +443,21 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
             }
         });
     } else {
-        await Promise.all(tasks);
+        // Check for pause every 100ms and abort if paused
+        const pauseCheckInterval = setInterval(() => {
+            if (checkPaused && checkPaused() && !controller.signal.aborted) {
+                log(`Emails: aborting due to pause`);
+                controller.abort();
+            }
+        }, 100);
+
+        try {
+            await Promise.all(tasks);
+            await flushBatch(true);
+            await flushPromise;
+        } finally {
+            clearInterval(pauseCheckInterval);
+        }
     }
 
     const writer = fs.createWriteStream(outputCsv, { flags: 'w' });

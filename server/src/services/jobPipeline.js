@@ -5,11 +5,13 @@ import { admin, firestore } from '../config/firebase.js';
 import { TMP_ROOT } from '../config/paths.js';
 import { DEFAULT_PRICING, loadPricing, computeJobCost } from '../utils/pricing.js';
 import { buildFoundersCsvFromInput, buildEmailsCsvFromInput, buildUnifiedRows, writeUploadCsv } from '../utils/csv.js';
-import { filterAndWriteProcessedDomains, upsertLeadsFromCsv } from './leads.js';
+import { filterAndWriteProcessedDomains, upsertLeadsFromCsv, upsertLeadRowsBatch } from './leads.js';
 import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
 import { runEmailVerifier } from './emailVerifier.js';
 import { runPersonalization } from './personalization/index.js';
+import { withTx, batchUpsertCompanies } from '../lib/db.js';
+import { parse as csvParse } from 'csv-parse';
 
 export const jobs = new Map();
 
@@ -25,6 +27,7 @@ export const jobs = new Map();
 
 const FIRESTORE_UPDATE_INTERVAL = 5; // Update every N processed items
 const FIRESTORE_MIN_INTERVAL_MS = 2000; // Minimum 2 seconds between updates
+const REALTIME_STAGE_MIN_INTERVAL_MS = 500; // Faster updates for realtime stages (emailDiscovery, verification)
 
 function shouldUpdateFirestore(job) {
     // Always update on status changes or completion
@@ -34,12 +37,19 @@ function shouldUpdateFirestore(job) {
         return true;
     }
     
+    // For realtime stages (emailDiscovery, verification), use faster update interval
+    const activeStage = Object.keys(job.stages).find(
+        key => job.stages[key]?.status === 'running'
+    );
+    const isRealtimeStage = activeStage === 'emailDiscovery' || activeStage === 'verification';
+    const minInterval = isRealtimeStage ? REALTIME_STAGE_MIN_INTERVAL_MS : FIRESTORE_MIN_INTERVAL_MS;
+    
     // Throttle progress updates
     const now = Date.now();
     const timeSinceLastUpdate = now - (job.__lastFirestoreUpdate || 0);
     
     // Ensure minimum time interval
-    if (timeSinceLastUpdate < FIRESTORE_MIN_INTERVAL_MS) {
+    if (timeSinceLastUpdate < minInterval) {
         return false;
     }
     
@@ -127,7 +137,8 @@ function log(job, message = null, meta = {}) {
             ...job.stages[stage],
             progress: {
                 ...(job.stages[stage].progress || {}),
-                ...rest
+                ...rest,
+                stage  // Preserve stage name so frontend can identify it
             }
         };
         
@@ -351,6 +362,9 @@ async function processJob(job) {
             log(job, `Deduplication: ${dedupeStats.total} total, ${dedupeStats.skipped} skipped, ${dedupeStats.new} new domains to process`);
         }
 
+        // Immediately upsert domains into SQL so the UI reflects new companies right after upload
+        await upsertDomainsImmediately(job, filteredDomainsPath);
+
         // If all domains were filtered out AND we're using skip strategy, complete early
         if (job.dedupeStats && job.dedupeStats.new === 0 && job.dedupeStrategy === 'skip') {
             try {
@@ -489,7 +503,17 @@ async function processJob(job) {
                     outputCsv: job.paths.emails,
                     apiKeys: job.apiKeys,
                     provider: job.emailVerificationProvider,
-                    log: (message, meta) => log(job, message, meta)
+                    log: (message, meta) => log(job, message, meta),
+                    job,
+                    checkPaused: () => job.paused,
+                    onBatch: async (rows) => {
+                        await upsertLeadRowsBatch({
+                            agencyId: job.uid,
+                            clientId: job.sqlClientId,
+                            rows,
+                            type: 'emails'
+                        });
+                    }
                 })
             );
             // Upsert leads with email lookup results (only when actually found)
@@ -572,7 +596,9 @@ async function processJob(job) {
                     outputCsv: job.paths.final,
                     apiKeys: job.apiKeys,
                     provider: job.emailVerificationProvider,
-                    log: (message, meta) => log(job, message, meta)
+                    log: (message, meta) => log(job, message, meta),
+                    job,
+                    checkPaused: () => job.paused
                 })
             );
         }
@@ -642,6 +668,50 @@ async function processJob(job) {
         log(job, `Job failed: ${job.error}`);
     }
 
+}
+
+async function upsertDomainsImmediately(job, domainsPath) {
+    if (!job?.sqlClientId) {
+        console.warn(`[${job?.id || 'unknown'}] Skipping domain upsert: missing sqlClientId`);
+        return;
+    }
+    if (!domainsPath || !fs.existsSync(domainsPath)) {
+        console.warn(`[${job?.id || 'unknown'}] Skipping domain upsert: domains file missing at ${domainsPath}`);
+        return;
+    }
+
+    const domainColumn = job.columnMapping?.domain || 'domain';
+    const domains = [];
+
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(domainsPath)
+            .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
+            .on('data', (row) => {
+                const domain = String(row[domainColumn] || row.domain || '').trim().toLowerCase();
+                if (domain) domains.push(domain);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    if (!domains.length) {
+        log(job, 'Domain upsert skipped: no domains found after parsing');
+        return;
+    }
+
+    const uniqueDomains = Array.from(new Set(domains));
+
+    try {
+        const start = Date.now();
+        await withTx(async (client) => {
+            const payloads = uniqueDomains.map((domain) => ({ domain }));
+            await batchUpsertCompanies(client, job.uid, job.sqlClientId, payloads);
+        });
+        log(job, `Domain upsert completed: ${uniqueDomains.length} domains in ${Date.now() - start}ms`);
+    } catch (err) {
+        console.error(`[${job?.id || 'unknown'}] Domain upsert failed:`, err?.message || err);
+        log(job, 'Domain upsert failed', { error: err?.message || err });
+    }
 }
 
 

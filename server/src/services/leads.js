@@ -73,6 +73,36 @@ function buildContactPayload(row, type) {
 }
 
 /**
+ * Upsert an in-memory batch of lead rows (no CSV needed)
+ */
+export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type }) {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    if (!agencyId || !clientId) return;
+
+    const payloads = rows.map((r) => buildContactPayload(r, type)).filter(Boolean);
+    if (!payloads.length) return;
+
+    await withTx(async (client) => {
+        const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
+
+        const contactRows = payloads.map((p) => ({
+            company_id: domainMap.get(p.domain),
+            role_type: p.roleType,
+            full_name: p.fullName || null,
+            email: p.email || null,
+            email_status: p.emailStatus || null,
+            confidence: p.confidence || null,
+            personalization_first_line: p.personalizationFirstLine || null,
+            last_verified_at: p.lastVerifiedAt || null
+        })).filter((r) => r.company_id);
+
+        if (contactRows.length > 0) {
+            await batchUpsertContacts(client, agencyId, clientId, contactRows);
+        }
+    });
+}
+
+/**
  * Fetch all contacts for an agency from SQL with optional filters
  * Used by frontend to display leads
  */
@@ -402,6 +432,7 @@ export default {
     markContactsAsSent,
     markEmailsAsSent,
     attachCampaignToLeads,
+    upsertLeadRowsBatch,
     incrementCampaignLeadCount
 };
 

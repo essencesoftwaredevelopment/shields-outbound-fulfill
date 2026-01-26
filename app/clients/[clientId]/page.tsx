@@ -647,6 +647,47 @@ export default function ClientPage() {
         return lead.campaigns.map((id) => campaignIdToName.get(id) || id);
     }, [campaignIdToName]);
 
+    const mapJobDocToJob = useCallback((docSnap: DocumentSnapshot): PipelineJob => {
+        const data = (docSnap.data() as Record<string, unknown> | undefined) || {};
+        const id = (data.id as string) || docSnap.id;
+        const createdAtRaw = data.createdAt;
+        const completedAtRaw = data.completedAt;
+
+        const toIso = (value: unknown) => {
+            if (typeof value === "string" && value) return value;
+            if (value && typeof (value as any).toDate === "function") {
+                try {
+                    return (value as any).toDate().toISOString();
+                } catch {
+                    return new Date().toISOString();
+                }
+            }
+            return new Date().toISOString();
+        };
+
+        const dedupe = data.dedupeStats as { total?: number; skipped?: number; new?: number } | undefined;
+        const totalVal = Number(dedupe?.total ?? 0);
+        const skippedVal = Number(dedupe?.skipped ?? 0);
+        const newVal = Number(dedupe?.new ?? 0);
+
+        return {
+            id,
+            status: (data.status as PipelineJob["status"]) || "queued",
+            error: (data.error as string) || null,
+            fileName: (data.fileName as string) || id,
+            createdAt: toIso(createdAtRaw),
+            completedAt: typeof completedAtRaw === "undefined" || completedAtRaw === null ? null : toIso(completedAtRaw),
+            stages: normalizeStages(data.stages),
+            dedupeStats: dedupe
+                ? {
+                    total: Number.isFinite(totalVal) ? totalVal : 0,
+                    skipped: Number.isFinite(skippedVal) ? skippedVal : 0,
+                    new: Number.isFinite(newVal) ? newVal : 0,
+                }
+                : null,
+        };
+    }, [normalizeStages]);
+
     const fetchLeads = useCallback(async (reset = false) => {
         if (!user || !clientId) return;
         setLeadsLoading(true);
@@ -962,35 +1003,7 @@ export default function ClientPage() {
         const jobsQuery = query(jobsRef, orderBy("createdAt", "desc"));
         const unsubscribe = onSnapshot(jobsQuery, (snap) => {
             console.log(`[Job History] Received ${snap.docs.length} jobs from Firestore`);
-            const rows = snap.docs.map((docSnap) => {
-                const data = docSnap.data() as Record<string, unknown>;
-                const id = (data.id as string) || docSnap.id;
-                const createdAt = typeof data.createdAt === "string" && data.createdAt
-                    ? data.createdAt
-                    : new Date().toISOString();
-                const completedAt = typeof data.completedAt === "string" ? data.completedAt : null;
-                const dedupe = data.dedupeStats as { total?: number; skipped?: number; new?: number } | undefined;
-                const totalVal = Number(dedupe?.total ?? 0);
-                const skippedVal = Number(dedupe?.skipped ?? 0);
-                const newVal = Number(dedupe?.new ?? 0);
-                const jobObj: PipelineJob = {
-                    id,
-                    status: (data.status as PipelineJob["status"]) || "queued",
-                    error: (data.error as string) || null,
-                    fileName: (data.fileName as string) || id,
-                    createdAt,
-                    completedAt,
-                    stages: normalizeStages(data.stages),
-                    dedupeStats: dedupe
-                        ? {
-                            total: Number.isFinite(totalVal) ? totalVal : 0,
-                            skipped: Number.isFinite(skippedVal) ? skippedVal : 0,
-                            new: Number.isFinite(newVal) ? newVal : 0,
-                        }
-                        : null,
-                };
-                return jobObj;
-            });
+            const rows = snap.docs.map(mapJobDocToJob);
             console.log(`[Job History] Parsed jobs:`, rows.map(j => ({ id: j.id, status: j.status, fileName: j.fileName })));
             setJobHistory(rows);
         }, (error) => {
@@ -999,7 +1012,32 @@ export default function ClientPage() {
         });
 
         return () => unsubscribe();
-    }, [user, clientId, normalizeStages]);
+    }, [user, clientId, mapJobDocToJob]);
+
+    useEffect(() => {
+        if (!user || !clientId || !selectedJobId) {
+            return;
+        }
+
+        const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "jobs", selectedJobId);
+        // Subscribe with explicit listener for realtime updates
+        const unsubscribe = onSnapshot(jobRef, { includeMetadataChanges: false }, (snap) => {
+            if (!snap.exists()) {
+                return;
+            }
+            const jobObj = mapJobDocToJob(snap);
+            // Only update from Firestore if NOT currently streaming via SSE
+            // SSE has fresher data for running jobs
+            const isStreaming = lastStreamingJobIdRef.current === selectedJobId;
+            if (!isStreaming || jobObj.status !== "running") {
+                setJobState(jobObj);
+            }
+        }, (error) => {
+            console.error("Job subscription error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [user, clientId, selectedJobId, mapJobDocToJob]);
 
     useEffect(() => {
         if (!jobHistory.length) {

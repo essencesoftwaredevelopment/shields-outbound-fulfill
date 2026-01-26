@@ -6,6 +6,10 @@
             "approve": true,
             "matchCommandLine": true
         },
-        "psql": true
+        "psql": true,
+        "/^cd /Users/jacques/Documents/ESSENCE/Service\\\\ Delivery/Projects/shields-outbound/server && node test-upsert\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }
