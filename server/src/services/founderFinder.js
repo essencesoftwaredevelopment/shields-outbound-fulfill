@@ -125,7 +125,12 @@ async function withRetry(fn, label, shouldBackoff = () => true, logger = () => {
             }
 
             if (attempt === MAX_RETRIES || !shouldBackoff(status, err)) {
+                // Log detailed error information for debugging
+                const errorDetails = payload ? JSON.stringify(payload) : msg;
                 logger(`${label} failed after ${attempt} attempts: ${status || ''} ${msg}`);
+                if (payload) {
+                    logger(`${label} error details: ${errorDetails}`);
+                }
                 throw err;
             }
 
@@ -384,7 +389,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
             
             // Only make Serper request if we have uncached domains
             if (domainsToFetch.length > 0) {
-                const fetchPayload = domainsToFetch.map(q => ({ q }));
+                const fetchPayload = domainsToFetch.map(q => ({ q, num: 10 }));
                 const fetchConfig = {
                     method: 'post',
                     maxBodyLength: Infinity,
