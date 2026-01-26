@@ -3,12 +3,22 @@ import fs from 'fs';
 import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
+import http from 'http';
 
 dotenv.config();
 
-const CONCURRENCY = 10;
+const CONCURRENCY = 3; // Reduced from 10 to prevent overwhelming the server
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
+const REQUEST_TIMEOUT = 30000; // 30 second timeout
+
+// Create HTTP agent with keep-alive to prevent ECONNRESET
+const httpAgent = new http.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 10,
+    timeout: REQUEST_TIMEOUT
+});
 
 // Email finding providers
 const PROVIDERS = {
@@ -207,12 +217,21 @@ async function verifyEmailWithSelfHosted(email) {
 
         try {
             console.log(`[VERIFY] Email: ${email}, Attempt: ${attempt}/${MAX_RETRIES}, Elapsed: ${Date.now() - startTime}ms`);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+            
             const res = await fetch(SELF_HOSTED_VERIFY_URL, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Connection': 'keep-alive'
+                },
                 body: JSON.stringify({ to_email: email }),
-                timeout: 10000
+                agent: httpAgent,
+                signal: controller.signal
             });
+            
+            clearTimeout(timeoutId);
             const fetchTime = Date.now() - attemptStart;
             console.log(`[VERIFY] Request completed for ${email} in ${fetchTime}ms, status: ${res.status}`);
 
@@ -236,7 +255,17 @@ async function verifyEmailWithSelfHosted(email) {
                 isDeliverable: smtp?.is_deliverable
             };
         } catch (error) {
-            console.log(`[VERIFY] Exception on attempt ${attempt} for ${email}: ${error.message}, elapsed=${Date.now() - startTime}ms`);
+            const errorType = error.name === 'AbortError' ? 'timeout' : error.code || 'unknown';
+            console.log(`[VERIFY] Exception on attempt ${attempt} for ${email}: ${error.message} (${errorType}), elapsed=${Date.now() - startTime}ms`);
+            
+            // Always retry on connection errors
+            if (attempt < MAX_RETRIES && (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.name === 'AbortError' || error.code === 'ECONNREFUSED')) {
+                console.log(`[VERIFY] Connection error for ${email}, retrying after ${backoff}ms`);
+                await wait(backoff);
+                backoff *= 2;
+                continue;
+            }
+            
             if (attempt >= MAX_RETRIES) {
                 console.log(`[VERIFY] Max retries exceeded for ${email}`);
                 return { isValid: false, error: error.message };

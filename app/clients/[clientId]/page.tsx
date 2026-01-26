@@ -16,6 +16,43 @@ import {
     PipelineStageStatus,
 } from "@/lib/pipeline/types";
 
+// Helper function to retry fetch on connection errors
+async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
+    const startTime = Date.now();
+    console.log(`🌐 [FETCH] Starting request to ${url}`);
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(url, options);
+            const duration = Date.now() - startTime;
+            console.log(`✅ [FETCH] Success ${url} (${duration}ms, status: ${response.status})`);
+            return response;
+        } catch (error: any) {
+            const duration = Date.now() - startTime;
+            console.error(`❌ [FETCH] Attempt ${attempt + 1}/${retries + 1} failed for ${url} (${duration}ms):`, {
+                name: error.name,
+                message: error.message,
+                code: error.code
+            });
+            
+            if (error.message?.includes('ECONNRESET')) {
+                console.error('🔥 ECONNRESET ERROR on frontend fetch!');
+            }
+            
+            if (attempt < retries && (error.message?.includes('ECONNRESET') || error.message?.includes('Failed to fetch'))) {
+                const backoff = 1000 * (attempt + 1);
+                console.warn(`🔄 [FETCH] Retrying in ${backoff}ms...`);
+                await new Promise(resolve => setTimeout(resolve, backoff));
+                continue;
+            }
+            
+            console.error(`💥 [FETCH] All attempts failed for ${url}`);
+            throw error;
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+
 type Niche = {
     id: string;
     label: string;
@@ -321,6 +358,86 @@ export default function ClientPage() {
 
     const [toastMessage, setToastMessage] = useState<string | null>(null);
     const [toastVisible, setToastVisible] = useState(false);
+
+    // Log whenever toast message changes
+    useEffect(() => {
+        if (toastMessage) {
+            // Filter out Next.js dev-mode RSC streaming errors
+            if (toastMessage === 'read ECONNRESET' || toastMessage.includes('react-server-dom-turbopack')) {
+                console.warn('⚠️ Suppressing Next.js dev-mode streaming error:', toastMessage);
+                setToastMessage(null);
+                return;
+            }
+            
+            console.log('🔔🔔🔔 TOAST MESSAGE SET 🔔🔔🔔');
+            console.log('Toast content:', toastMessage);
+            console.log('Stack trace at toast set:', new Error().stack);
+            
+            if (toastMessage.toLowerCase().includes('connection')) {
+                console.error('🔥🔥🔥 CONNECTION ERROR TOAST DISPLAYED 🔥🔥🔥');
+                console.error('Toast message:', toastMessage);
+            }
+            
+            setToastVisible(true);
+        }
+    }, [toastMessage]);
+
+    // Override console.error to catch ALL errors
+    useEffect(() => {
+        const originalError = console.error;
+        console.error = (...args: any[]) => {
+            const errorString = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+            if (errorString.includes('ECONNRESET')) {
+                console.log('%c🔥🔥🔥 ECONNRESET DETECTED IN CONSOLE.ERROR 🔥🔥🔥', 'background: red; color: white; font-size: 20px; padding: 10px;');
+                console.log('Arguments:', args);
+                console.trace('Stack trace:');
+            }
+            originalError.apply(console, args);
+        };
+
+        return () => {
+            console.error = originalError;
+        };
+    }, []);
+
+    // Global error handler to catch unhandled errors
+    useEffect(() => {
+        const handleError = (event: ErrorEvent) => {
+            console.error('🚨🚨🚨 GLOBAL ERROR CAUGHT 🚨🚨🚨', {
+                message: event.message,
+                filename: event.filename,
+                lineno: event.lineno,
+                colno: event.colno,
+                error: event.error
+            });
+            
+            if (event.message?.includes('ECONNRESET')) {
+                console.error('🔥🔥🔥 THIS IS THE ECONNRESET CAUSING YOUR POPUP! 🔥🔥🔥');
+                setToastMessage('Connection reset error detected. Check console for details.');
+            }
+        };
+
+        const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+            console.error('🚨🚨🚨 UNHANDLED PROMISE REJECTION 🚨🚨🚨', {
+                reason: event.reason,
+                promise: event.promise
+            });
+            
+            if (event.reason?.message?.includes('ECONNRESET') || event.reason?.code === 'ECONNRESET') {
+                console.error('🔥🔥🔥 ECONNRESET IN UNHANDLED PROMISE! 🔥🔥🔥');
+                console.error('Stack trace:', event.reason?.stack);
+                setToastMessage('Connection error (unhandled promise). Check console.');
+            }
+        };
+
+        window.addEventListener('error', handleError);
+        window.addEventListener('unhandledrejection', handleUnhandledRejection);
+
+        return () => {
+            window.removeEventListener('error', handleError);
+            window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+        };
+    }, []);
 
     // Upload to Instantly modal state
     const [uploadModalOpen, setUploadModalOpen] = useState(false);
@@ -713,7 +830,7 @@ export default function ClientPage() {
                 params.append('offset', String(leadsCursor));
             }
 
-            const response = await fetch(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
                 headers: {
                     'Authorization': `Bearer ${idToken}`
                 }
@@ -753,8 +870,22 @@ export default function ClientPage() {
             // Set cursor for pagination (use count of loaded items as offset)
             setLeadsCursor(reset ? mapped.length : (leadsCursor || 0) + mapped.length);
             setLeadsHasMore(hasMore || false);
-        } catch (error) {
-            console.error('Failed to fetch leads:', error);
+        } catch (error: any) {
+            console.error('❌ [LEADS ERROR] Failed to fetch leads:', {
+                message: error.message,
+                code: error.code,
+                name: error.name,
+                stack: error.stack?.split('\n').slice(0, 5)
+            });
+            
+            if (error.message?.includes('ECONNRESET') || error.code === 'ECONNRESET') {
+                console.error('🔥🔥🔥 ECONNRESET ERROR CAUGHT IN fetchLeads() 🔥🔥🔥');
+                console.error('This is likely causing the popup you see');
+                setToastMessage('Connection error. Please refresh the page.');
+            } else {
+                setToastMessage(`Error loading leads: ${error.message}`);
+            }
+            
             setLeadsHasMore(false);
         } finally {
             setLeadsLoading(false);
@@ -788,7 +919,7 @@ export default function ClientPage() {
         if (!jobId || !user || !clientId) return;
         try {
             const idToken = await getIdToken(user);
-            const response = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobId}?clientId=${clientId}`, {
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobId}?clientId=${clientId}`, {
                 headers: {
                     'Authorization': `Bearer ${idToken}`
                 }
@@ -798,8 +929,18 @@ export default function ClientPage() {
             if (payload?.job) {
                 setJobState(payload.job);
             }
-        } catch (error) {
-            console.error('Failed to fetch job snapshot:', error);
+        } catch (error: any) {
+            console.error('❌ [JOB SNAPSHOT ERROR]:', {
+                message: error.message,
+                code: error.code,
+                name: error.name,
+                stack: error.stack?.split('\n').slice(0, 5)
+            });
+            
+            if (error.message?.includes('ECONNRESET') || error.code === 'ECONNRESET') {
+                console.error('🔥🔥🔥 ECONNRESET ERROR CAUGHT IN fetchJobSnapshot() 🔥🔥🔥');
+                setToastMessage('Connection error loading job. Please refresh.');
+            }
         }
     }, [user, clientId]);
 
@@ -846,7 +987,15 @@ export default function ClientPage() {
                 }
             };
 
-            stream.onerror = () => {
+            stream.onerror = (event) => {
+                console.error('🔥🔥🔥 EventSource ERROR - THIS IS LIKELY YOUR ECONNRESET! 🔥🔥🔥', {
+                    event,
+                    jobId,
+                    readyState: stream.readyState,
+                    url: stream.url
+                });
+                console.trace('EventSource error stack trace:');
+                
                 setJobStreamConnected(false);
                 setJobStatusMessage("Lost connection to pipeline stream, retrying...");
                 stream.close();
@@ -1162,7 +1311,7 @@ export default function ClientPage() {
         setCampaignSyncMessage("");
         try {
             const idToken = await getIdToken(user);
-            const resp = await fetch(`/api/clients/${encodeURIComponent(clientId)}/campaigns`, {
+            const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(clientId)}/campaigns`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken })
@@ -1413,7 +1562,7 @@ export default function ClientPage() {
         setJobStatusMessage('Stopping job...');
         try {
             const idToken = await getIdToken(user);
-            const resp = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/stop`, {
+            const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/stop`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken, clientId })
@@ -1442,7 +1591,7 @@ export default function ClientPage() {
         setPausingJob(true);
         try {
             const idToken = await getIdToken(user);
-            const resp = await fetch(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/${endpoint}`, {
+            const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken, clientId })
@@ -1490,7 +1639,7 @@ export default function ClientPage() {
         setIsDeletingClient(true);
         try {
             const idToken = await getIdToken(user);
-            const resp = await fetch(`/api/clients/${encodeURIComponent(clientId)}/delete`, {
+            const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(clientId)}/delete`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken })
@@ -1529,7 +1678,7 @@ export default function ClientPage() {
         try {
             const idToken = await getIdToken(user);
             setUploading(true);
-            const response = await fetch(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/csv-preview`, {
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/csv-preview`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken, clientId })
@@ -1588,7 +1737,7 @@ export default function ClientPage() {
         try {
             setUploading(true);
             const idToken = await getIdToken(user);
-            const response = await fetch(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/upload-to-instantly`, {
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/upload-to-instantly`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1646,7 +1795,7 @@ export default function ClientPage() {
         setDeletingJobId(jobId);
         try {
             const idToken = await getIdToken(user);
-            const resp = await fetch(`${getPipelineBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/delete`, {
+            const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/delete`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken, clientId })

@@ -21,7 +21,30 @@ export const pool = new Pool({
     ssl: sslConfig,
     max: 20,
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 10_000
+    connectionTimeoutMillis: 30_000, // Increased from 10s to 30s
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000
+});
+
+// Handle pool errors to prevent crashes
+pool.on('error', (err) => {
+    console.error('❌ [DB POOL ERROR]', {
+        code: err.code,
+        message: err.message,
+        stack: err.stack?.split('\n').slice(0, 3).join('\n')
+    });
+});
+
+pool.on('connect', () => {
+    console.log('✅ [DB] New connection established');
+});
+
+pool.on('acquire', () => {
+    console.log('🔵 [DB] Client acquired from pool');
+});
+
+pool.on('remove', () => {
+    console.log('🔴 [DB] Client removed from pool');
 });
 
 export async function testConnection() {

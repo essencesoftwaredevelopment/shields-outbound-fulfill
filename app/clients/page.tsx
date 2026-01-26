@@ -9,6 +9,43 @@ import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
 import AppShell from "@/components/app-shell";
 
+// Helper function to retry fetch on connection errors
+async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
+    const startTime = Date.now();
+    console.log(`🌐 [FETCH] Starting request to ${url}`);
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(url, options);
+            const duration = Date.now() - startTime;
+            console.log(`✅ [FETCH] Success ${url} (${duration}ms, status: ${response.status})`);
+            return response;
+        } catch (error: any) {
+            const duration = Date.now() - startTime;
+            console.error(`❌ [FETCH] Attempt ${attempt + 1}/${retries + 1} failed for ${url} (${duration}ms):`, {
+                name: error.name,
+                message: error.message,
+                code: error.code
+            });
+            
+            if (error.message?.includes('ECONNRESET')) {
+                console.error('🔥 ECONNRESET ERROR on frontend fetch!');
+            }
+            
+            if (attempt < retries && (error.message?.includes('ECONNRESET') || error.message?.includes('Failed to fetch'))) {
+                const backoff = 1000 * (attempt + 1);
+                console.warn(`🔄 [FETCH] Retrying in ${backoff}ms...`);
+                await new Promise(resolve => setTimeout(resolve, backoff));
+                continue;
+            }
+            
+            console.error(`💥 [FETCH] All attempts failed for ${url}`);
+            throw error;
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+
 type Niche = {
     id: string;
     label: string;
@@ -184,7 +221,7 @@ export default function ClientsPage() {
             const currentUser = firebaseAuth.currentUser;
             const idToken = currentUser ? await getIdToken(currentUser) : null;
             if (!idToken) throw new Error("Missing auth token");
-            const resp = await fetch(`/api/clients/${encodeURIComponent(selectedClientId)}/campaigns`, {
+            const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(selectedClientId)}/campaigns`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ idToken })

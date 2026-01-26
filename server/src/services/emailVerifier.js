@@ -3,12 +3,22 @@ import fs from 'fs';
 import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
+import http from 'http';
 
 dotenv.config();
 
-const CONCURRENCY = 15;
+const CONCURRENCY = 5; // Reduced from 15 to prevent overwhelming the server
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
+const REQUEST_TIMEOUT = 30000; // 30 second timeout
+
+// Create HTTP agent with keep-alive to prevent ECONNRESET
+const httpAgent = new http.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 10,
+    timeout: REQUEST_TIMEOUT
+});
 
 // Email verification providers
 const PROVIDERS = {
@@ -122,16 +132,23 @@ async function verifyEmailWithSelfHosted(email) {
         attempt += 1;
 
         try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+            
             const res = await fetch(SELF_HOSTED_URL, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Connection': 'keep-alive'
                 },
                 body: JSON.stringify({
                     to_email: email
                 }),
-                timeout: 10000 // 10 second timeout
+                agent: httpAgent,
+                signal: controller.signal
             });
+            
+            clearTimeout(timeoutId);
 
             if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
                 await wait(backoff);
@@ -160,6 +177,17 @@ async function verifyEmailWithSelfHosted(email) {
                 raw: data
             };
         } catch (error) {
+            const errorType = error.name === 'AbortError' ? 'timeout' : error.code || 'unknown';
+            console.log(`[VERIFY] Exception on attempt ${attempt} for ${email}: ${error.message} (${errorType})`);
+            
+            // Always retry on connection errors
+            if (attempt < MAX_RETRIES && (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.name === 'AbortError' || error.code === 'ECONNREFUSED')) {
+                console.log(`[VERIFY] Connection error for ${email}, retrying after ${backoff}ms`);
+                await wait(backoff);
+                backoff *= 2;
+                continue;
+            }
+            
             if (attempt >= MAX_RETRIES) {
                 return {
                     email,

@@ -11,6 +11,48 @@ async function readJsonSafely(response: Response) {
     }
 }
 
+async function fetchWithRetry(url: string, options: RequestInit, retries = 2): Promise<Response> {
+    const startTime = Date.now();
+    console.log(`🌐 [API] Starting request to ${url}`);
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(url, options);
+            const duration = Date.now() - startTime;
+            console.log(`✅ [API] Success ${url} (${duration}ms, status: ${response.status})`);
+            return response;
+        } catch (error: any) {
+            const duration = Date.now() - startTime;
+            console.error(`❌ [API] Attempt ${attempt + 1}/${retries + 1} failed for ${url} (${duration}ms):`, {
+                name: error.name,
+                message: error.message,
+                code: error.code
+            });
+            
+            // Retry on connection errors
+            if (attempt < retries && (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.name === 'TypeError')) {
+                const backoff = 1000 * (attempt + 1);
+                console.warn(`🔄 [API] Retrying in ${backoff}ms...`);
+                await new Promise(resolve => setTimeout(resolve, backoff));
+                continue;
+            }
+            
+            // Better error messages for common network errors
+            if (error.code === 'ECONNRESET') {
+                console.error('🔥 ECONNRESET ERROR in pipeline client!');
+                throw new Error('Connection was reset. Please try again.');
+            }
+            if (error.code === 'ECONNREFUSED') {
+                throw new Error('Cannot connect to server. Is it running?');
+            }
+            
+            console.error(`💥 [API] All attempts failed for ${url}`);
+            throw error;
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+
 export interface CreatePipelineJobOptions {
     file: File;
     idToken: string;
@@ -115,7 +157,7 @@ export async function createPipelineJob({
         formData.append("dedupeStrategy", dedupeStrategy);
     }
 
-    const response = await fetch(`${pipelineBaseUrl}/api/jobs`, {
+    const response = await fetchWithRetry(`${pipelineBaseUrl}/api/jobs`, {
         method: "POST",
         body: formData,
         signal,
@@ -131,7 +173,7 @@ export async function createPipelineJob({
 }
 
 export async function createClient({ idToken, name, industry, instantly_key }: { idToken: string; name: string; industry: 'ecom' | 'saas' | 'agency' | 'local'; instantly_key: string; }) {
-    const response = await fetch(`${pipelineBaseUrl}/api/clients`, {
+    const response = await fetchWithRetry(`${pipelineBaseUrl}/api/clients`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ idToken, name, industry, instantly_key }),

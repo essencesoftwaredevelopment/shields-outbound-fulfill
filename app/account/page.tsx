@@ -6,6 +6,43 @@ import { doc, getDoc, updateDoc } from "firebase/firestore";
 import { firestore } from "@/lib/firebase/firestore";
 import { useMemo, useState, useEffect } from "react";
 
+// Helper function to retry fetch on connection errors
+async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
+    const startTime = Date.now();
+    console.log(`🌐 [FETCH] Starting request to ${url}`);
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(url, options);
+            const duration = Date.now() - startTime;
+            console.log(`✅ [FETCH] Success ${url} (${duration}ms, status: ${response.status})`);
+            return response;
+        } catch (error: any) {
+            const duration = Date.now() - startTime;
+            console.error(`❌ [FETCH] Attempt ${attempt + 1}/${retries + 1} failed for ${url} (${duration}ms):`, {
+                name: error.name,
+                message: error.message,
+                code: error.code
+            });
+            
+            if (error.message?.includes('ECONNRESET')) {
+                console.error('🔥 ECONNRESET ERROR on frontend fetch!');
+            }
+            
+            if (attempt < retries && (error.message?.includes('ECONNRESET') || error.message?.includes('Failed to fetch'))) {
+                const backoff = 1000 * (attempt + 1);
+                console.warn(`🔄 [FETCH] Retrying in ${backoff}ms...`);
+                await new Promise(resolve => setTimeout(resolve, backoff));
+                continue;
+            }
+            
+            console.error(`💥 [FETCH] All attempts failed for ${url}`);
+            throw error;
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+
 export default function AccountPage() {
     const { user } = useAuth();
     const [checkoutLoading, setCheckoutLoading] = useState(false);
@@ -68,7 +105,7 @@ export default function AccountPage() {
             }
             const idToken = await user.getIdToken();
             const endpoint = `${checkoutBaseUrl || ""}/api/stripe/checkout`;
-            const resp = await fetch(endpoint, {
+            const resp = await fetchWithRetry(endpoint, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ idToken }),

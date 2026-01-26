@@ -1,6 +1,17 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Increase server timeouts to prevent ECONNRESET
+  experimental: {
+    serverActions: {
+      bodySizeLimit: '10mb',
+    },
+  },
+  // Increase HTTP timeout
+  httpAgentOptions: {
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+  },
   async rewrites() {
     // Proxy API calls to the Express server during dev
     const base = process.env.SERVER_URL && /^(http:\/\/|https:\/\/)/.test(process.env.SERVER_URL)
