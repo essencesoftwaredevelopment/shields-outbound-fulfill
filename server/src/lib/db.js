@@ -66,19 +66,19 @@ export async function batchUpsertCompanies(txClient, agencyId, clientId, rows) {
 
     // Batch upsert in a single query for efficiency
     const valuesList = [];
-    const params = [agencyId, clientId]; // Start with agencyId and clientId
-    let paramIndex = 3;
+    const params = [agencyId]; // Start with agencyId only
+    let paramIndex = 2;
 
     for (const domain of uniqueDomains) {
         params.push(domain.toLowerCase());
-        valuesList.push(`($1, $2, $${paramIndex})`);
+        valuesList.push(`($1, $${paramIndex})`);
         paramIndex += 1;
     }
 
     const query = `
-        INSERT INTO companies (agency_id, client_id, domain_normalized)
+        INSERT INTO companies (agency_id, domain_normalized)
         VALUES ${valuesList.join(', ')}
-        ON CONFLICT (client_id, domain_normalized)
+        ON CONFLICT (agency_id, domain_normalized)
         DO UPDATE SET updated_at = now()
         RETURNING id, domain_normalized
     `;
@@ -108,8 +108,8 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
     if (!clientId) throw new Error('clientId is required');
 
     const valuesList = [];
-    const params = [clientId]; // Start with clientId
-    let paramIndex = 2;
+    const params = []; // No client_id param
+    let paramIndex = 1;
 
     for (const row of rows) {
         const { 
@@ -125,16 +125,16 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
         if (!company_id || !role_type) continue; // Skip invalid rows
 
         params.push(company_id, role_type, full_name, email, email_status, confidence, agencyId, personalization_first_line);
-        valuesList.push(`($1, $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`);
+        valuesList.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`);
         paramIndex += 8;
     }
 
     if (!valuesList.length) return [];
 
     const query = `
-        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
+        INSERT INTO contacts (company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
         VALUES ${valuesList.join(', ')}
-        ON CONFLICT (client_id, email)
+        ON CONFLICT (company_id, role_type)
         DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
             role_type = COALESCE(EXCLUDED.role_type, contacts.role_type),
@@ -143,7 +143,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
             updated_at = now()
-        RETURNING id, agency_id, company_id, client_id, role_type, full_name, email, email_status, 
+        RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
                   last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
     `;
 
@@ -164,16 +164,14 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
  * @returns {Promise<Object>} Checkpoint row
  */
 export async function writeCheckpoint(txClient, agencyId, clientId, jobId, stage, cursor) {
-    if (!clientId) throw new Error('clientId is required');
-
     const query = `
-        INSERT INTO job_stage_checkpoints (agency_id, client_id, job_id, stage, cursor)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (client_id, job_id, stage)
-        DO UPDATE SET cursor = $5, updated_at = now()
-        RETURNING agency_id, client_id, job_id, stage, cursor, updated_at
+        INSERT INTO job_stage_checkpoints (agency_id, job_id, stage, cursor)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (agency_id, job_id, stage)
+        DO UPDATE SET cursor = $4, updated_at = now()
+        RETURNING agency_id, job_id, stage, cursor, updated_at
     `;
-    const result = await txClient.query(query, [agencyId, clientId, jobId, stage, cursor]);
+    const result = await txClient.query(query, [agencyId, jobId, stage, cursor]);
     return result.rows[0];
 }
 
