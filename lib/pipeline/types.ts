@@ -23,13 +23,21 @@ export interface PipelineStageState {
 
 export interface PipelineJob {
     id: string;
-    status: "queued" | "running" | "completed" | "pending-upload" | "uploaded" | "discarded" | "error" | "cancelled" | "paused";
+    status: "queued" | "running" | "failed" | "completed";
     error: string | null;
+    errorStage?: PipelineStageKey | null;
     fileName: string;
     createdAt: string;
     completedAt: string | null;
     stages: Record<PipelineStageKey, PipelineStageState>;
     dedupeStats?: { total: number; skipped: number; new: number } | null;
+    cost?: number;
+    clientId?: string;
+    // Secondary metadata - not part of primary lifecycle
+    uploaded?: boolean;
+    uploadedAt?: string | null;
+    discarded?: boolean;
+    paused?: boolean;
 }
 
 export interface PipelineLogEntry {

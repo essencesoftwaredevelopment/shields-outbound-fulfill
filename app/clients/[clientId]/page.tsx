@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, startAt, endAt, DocumentSnapshot } from "firebase/firestore";
+import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, startAt, endAt, DocumentSnapshot, deleteDoc } from "firebase/firestore";
 import { getIdToken } from "firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
@@ -83,6 +83,21 @@ type Campaign = {
     totalLeads?: number;
 };
 
+type Segment = {
+    id: string;
+    name: string;
+    description?: string;
+    filters: {
+        fullName?: string;
+        email?: 'found' | 'not_found';
+        emailStatus?: string[];
+        createdAfter?: string;
+        createdBefore?: string;
+    };
+    createdAt?: string;
+    updatedAt?: string;
+};
+
 type JobStatus = PipelineJob["status"];
 type StageStatus = PipelineStageStatus;
 
@@ -108,14 +123,9 @@ const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }
 
 const JOB_STATUS_LABELS: Record<JobStatus, string> = {
     queued: "Queued",
-    running: "Running",
+    running: "Processing",
+    failed: "Failed",
     completed: "Completed",
-    "pending-upload": "Ready to Upload",
-    uploaded: "Uploaded",
-    discarded: "Discarded",
-    error: "Error",
-    cancelled: "Cancelled",
-    paused: "Paused",
 };
 
 const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
@@ -126,15 +136,10 @@ const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
 };
 
 const JOB_STATUS_COLORS: Record<JobStatus, string> = {
-    queued: "#fbbf24",
-    running: "#3b82f6",
-    completed: "#22c55e",
-    "pending-upload": "#22c55e",
-    uploaded: "#10b981",
-    discarded: "#a1a1aa",
-    error: "#f87171",
-    cancelled: "#a1a1aa",
-    paused: "#f59e0b",
+    queued: "#9ca3af",    // Grey for neutral/waiting
+    running: "#3b82f6",   // Blue for processing
+    failed: "#ef4444",    // Red for failure only
+    completed: "#22c55e", // Green for success only
 };
 
 const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
@@ -247,6 +252,27 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
     return { throughputNum, total };
 };
 
+const calculateJobProgress = (job: PipelineJob): { processed: number; total: number; percent: number } => {
+    // Find the currently active or last completed stage to get the most accurate progress
+    let processed = 0;
+    let total = job.dedupeStats?.total || 0;
+    
+    // Check stages in order for progress
+    for (const stageKey of STAGE_ORDER) {
+        const stage = job.stages?.[stageKey];
+        if (stage && (stage.status === 'running' || stage.status === 'completed')) {
+            const stageTotals = deriveStageTotals(stage);
+            if (stageTotals.total) {
+                total = stageTotals.total;
+                processed = stage.progress?.processed || 0;
+            }
+        }
+    }
+    
+    const percent = total > 0 ? Math.round((processed / total) * 100) : 0;
+    return { processed, total, percent };
+};
+
 export default function ClientPage() {
     const router = useRouter();
     const params = useParams();
@@ -254,8 +280,8 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
 
-    const [activeTab, setActiveTab] = useState<"info" | "campaigns" | "leads">(
-        (searchParams?.get("tab") as "info" | "campaigns" | "leads") || "campaigns"
+    const [activeTab, setActiveTab] = useState<"info" | "campaigns" | "leads" | "segments">(
+        (searchParams?.get("tab") as "info" | "campaigns" | "leads" | "segments") || "campaigns"
     );
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
@@ -297,6 +323,10 @@ export default function ClientPage() {
     const previousJobIdRef = useRef<string | null>(null);
     const lastUploadErrorRef = useRef<string | null>(null);
     const jobStateRef = useRef<PipelineJob | null>(null);
+    const lastFetchTimeRef = useRef<number>(0);
+    const userDeselectedRef = useRef<boolean>(false);
+    const isFetchingRef = useRef<boolean>(false);
+    const currentJobStatusRef = useRef<string | null>(null);
     const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
     const [activeJobStatus, setActiveJobStatus] = useState<string | null>(null);
     const [uploadMetrics, setUploadMetrics] = useState<{ count: number; total: number } | null>(null);
@@ -305,6 +335,8 @@ export default function ClientPage() {
     const [isDeletingClient, setIsDeletingClient] = useState(false);
     const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
     const [pausingJob, setPausingJob] = useState(false);
+    const [pipelineVisible, setPipelineVisible] = useState(true);
+    const [expandedErrorJobId, setExpandedErrorJobId] = useState<string | null>(null);
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
@@ -471,6 +503,25 @@ export default function ClientPage() {
     const [syncingCampaigns, setSyncingCampaigns] = useState(false);
     const [campaignSyncMessage, setCampaignSyncMessage] = useState("");
 
+    // Segments state
+    const [segments, setSegments] = useState<Segment[]>([]);
+    const [segmentCounts, setSegmentCounts] = useState<Record<string, number>>({});
+    const [editingSegment, setEditingSegment] = useState<Segment | null>(null);
+    const [segmentModalOpen, setSegmentModalOpen] = useState(false);
+    const [segmentName, setSegmentName] = useState("");
+    const [segmentDescription, setSegmentDescription] = useState("");
+    const [segmentFullName, setSegmentFullName] = useState("");
+    const [segmentEmail, setSegmentEmail] = useState<'' | 'found' | 'not_found'>('');
+    const [segmentEmailStatus, setSegmentEmailStatus] = useState<string[]>([]);
+    const [segmentCreatedAfter, setSegmentCreatedAfter] = useState("");
+    const [segmentCreatedBefore, setSegmentCreatedBefore] = useState("");
+    const [selectedSegmentId, setSelectedSegmentId] = useState<string>("");
+    const [segmentLeads, setSegmentLeads] = useState<Lead[]>([]);
+    const [segmentLeadsLoading, setSegmentLeadsLoading] = useState(false);
+    const [savingSegment, setSavingSegment] = useState(false);
+    const [deletingSegmentId, setDeletingSegmentId] = useState<string | null>(null);
+    const [downloadingSegmentId, setDownloadingSegmentId] = useState<string | null>(null);
+
     const niches = useMemo<Niche[]>(
         () => [
             {
@@ -506,20 +557,10 @@ export default function ClientPage() {
     );
 
     const canUploadToInstantly = useMemo(() => {
-        if (!jobState) {
-            return false;
-        }
-        if (jobPendingUpload) {
-            return true;
-        }
-        if (activeJobStatus === "pending-upload") {
-            return true;
-        }
-        if (!activeJobStatus && jobState.status === "completed" ) {
-            return true;
-        }
-        return false;
-    }, [activeJobStatus, jobPendingUpload, jobState]);
+        // Only show upload button when job is truly completed
+        // Backend should have generated output files by this point
+        return jobState?.status === "completed";
+    }, [jobState]);
 
     const stageCompletionPercent = useMemo(() => {
         if (!jobState?.stages) return 0;
@@ -560,25 +601,8 @@ export default function ClientPage() {
         const formatNumber = (value: unknown) =>
             typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : null;
 
-        if (activeJobStatus === "pending-upload") {
-            const readyCount = formatNumber(
-                jobState?.stages?.verification?.summary?.valid
-                ?? jobState?.stages?.emailDiscovery?.summary?.found
-                ?? jobState?.dedupeStats?.new
-            );
-            const totalCount = formatNumber(
-                jobState?.dedupeStats?.total
-            );
-            const baseMessage = readyCount && totalCount
-                ? `Ready to upload ${readyCount} of ${totalCount} leads to Instantly.`
-                : readyCount
-                    ? `Ready to upload ${readyCount} leads to Instantly.`
-                    : "Ready for Instantly upload.";
-            if (instantlyUploadError) {
-                return `${baseMessage} Last upload attempt failed: ${instantlyUploadError}`;
-            }
-            return baseMessage;
-        }
+        // activeJobStatus can still be: pending-upload, uploaded, discarded, failed
+        // These are secondary states tracked in the activeJob doc
 
         if (activeJobStatus === "uploaded") {
             const uploadedCount = formatNumber(uploadMetrics?.count);
@@ -596,11 +620,15 @@ export default function ClientPage() {
             return "Job discarded. Download CSV if you still need the leads.";
         }
 
-        if (activeJobStatus === "error") {
+        if (activeJobStatus === "failed") {
             return jobState?.error || instantlyUploadError || "Pipeline failed.";
         }
 
         if (activeJobStatus === "running") {
+            // Check if job is paused
+            if (jobState?.paused) {
+                return "Pipeline paused.";
+            }
             return "Pipeline running.";
         }
 
@@ -703,34 +731,93 @@ export default function ClientPage() {
             }
         });
 
+        // Subscribe to segments subcollection
+        const segmentsCol = collection(firestore, "users", user.uid, "clients", clientId, "segments");
+        const unsubSegments = onSnapshot(segmentsCol, (snap) => {
+            if (cancelled) return;
+            const rows = snap.docs.map((d) => {
+                const data = d.data();
+                return {
+                    id: d.id,
+                    name: (data.name as string) || d.id,
+                    description: (data.description as string) || "",
+                    filters: data.filters || {},
+                    createdAt: data.createdAt?.toDate ? new Date(data.createdAt.toDate()).toLocaleString() : "",
+                    updatedAt: data.updatedAt?.toDate ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
+                } as Segment;
+            });
+            setSegments(rows.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')));
+        }, () => {
+            if (!cancelled) {
+                setSegments([]);
+            }
+        });
+
         return () => {
             cancelled = true;
             try { unsubClient(); } catch { }
             try { unsubCampaigns(); } catch { }
+            try { unsubSegments(); } catch { }
         };
     }, [user, clientId]);
 
     useEffect(() => {
         if (!user || !clientId) return;
         
-        // Reset and refetch when search, email status filter, or campaign changes
+        // Reset and refetch when search, email status filter, founder filter, email filter, or campaign changes
         setLeads([]);
         setLeadsCursor(0);
         setLeadsHasMore(true);
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, leadSearch, emailStatusFilter, campaignFilterId]);
+    }, [user, clientId, leadSearch, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
 
-    // Trigger full data fetch when search or founder/email filters are first applied
+    // Fetch segment counts when segments change
     useEffect(() => {
-        if (!user || !clientId) return;
-        
-        const needsFullFetch = Boolean(leadSearch || founderFilter || emailFilter);
-        if (needsFullFetch && !allLeadsCached && leads.length > 0) {
-            fetchLeads(false);
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [founderFilter, emailFilter]);
+        if (!user || !clientId || segments.length === 0) return;
+
+        const fetchSegmentCounts = async () => {
+            const idToken = await getIdToken(user);
+            const counts: Record<string, number> = {};
+
+            await Promise.all(
+                segments.map(async (segment) => {
+                    try {
+                        const params = new URLSearchParams();
+                        params.append('clientId', clientId);
+                        params.append('limit', '1');
+
+                        if (segment.filters.fullName) params.append('fullName', segment.filters.fullName);
+                        if (segment.filters.email === 'found') params.append('emailFilter', 'exists');
+                        else if (segment.filters.email === 'not_found') params.append('emailFilter', 'not_found');
+                        if (segment.filters.emailStatus && segment.filters.emailStatus.length > 0) {
+                            params.append('emailStatusMulti', segment.filters.emailStatus.join(','));
+                        }
+                        if (segment.filters.createdAfter) params.append('createdAfter', segment.filters.createdAfter);
+                        if (segment.filters.createdBefore) params.append('createdBefore', segment.filters.createdBefore);
+
+                        const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                            headers: { 'Authorization': `Bearer ${idToken}` }
+                        });
+
+                        if (response.ok) {
+                            const data = await response.json();
+                            counts[segment.id] = data.total || 0;
+                        }
+                    } catch (error) {
+                        console.error(`Failed to fetch count for segment ${segment.id}:`, error);
+                        counts[segment.id] = 0;
+                    }
+                })
+            );
+
+            setSegmentCounts(counts);
+        };
+
+        fetchSegmentCounts();
+    }, [user, clientId, segments]);
+
+
 
     useEffect(() => {
         if (toastVisible) {
@@ -821,6 +908,14 @@ export default function ClientPage() {
                 params.append('emailStatus', emailStatusFilter);
             }
 
+            if (founderFilter) {
+                params.append('founderFilter', founderFilter);
+            }
+
+            if (emailFilter) {
+                params.append('emailFilter', emailFilter);
+            }
+
             // Send search term to backend for SQL filtering
             if (leadSearch.trim()) {
                 params.append('search', leadSearch.trim());
@@ -857,7 +952,12 @@ export default function ClientPage() {
                 campaigns: row.campaigns || []
             }));
 
-            setLeads(reset ? mapped : (prev) => [...prev, ...mapped]);
+            // Deduplicate leads by ID to prevent React key conflicts
+            setLeads(reset ? mapped : (prev) => {
+                const existingIds = new Set(prev.map(l => l.id));
+                const newLeads = mapped.filter(l => !existingIds.has(l.id));
+                return [...prev, ...newLeads];
+            });
             
             // Use server-provided total count
             const verifiedCount = apiLeads.filter((r: any) => r.verified).length;
@@ -890,15 +990,22 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, leadSearch, leadsCursor, emailStatusFilter]);
+    }, [user, clientId, leadSearch, leadsCursor, emailStatusFilter, founderFilter, emailFilter]);
 
     const loadMoreLeads = useCallback(() => {
         if (leadsLoading || !leadsHasMore) return;
         fetchLeads(false);
     }, [fetchLeads, leadsHasMore, leadsLoading]);
 
-    // Leads are already filtered server-side, no need for client-side filtering
-    const filteredLeads = useMemo(() => leads, [leads]);
+    // Most filters are applied server-side, but campaign filter is applied client-side
+    const filteredLeads = useMemo(() => {
+        if (!campaignFilterId) {
+            return leads;
+        }
+        return leads.filter((lead) => {
+            return lead.campaigns && lead.campaigns.includes(campaignFilterId);
+        });
+    }, [leads, campaignFilterId]);
 
     const displayedStats = useMemo(() => {
         // Stats come from server with filters applied
@@ -915,8 +1022,26 @@ export default function ClientPage() {
         jobStateRef.current = jobState;
     }, [jobState]);
 
-    const fetchJobSnapshot = useCallback(async (jobId: string) => {
+    const fetchJobSnapshot = useCallback(async (jobId: string, force = false) => {
         if (!jobId || !user || !clientId) return;
+        
+        // Prevent concurrent fetches
+        if (isFetchingRef.current) {
+            console.log(`⏭️ [GUARD] Skipping fetchJobSnapshot - fetch already in progress`);
+            return;
+        }
+        
+        // Debounce: prevent fetches more often than once per 3 seconds unless forced
+        const now = Date.now();
+        const timeSinceLastFetch = now - lastFetchTimeRef.current;
+        if (!force && timeSinceLastFetch < 3000) {
+            console.log(`⏭️ [DEBOUNCE] Skipping fetchJobSnapshot, last fetch was ${timeSinceLastFetch}ms ago`);
+            return;
+        }
+        
+        isFetchingRef.current = true;
+        lastFetchTimeRef.current = now;
+        
         try {
             const idToken = await getIdToken(user);
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobId}?clientId=${clientId}`, {
@@ -941,6 +1066,8 @@ export default function ClientPage() {
                 console.error('🔥🔥🔥 ECONNRESET ERROR CAUGHT IN fetchJobSnapshot() 🔥🔥🔥');
                 setToastMessage('Connection error loading job. Please refresh.');
             }
+        } finally {
+            isFetchingRef.current = false;
         }
     }, [user, clientId]);
 
@@ -957,6 +1084,20 @@ export default function ClientPage() {
             if (!jobId) {
                 return;
             }
+            
+            // Don't open stream if job isn't running/queued
+            const currentStatus = currentJobStatusRef.current;
+            if (currentStatus && currentStatus !== 'running' && currentStatus !== 'queued') {
+                console.log(`⏭️ [GUARD] Not opening stream - job status is "${currentStatus}", not running/queued`);
+                return;
+            }
+            
+            // Prevent opening multiple streams for the same job
+            if (jobStreamRef.current && lastStreamingJobIdRef.current === jobId) {
+                console.log(`⏭️ [GUARD] Stream already open for job ${jobId}`);
+                return;
+            }
+            
             closeJobStream();
             if (!isReconnect) {
                 reconnectAttemptsRef.current = 0;
@@ -964,7 +1105,10 @@ export default function ClientPage() {
             setSelectedJobId(jobId);
             lastStreamingJobIdRef.current = jobId;
             setJobStatusMessage(isReconnect ? "Reconnecting to pipeline..." : "Connecting to pipeline...");
-            fetchJobSnapshot(jobId);
+            // Only fetch snapshot on initial open, not reconnects
+            if (!isReconnect) {
+                fetchJobSnapshot(jobId, true);
+            }
 
             const stream = new EventSource(getJobStreamUrl(jobId));
             jobStreamRef.current = stream;
@@ -988,29 +1132,39 @@ export default function ClientPage() {
             };
 
             stream.onerror = (event) => {
-                console.error('🔥🔥🔥 EventSource ERROR - THIS IS LIKELY YOUR ECONNRESET! 🔥🔥🔥', {
-                    event,
+                console.warn('⚠️ EventSource error:', {
                     jobId,
                     readyState: stream.readyState,
-                    url: stream.url
+                    attempt: reconnectAttemptsRef.current,
+                    status: currentJobStatusRef.current
                 });
-                console.trace('EventSource error stack trace:');
                 
                 setJobStreamConnected(false);
-                setJobStatusMessage("Lost connection to pipeline stream, retrying...");
                 stream.close();
                 jobStreamRef.current = null;
-                fetchJobSnapshot(jobId);
+                
+                // Check if job status still requires streaming before reconnecting
+                const currentStatus = currentJobStatusRef.current;
+                if (currentStatus && currentStatus !== 'running' && currentStatus !== 'queued') {
+                    console.log(`⏹️ Stopping stream reconnection - job status is "${currentStatus}"`);
+                    setJobStatusMessage("");
+                    return;
+                }
+                
+                setJobStatusMessage("Lost connection to pipeline stream, retrying...");
 
                 const MAX_RETRIES = 5;
                 if (reconnectAttemptsRef.current >= MAX_RETRIES) {
                     setJobStatusMessage("Unable to reconnect to pipeline stream.");
+                    // Fetch one final time after giving up
+                    fetchJobSnapshot(jobId, true);
                     return;
                 }
 
                 const attempt = reconnectAttemptsRef.current;
                 reconnectAttemptsRef.current = attempt + 1;
                 const delay = Math.min(10000, 1000 * Math.pow(2, attempt));
+                console.log(`⏳ Reconnecting in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
                 reconnectTimeoutRef.current = setTimeout(() => {
                     openJobStream(jobId, true);
                 }, delay);
@@ -1062,6 +1216,9 @@ export default function ClientPage() {
             setActiveJobStatus(status);
             setUploadMetrics(parsedMetrics);
             setInstantlyUploadError(uploadErrorMessage);
+            
+            // Store current status in ref for stream error handler to check
+            currentJobStatusRef.current = status;
 
             if (status === "pending-upload") {
                 if (uploadErrorMessage && uploadErrorMessage !== lastUploadErrorRef.current) {
@@ -1084,7 +1241,8 @@ export default function ClientPage() {
                 const compositeKey = `${jobId}:${status ?? ""}`;
                 if (previousJobIdRef.current !== compositeKey) {
                     previousJobIdRef.current = compositeKey;
-                    fetchJobSnapshot(jobId);
+                    // Use force=false to respect debouncing
+                    fetchJobSnapshot(jobId, false);
                 }
             } else {
                 previousJobIdRef.current = null;
@@ -1096,13 +1254,13 @@ export default function ClientPage() {
                 if (!isStreaming) {
                     openJobStream(jobId);
                 }
-            } else if (isStreaming && (!status || status === "completed" || status === "pending-upload" || status === "uploaded" || status === "error" || status === "discarded")) {
+            } else if (isStreaming && (!status || status === "completed" || status === "uploaded" || status === "failed" || status === "discarded")) {
                 closeJobStream();
             }
 
             if (status && status !== lastActiveStatusRef.current) {
-                if (status === "pending-upload") {
-                    const message = "Pipeline finished. Ready for Instantly upload.";
+                if (status === "completed") {
+                    const message = "Pipeline finished.";
                     setJobStatusMessage(message);
                     setToastMessage(message);
                     setToastVisible(true);
@@ -1123,7 +1281,7 @@ export default function ClientPage() {
                     setToastVisible(true);
                     setUploadModalOpen(false);
                     setJobState(null);
-                } else if (status === "error") {
+                } else if (status === "failed") {
                     const message = errorMessage || "Pipeline failed.";
                     setJobStatusMessage(message);
                     setToastMessage(message);
@@ -1239,11 +1397,13 @@ export default function ClientPage() {
             return;
         }
 
-        // If nothing selected yet, default to latest
+        // If nothing selected yet, default to latest (unless user explicitly deselected)
         if (!selectedJobId) {
-            setSelectedJobId(latest.id);
-            if (!streamingSelected) {
-                setJobState(latest);
+            if (!userDeselectedRef.current) {
+                setSelectedJobId(latest.id);
+                if (!streamingSelected) {
+                    setJobState(latest);
+                }
             }
             return;
         }
@@ -1285,7 +1445,7 @@ export default function ClientPage() {
                 }
             })();
             lastStreamingJobIdRef.current = null;
-        } else if (jobState.status === "error") {
+        } else if (jobState.status === "failed") {
             if (!isLiveJob) {
                 return;
             }
@@ -1383,6 +1543,7 @@ export default function ClientPage() {
         if (!job) {
             return;
         }
+        userDeselectedRef.current = false;
         setJobState(job);
         setSelectedJobId(job.id);
 
@@ -1548,7 +1709,7 @@ export default function ClientPage() {
     }, [findFounder, skipFounderFinder, findEmail, skipEmailFinder]);
 
     const handleDownloadResults = (scope: 'all' | 'valid') => {
-        if (!jobState || (jobState.status !== "completed" && jobState.status !== "pending-upload")) {
+        if (!jobState || jobState.status !== "completed") {
             return;
         }
         const url = getJobResultUrl(jobState.id, scope);
@@ -1571,9 +1732,21 @@ export default function ClientPage() {
                 const data = await resp.json().catch(() => ({}));
                 throw new Error(data.error || `Failed to stop job (${resp.status})`);
             }
+            
+            const data = await resp.json();
+            
             closeJobStream();
-            setJobState((prev) => prev ? { ...prev, status: 'cancelled', error: 'Cancelled by user' } : prev);
-            setJobStatusMessage('Job cancelled.');
+            
+            // Handle stale job cleanup
+            if (data.status === 'cleaned') {
+                setJobState(null);
+                setJobStatusMessage('');
+                setToastMessage(data.message || 'Stale job reference cleared.');
+                setToastVisible(true);
+            } else {
+                setJobState((prev) => prev ? { ...prev, status: 'failed', cancelled: true, error: 'Cancelled by user' } : prev);
+                setJobStatusMessage('Job cancelled.');
+            }
         } catch (error) {
             setToastMessage(error instanceof Error ? error.message : 'Failed to stop job');
             setToastVisible(true);
@@ -1585,7 +1758,7 @@ export default function ClientPage() {
     const handlePauseResumeJob = async () => {
         if (!user || !jobState?.id || !clientId) return;
         
-        const isPaused = jobState.status === 'paused';
+        const isPaused = jobState.paused === true;
         const endpoint = isPaused ? 'resume' : 'pause';
         
         setPausingJob(true);
@@ -1600,8 +1773,7 @@ export default function ClientPage() {
                 const data = await resp.json().catch(() => ({}));
                 throw new Error(data.error || `Failed to ${endpoint} job (${resp.status})`);
             }
-            const newStatus = isPaused ? 'running' : 'paused';
-            setJobState((prev) => prev ? { ...prev, status: newStatus as any } : prev);
+            setJobState((prev) => prev ? { ...prev, paused: !isPaused } : prev);
             setJobStatusMessage(isPaused ? 'Job resumed.' : 'Job paused.');
         } catch (error) {
             setToastMessage(error instanceof Error ? error.message : `Failed to ${endpoint} job`);
@@ -1628,6 +1800,245 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setIsSavingClient(false);
+        }
+    };
+
+    const handleOpenSegmentModal = (segment?: Segment) => {
+        if (segment) {
+            setEditingSegment(segment);
+            setSegmentName(segment.name);
+            setSegmentDescription(segment.description || "");
+            setSegmentFullName(segment.filters.fullName || "");
+            setSegmentEmail(segment.filters.email || '');
+            setSegmentEmailStatus(segment.filters.emailStatus || []);
+            setSegmentCreatedAfter(segment.filters.createdAfter || "");
+            setSegmentCreatedBefore(segment.filters.createdBefore || "");
+        } else {
+            setEditingSegment(null);
+            setSegmentName("");
+            setSegmentDescription("");
+            setSegmentFullName("");
+            setSegmentEmail('');
+            setSegmentEmailStatus([]);
+            setSegmentCreatedAfter("");
+            setSegmentCreatedBefore("");
+        }
+        setSegmentModalOpen(true);
+    };
+
+    const handleSaveSegment = async () => {
+        if (!user || !clientId || !segmentName.trim()) {
+            setToastMessage('Segment name is required');
+            setToastVisible(true);
+            return;
+        }
+
+        setSavingSegment(true);
+        try {
+            const segmentData = {
+                name: segmentName.trim(),
+                description: segmentDescription.trim(),
+                filters: {
+                    ...(segmentFullName && { fullName: segmentFullName }),
+                    ...(segmentEmail && { email: segmentEmail }),
+                    ...(segmentEmailStatus.length > 0 && { emailStatus: segmentEmailStatus }),
+                    ...(segmentCreatedAfter && { createdAfter: segmentCreatedAfter }),
+                    ...(segmentCreatedBefore && { createdBefore: segmentCreatedBefore }),
+                },
+                updatedAt: serverTimestamp(),
+                ...(editingSegment ? {} : { createdAt: serverTimestamp() })
+            };
+
+            const segmentId = editingSegment?.id || Date.now().toString();
+            const segmentRef = doc(firestore, "users", user.uid, "clients", clientId, "segments", segmentId);
+            await setDoc(segmentRef, segmentData, { merge: true });
+
+            setToastMessage(editingSegment ? 'Segment updated' : 'Segment created');
+            setToastVisible(true);
+            setSegmentModalOpen(false);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save segment');
+            setToastVisible(true);
+        } finally {
+            setSavingSegment(false);
+        }
+    };
+
+    const handleDeleteSegment = async (segmentId: string) => {
+        if (!user || !clientId) return;
+        const confirmDelete = window.confirm("Delete this segment?");
+        if (!confirmDelete) return;
+
+        setDeletingSegmentId(segmentId);
+        try {
+            // Remove from Firestore entirely
+            const segmentRef = doc(firestore, "users", user.uid, "clients", clientId, "segments", segmentId);
+            await deleteDoc(segmentRef);
+            
+            setToastMessage('Segment deleted');
+            setToastVisible(true);
+            if (selectedSegmentId === segmentId) {
+                setSelectedSegmentId("");
+                setSegmentLeads([]);
+            }
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to delete segment');
+            setToastVisible(true);
+        } finally {
+            setDeletingSegmentId(null);
+        }
+    };
+
+    const handleDownloadSegmentCSV = async (segmentId: string) => {
+        const segment = segments.find(s => s.id === segmentId);
+        if (!user || !clientId || !segment) return;
+
+        setDownloadingSegmentId(segmentId);
+        try {
+            const idToken = await getIdToken(user);
+            const params = new URLSearchParams();
+            params.append('clientId', clientId);
+            params.append('limit', '500');
+
+            // Apply segment filters
+            if (segment.filters.fullName) params.append('fullName', segment.filters.fullName);
+            if (segment.filters.email === 'found') params.append('emailFilter', 'exists');
+            else if (segment.filters.email === 'not_found') params.append('emailFilter', 'not_found');
+            if (segment.filters.emailStatus && segment.filters.emailStatus.length > 0) {
+                params.append('emailStatusMulti', segment.filters.emailStatus.join(','));
+            }
+            if (segment.filters.createdAfter) params.append('createdAfter', segment.filters.createdAfter);
+            if (segment.filters.createdBefore) params.append('createdBefore', segment.filters.createdBefore);
+
+            // Fetch all leads for this segment
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                headers: { 'Authorization': `Bearer ${idToken}` }
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to fetch segment leads: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            const leads: Lead[] = data.leads.map((row: any) => ({
+                id: row.id,
+                domain: row.domain || "",
+                email: row.email || "",
+                status: row.status || "",
+                verified: row.verified,
+                firstLine: row.firstLine || "",
+                founderName: row.founderName || "",
+                personalizationUrl: row.personalizationUrl || "",
+                personalizationTitle: row.personalizationTitle || "",
+                updatedAt: row.updatedAt || "",
+                campaigns: row.campaigns || []
+            }));
+
+            // Generate CSV
+            const headers = ['Founder Name', 'Email', 'Status', 'Domain', 'First Line', 'Personalization URL', 'Personalization Title', 'Created At'];
+            const csvRows = [headers.join(',')];
+
+            leads.forEach((lead) => {
+                const row = [
+                    lead.founderName || '',
+                    lead.email || '',
+                    lead.status || '',
+                    lead.domain || '',
+                    (lead.firstLine || '').replace(/"/g, '""'),
+                    lead.personalizationUrl || '',
+                    (lead.personalizationTitle || '').replace(/"/g, '""'),
+                    lead.updatedAt || ''
+                ];
+                csvRows.push(row.map(val => `"${val}"`).join(','));
+            });
+
+            const csvContent = csvRows.join('\n');
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', `${segment.name.replace(/[^a-z0-9]/gi, '_')}_${new Date().toISOString().split('T')[0]}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+
+            setToastMessage(`Downloaded ${leads.length} leads`);
+            setToastVisible(true);
+        } catch (error) {
+            console.error('CSV download failed:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to download CSV');
+            setToastVisible(true);
+        } finally {
+            setDownloadingSegmentId(null);
+        }
+    };
+
+    const handleLoadSegmentLeads = async (segmentId: string) => {
+        const segment = segments.find(s => s.id === segmentId);
+        if (!user || !clientId || !segment) return;
+
+        setSelectedSegmentId(segmentId);
+        setSegmentLeadsLoading(true);
+        setSegmentLeads([]);
+
+        try {
+            const idToken = await getIdToken(user);
+            const params = new URLSearchParams();
+            params.append('clientId', clientId);
+            params.append('limit', '500');
+
+            // Apply segment filters
+            if (segment.filters.fullName) {
+                params.append('fullName', segment.filters.fullName);
+            }
+            if (segment.filters.email === 'found') {
+                params.append('emailFilter', 'exists');
+            } else if (segment.filters.email === 'not_found') {
+                params.append('emailFilter', 'not_found');
+            }
+            if (segment.filters.emailStatus && segment.filters.emailStatus.length > 0) {
+                params.append('emailStatusMulti', segment.filters.emailStatus.join(','));
+            }
+            if (segment.filters.createdAfter) {
+                params.append('createdAfter', segment.filters.createdAfter);
+            }
+            if (segment.filters.createdBefore) {
+                params.append('createdBefore', segment.filters.createdBefore);
+            }
+
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                headers: {
+                    'Authorization': `Bearer ${idToken}`
+                }
+            });
+            
+            if (!response.ok) {
+                throw new Error(`Failed to fetch segment leads: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            const mapped: Lead[] = data.leads.map((row: any) => ({
+                id: row.id,
+                domain: row.domain || "",
+                email: row.email || "",
+                status: row.status || "",
+                verified: row.verified,
+                firstLine: row.firstLine || "",
+                founderName: row.founderName || "",
+                personalizationUrl: row.personalizationUrl || "",
+                personalizationTitle: row.personalizationTitle || "",
+                updatedAt: row.updatedAt || "",
+                campaigns: row.campaigns || []
+            }));
+
+            setSegmentLeads(mapped);
+        } catch (error) {
+            console.error('Failed to fetch segment leads:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to load segment leads');
+            setToastVisible(true);
+        } finally {
+            setSegmentLeadsLoading(false);
         }
     };
 
@@ -1873,6 +2284,12 @@ export default function ClientPage() {
                             All Leads
                         </button>
                         <button
+                            className={`tab-nav__button ${activeTab === "segments" ? "tab-nav__button--active" : ""}`}
+                            onClick={() => setActiveTab("segments")}
+                        >
+                            Segments
+                        </button>
+                        <button
                             className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
                             onClick={() => setActiveTab("info")}
                         >
@@ -1997,7 +2414,55 @@ export default function ClientPage() {
                                 </div>
                             )}
 
-                            <div style={{ marginTop: '2rem' }}>
+                            {pipelineVisible && jobState && (
+                                <div style={{ 
+                                    marginTop: '2rem',
+                                    background: 'rgba(255, 255, 255, 0.03)',
+                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                    borderRadius: '16px',
+                                    padding: '2rem',
+                                    position: 'relative'
+                                }}>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            userDeselectedRef.current = true;
+                                            setSelectedJobId(null);
+                                            setJobState(null);
+                                            closeJobStream();
+                                        }}
+                                        aria-label="Deselect job"
+                                        style={{
+                                            position: 'absolute',
+                                            top: '1rem',
+                                            right: '1rem',
+                                            background: 'rgba(255, 255, 255, 0.05)',
+                                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                                            borderRadius: '8px',
+                                            width: '32px',
+                                            height: '32px',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            cursor: 'pointer',
+                                            color: 'rgba(255, 255, 255, 0.6)',
+                                            fontSize: '1.25rem',
+                                            transition: 'all 0.2s ease',
+                                            padding: 0
+                                        }}
+                                        onMouseEnter={(e) => {
+                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)';
+                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)';
+                                        }}
+                                        onMouseLeave={(e) => {
+                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
+                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.6)';
+                                        }}
+                                    >
+                                        ×
+                                    </button>
                                 <div className="pipeline-panel__header">
                                     <div>
                                         <p className="eyebrow eyebrow--muted">
@@ -2021,30 +2486,59 @@ export default function ClientPage() {
                                         {jobState && (
                                             <div className="pipeline-status-row">
                                                 <p className="pipeline-panel__subtitle pipeline-panel__subtitle--status">
-                                                    Viewing job: {jobState.fileName || jobState.id} · {JOB_STATUS_LABELS[jobState.status]}
+                                                    Viewing job: {jobState.fileName || jobState.id} · {jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status]}
                                                 </p>
-                                                {(jobState.status === 'running' || jobState.status === 'queued' || jobState.status === 'paused') && (
+                                                {(jobState.status === 'running' || jobState.status === 'queued' || jobState.paused) && (
                                                     <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
-                                                        {(jobState.status === 'running' || jobState.status === 'paused') && (
+                                                        {(jobState.status === 'running' || jobState.paused) && (
                                                             <button
                                                                 type="button"
-                                                                className="secondary-button secondary-button--active"
+                                                                className="primary-button"
                                                                 onClick={handlePauseResumeJob}
                                                                 disabled={pausingJob}
-                                                                style={{ minWidth: '100px' }}
+                                                                style={{ 
+                                                                    minWidth: '120px',
+                                                                    display: 'flex',
+                                                                    alignItems: 'center',
+                                                                    justifyContent: 'center',
+                                                                    gap: '0.5rem'
+                                                                }}
                                                             >
-                                                                {pausingJob ? (jobState.status === 'paused' ? 'Resuming...' : 'Pausing...') : (jobState.status === 'paused' ? 'Resume' : 'Pause')}
+                                                                {pausingJob ? (
+                                                                    jobState.paused ? 'Resuming...' : 'Pausing...'
+                                                                ) : (
+                                                                    <>
+                                                                        {jobState.paused ? (
+                                                                            <>
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
+                                                                                    <polygon points="5 3 19 12 5 21 5 3"/>
+                                                                                </svg>
+                                                                                Resume
+                                                                            </>
+                                                                        ) : (
+                                                                            <>
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
+                                                                                    <rect x="6" y="4" width="4" height="16"/>
+                                                                                    <rect x="14" y="4" width="4" height="16"/>
+                                                                                </svg>
+                                                                                Pause
+                                                                            </>
+                                                                        )}
+                                                                    </>
+                                                                )}
                                                             </button>
                                                         )}
-                                                        <button
-                                                            type="button"
-                                                            className="destructive-button"
-                                                            onClick={handleStopJob}
-                                                            disabled={stoppingJob}
-                                                            style={{ minWidth: '100px' }}
-                                                        >
-                                                            {stoppingJob ? 'Stopping...' : 'Stop run'}
-                                                        </button>
+                                                        {!jobState.paused && (
+                                                            <button
+                                                                type="button"
+                                                                className="destructive-button"
+                                                                onClick={handleStopJob}
+                                                                disabled={stoppingJob}
+                                                                style={{ minWidth: '100px' }}
+                                                            >
+                                                                {stoppingJob ? 'Stopping...' : 'Stop run'}
+                                                            </button>
+                                                        )}
                                                     </div>
                                                 )}
                                             </div>
@@ -2055,7 +2549,7 @@ export default function ClientPage() {
                                             </p>
                                         )}
                                     </div>
-                                    {(jobState?.status === 'completed' || jobState?.status === 'pending-upload' || canUploadToInstantly) && (
+                                    {(jobState?.status === 'completed' || canUploadToInstantly) && (
                                         <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
                                             <button
                                                 type="button"
@@ -2203,7 +2697,21 @@ export default function ClientPage() {
                                                         <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
                                                     </div>
                                                     
-                                                    {stage?.error ? (
+                                                    {stage?.error === 'Add Credits to TryKitt' ? (
+                                                        <div style={{
+                                                            marginTop: '0.75rem',
+                                                            padding: '1rem',
+                                                            background: 'rgba(239, 68, 68, 0.15)',
+                                                            border: '1px solid rgba(239, 68, 68, 0.5)',
+                                                            borderRadius: '8px',
+                                                            color: '#ef4444',
+                                                            fontWeight: 600,
+                                                            fontSize: '0.95rem',
+                                                            textAlign: 'center'
+                                                        }}>
+                                                            ⚠️ Add Credits to TryKitt
+                                                        </div>
+                                                    ) : stage?.error ? (
                                                         <p className="stage-card__error">{stage.error}</p>
                                                     ) : heroNumber !== null ? (
                                                         <>
@@ -2240,10 +2748,30 @@ export default function ClientPage() {
                                         </p>
                                     </div>
                                 )}
+                                </div>
+                            )}
 
-                                <div style={{ marginTop: '2.5rem' }}>
-                                    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem' }}>
-                                        <p className="eyebrow eyebrow--muted">Job history</p>
+                            {!pipelineVisible && jobState && (
+                                <div style={{ marginTop: '2rem', textAlign: 'center' }}>
+                                    <button
+                                        type="button"
+                                        onClick={() => setPipelineVisible(true)}
+                                        className="secondary-button secondary-button--active"
+                                        style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '0.5rem'
+                                        }}
+                                    >
+                                        <span>Show Pipeline</span>
+                                        <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>({jobState.fileName || jobState.id})</span>
+                                    </button>
+                                </div>
+                            )}
+
+                            <div style={{ marginTop: '2.5rem' }}>
+                                <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem' }}>
+                                    <p className="eyebrow eyebrow--muted">Job history</p>
                                         {jobHistory.length > 0 && (
                                             <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.55)' }}>
                                                 {jobHistory.length} run{jobHistory.length === 1 ? '' : 's'} saved
@@ -2255,119 +2783,323 @@ export default function ClientPage() {
                                             {jobHistory.map((job) => {
                                                 const isSelected = job.id === selectedJobId;
                                                 const statusColor = JOB_STATUS_COLORS[job.status];
+                                                const isExpanded = expandedErrorJobId === job.id;
+                                                
+                                                // Calculate metrics
                                                 const totalProcessed = job.dedupeStats?.total
                                                     || job.stages?.verification?.progress?.total
                                                     || job.stages?.founders?.progress?.total
                                                     || 0;
-                                                const validLeads = job.stages?.verification?.summary?.valid
-                                                    || job.stages?.emailDiscovery?.summary?.found
+                                                const validLeads = (job.stages?.verification?.summary as any)?.valid
+                                                    || (job.stages?.verification?.summary as any)?.Valid
+                                                    || (job.stages?.emailDiscovery?.summary as any)?.found
+                                                    || (job.stages?.emailDiscovery?.summary as any)?.Found
                                                     || 0;
+                                                const invalidLeads = totalProcessed - validLeads;
+                                                
+                                                // Calculate progress for running jobs
+                                                const progress = calculateJobProgress(job);
+                                                
                                                 return (
-                                                    <div
-                                                        key={job.id}
-                                                        role="button"
-                                                        tabIndex={0}
-                                                        onClick={() => handleSelectJob(job)}
-                                                        onKeyDown={(event) => {
-                                                            if (event.key === 'Enter' || event.key === ' ') {
-                                                                event.preventDefault();
-                                                                handleSelectJob(job);
-                                                            }
-                                                        }}
-                                                        style={{
-                                                            display: 'grid',
-                                                            gridTemplateColumns: 'minmax(0, 1fr) 120px 180px',
-                                                            alignItems: 'center',
-                                                            gap: '1rem',
-                                                            padding: '1rem 1.25rem',
-                                                            borderRadius: '12px',
-                                                            border: `1px solid ${isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)'}`,
-                                                            background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
-                                                            cursor: 'pointer',
-                                                            transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.2s ease',
-                                                            position: 'relative'
-                                                        }}
-                                                        onMouseEnter={(event) => {
-                                                            event.currentTarget.style.transform = 'translateY(-2px)';
-                                                            if (!isSelected) {
-                                                                event.currentTarget.style.borderColor = 'rgba(59, 130, 246, 0.35)';
-                                                            }
-                                                        }}
-                                                        onMouseLeave={(event) => {
-                                                            event.currentTarget.style.transform = 'translateY(0)';
-                                                            event.currentTarget.style.borderColor = isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)';
-                                                        }}
-                                                    >
-                                                        <div>
-                                                            <p style={{
-                                                                margin: 0,
-                                                                fontWeight: 600,
-                                                                color: '#ffffff',
-                                                                fontSize: '0.95rem'
-                                                            }}>{job.fileName || job.id}</p>
-                                                            <p style={{
-                                                                margin: '0.35rem 0 0',
-                                                                fontSize: '0.8rem',
-                                                                color: 'rgba(255, 255, 255, 0.55)'
-                                                            }}>Started {formatJobDate(job.createdAt)}</p>
-                                                        </div>
-                                                        <div style={{ display: 'flex', justifyContent: 'center' }}>
-                                                            <span style={{
-                                                                display: 'inline-flex',
-                                                                alignItems: 'center',
-                                                                justifyContent: 'center',
-                                                                padding: '0.3rem 0.75rem',
-                                                                borderRadius: '999px',
-                                                                fontSize: '0.72rem',
-                                                                fontWeight: 600,
-                                                                letterSpacing: '0.03em',
-                                                                textTransform: 'uppercase',
-                                                                background: `${statusColor}22`,
-                                                                color: statusColor,
-                                                                border: `1px solid ${statusColor}55`
-                                                            }}>{JOB_STATUS_LABELS[job.status]}</span>
-                                                        </div>
-                                                        <div style={{ textAlign: 'right' }}>
-                                                            <p style={{
-                                                                margin: 0,
-                                                                color: 'rgba(255, 255, 255, 0.7)',
-                                                                fontSize: '0.8rem'
-                                                            }}>Completed</p>
-                                                            <p style={{
-                                                                margin: '0.25rem 0 0',
-                                                                fontSize: '0.9rem',
-                                                                fontWeight: 500,
-                                                                color: job.status === 'completed' ? '#22c55e' : 'rgba(255, 255, 255, 0.6)'
-                                                            }}>{job.status === 'completed' ? formatJobDate(job.completedAt) : 'In progress'}</p>
-                                                            <p style={{
-                                                                margin: '0.25rem 0 0',
-                                                                fontSize: '0.75rem',
-                                                                color: 'rgba(255, 255, 255, 0.45)'
-                                                            }}>{validLeads.toLocaleString()} valid · {totalProcessed.toLocaleString()} total</p>
-                                                        </div>
-                                                        <button
-                                                            type="button"
-                                                            onClick={(event) => {
-                                                                event.stopPropagation();
-                                                                handleDeleteJob(job.id);
+                                                    <div key={job.id}>
+                                                        <div
+                                                            role="button"
+                                                            tabIndex={0}
+                                                            onClick={() => handleSelectJob(job)}
+                                                            onKeyDown={(event) => {
+                                                                if (event.key === 'Enter' || event.key === ' ') {
+                                                                    event.preventDefault();
+                                                                    handleSelectJob(job);
+                                                                }
                                                             }}
-                                                            disabled={deletingJobId === job.id}
-                                                            className="destructive-button"
                                                             style={{
-                                                                position: 'absolute',
-                                                                top: '10px',
-                                                                right: '10px',
-                                                                padding: '0.35rem 0.75rem',
-                                                                height: 'auto',
-                                                                minHeight: 'auto',
-                                                                fontSize: '0.75rem',
-                                                                borderRadius: '8px',
-                                                                boxShadow: 'none',
-                                                                flex: '0 0 auto'
+                                                                display: 'flex',
+                                                                flexDirection: 'column',
+                                                                padding: '1.25rem',
+                                                                borderRadius: '12px',
+                                                                border: `1px solid ${isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)'}`,
+                                                                background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+                                                                cursor: 'pointer',
+                                                                transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.2s ease',
+                                                                position: 'relative'
+                                                            }}
+                                                            onMouseEnter={(event) => {
+                                                                event.currentTarget.style.transform = 'translateY(-2px)';
+                                                                if (!isSelected) {
+                                                                    event.currentTarget.style.borderColor = 'rgba(59, 130, 246, 0.35)';
+                                                                }
+                                                            }}
+                                                            onMouseLeave={(event) => {
+                                                                event.currentTarget.style.transform = 'translateY(0)';
+                                                                event.currentTarget.style.borderColor = isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)';
                                                             }}
                                                         >
-                                                            {deletingJobId === job.id ? 'Deleting...' : 'Delete'}
-                                                        </button>
+                                                            {/* Top row: Filename + Badge */}
+                                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '1rem' }}>
+                                                                <div style={{ flex: 1, minWidth: 0 }}>
+                                                                    <p style={{
+                                                                        margin: 0,
+                                                                        fontWeight: 700,
+                                                                        color: '#ffffff',
+                                                                        fontSize: '1.05rem',
+                                                                        overflow: 'hidden',
+                                                                        textOverflow: 'ellipsis',
+                                                                        whiteSpace: 'nowrap'
+                                                                    }}>{job.fileName || job.id}</p>
+                                                                    <p style={{
+                                                                        margin: '0.4rem 0 0',
+                                                                        fontSize: '0.8rem',
+                                                                        color: 'rgba(255, 255, 255, 0.55)'
+                                                                    }}>Started {formatJobDate(job.createdAt)}</p>
+                                                                </div>
+                                                                
+                                                                {/* Lifecycle badge */}
+                                                                <span style={{
+                                                                    display: 'inline-flex',
+                                                                    alignItems: 'center',
+                                                                    justifyContent: 'center',
+                                                                    padding: '0.4rem 0.9rem',
+                                                                    borderRadius: '999px',
+                                                                    fontSize: '0.75rem',
+                                                                    fontWeight: 700,
+                                                                    letterSpacing: '0.04em',
+                                                                    textTransform: 'uppercase',
+                                                                    background: `${statusColor}22`,
+                                                                    color: statusColor,
+                                                                    border: `1.5px solid ${statusColor}`,
+                                                                    flexShrink: 0
+                                                                }}>{JOB_STATUS_LABELS[job.status]}</span>
+                                                            </div>
+
+                                                            {/* Progress bar for running jobs */}
+                                                            {job.status === 'running' && progress.total > 0 && (
+                                                                <div style={{ marginTop: '1rem' }}>
+                                                                    <div style={{
+                                                                        display: 'flex',
+                                                                        justifyContent: 'space-between',
+                                                                        alignItems: 'baseline',
+                                                                        marginBottom: '0.4rem'
+                                                                    }}>
+                                                                        <span style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.7)' }}>
+                                                                            Processing: {progress.processed.toLocaleString()} / {progress.total.toLocaleString()} rows
+                                                                        </span>
+                                                                        <span style={{ fontSize: '0.85rem', fontWeight: 600, color: statusColor }}>
+                                                                            {progress.percent}%
+                                                                        </span>
+                                                                    </div>
+                                                                    <div style={{
+                                                                        width: '100%',
+                                                                        height: '6px',
+                                                                        background: 'rgba(255, 255, 255, 0.1)',
+                                                                        borderRadius: '999px',
+                                                                        overflow: 'hidden'
+                                                                    }}>
+                                                                        <div style={{
+                                                                            width: `${progress.percent}%`,
+                                                                            height: '100%',
+                                                                            background: statusColor,
+                                                                            transition: 'width 0.3s ease'
+                                                                        }}/>
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Metrics row */}
+                                                            <div style={{
+                                                                display: 'grid',
+                                                                gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))',
+                                                                gap: '1rem',
+                                                                marginTop: job.status === 'running' ? '1rem' : '1.25rem',
+                                                                paddingTop: '1rem',
+                                                                borderTop: '1px solid rgba(255, 255, 255, 0.06)'
+                                                            }}>
+                                                                <div>
+                                                                    <p style={{
+                                                                        margin: 0,
+                                                                        fontSize: '0.7rem',
+                                                                        textTransform: 'uppercase',
+                                                                        letterSpacing: '0.05em',
+                                                                        color: 'rgba(255, 255, 255, 0.5)',
+                                                                        fontWeight: 600
+                                                                    }}>Valid</p>
+                                                                    <p style={{
+                                                                        margin: '0.25rem 0 0',
+                                                                        fontSize: '1.1rem',
+                                                                        fontWeight: 700,
+                                                                        color: '#22c55e'
+                                                                    }}>{validLeads.toLocaleString()}</p>
+                                                                </div>
+                                                                <div>
+                                                                    <p style={{
+                                                                        margin: 0,
+                                                                        fontSize: '0.7rem',
+                                                                        textTransform: 'uppercase',
+                                                                        letterSpacing: '0.05em',
+                                                                        color: 'rgba(255, 255, 255, 0.5)',
+                                                                        fontWeight: 600
+                                                                    }}>Invalid</p>
+                                                                    <p style={{
+                                                                        margin: '0.25rem 0 0',
+                                                                        fontSize: '1.1rem',
+                                                                        fontWeight: 700,
+                                                                        color: 'rgba(255, 255, 255, 0.5)'
+                                                                    }}>{invalidLeads.toLocaleString()}</p>
+                                                                </div>
+                                                                <div>
+                                                                    <p style={{
+                                                                        margin: 0,
+                                                                        fontSize: '0.7rem',
+                                                                        textTransform: 'uppercase',
+                                                                        letterSpacing: '0.05em',
+                                                                        color: 'rgba(255, 255, 255, 0.5)',
+                                                                        fontWeight: 600
+                                                                    }}>Total</p>
+                                                                    <p style={{
+                                                                        margin: '0.25rem 0 0',
+                                                                        fontSize: '1.1rem',
+                                                                        fontWeight: 700,
+                                                                        color: '#ffffff'
+                                                                    }}>{totalProcessed.toLocaleString()}</p>
+                                                                </div>
+                                                                {job.status === 'completed' && job.completedAt && (
+                                                                    <div>
+                                                                        <p style={{
+                                                                            margin: 0,
+                                                                            fontSize: '0.7rem',
+                                                                            textTransform: 'uppercase',
+                                                                            letterSpacing: '0.05em',
+                                                                            color: 'rgba(255, 255, 255, 0.5)',
+                                                                            fontWeight: 600
+                                                                        }}>Finished</p>
+                                                                        <p style={{
+                                                                            margin: '0.25rem 0 0',
+                                                                            fontSize: '0.85rem',
+                                                                            fontWeight: 500,
+                                                                            color: 'rgba(255, 255, 255, 0.7)'
+                                                                        }}>{formatJobDate(job.completedAt)}</p>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+
+                                                            {/* Delete button */}
+                                                            <button
+                                                                type="button"
+                                                                onClick={(event) => {
+                                                                    event.stopPropagation();
+                                                                    handleDeleteJob(job.id);
+                                                                }}
+                                                                disabled={deletingJobId === job.id}
+                                                                className="destructive-button"
+                                                                style={{
+                                                                    position: 'absolute',
+                                                                    top: '10px',
+                                                                    right: '10px',
+                                                                    padding: '0.35rem 0.75rem',
+                                                                    height: 'auto',
+                                                                    minHeight: 'auto',
+                                                                    fontSize: '0.7rem',
+                                                                    borderRadius: '8px',
+                                                                    boxShadow: 'none',
+                                                                    opacity: 0.6,
+                                                                    transition: 'opacity 0.2s ease'
+                                                                }}
+                                                                onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
+                                                                onMouseLeave={(e) => e.currentTarget.style.opacity = '0.6'}
+                                                            >
+                                                                {deletingJobId === job.id ? 'Deleting...' : 'Delete'}
+                                                            </button>
+                                                        </div>
+
+                                                        {/* Expandable error panel for failed jobs */}
+                                                        {job.status === 'failed' && (
+                                                            <>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        setExpandedErrorJobId(isExpanded ? null : job.id);
+                                                                    }}
+                                                                    style={{
+                                                                        width: '100%',
+                                                                        padding: '0.75rem',
+                                                                        marginTop: '0.5rem',
+                                                                        background: 'rgba(239, 68, 68, 0.1)',
+                                                                        border: '1px solid rgba(239, 68, 68, 0.3)',
+                                                                        borderRadius: '8px',
+                                                                        color: '#ef4444',
+                                                                        fontSize: '0.85rem',
+                                                                        fontWeight: 600,
+                                                                        cursor: 'pointer',
+                                                                        display: 'flex',
+                                                                        alignItems: 'center',
+                                                                        justifyContent: 'space-between',
+                                                                        transition: 'background 0.2s ease'
+                                                                    }}
+                                                                    onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)'}
+                                                                    onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(239, 68, 68, 0.1)'}
+                                                                >
+                                                                    <span>❌ View Error Details</span>
+                                                                    <span style={{ fontSize: '1rem' }}>{isExpanded ? '▼' : '▶'}</span>
+                                                                </button>
+                                                                
+                                                                {isExpanded && (
+                                                                    <div style={{
+                                                                        marginTop: '0.5rem',
+                                                                        padding: '1.25rem',
+                                                                        background: 'rgba(239, 68, 68, 0.05)',
+                                                                        border: '1px solid rgba(239, 68, 68, 0.2)',
+                                                                        borderRadius: '8px'
+                                                                    }}>
+                                                                        <p style={{
+                                                                            margin: 0,
+                                                                            fontSize: '0.9rem',
+                                                                            fontWeight: 700,
+                                                                            color: '#ef4444',
+                                                                            marginBottom: '0.75rem'
+                                                                        }}>
+                                                                            Job failed during {job.errorStage ? STAGE_METADATA[job.errorStage]?.title || job.errorStage : 'processing'}
+                                                                        </p>
+                                                                        <p style={{
+                                                                            margin: 0,
+                                                                            fontSize: '0.85rem',
+                                                                            color: 'rgba(255, 255, 255, 0.8)',
+                                                                            marginBottom: '1rem',
+                                                                            lineHeight: 1.5
+                                                                        }}>
+                                                                            <strong>Reason:</strong><br/>
+                                                                            {job.error || 'Unknown error occurred'}
+                                                                        </p>
+                                                                        
+                                                                        {/* TODO: Add retry actions once backend support is ready */}
+                                                                        <div style={{
+                                                                            display: 'flex',
+                                                                            gap: '0.75rem',
+                                                                            paddingTop: '1rem',
+                                                                            borderTop: '1px solid rgba(255, 255, 255, 0.1)'
+                                                                        }}>
+                                                                            <button
+                                                                                type="button"
+                                                                                className="secondary-button"
+                                                                                disabled
+                                                                                style={{ fontSize: '0.8rem', opacity: 0.5 }}
+                                                                                title="Retry functionality coming soon"
+                                                                            >
+                                                                                Retry Failed Rows
+                                                                            </button>
+                                                                            <button
+                                                                                type="button"
+                                                                                className="secondary-button"
+                                                                                disabled
+                                                                                style={{ fontSize: '0.8rem', opacity: 0.5 }}
+                                                                                title="Restart functionality coming soon"
+                                                                            >
+                                                                                Restart Job
+                                                                            </button>
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+                                                            </>
+                                                        )}
                                                     </div>
                                                 );
                                             })}
@@ -2378,7 +3110,6 @@ export default function ClientPage() {
                                         </p>
                                     )}
                                 </div>
-                            </div>
                         </>
                     )}
 
@@ -2868,6 +3599,302 @@ export default function ClientPage() {
                                     </div>
                                 )}
                             </div>
+                        </>
+                    )}
+
+                    {/* Segments Tab */}
+                    {activeTab === "segments" && (
+                        <>
+                            <div style={{ marginTop: '2rem', display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={() => handleOpenSegmentModal()}
+                                >
+                                    ➕ Create Segment
+                                </button>
+                            </div>
+
+                            {segments.length === 0 ? (
+                                <div className="pipeline-panel__empty" style={{ marginTop: '2rem' }}>
+                                    <p>No segments yet.</p>
+                                    <p className="pipeline-panel__subtitle">Create segments to filter leads with custom criteria.</p>
+                                </div>
+                            ) : (
+                                <div style={{ marginTop: '2rem' }}>
+                                    <p className="eyebrow eyebrow--muted">Saved Segments</p>
+                                    <div style={{
+                                        marginTop: '1rem',
+                                        display: 'grid',
+                                        gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
+                                        gap: '1rem'
+                                    }}>
+                                        {segments.map((segment) => (
+                                            <div
+                                                key={segment.id}
+                                                style={{
+                                                    border: selectedSegmentId === segment.id ? '2px solid #3b82f6' : '1px solid rgba(255, 255, 255, 0.15)',
+                                                    borderRadius: '16px',
+                                                    padding: '1.25rem',
+                                                    background: selectedSegmentId === segment.id ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255, 255, 255, 0.05)',
+                                                    transition: 'all 0.2s ease',
+                                                    cursor: 'pointer'
+                                                }}
+                                                onClick={() => handleLoadSegmentLeads(segment.id)}
+                                            >
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                                                    <h3 style={{
+                                                        margin: 0,
+                                                        fontSize: '1.1rem',
+                                                        fontWeight: 600,
+                                                        color: '#ffffff'
+                                                    }}>{segment.name}</h3>
+                                                    <span style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        padding: '0.25rem 0.65rem',
+                                                        borderRadius: '999px',
+                                                        fontSize: '0.75rem',
+                                                        fontWeight: 600,
+                                                        background: 'rgba(59, 130, 246, 0.15)',
+                                                        color: '#60a5fa',
+                                                        border: '1px solid rgba(59, 130, 246, 0.3)',
+                                                        whiteSpace: 'nowrap'
+                                                    }}>
+                                                        {segmentCounts[segment.id] !== undefined ? segmentCounts[segment.id].toLocaleString() : '...'} leads
+                                                    </span>
+                                                </div>
+                                                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            handleDownloadSegmentCSV(segment.id);
+                                                        }}
+                                                        disabled={downloadingSegmentId === segment.id}
+                                                        style={{
+                                                            background: 'rgba(34, 197, 94, 0.1)',
+                                                            border: '1px solid rgba(34, 197, 94, 0.3)',
+                                                            borderRadius: '6px',
+                                                            padding: '0.35rem 0.5rem',
+                                                            fontSize: '0.8rem',
+                                                            cursor: 'pointer',
+                                                            color: '#22c55e'
+                                                        }}
+                                                    >
+                                                        {downloadingSegmentId === segment.id ? '⏳' : '📥'} CSV
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            handleOpenSegmentModal(segment);
+                                                        }}
+                                                        style={{
+                                                            background: 'rgba(255, 255, 255, 0.1)',
+                                                            border: '1px solid rgba(255, 255, 255, 0.2)',
+                                                            borderRadius: '6px',
+                                                            padding: '0.35rem 0.5rem',
+                                                            fontSize: '0.8rem',
+                                                            cursor: 'pointer',
+                                                            color: '#fff'
+                                                        }}
+                                                    >
+                                                        Edit
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            handleDeleteSegment(segment.id);
+                                                        }}
+                                                        disabled={deletingSegmentId === segment.id}
+                                                        style={{
+                                                            background: 'rgba(239, 68, 68, 0.1)',
+                                                            border: '1px solid rgba(239, 68, 68, 0.3)',
+                                                            borderRadius: '6px',
+                                                            padding: '0.35rem 0.5rem',
+                                                            fontSize: '0.8rem',
+                                                            cursor: 'pointer',
+                                                            color: '#ef4444'
+                                                        }}
+                                                    >
+                                                        {deletingSegmentId === segment.id ? '...' : 'Delete'}
+                                                    </button>
+                                                </div>
+                                                {segment.description && (
+                                                    <p style={{
+                                                        margin: '0 0 0.75rem 0',
+                                                        fontSize: '0.9rem',
+                                                        color: 'rgba(255, 255, 255, 0.7)'
+                                                    }}>{segment.description}</p>
+                                                )}
+                                                <div style={{
+                                                    display: 'flex',
+                                                    flexDirection: 'column',
+                                                    gap: '0.35rem',
+                                                    fontSize: '0.85rem',
+                                                    color: 'rgba(255, 255, 255, 0.6)',
+                                                    marginTop: '0.75rem',
+                                                    paddingTop: '0.75rem',
+                                                    borderTop: '1px solid rgba(255, 255, 255, 0.1)'
+                                                }}>
+                                                    {segment.filters.fullName && (
+                                                        <div><strong>Name contains:</strong> {segment.filters.fullName}</div>
+                                                    )}
+                                                    {segment.filters.email && (
+                                                        <div><strong>Email:</strong> {segment.filters.email === 'found' ? 'Found' : 'Not Found'}</div>
+                                                    )}
+                                                    {segment.filters.emailStatus && segment.filters.emailStatus.length > 0 && (
+                                                        <div><strong>Status:</strong> {segment.filters.emailStatus.join(', ')}</div>
+                                                    )}
+                                                    {segment.filters.createdAfter && (
+                                                        <div><strong>After:</strong> {new Date(segment.filters.createdAfter).toLocaleDateString()}</div>
+                                                    )}
+                                                    {segment.filters.createdBefore && (
+                                                        <div><strong>Before:</strong> {new Date(segment.filters.createdBefore).toLocaleDateString()}</div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Segment Leads Display */}
+                            {selectedSegmentId && (
+                                <div style={{ marginTop: '2rem' }}>
+                                    <p className="eyebrow eyebrow--muted">
+                                        Segment Results: {segments.find(s => s.id === selectedSegmentId)?.name}
+                                    </p>
+                                    {segmentLeadsLoading ? (
+                                        <div className="pipeline-panel__empty" style={{ marginTop: '1rem' }}>
+                                            <div style={{
+                                                display: 'flex',
+                                                flexDirection: 'column',
+                                                alignItems: 'center',
+                                                gap: '1rem'
+                                            }}>
+                                                <svg className="spinner" style={{ width: '32px', height: '32px' }} viewBox="0 0 24 24" fill="none">
+                                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                                </svg>
+                                                <p>Loading segment leads...</p>
+                                            </div>
+                                        </div>
+                                    ) : segmentLeads.length === 0 ? (
+                                        <div className="pipeline-panel__empty" style={{ marginTop: '1rem' }}>
+                                            <p>No leads match this segment.</p>
+                                        </div>
+                                    ) : (
+                                        <div style={{
+                                            marginTop: '1rem',
+                                            overflowX: 'auto',
+                                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                                            borderRadius: '8px',
+                                            backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                                            maxHeight: '520px',
+                                            overflowY: 'auto'
+                                        }}>
+                                            <table style={{
+                                                width: '100%',
+                                                borderCollapse: 'collapse',
+                                                fontSize: '0.875rem'
+                                            }}>
+                                                <thead>
+                                                    <tr style={{
+                                                        backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                                                        borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                                    }}>
+                                                        <th style={{
+                                                            textAlign: 'left',
+                                                            padding: '0.75rem 1rem',
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Founder Name</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
+                                                            padding: '0.75rem 1rem',
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Email</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
+                                                            padding: '0.75rem 1rem',
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Status</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
+                                                            padding: '0.75rem 1rem',
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Domain</th>
+                                                        <th style={{
+                                                            textAlign: 'left',
+                                                            padding: '0.75rem 1rem',
+                                                            fontWeight: 600,
+                                                            color: 'rgba(255, 255, 255, 0.9)'
+                                                        }}>Created</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {segmentLeads.map((lead, index) => (
+                                                        <tr
+                                                            key={lead.id}
+                                                            onClick={() => setSelectedLead(lead)}
+                                                            style={{
+                                                                backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
+                                                                borderBottom: index < segmentLeads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+                                                                cursor: 'pointer',
+                                                                transition: 'background-color 0.15s ease'
+                                                            }}
+                                                            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
+                                                            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
+                                                        >
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '220px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.founderName || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '250px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.email || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '140px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.status || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '220px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.domain || '—'}</td>
+                                                            <td style={{
+                                                                padding: '0.75rem 1rem',
+                                                                maxWidth: '180px',
+                                                                overflow: 'hidden',
+                                                                textOverflow: 'ellipsis',
+                                                                whiteSpace: 'nowrap'
+                                                            }}>{lead.updatedAt || '—'}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </>
                     )}
 
@@ -3629,10 +4656,171 @@ export default function ClientPage() {
                             <button
                                 type="button"
                                 className="primary-button"
-                                disabled={!jobState || (jobState.status !== 'completed' && jobState.status !== 'pending-upload')}
+                                disabled={!jobState || jobState.status !== 'completed'}
                                 onClick={() => handleDownloadResults(downloadScope)}
                             >
                                 Download
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Segment Modal */}
+            {segmentModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => setSegmentModalOpen(false)}
+                >
+                    <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '700px', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }}>
+                        <div className="modal__header" style={{ flexShrink: 0 }}>
+                            <div>
+                                <h2 className="modal__title">
+                                    {editingSegment ? 'Edit Segment' : 'Create Segment'}
+                                </h2>
+                                <p className="modal__description">
+                                    Define filters to create a reusable lead segment.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', overflowY: 'auto', flex: 1 }}>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Segment Name *</span>
+                                <input
+                                    type="text"
+                                    value={segmentName}
+                                    onChange={(e) => setSegmentName(e.target.value)}
+                                    placeholder="e.g., High Quality Leads"
+                                />
+                            </label>
+
+                            <label className="settings-field">
+                                <span className="settings-field__label">Description (optional)</span>
+                                <textarea
+                                    value={segmentDescription}
+                                    onChange={(e) => setSegmentDescription(e.target.value)}
+                                    placeholder="Describe this segment..."
+                                    rows={2}
+                                    style={{
+                                        resize: 'vertical',
+                                        fontFamily: 'inherit',
+                                        fontSize: 'inherit'
+                                    }}
+                                />
+                            </label>
+
+                            <div style={{
+                                padding: '1.25rem',
+                                background: 'rgba(255, 255, 255, 0.03)',
+                                borderRadius: '8px',
+                                border: '1px solid rgba(255, 255, 255, 0.1)'
+                            }}>
+                                <p className="eyebrow eyebrow--muted" style={{ marginBottom: '1rem' }}>Filters</p>
+
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Full Name Contains</span>
+                                        <input
+                                            type="text"
+                                            value={segmentFullName}
+                                            onChange={(e) => setSegmentFullName(e.target.value)}
+                                            placeholder="Search in founder name..."
+                                        />
+                                        <span className="settings-field__hint">Case-insensitive partial match</span>
+                                    </label>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Email Status</span>
+                                        <select
+                                            value={segmentEmail}
+                                            onChange={(e) => setSegmentEmail(e.target.value as '' | 'found' | 'not_found')}
+                                        >
+                                            <option value="">Any</option>
+                                            <option value="found">Email Found</option>
+                                            <option value="not_found">Email Not Found</option>
+                                        </select>
+                                    </label>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Email Verification</span>
+                                        <div style={{
+                                            display: 'flex',
+                                            flexDirection: 'column',
+                                            gap: '0.5rem',
+                                            marginTop: '0.5rem'
+                                        }}>
+                                            {['valid', 'valid-risky', 'invalid'].map((status) => (
+                                                <label
+                                                    key={status}
+                                                    style={{
+                                                        display: 'flex',
+                                                        alignItems: 'center',
+                                                        gap: '0.5rem',
+                                                        cursor: 'pointer',
+                                                        padding: '0.5rem',
+                                                        borderRadius: '6px',
+                                                        background: segmentEmailStatus.includes(status) ? 'rgba(59, 130, 246, 0.1)' : 'transparent'
+                                                    }}
+                                                >
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={segmentEmailStatus.includes(status)}
+                                                        onChange={(e) => {
+                                                            if (e.target.checked) {
+                                                                setSegmentEmailStatus([...segmentEmailStatus, status]);
+                                                            } else {
+                                                                setSegmentEmailStatus(segmentEmailStatus.filter(s => s !== status));
+                                                            }
+                                                        }}
+                                                        style={{ cursor: 'pointer' }}
+                                                    />
+                                                    <span style={{ textTransform: 'capitalize' }}>{status}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                        <span className="settings-field__hint">Select one or more verification statuses</span>
+                                    </label>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Created After</span>
+                                        <input
+                                            type="date"
+                                            value={segmentCreatedAfter}
+                                            onChange={(e) => setSegmentCreatedAfter(e.target.value)}
+                                        />
+                                    </label>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Created Before</span>
+                                        <input
+                                            type="date"
+                                            value={segmentCreatedBefore}
+                                            onChange={(e) => setSegmentCreatedBefore(e.target.value)}
+                                        />
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="modal__actions" style={{ flexShrink: 0, borderTop: '1px solid rgba(255, 255, 255, 0.1)', paddingTop: '1rem', marginTop: '1rem' }}>
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setSegmentModalOpen(false)}
+                                disabled={savingSegment}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                onClick={handleSaveSegment}
+                                disabled={savingSegment || !segmentName.trim()}
+                            >
+                                {savingSegment ? 'Saving...' : (editingSegment ? 'Update Segment' : 'Create Segment')}
                             </button>
                         </div>
                     </div>

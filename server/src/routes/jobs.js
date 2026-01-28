@@ -246,6 +246,23 @@ router.post('/jobs/:id/stop', async (req, res) => {
 
         const job = jobs.get(jobId);
         if (!job) {
+            // Job not in memory - could be stale Firestore doc. Clean it up.
+            try {
+                const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
+                const activeJobSnap = await activeJobRef.get();
+                
+                if (activeJobSnap.exists && activeJobSnap.data()?.jobId === jobId) {
+                    // Clear the stale activeJob document
+                    await activeJobRef.delete();
+                    console.log(`Cleaned up stale activeJob document for job ${jobId}`);
+                    return res.json({ 
+                        status: 'cleaned', 
+                        message: 'Stale job reference removed. The job has already completed or was cleaned up.' 
+                    });
+                }
+            } catch (err) {
+                console.warn('Failed to clean up stale activeJob document:', err?.message || err);
+            }
             return res.status(404).json({ error: 'Job not found.' });
         }
         if (job.uid !== uid || job.clientId !== clientId) {
@@ -293,6 +310,22 @@ router.post('/jobs/:id/pause', async (req, res) => {
 
         const job = jobs.get(jobId);
         if (!job) {
+            // Job not in memory - could be stale Firestore doc. Clean it up.
+            try {
+                const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
+                const activeJobSnap = await activeJobRef.get();
+                
+                if (activeJobSnap.exists && activeJobSnap.data()?.jobId === jobId) {
+                    await activeJobRef.delete();
+                    console.log(`Cleaned up stale activeJob document for job ${jobId}`);
+                    return res.json({ 
+                        status: 'cleaned', 
+                        message: 'Stale job reference removed. The job has already completed or was cleaned up.' 
+                    });
+                }
+            } catch (err) {
+                console.warn('Failed to clean up stale activeJob document:', err?.message || err);
+            }
             return res.status(404).json({ error: 'Job not found.' });
         }
         if (job.uid !== uid || job.clientId !== clientId) {

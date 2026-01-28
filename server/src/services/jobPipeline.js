@@ -31,7 +31,7 @@ const REALTIME_STAGE_MIN_INTERVAL_MS = 500; // Faster updates for realtime stage
 
 function shouldUpdateFirestore(job) {
     // Always update on status changes or completion
-    if (job.__lastStatus !== job.status || job.status === 'completed' || job.status === 'error') {
+    if (job.__lastStatus !== job.status || job.status === 'completed' || job.status === 'failed') {
         job.__lastStatus = job.status;
         job.__lastFirestoreUpdate = Date.now();
         return true;
@@ -100,6 +100,10 @@ function pushState(job, forceFirestoreUpdate = false) {
         status: job.status,
         stages: job.stages,
         error: job.error,
+        paused: job.paused || false,
+        pausedAt: job.pausedAt || null,
+        resumedAt: job.resumedAt || null,
+        cancelled: job.cancelled || false,
         createdAt: job.createdAt,
         completedAt: job.completedAt,
         clientId: job.clientId,
@@ -227,6 +231,18 @@ async function runStage(job, stageKey, handler) {
         return summary;
     } catch (err) {
         const message = err?.message || 'Unknown error';
+        
+        // Check for credit exhaustion error
+        if (err?.code === 'CREDIT_EXHAUSTED') {
+            console.log(`[${job.id}] Credit exhausted at stage ${stageKey}, pausing job`);
+            updateStage(job, stageKey, { status: 'error', error: 'Add Credits to TryKitt' });
+            markPaused(job, 'Add Credits to TryKitt');
+            // Throw a special error that processJob will catch and handle gracefully
+            const pauseError = new Error('Job paused due to credit exhaustion');
+            pauseError.code = 'JOB_PAUSED';
+            throw pauseError;
+        }
+        
         updateStage(job, stageKey, { status: 'error', completedAt: new Date().toISOString(), error: message });
         throw err;
     }
@@ -234,7 +250,7 @@ async function runStage(job, stageKey, handler) {
 
 function markCancelled(job, reason = 'Cancelled by user') {
     job.cancelled = true;
-    job.status = 'cancelled';
+    job.status = 'failed';  // Cancelled jobs are treated as failed in primary status
     job.error = reason;
     job.completedAt = job.completedAt || new Date().toISOString();
     pushState(job);
@@ -243,8 +259,9 @@ function markCancelled(job, reason = 'Cancelled by user') {
 
 function markPaused(job, reason = 'Paused by user') {
     job.paused = true;
-    job.status = 'paused';
+    job.status = 'running';  // Paused jobs keep running status (can be resumed)
     job.pausedAt = new Date().toISOString();
+    console.log(`[${job.id}] Job paused. paused=${job.paused}, status=${job.status}`);
     log(job, reason);
     pushState(job);
 }
@@ -402,10 +419,10 @@ async function processJob(job) {
                 };
             });
 
-            job.status = 'pending-upload';
+            job.status = 'completed';
             job.completedAt = new Date().toISOString();
             pushState(job);
-            await updateActiveJob(job, 'pending-upload', { uploadError: null, uploadMetrics: null });
+            await updateActiveJob(job, 'completed', { uploadError: null, uploadMetrics: null });
             log(job, 'Job completed: All domains were already processed (duplicates)');
             return;
         }
@@ -649,11 +666,11 @@ async function processJob(job) {
             console.warn(`[${job.id}] Failed to build upload.csv`, err?.message || err);
         }
 
-        job.status = 'pending-upload';
+        job.status = 'completed';
         job.completedAt = new Date().toISOString();
         pushState(job);
-        console.log(`[${job.id}] Updating activeJob to pending-upload...`);
-        await updateActiveJob(job, 'pending-upload', { uploadError: null, uploadMetrics: null });
+        console.log(`[${job.id}] Updating activeJob to completed...`);
+        await updateActiveJob(job, 'completed', { uploadError: null, uploadMetrics: null });
         console.log(`[${job.id}] ActiveJob updated successfully`);
         log(job, `Job completed. Final CSV ready at ${job.paths.final}`);
     } catch (err) {
@@ -661,10 +678,16 @@ async function processJob(job) {
             markCancelled(job, 'Cancelled during processing');
             return;
         }
-        job.status = 'error';
+        // Handle paused jobs gracefully (e.g., credit exhaustion)
+        if (err?.code === 'JOB_PAUSED') {
+            console.log(`[${job.id}] Job paused gracefully`);
+            closeStreams(job);
+            return;
+        }
+        job.status = 'failed';
         job.error = err?.message || 'Unexpected pipeline error';
         pushState(job);
-        await updateActiveJob(job, 'error', { error: job.error, uploadError: null, uploadMetrics: null });
+        await updateActiveJob(job, 'failed', { error: job.error, uploadError: null, uploadMetrics: null });
         log(job, `Job failed: ${job.error}`);
     }
 
@@ -720,6 +743,10 @@ function serializeJob(job) {
         id: job.id,
         status: job.status,
         error: job.error,
+        paused: job.paused || false,
+        pausedAt: job.pausedAt || null,
+        resumedAt: job.resumedAt || null,
+        cancelled: job.cancelled || false,
         fileName: job.fileName,
         createdAt: job.createdAt,
         completedAt: job.completedAt,

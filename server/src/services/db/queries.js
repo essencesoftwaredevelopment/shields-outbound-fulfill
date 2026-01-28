@@ -145,24 +145,67 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (company_id, role_type)
         DO UPDATE SET
-            full_name = COALESCE($4, full_name),
-            email = COALESCE($5, email),
-            email_status = COALESCE($6, email_status),
-            confidence = COALESCE($7, confidence),
+            full_name = EXCLUDED.full_name,
+            email = COALESCE(EXCLUDED.email, contacts.email),
+            email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
+            confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             updated_at = now()
         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
                   last_verified_at, last_contacted_at, confidence, created_at, updated_at
     `;
-    const result = await pool.query(query, [
-        agencyId,
-        companyId,
-        roleType,
-        full_name,
-        email,
-        email_status,
-        confidence
-    ]);
-    return result.rows[0];
+    
+    try {
+        const result = await pool.query(query, [
+            agencyId,
+            companyId,
+            roleType,
+            full_name,
+            email,
+            email_status,
+            confidence
+        ]);
+        return result.rows[0];
+    } catch (err) {
+        // Handle email uniqueness constraint violations
+        // Note: This handles both (agency_id, email) and (client_id, email) constraints
+        if (err.code === '23505' && email && (err.constraint?.includes('email') || err.message?.includes('email'))) {
+            console.warn(`[upsertContact] Email uniqueness violation for ${email}, updating existing record`);
+            
+            // Update the existing contact with this email
+            const updateQuery = `
+                UPDATE contacts
+                SET
+                    company_id = $1,
+                    role_type = $2,
+                    full_name = COALESCE($3, full_name),
+                    email_status = COALESCE($4, email_status),
+                    confidence = COALESCE($5, confidence),
+                    updated_at = now()
+                WHERE agency_id = $6 AND email = $7
+                RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
+                          last_verified_at, last_contacted_at, confidence, created_at, updated_at
+            `;
+            const updateResult = await pool.query(updateQuery, [
+                companyId,
+                roleType,
+                full_name,
+                email_status,
+                confidence,
+                agencyId,
+                email
+            ]);
+            
+            if (updateResult.rows[0]) {
+                return updateResult.rows[0];
+            }
+            
+            // If update didn't find a row, re-throw original error
+            throw err;
+        }
+        
+        // Re-throw any other errors
+        throw err;
+    }
 }
 
 /**

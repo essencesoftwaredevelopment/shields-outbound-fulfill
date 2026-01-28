@@ -11,6 +11,7 @@ const CONCURRENCY = 5; // Reduced from 15 to prevent overwhelming the server
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT = 30000; // 30 second timeout
+const REQUEST_TIMEOUT_MS = 20000; // 20s hard timeout per verification request
 
 // Create HTTP agent with keep-alive to prevent ECONNRESET
 const httpAgent = new http.Agent({
@@ -33,6 +34,24 @@ const shouldRetry = status => status === 402 || status === 429 || status >= 500;
 
 function normalize(value) {
     return (value || '').trim();
+}
+
+/**
+ * Fetch with AbortController timeout to prevent hanging requests
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            throw new Error('timeout');
+        }
+        throw err;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 async function readEmailCandidates(filePath) {
@@ -64,7 +83,7 @@ async function verifyEmailWithTryKitt(email, apiKey) {
         attempt += 1;
 
         try {
-            const res = await fetch('https://api.trykitt.ai/job/verify_email', {
+            const res = await fetchWithTimeout('https://api.trykitt.ai/job/verify_email', {
                 method: 'POST',
                 headers: {
                     'x-api-key': apiKey,
@@ -76,13 +95,29 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                 })
             });
 
+            // Debug logging
+            console.log(`[EMAIL VERIFIER DEBUG] Request to TryKitt for email: ${email}`);
+            console.log(`[EMAIL VERIFIER DEBUG] Response Status: ${res.status} ${res.statusText}`);
+            console.log(`[EMAIL VERIFIER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
+
             const text = await res.text();
+            console.log(`[EMAIL VERIFIER DEBUG] Response Body:`, text);
+            
             let parsed;
 
             try {
                 parsed = JSON.parse(text);
             } catch {
+                console.log(`[EMAIL VERIFIER DEBUG] Failed to parse JSON response`);
                 parsed = null;
+            }
+
+            // Check for credit exhaustion (402)
+            if (res.status === 402) {
+                const error = new Error('TryKitt account out of credits');
+                error.code = 'CREDIT_EXHAUSTED';
+                error.stage = 'verification';
+                throw error;
             }
 
             const validity = parsed?.validity ?? null;
@@ -100,6 +135,18 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                 raw: parsed
             };
         } catch (error) {
+            // Re-throw credit exhaustion errors immediately
+            if (error.code === 'CREDIT_EXHAUSTED') {
+                throw error;
+            }
+            
+            if (error.message === 'timeout') {
+                return {
+                    email,
+                    status: 'ERROR',
+                    validity: 'timeout'
+                };
+            }
             if (attempt >= MAX_RETRIES) {
                 return {
                     email,
@@ -132,10 +179,7 @@ async function verifyEmailWithSelfHosted(email) {
         attempt += 1;
 
         try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-            
-            const res = await fetch(SELF_HOSTED_URL, {
+            const res = await fetchWithTimeout(SELF_HOSTED_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -144,11 +188,13 @@ async function verifyEmailWithSelfHosted(email) {
                 body: JSON.stringify({
                     to_email: email
                 }),
-                agent: httpAgent,
-                signal: controller.signal
+                agent: httpAgent
             });
-            
-            clearTimeout(timeoutId);
+
+            // Debug logging
+            console.log(`[EMAIL VERIFIER DEBUG] Self-hosted verify for email: ${email}`);
+            console.log(`[EMAIL VERIFIER DEBUG] Response Status: ${res.status}`);
+            console.log(`[EMAIL VERIFIER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
 
             if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
                 await wait(backoff);
@@ -157,6 +203,8 @@ async function verifyEmailWithSelfHosted(email) {
             }
 
             const data = await res.json();
+            console.log(`[EMAIL VERIFIER DEBUG] Response Body:`, JSON.stringify(data));
+            
             const { is_reachable, smtp, misc } = data;
 
             // Map self-hosted response to TryKitt format
@@ -180,6 +228,13 @@ async function verifyEmailWithSelfHosted(email) {
             const errorType = error.name === 'AbortError' ? 'timeout' : error.code || 'unknown';
             console.log(`[VERIFY] Exception on attempt ${attempt} for ${email}: ${error.message} (${errorType})`);
             
+            if (error.message === 'timeout') {
+                return {
+                    email,
+                    status: 'ERROR',
+                    validity: 'timeout'
+                };
+            }            
             // Always retry on connection errors
             if (attempt < MAX_RETRIES && (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.name === 'AbortError' || error.code === 'ECONNREFUSED')) {
                 console.log(`[VERIFY] Connection error for ${email}, retrying after ${backoff}ms`);
@@ -280,13 +335,26 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
                 return;
             }
 
-            const result = await verifyEmail(item.row.email, provider, API_KEY);
-            const status = result.validity || 'unknown';
-            rows[item.index].email_status = status;
+            try {
+                const result = await verifyEmail(item.row.email, provider, API_KEY);
+                const status = result.validity || 'unknown';
+                rows[item.index].email_status = status;
 
-            if (Object.prototype.hasOwnProperty.call(stats, status)) {
-                stats[status] += 1;
-            } else {
+                if (Object.prototype.hasOwnProperty.call(stats, status)) {
+                    stats[status] += 1;
+                } else {
+                    stats.unknown += 1;
+                }
+            } catch (error) {
+                // Check for credit exhaustion - abort entire job
+                if (error.code === 'CREDIT_EXHAUSTED') {
+                    console.log(`[EMAIL_VERIFIER] Credit exhausted, aborting job`);
+                    controller.abort();
+                    throw error; // Re-throw to stop execution
+                }
+                // Other errors - record as unknown status for this row
+                console.error(`[EMAIL_VERIFIER] Error verifying ${item.row.email}:`, error.message);
+                rows[item.index].email_status = 'unknown';
                 stats.unknown += 1;
             }
 
@@ -318,6 +386,30 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
 
     try {
         await Promise.all(tasks);
+    } catch (error) {
+        // If credit exhausted, write partial results and re-throw
+        if (error.code === 'CREDIT_EXHAUSTED') {
+            console.log(`[EMAIL_VERIFIER] Writing partial results before pausing...`);
+            
+            // Write what we have so far
+            const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
+            writer.write('domain,founder_name,email,email_status\n');
+            rows.forEach(row => {
+                writer.write(
+                    [
+                        toCsvValue(row.domain),
+                        toCsvValue(row.founder_name),
+                        toCsvValue(row.email),
+                        toCsvValue(row.email_status)
+                    ].join(',') + '\n'
+                );
+            });
+            writer.end();
+            await new Promise(res => writer.on('finish', res));
+            
+            throw error; // Re-throw to propagate to runStage
+        }
+        throw error; // Re-throw other errors
     } finally {
         clearInterval(pauseCheckInterval);
     }

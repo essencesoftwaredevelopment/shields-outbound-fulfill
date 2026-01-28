@@ -153,12 +153,28 @@ async function lookupEmail(fullName, domain, apiKey) {
                 body: JSON.stringify(body)
             });
 
+            // Debug logging
+            // console.log(`[EMAIL FINDER DEBUG] Request to TryKitt for domain: ${domain}`);
+            // console.log(`[EMAIL FINDER DEBUG] Response Status: ${res.status} ${res.statusText}`);
+            // console.log(`[EMAIL FINDER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
+
             const text = await res.text();
+            // console.log(`[EMAIL FINDER DEBUG] Response Body:`, text);
+            
             let parsed = null;
             try {
                 parsed = text ? JSON.parse(text) : null;
             } catch {
+                // console.log(`[EMAIL FINDER DEBUG] Failed to parse JSON response`);
                 parsed = null;
+            }
+
+            // Check for credit exhaustion (402)
+            if (res.status === 402) {
+                const error = new Error('TryKitt account out of credits');
+                error.code = 'CREDIT_EXHAUSTED';
+                error.stage = 'emailDiscovery';
+                throw error;
             }
 
             if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
@@ -184,6 +200,11 @@ async function lookupEmail(fullName, domain, apiKey) {
                 raw: parsed
             };
         } catch (error) {
+            // Re-throw credit exhaustion errors immediately
+            if (error.code === 'CREDIT_EXHAUSTED') {
+                throw error;
+            }
+            
             if (attempt >= MAX_RETRIES) {
                 return {
                     email: null,
@@ -233,7 +254,8 @@ async function verifyEmailWithSelfHosted(email) {
             
             clearTimeout(timeoutId);
             const fetchTime = Date.now() - attemptStart;
-            console.log(`[VERIFY] Request completed for ${email} in ${fetchTime}ms, status: ${res.status}`);
+            // console.log(`[VERIFY] Request completed for ${email} in ${fetchTime}ms, status: ${res.status}`);
+            // console.log(`[EMAIL FINDER DEBUG] Self-hosted verify response headers:`, Object.fromEntries(res.headers.entries()));
 
             if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
                 console.log(`[VERIFY] Retryable error ${res.status} for ${email}, backing off ${backoff}ms`);
@@ -243,6 +265,8 @@ async function verifyEmailWithSelfHosted(email) {
             }
 
             const data = await res.json();
+            // console.log(`[EMAIL FINDER DEBUG] Self-hosted verify response body:`, JSON.stringify(data));
+            
             const { is_reachable, smtp, misc } = data;
 
             const isValid = (is_reachable === 'safe' || is_reachable === 'risky') && smtp?.is_deliverable;
@@ -403,23 +427,36 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
             let email = '';
             let status = 'not_started';
 
-            // Use appropriate provider
+            try {
+                // Use appropriate provider
                 const lookupStart = Date.now();
-            let lookup;
-            if (provider === PROVIDERS.SELF_HOSTED) {
+                let lookup;
+                if (provider === PROVIDERS.SELF_HOSTED) {
                     console.log(`[EMAIL_FINDER] Starting self-hosted lookup for ${founderName} @ ${domain}`);
-                lookup = await findEmailSelfHosted(founderName, domain);
+                    lookup = await findEmailSelfHosted(founderName, domain);
                     console.log(`[EMAIL_FINDER] Self-hosted lookup completed for ${founderName} @ ${domain} in ${Date.now() - lookupStart}ms, result: ${lookup.status}`);
-            } else {
-                lookup = await lookupEmail(founderName, domain, API_KEY);
-            }
-            
-            email = lookup.email || '';
-            status = lookup.status || (email ? 'found' : 'not_found');
+                } else {
+                    lookup = await lookupEmail(founderName, domain, API_KEY);
+                }
+                
+                email = lookup.email || '';
+                status = lookup.status || (email ? 'found' : 'not_found');
 
-            // Normalize external "no-results-found" to our canonical not_found
-            if (status === 'no-results-found') {
-                status = 'not_found';
+                // Normalize external "no-results-found" to our canonical not_found
+                if (status === 'no-results-found') {
+                    status = 'not_found';
+                }
+            } catch (error) {
+                // Check for credit exhaustion - abort entire job
+                if (error.code === 'CREDIT_EXHAUSTED') {
+                    console.log(`[EMAIL_FINDER] Credit exhausted, aborting job`);
+                    controller.abort();
+                    throw error; // Re-throw to stop execution
+                }
+                // Other errors - record as error status for this row
+                console.error(`[EMAIL_FINDER] Error looking up ${domain}:`, error.message);
+                email = '';
+                status = `error: ${error.message}`;
             }
 
             if (email) {
@@ -484,6 +521,36 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
             await Promise.all(tasks);
             await flushBatch(true);
             await flushPromise;
+        } catch (error) {
+            // If credit exhausted, write partial results and re-throw
+            if (error.code === 'CREDIT_EXHAUSTED') {
+                console.log(`[EMAIL_FINDER] Writing partial results before pausing...`);
+                await flushBatch(true);
+                await flushPromise;
+                
+                // Write what we have so far
+                const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
+                writer.write('domain,founder_name,email,lookup_status\n');
+                results.forEach((row, index) => {
+                    const safeRow = row || {
+                        domain: founders[index]?.domain,
+                        founder_name: founders[index]?.founder_name,
+                        email: '',
+                        status: 'not_processed'
+                    };
+                    const rowCsv = [
+                        toCsvValue(safeRow.domain),
+                        toCsvValue(safeRow.founder_name),
+                        toCsvValue(safeRow.email),
+                        toCsvValue(safeRow.status)
+                    ].join(',');
+                    writer.write(rowCsv + '\n');
+                });
+                writer.end();
+                
+                throw error; // Re-throw to propagate to runStage
+            }
+            throw error; // Re-throw other errors
         } finally {
             clearInterval(pauseCheckInterval);
         }

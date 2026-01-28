@@ -84,17 +84,27 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type }) {
 
     await withTx(async (client) => {
         const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
+        
+        console.log(`[upsertLeadRowsBatch] Domain map has ${domainMap.size} entries`);
 
-        const contactRows = payloads.map((p) => ({
-            company_id: domainMap.get(p.domain),
-            role_type: p.roleType,
-            full_name: p.fullName || null,
-            email: p.email || null,
-            email_status: p.emailStatus || null,
-            confidence: p.confidence || null,
-            personalization_first_line: p.personalizationFirstLine || null,
-            last_verified_at: p.lastVerifiedAt || null
-        })).filter((r) => r.company_id);
+        const contactRows = payloads.map((p) => {
+            const company_id = domainMap.get(p.domain);
+            if (!company_id) {
+                console.warn(`[upsertLeadRowsBatch] No company_id found for domain: ${p.domain}`);
+            }
+            return {
+                company_id,
+                role_type: p.roleType,
+                full_name: p.fullName || null,
+                email: p.email || null,
+                email_status: p.emailStatus || null,
+                confidence: p.confidence || null,
+                personalization_first_line: p.personalizationFirstLine || null,
+                last_verified_at: p.lastVerifiedAt || null
+            };
+        }).filter((r) => r.company_id);
+        
+        console.log(`[upsertLeadRowsBatch] Filtered to ${contactRows.length} contacts with valid company_id`);
 
         if (contactRows.length > 0) {
             await batchUpsertContacts(client, agencyId, clientId, contactRows);

@@ -25,9 +25,15 @@ const router = express.Router();
  *
  * Query parameters:
  *   - clientId: Client slug to resolve to numeric SQL client_id (required)
- *   - emailStatus: Filter by email_status (valid, risky, invalid, unknown)
+ *   - emailStatus: Filter by single email_status (valid, valid-risky, invalid, etc.)
+ *   - emailStatusMulti: Filter by multiple email statuses (comma-separated, e.g., "valid,valid-risky")
  *   - roleType: Filter by role type (founder, dm, etc.)
- *   - search: Search term for domain, email, or founder name
+ *   - search: Search term for domain, email, or founder name (general search)
+ *   - fullName: Specific full name search (contains, for segments)
+ *   - founderFilter: Filter founder existence (exists, not_found)
+ *   - emailFilter: Filter email existence (exists, not_found)
+ *   - createdAfter: Filter leads created after date (ISO 8601 format)
+ *   - createdBefore: Filter leads created before date (ISO 8601 format)
  *   - limit: Max results (default 200, max 500)
  *   - offset: Pagination offset (default 0)
  *
@@ -36,7 +42,20 @@ const router = express.Router();
 router.get('/leads', verifyFirebaseToken, async (req, res) => {
     try {
         const agencyId = req.agencyId;
-        const { clientId: clientSlug, emailStatus, roleType, search, limit = 200, offset = 0 } = req.query;
+        const {
+            clientId: clientSlug,
+            emailStatus,
+            emailStatusMulti,
+            roleType,
+            search,
+            fullName,
+            founderFilter,
+            emailFilter,
+            createdAfter,
+            createdBefore,
+            limit = 200,
+            offset = 0
+        } = req.query;
 
         if (!clientSlug) {
             return res.status(400).json({ error: 'clientId parameter is required' });
@@ -59,10 +78,22 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         const params = [agencyId, clientId];
         let paramIndex = 3;
 
+        // Single email status filter
         if (emailStatus) {
             whereClause += ` AND c.email_status = $${paramIndex}`;
             params.push(emailStatus);
             paramIndex++;
+        }
+
+        // Multi-select email status filter (for segments)
+        if (emailStatusMulti) {
+            const statuses = emailStatusMulti.split(',').filter(s => s.trim());
+            if (statuses.length > 0) {
+                const placeholders = statuses.map((_, i) => `$${paramIndex + i}`).join(',');
+                whereClause += ` AND c.email_status IN (${placeholders})`;
+                params.push(...statuses);
+                paramIndex += statuses.length;
+            }
         }
 
         if (roleType) {
@@ -71,6 +102,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramIndex++;
         }
 
+        // General search filter
         if (search) {
             const searchTerm = `%${search.toLowerCase()}%`;
             whereClause += ` AND (
@@ -79,6 +111,41 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 OR LOWER(c.full_name) LIKE $${paramIndex}
             )`;
             params.push(searchTerm);
+            paramIndex++;
+        }
+
+        // Specific full name search (for segments)
+        if (fullName) {
+            const nameTerm = `%${fullName.toLowerCase()}%`;
+            whereClause += ` AND LOWER(c.full_name) LIKE $${paramIndex}`;
+            params.push(nameTerm);
+            paramIndex++;
+        }
+
+        // Filter by founder existence
+        if (founderFilter === 'exists') {
+            whereClause += ` AND c.full_name IS NOT NULL AND c.full_name != '' AND LOWER(c.full_name) NOT LIKE '%not found%' AND LOWER(c.full_name) != 'not_found'`;
+        } else if (founderFilter === 'not_found') {
+            whereClause += ` AND (c.full_name IS NULL OR c.full_name = '' OR LOWER(c.full_name) LIKE '%not found%' OR LOWER(c.full_name) = 'not_found')`;
+        }
+
+        // Filter by email existence
+        if (emailFilter === 'exists') {
+            whereClause += ` AND c.email IS NOT NULL AND c.email != '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+        } else if (emailFilter === 'not_found') {
+            whereClause += ` AND (c.email IS NULL OR c.email = '' OR LOWER(c.email) LIKE '%not found%' OR LOWER(c.email) = 'not_found')`;
+        }
+
+        // Date filters
+        if (createdAfter) {
+            whereClause += ` AND c.created_at >= $${paramIndex}::timestamp`;
+            params.push(createdAfter);
+            paramIndex++;
+        }
+
+        if (createdBefore) {
+            whereClause += ` AND c.created_at <= $${paramIndex}::timestamp`;
+            params.push(createdBefore);
             paramIndex++;
         }
 

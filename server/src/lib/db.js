@@ -60,36 +60,49 @@ export async function batchUpsertCompanies(txClient, agencyId, clientId, rows) {
     if (!clientId) throw new Error('clientId is required');
 
     const domainMap = new Map();
-    const uniqueDomains = [...new Set(rows.map((r) => (r.domain || '').toLowerCase()).filter(Boolean))];
+    const uniqueDomains = [...new Set(rows.map((r) => (r.domain || '').toLowerCase().trim()).filter(Boolean))];
 
-    if (!uniqueDomains.length) return domainMap;
+    if (!uniqueDomains.length) {
+        console.warn(`[batchUpsertCompanies] No valid domains found in ${rows.length} rows`);
+        return domainMap;
+    }
+
+    console.log(`[batchUpsertCompanies] Upserting ${uniqueDomains.length} unique domains for agency ${agencyId}, client ${clientId}`);
 
     // Batch upsert in a single query for efficiency
     const valuesList = [];
-    const params = [agencyId]; // Start with agencyId only
-    let paramIndex = 2;
+    const params = [agencyId, clientId]; // Include both agencyId and clientId
+    let paramIndex = 3;
 
     for (const domain of uniqueDomains) {
-        params.push(domain.toLowerCase());
-        valuesList.push(`($1, $${paramIndex})`);
+        params.push(domain);
+        valuesList.push(`($1, $2, $${paramIndex})`);
         paramIndex += 1;
     }
 
     const query = `
-        INSERT INTO companies (agency_id, domain_normalized)
+        INSERT INTO companies (agency_id, client_id, domain_normalized)
         VALUES ${valuesList.join(', ')}
-        ON CONFLICT (agency_id, domain_normalized)
+        ON CONFLICT (client_id, domain_normalized)
         DO UPDATE SET updated_at = now()
         RETURNING id, domain_normalized
     `;
 
-    const result = await txClient.query(query, params);
+    try {
+        const result = await txClient.query(query, params);
+        console.log(`[batchUpsertCompanies] Upserted ${result.rows.length} companies`);
 
-    for (const row of result.rows) {
-        domainMap.set(row.domain_normalized, row.id);
+        for (const row of result.rows) {
+            domainMap.set(row.domain_normalized, row.id);
+        }
+
+        return domainMap;
+    } catch (err) {
+        console.error(`[batchUpsertCompanies] Query failed:`, err.message);
+        console.error(`[batchUpsertCompanies] Query:`, query);
+        console.error(`[batchUpsertCompanies] First 3 params:`, params.slice(0, 3));
+        throw err;
     }
-
-    return domainMap;
 }
 
 /**
@@ -108,8 +121,9 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
     if (!clientId) throw new Error('clientId is required');
 
     const valuesList = [];
-    const params = []; // No client_id param
-    let paramIndex = 1;
+    const params = [clientId]; // Add clientId as first param
+    let paramIndex = 2;
+    const rowsMetadata = []; // Keep track of row data for fallback updates
 
     for (const row of rows) {
         const { 
@@ -122,23 +136,28 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
             personalization_first_line = null
         } = row;
 
-        if (!company_id || !role_type) continue; // Skip invalid rows
+        if (!company_id || !role_type) {
+            console.warn(`[batchUpsertContacts] Skipping row with null company_id or role_type:`, { company_id, role_type, email });
+            continue; // Skip invalid rows
+        }
 
         params.push(company_id, role_type, full_name, email, email_status, confidence, agencyId, personalization_first_line);
-        valuesList.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`);
+        valuesList.push(`($1, $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`);
         paramIndex += 8;
+        
+        // Store metadata for potential fallback update
+        rowsMetadata.push({ company_id, role_type, full_name, email, email_status, confidence, personalization_first_line });
     }
 
     if (!valuesList.length) return [];
 
     const query = `
-        INSERT INTO contacts (company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
+        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
         VALUES ${valuesList.join(', ')}
         ON CONFLICT (company_id, role_type)
         DO UPDATE SET
-            company_id = COALESCE(EXCLUDED.company_id, contacts.company_id),
-            role_type = COALESCE(EXCLUDED.role_type, contacts.role_type),
-            full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
+            full_name = EXCLUDED.full_name,
+            email = COALESCE(EXCLUDED.email, contacts.email),
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
@@ -147,8 +166,74 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
                   last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
     `;
 
-    const result = await txClient.query(query, params);
-    return result.rows;
+    try {
+        const result = await txClient.query(query, params);
+        return result.rows;
+    } catch (err) {
+        // If we hit the (client_id, email) unique constraint, handle it gracefully
+        if (err.code === '23505' && err.constraint === 'contacts_client_email_unique') {
+            console.warn(`[batchUpsertContacts] Email uniqueness violation detected, falling back to individual updates`);
+            
+            // Fall back to individual inserts/updates to handle email conflicts
+            const results = [];
+            for (const row of rowsMetadata) {
+                try {
+                    const individualQuery = `
+                        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (company_id, role_type)
+                        DO UPDATE SET
+                            full_name = EXCLUDED.full_name,
+                            email = COALESCE(EXCLUDED.email, contacts.email),
+                            email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
+                            confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
+                            personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
+                            updated_at = now()
+                        RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
+                                  last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
+                    `;
+                    const individualResult = await txClient.query(individualQuery, [
+                        clientId, row.company_id, row.role_type, row.full_name, 
+                        row.email, row.email_status, row.confidence, agencyId, row.personalization_first_line
+                    ]);
+                    results.push(individualResult.rows[0]);
+                } catch (innerErr) {
+                    // If still a duplicate email error, update the existing record instead
+                    if (innerErr.code === '23505' && innerErr.constraint === 'contacts_client_email_unique' && row.email) {
+                        console.warn(`[batchUpsertContacts] Updating existing contact with email: ${row.email}`);
+                        const updateQuery = `
+                            UPDATE contacts
+                            SET
+                                company_id = $1,
+                                role_type = $2,
+                                full_name = COALESCE($3, full_name),
+                                email_status = COALESCE($4, email_status),
+                                confidence = COALESCE($5, confidence),
+                                personalization_first_line = COALESCE($6, personalization_first_line),
+                                updated_at = now()
+                            WHERE client_id = $7 AND email = $8
+                            RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
+                                      last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
+                        `;
+                        const updateResult = await txClient.query(updateQuery, [
+                            row.company_id, row.role_type, row.full_name, 
+                            row.email_status, row.confidence, row.personalization_first_line,
+                            clientId, row.email
+                        ]);
+                        if (updateResult.rows[0]) {
+                            results.push(updateResult.rows[0]);
+                        }
+                    } else {
+                        // Log but don't fail the entire batch for other errors
+                        console.error(`[batchUpsertContacts] Failed to insert/update contact:`, innerErr.message, row);
+                    }
+                }
+            }
+            return results;
+        }
+        // Re-throw if it's not the expected constraint error
+        throw err;
+    }
 }
 
 /**
