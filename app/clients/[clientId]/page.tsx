@@ -3319,60 +3319,77 @@ export default function ClientPage() {
                                         try {
                                             let leadsToExport = leads;
                                             
-                                            // If we haven't cached all leads yet, fetch them all now
+                                            // If we haven't cached all leads yet, fetch them all now from SQL
                                             if (!allLeadsCached && user && clientId) {
-                                                const leadsCol = collection(firestore, "users", user.uid, "clients", clientId, "leads");
-                                                const constraints: unknown[] = [];
+                                                const idToken = await getIdToken(user);
+                                                const params = new URLSearchParams();
+                                                params.append('clientId', clientId);
+                                                params.append('limit', '500');
+                                                
+                                                // Apply filters to API request
                                                 if (campaignFilterId) {
-                                                    constraints.push(where("campaigns", "array-contains", campaignFilterId));
+                                                    params.append('instantlyCampaignId', campaignFilterId);
                                                 }
                                                 if (emailStatusFilter) {
-                                                    constraints.push(where("email_status", "==", emailStatusFilter));
+                                                    params.append('emailStatus', emailStatusFilter);
+                                                }
+                                                if (leadSearch.trim()) {
+                                                    params.append('search', leadSearch.trim());
+                                                }
+                                                if (founderFilter) {
+                                                    params.append('founderFilter', founderFilter);
+                                                }
+                                                if (emailFilter) {
+                                                    params.append('emailFilter', emailFilter);
                                                 }
                                                 
-                                                const mapDocToLead = (d: any): Lead => {
-                                                    const data = d.data();
-                                                    const emailStatus = (data.email_status as string) || "";
-                                                    const isVerified = emailStatus === "valid" || emailStatus === "verified";
-                                                    return {
-                                                        id: d.id,
-                                                        domain: (data.domain as string) || (data.website as string) || "",
-                                                        email: (data.email as string) || "",
-                                                        status: emailStatus,
-                                                        verified: isVerified,
-                                                        firstLine: (data.personalization_first_line as string) || "",
-                                                        founderName: (data.founder_name as string) || "",
-                                                        personalizationUrl: (data.personalization_url as string) || "",
-                                                        personalizationTitle: (data.personalization_title as string) || "",
-                                                        updatedAt: data.updatedAt ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
-                                                        campaigns: Array.isArray(data.campaigns) ? data.campaigns : (data.campaignId ? [data.campaignId] : [])
-                                                    } as Lead;
-                                                };
-                                                
-                                                const pageSize = 500;
-                                                let cursor: DocumentSnapshot | null = null;
                                                 const collected: Lead[] = [];
-                                                let pagesRead = 0;
+                                                let offset = 0;
+                                                let hasMore = true;
                                                 
-                                                // eslint-disable-next-line no-constant-condition
-                                                while (true) {
-                                                    const clauses: any[] = [...constraints, orderBy("updatedAt", "desc")];
-                                                    if (cursor) {
-                                                        clauses.push(startAfter(cursor));
+                                                // Fetch all pages
+                                                while (hasMore) {
+                                                    params.set('offset', String(offset));
+                                                    
+                                                    const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                                                        headers: {
+                                                            'Authorization': `Bearer ${idToken}`
+                                                        }
+                                                    });
+                                                    
+                                                    if (!response.ok) {
+                                                        throw new Error(`Failed to fetch leads: ${response.statusText}`);
                                                     }
-                                                    clauses.push(limit(pageSize));
                                                     
-                                                    const snap = await getDocs(query(leadsCol, ...clauses));
-                                                    snap.docs.forEach((docSnap) => collected.push(mapDocToLead(docSnap)));
-                                                    pagesRead += 1;
+                                                    const data = await response.json();
+                                                    const { leads: apiLeads, hasMore: more } = data;
                                                     
-                                                    if (snap.size < pageSize) {
-                                                        break;
-                                                    }
-                                                    cursor = snap.docs[snap.docs.length - 1];
+                                                    // Map API response to Lead type
+                                                    const mapped: Lead[] = apiLeads.map((row: any) => ({
+                                                        id: row.id,
+                                                        domain: row.domain || "",
+                                                        email: row.email || "",
+                                                        status: row.status || "",
+                                                        verified: row.verified,
+                                                        firstLine: row.firstLine || "",
+                                                        founderName: row.founderName || "",
+                                                        roleType: row.roleType || "",
+                                                        personalizationUrl: row.personalizationUrl || "",
+                                                        personalizationTitle: row.personalizationTitle || "",
+                                                        updatedAt: row.updatedAt || "",
+                                                        createdAt: row.createdAt || "",
+                                                        lastVerifiedAt: row.lastVerifiedAt || "",
+                                                        campaigns: row.campaigns || [],
+                                                        campaignsData: row.campaignsData || []
+                                                    }));
                                                     
-                                                    if (pagesRead >= 100) {
-                                                        console.warn('Reached max page limit while exporting');
+                                                    collected.push(...mapped);
+                                                    offset += mapped.length;
+                                                    hasMore = more && mapped.length > 0;
+                                                    
+                                                    // Safety limit
+                                                    if (collected.length >= 50000) {
+                                                        console.warn('Reached max export limit of 50,000 leads');
                                                         break;
                                                     }
                                                 }
@@ -3380,73 +3397,8 @@ export default function ClientPage() {
                                                 leadsToExport = collected;
                                             }
                                             
-                                            // Apply client-side filters to get final export set
-                                            let filtered = leadsToExport;
-                                            
-                                            // Search filter
-                                            if (leadSearch.trim()) {
-                                                const term = leadSearch.trim().toLowerCase();
-                                                filtered = filtered.filter((lead) => {
-                                                    const domain = (lead.domain || "").toLowerCase();
-                                                    const email = (lead.email || "").toLowerCase();
-                                                    const founder = (lead.founderName || "").toLowerCase();
-                                                    return domain.includes(term) || email.includes(term) || founder.includes(term);
-                                                });
-                                            }
-                                            
-                                            // Founder filter
-                                            if (founderFilter === "exists") {
-                                                filtered = filtered.filter((lead) => {
-                                                    const founder = (lead.founderName || "").trim();
-                                                    const founderLower = founder.toLowerCase();
-                                                    return founder.length > 0 && !founderLower.includes("not found") && founderLower !== "not_found";
-                                                });
-                                            } else if (founderFilter === "not_found") {
-                                                filtered = filtered.filter((lead) => {
-                                                    const founder = (lead.founderName || "").trim();
-                                                    const founderLower = founder.toLowerCase();
-                                                    return founder.length === 0 || founderLower.includes("not found") || founderLower === "not_found";
-                                                });
-                                            }
-                                            
-                                            // Email filter
-                                            if (emailFilter === "exists") {
-                                                filtered = filtered.filter((lead) => {
-                                                    const status = (lead.status || "").trim();
-                                                    const email = (lead.email || "").trim();
-                                                    const emailLower = email.toLowerCase();
-                                                    // Email finder ran (status exists) and email found
-                                                    return status.length > 0 && email.length > 0 && !emailLower.includes("not found") && emailLower !== "not_found";
-                                                });
-                                            } else if (emailFilter === "not_found") {
-                                                filtered = filtered.filter((lead) => {
-                                                    const status = (lead.status || "").trim();
-                                                    const email = (lead.email || "").trim();
-                                                    // Email finder ran (status exists) but no email found
-                                                    return status.length > 0 && email.length === 0;
-                                                });
-                                            } else if (emailFilter === "not_run") {
-                                                filtered = filtered.filter((lead) => {
-                                                    const status = (lead.status || "").trim();
-                                                    // Email finder never ran (no status)
-                                                    return status.length === 0;
-                                                });
-                                            }
-                                            
-                                            // Email status filter (already applied in DB if used)
-                                            if (emailStatusFilter && allLeadsCached) {
-                                                if (emailStatusFilter === 'not_run') {
-                                                    filtered = filtered.filter((lead) => {
-                                                        const status = (lead.status || "").trim();
-                                                        return status.length === 0;
-                                                    });
-                                                } else {
-                                                    filtered = filtered.filter((lead) => {
-                                                        const status = (lead.status || "").toLowerCase();
-                                                        return status === emailStatusFilter.toLowerCase();
-                                                    });
-                                                }
-                                            }
+                                            // Filters are already applied by the SQL API, just use the data directly
+                                            const filtered = leadsToExport;
                                             
                                             // Generate CSV
                                             const headers = ['Founder Name', 'Email', 'Status', 'Domain', 'First Line', 'Personalization URL', 'Personalization Title', 'Campaigns', 'Updated At'];
