@@ -22,6 +22,7 @@ import { buildUnifiedRows } from '../utils/csv.js';
 import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaignLeadCount } from '../services/leads.js';
 import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, processJob, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
 import { getOrCreateClient } from '../services/db/queries.js';
+import { pool } from '../config/db.js';
 
 const router = express.Router();
 
@@ -727,11 +728,328 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
         } catch (firestoreError) {
             console.warn('Failed to persist campaign lead linkage/counts:', firestoreError?.message || firestoreError);
         }
+        
+        // Track upload in SQL contact_instantly_campaigns table
+        try {
+            if (uploaded > 0) {
+                // Get SQL client_id
+                const clientResult = await pool.query(
+                    'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+                    [uid, clientId]
+                );
+                
+                if (clientResult.rows.length > 0) {
+                    const sqlClientId = clientResult.rows[0].id;
+                    
+                    // Get campaign SQL ID
+                    const campaignResult = await pool.query(
+                        'SELECT id FROM instantly_campaigns WHERE agency_id = $1 AND instantly_campaign_id = $2',
+                        [uid, campaignId]
+                    );
+                    
+                    if (campaignResult.rows.length > 0) {
+                        const sqlCampaignId = campaignResult.rows[0].id;
+                        
+                        // Get contact IDs for uploaded leads (only valid/risky emails)
+                        const emails = verified.slice(0, uploaded).map(row => row.email).filter(Boolean);
+                        if (emails.length > 0) {
+                            const contactsResult = await pool.query(
+                                `SELECT id, email FROM contacts 
+                                 WHERE client_id = $1 AND email = ANY($2) 
+                                 AND email_status IN ('valid', 'risky')`,
+                                [sqlClientId, emails]
+                            );
+                            
+                            if (contactsResult.rows.length > 0) {
+                                // Bulk insert into contact_instantly_campaigns
+                                const values = contactsResult.rows.map((_, idx) => {
+                                    const offset = idx * 3;
+                                    return `($${offset + 1}, $${offset + 2}, $${offset + 3})`;
+                                }).join(', ');
+                                
+                                const params = contactsResult.rows.flatMap(contact => [
+                                    contact.id,
+                                    sqlCampaignId,
+                                    jobId
+                                ]);
+                                
+                                await pool.query(
+                                    `INSERT INTO contact_instantly_campaigns 
+                                        (contact_id, campaign_id, job_id, upload_source, added_at)
+                                     VALUES ${values}
+                                     ON CONFLICT (contact_id, campaign_id) 
+                                     DO UPDATE SET 
+                                        job_id = COALESCE(contact_instantly_campaigns.job_id, EXCLUDED.job_id),
+                                        added_at = now()`,
+                                    params
+                                );
+                                
+                                console.log(`[SQL] Tracked ${contactsResult.rows.length} contacts in campaign ${sqlCampaignId}`);
+                            }
+                        }
+                    } else {
+                        console.warn('[SQL] Campaign not found in SQL, skipping tracking', { campaignId });
+                    }
+                }
+            }
+        } catch (sqlError) {
+            console.error('[SQL] Failed to track upload in SQL:', sqlError?.message || sqlError);
+            // Don't fail the request if SQL tracking fails
+        }
+        
         return res.json({ count: uploaded, total: verified.length });
     } catch (error) {
         console.error('Upload to Instantly error:', error);
         await recordUploadFailure('Failed to upload to Instantly.');
         return res.status(500).json({ error: 'Failed to upload to Instantly.' });
+    }
+});
+
+// POST /api/jobs/:jobId/mark-manual-upload - Mark contacts as manually uploaded
+router.post('/jobs/:jobId/mark-manual-upload', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const { idToken, clientId, campaignId, notes } = req.body;
+
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
+        if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });
+        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        // Get SQL client_id
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [uid, clientId]
+        );
+
+        if (clientResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Client not found in SQL.' });
+        }
+
+        const sqlClientId = clientResult.rows[0].id;
+
+        // Verify campaign exists and get its info
+        const campaignResult = await pool.query(
+            'SELECT id, name FROM instantly_campaigns WHERE id = $1 AND agency_id = $2 AND client_id = $3',
+            [campaignId, uid, sqlClientId]
+        );
+
+        if (campaignResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Campaign not found or access denied.' });
+        }
+
+        const campaignName = campaignResult.rows[0].name;
+
+        // Get qualified contacts for this job
+        // Criteria: valid/risky email + non-empty/non-invalid personalization
+        const contactsResult = await pool.query(
+            `SELECT id, email, full_name, personalization_first_line
+             FROM contacts 
+             WHERE client_id = $1 
+             AND job_id = $2
+             AND (email_status = 'valid' OR email_status = 'risky')
+             AND personalization_first_line IS NOT NULL
+             AND personalization_first_line != 'invalid'
+             AND personalization_first_line != ''
+             ORDER BY created_at DESC`,
+            [sqlClientId, jobId]
+        );
+
+        if (contactsResult.rows.length === 0) {
+            return res.status(404).json({ 
+                error: 'No qualified contacts found.',
+                message: 'Contacts must have valid/risky email status and valid personalization.'
+            });
+        }
+
+        // Bulk insert into contact_instantly_campaigns with manual source
+        const values = contactsResult.rows.map((_, idx) => {
+            const offset = idx * 5;
+            return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`;
+        }).join(', ');
+
+        const params = contactsResult.rows.flatMap(contact => [
+            contact.id,
+            campaignId,
+            'manual',
+            uid,
+            jobId
+        ]);
+
+        // Add notes parameter if provided
+        let query;
+        if (notes && notes.trim()) {
+            const notesParams = contactsResult.rows.map(() => notes.trim());
+            params.push(...notesParams);
+            
+            const valuesWithNotes = contactsResult.rows.map((_, idx) => {
+                const offset = idx * 5;
+                const notesOffset = contactsResult.rows.length * 5 + idx;
+                return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${notesOffset + 1})`;
+            }).join(', ');
+            
+            query = `
+                INSERT INTO contact_instantly_campaigns 
+                    (contact_id, campaign_id, upload_source, uploaded_by, job_id, notes)
+                VALUES ${valuesWithNotes}
+                ON CONFLICT (contact_id, campaign_id) DO NOTHING
+                RETURNING contact_id
+            `;
+        } else {
+            query = `
+                INSERT INTO contact_instantly_campaigns 
+                    (contact_id, campaign_id, upload_source, uploaded_by, job_id)
+                VALUES ${values}
+                ON CONFLICT (contact_id, campaign_id) DO NOTHING
+                RETURNING contact_id
+            `;
+        }
+
+        const result = await pool.query(query, params);
+
+        console.log(`[Manual Upload] Marked ${result.rows.length} contacts for job ${jobId} to campaign ${campaignName}`);
+
+        res.json({
+            success: true,
+            contactCount: result.rows.length,
+            campaignName,
+            campaignId
+        });
+
+    } catch (error) {
+        console.error('Error marking manual upload:', error);
+        res.status(500).json({ error: 'Failed to mark manual upload.' });
+    }
+});
+
+// GET /api/jobs/:jobId/upload-status - Get upload status for a job
+router.get('/jobs/:jobId/upload-status', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const { clientId, agencyId } = req.query;
+
+        if (!clientId || !agencyId) {
+            return res.status(400).json({ error: 'Missing clientId or agencyId query parameters.' });
+        }
+
+        // Get SQL client_id
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+
+        if (clientResult.rows.length === 0) {
+            return res.json({ uploads: [] });
+        }
+
+        const sqlClientId = clientResult.rows[0].id;
+
+        // Get upload status aggregated by campaign and source
+        const uploadsResult = await pool.query(
+            `SELECT 
+                ic.id as campaign_id,
+                ic.name as campaign_name,
+                ic.instantly_campaign_id,
+                cic.upload_source,
+                COUNT(cic.contact_id) as contact_count,
+                MIN(cic.added_at) as first_uploaded_at,
+                MAX(cic.added_at) as last_uploaded_at,
+                cic.notes
+             FROM contact_instantly_campaigns cic
+             JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+             JOIN contacts c ON c.id = cic.contact_id
+             WHERE cic.job_id = $1 
+             AND ic.agency_id = $2 
+             AND c.client_id = $3
+             GROUP BY ic.id, ic.name, ic.instantly_campaign_id, cic.upload_source, cic.notes
+             ORDER BY last_uploaded_at DESC`,
+            [jobId, agencyId, sqlClientId]
+        );
+
+        res.json({ uploads: uploadsResult.rows });
+
+    } catch (error) {
+        console.error('Error fetching upload status:', error);
+        res.status(500).json({ error: 'Failed to fetch upload status.' });
+    }
+});
+
+// GET /api/jobs/:jobId/qualified-count - Get count of qualified contacts for manual upload
+router.get('/jobs/:jobId/qualified-count', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const { clientId, agencyId } = req.query;
+
+        if (!clientId || !agencyId) {
+            return res.status(400).json({ error: 'Missing clientId or agencyId query parameters.' });
+        }
+
+        // Get or create SQL client_id using the Firestore client slug
+        const sqlClientId = await getOrCreateClient(agencyId, clientId);
+
+        // Get counts for qualified contacts from this specific job
+        const countsResult = await pool.query(
+            `SELECT 
+                COUNT(*) FILTER (
+                    WHERE (email_status = 'valid' OR email_status = 'risky')
+                    AND personalization_first_line IS NOT NULL
+                    AND personalization_first_line != 'invalid'
+                    AND personalization_first_line != ''
+                ) as qualified_count,
+                COUNT(*) as total_count
+             FROM contacts 
+             WHERE client_id = $1 AND job_id = $2`,
+            [sqlClientId, jobId]
+        );
+
+        res.json({
+            qualifiedCount: parseInt(countsResult.rows[0].qualified_count) || 0,
+            totalCount: parseInt(countsResult.rows[0].total_count) || 0
+        });
+
+    } catch (error) {
+        console.error('Error fetching qualified count:', error);
+        res.status(500).json({ error: 'Failed to fetch qualified count.' });
+    }
+});
+
+// DELETE /api/jobs/:jobId/revert-manual-upload - Revert manual upload
+router.delete('/jobs/:jobId/revert-manual-upload', async (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const { idToken, clientId, campaignId } = req.body;
+
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });
+        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        // Delete only manual uploads for this job and campaign by this user
+        const result = await pool.query(
+            `DELETE FROM contact_instantly_campaigns 
+             WHERE job_id = $1 
+             AND campaign_id = $2 
+             AND upload_source = 'manual'
+             AND uploaded_by = $3
+             RETURNING contact_id`,
+            [jobId, campaignId, uid]
+        );
+
+        console.log(`[Manual Upload Revert] Removed ${result.rows.length} contacts from campaign ${campaignId} for job ${jobId}`);
+
+        res.json({
+            success: true,
+            removedCount: result.rows.length
+        });
+
+    } catch (error) {
+        console.error('Error reverting manual upload:', error);
+        res.status(500).json({ error: 'Failed to revert manual upload.' });
     }
 });
 

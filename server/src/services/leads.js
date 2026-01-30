@@ -161,13 +161,14 @@ export async function getLeadStats(agencyId) {
     return result.rows[0] || {};
 }
 
-async function upsertContact({ agencyId, companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, lastVerifiedAt = null }) {
+async function upsertContact({ agencyId, companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, lastVerifiedAt = null, jobId = null }) {
     try {
         await queries.upsertContact(agencyId, companyId, roleType, {
             full_name: fullName,
             email,
             email_status: emailStatus,
-            confidence
+            confidence,
+            job_id: jobId
         });
     } catch (err) {
         console.error('Contact upsert error:', err?.message || err);
@@ -192,7 +193,7 @@ export async function upsertLead(agencyId, domain, data) {
  * Legacy function kept for backward compatibility
  * Use processCsvWithCheckpoints for crash-safe processing
  */
-export async function upsertLeadsFromCsv({ agencyId, clientId, csvPath, type }) {
+export async function upsertLeadsFromCsv({ agencyId, clientId, csvPath, type, jobId = null }) {
     if (!fs.existsSync(csvPath) || !agencyId || !clientId) return;
     const rows = [];
     await new Promise((resolve, reject) => {
@@ -224,7 +225,8 @@ export async function upsertLeadsFromCsv({ agencyId, clientId, csvPath, type }) 
                 email: p.email || null,
                 email_status: p.emailStatus || null,
                 confidence: p.confidence || null,
-                personalization_first_line: p.personalizationFirstLine || null
+                personalization_first_line: p.personalizationFirstLine || null,
+                job_id: jobId
             })).filter((r) => r.company_id);
 
             if (contactRows.length > 0) {

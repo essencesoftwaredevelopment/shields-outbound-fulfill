@@ -142,7 +142,11 @@ export async function buildUnifiedRows({ jobId, scope = 'all', resolveJobPaths }
     });
 
     if (scope === 'valid') {
-        return unified.filter(r => VALID_UPLOAD_STATUSES.has((r.email_status || '').toLowerCase()));
+        return unified.filter(r => {
+            const hasValidStatus = VALID_UPLOAD_STATUSES.has((r.email_status || '').toLowerCase());
+            const personalizationNotInvalid = (r.personalization_first_line || '').toLowerCase() !== 'invalid';
+            return hasValidStatus && personalizationNotInvalid;
+        });
     }
     
     if (scope === 'with-email') {
@@ -163,7 +167,7 @@ export async function buildUnifiedRows({ jobId, scope = 'all', resolveJobPaths }
 
 export async function writeUploadCsv(filePath, rows) {
     if (!rows || !Array.isArray(rows)) return;
-    const headers = ['domain', 'founder_name', 'email', 'email_status', 'first_name', 'last_name', 'personalization', 'personalization_first_line', 'personalization_title', 'personalization_url', 'product_title'];
+    const headers = ['domain', 'founder_name', 'email', 'email_status', 'first_name', 'last_name', 'personalization'];
     const writer = fs.createWriteStream(filePath);
     writer.write(headers.join(',') + '\n');
     rows.forEach((row) => {

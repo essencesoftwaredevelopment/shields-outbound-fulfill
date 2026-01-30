@@ -347,6 +347,16 @@ export default function ClientPage() {
     const [pipelineVisible, setPipelineVisible] = useState(true);
     const [expandedErrorJobId, setExpandedErrorJobId] = useState<string | null>(null);
 
+    // Manual upload modal state
+    const [showManualUploadModal, setShowManualUploadModal] = useState(false);
+    const [selectedJobForManual, setSelectedJobForManual] = useState<any>(null);
+    const [manualUploadCampaigns, setManualUploadCampaigns] = useState<Campaign[]>([]);
+    const [selectedManualCampaign, setSelectedManualCampaign] = useState('');
+    const [manualUploadNotes, setManualUploadNotes] = useState('');
+    const [manualUploadLoading, setManualUploadLoading] = useState(false);
+    const [qualifiedContactsCount, setQualifiedContactsCount] = useState<{qualified: number, total: number} | null>(null);
+    const [jobUploadStatus, setJobUploadStatus] = useState<Record<string, any[]>>({});
+
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
         return `https://api.shieldsoutboundserver.org/webhook/events/${user.uid}/${clientId}`;
@@ -700,13 +710,16 @@ export default function ClientPage() {
 
     // Helper function to display email
     const displayEmail = (email: string | undefined, emailStatus: string | undefined) => {
-        // If email_status is empty, the email finder hasn't run yet
-        if (!emailStatus || emailStatus.trim() === '') return 'Not Run';
-        // If email is empty but status exists, it was not found
-        if (!email || email.trim() === '') return 'Not Found';
-        const emailLower = email.toLowerCase().trim();
-        if (emailLower === 'not found' || emailLower === 'not_found' || emailLower.includes('not found')) return 'Not Found';
-        return email;
+        // If email exists, show it (even if from Instantly backfill without status)
+        if (email && email.trim() !== '') {
+            const emailLower = email.toLowerCase().trim();
+            if (emailLower === 'not found' || emailLower === 'not_found' || emailLower.includes('not found')) return 'Not Found';
+            return email;
+        }
+        // If email_status exists but no email, it was not found
+        if (emailStatus && emailStatus.trim() !== '') return 'Not Found';
+        // No email and no status means email finder hasn't run yet
+        return 'Not Run';
     };
 
     // Helper function to display email status
@@ -1485,6 +1498,13 @@ export default function ClientPage() {
             setSelectedJobId(jobState.id);
         }
     }, [jobState?.id]);
+
+    // Fetch upload status when job history changes
+    useEffect(() => {
+        if (jobHistory.length > 0 && user) {
+            fetchJobsUploadStatus();
+        }
+    }, [jobHistory.length, user]);
 
     useEffect(() => {
         if (!jobState || !user || !clientId) {
@@ -2303,6 +2323,173 @@ export default function ClientPage() {
         }
     };
 
+    // Manual upload handlers
+    const fetchQualifiedCount = async (jobId: string) => {
+        try {
+            const token = await user?.getIdToken();
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/jobs/${jobId}/qualified-count?clientId=${clientId}&agencyId=${user?.uid}`,
+                { headers: { Authorization: `Bearer ${token}` } }
+            );
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            console.error('Error fetching qualified count:', error);
+            return { qualifiedCount: 0, totalCount: 0 };
+        }
+    };
+
+    const fetchJobsUploadStatus = async () => {
+        try {
+            const token = await user?.getIdToken();
+            const statusMap: Record<string, any[]> = {};
+            
+            for (const job of jobHistory) {
+                const response = await fetch(
+                    `${getPipelineBaseUrl()}/api/jobs/${job.id}/upload-status?clientId=${clientId}&agencyId=${user?.uid}`,
+                    { headers: { Authorization: `Bearer ${token}` } }
+                );
+                const data = await response.json();
+                if (data.uploads && data.uploads.length > 0) {
+                    statusMap[job.id] = data.uploads;
+                }
+            }
+            
+            setJobUploadStatus(statusMap);
+        } catch (error) {
+            console.error('Error fetching upload status:', error);
+        }
+    };
+
+    const handleOpenManualUpload = async (job: any) => {
+        setSelectedJobForManual(job);
+        setShowManualUploadModal(true);
+        setManualUploadLoading(true);
+        
+        try {
+            const token = await user?.getIdToken();
+            const campaignsResponse = await fetch(
+                `${getPipelineBaseUrl()}/api/clients/${clientId}/campaigns/list?agencyId=${user?.uid}`,
+                { headers: { Authorization: `Bearer ${token}` } }
+            );
+            
+            if (!campaignsResponse.ok) {
+                throw new Error(`Failed to fetch campaigns: ${campaignsResponse.status}`);
+            }
+            
+            const campaignsData = await campaignsResponse.json();
+            setManualUploadCampaigns(campaignsData.campaigns || []);
+            
+            const countData = await fetchQualifiedCount(job.id);
+            setQualifiedContactsCount(countData);
+            
+        } catch (error) {
+            console.error('Error loading manual upload data:', error);
+            setToastMessage('Failed to load campaigns. Please try again.');
+            setToastVisible(true);
+        } finally {
+            setManualUploadLoading(false);
+        }
+    };
+
+    const handleConfirmManualUpload = async () => {
+        if (!selectedManualCampaign) {
+            setToastMessage('Please select a campaign');
+            setToastVisible(true);
+            return;
+        }
+        
+        if (!qualifiedContactsCount) {
+            setToastMessage('No qualified contacts to mark');
+            setToastVisible(true);
+            return;
+        }
+
+        try {
+            setManualUploadLoading(true);
+            const token = await user?.getIdToken();
+            
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/jobs/${selectedJobForManual.id}/mark-manual-upload`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        idToken: token,
+                        campaignId: selectedManualCampaign,
+                        notes: manualUploadNotes,
+                        clientId
+                    })
+                }
+            );
+
+            const data = await response.json();
+            
+            if (data.success) {
+                setToastMessage(`✅ Marked ${data.contactCount} contacts as uploaded to ${data.campaignName}`);
+                setToastVisible(true);
+                setShowManualUploadModal(false);
+                setSelectedManualCampaign('');
+                setManualUploadNotes('');
+                setQualifiedContactsCount(null);
+                fetchJobsUploadStatus();
+            } else {
+                setToastMessage(`❌ ${data.error || 'Failed to mark manual upload'}`);
+                setToastVisible(true);
+            }
+        } catch (error) {
+            console.error('Error marking manual upload:', error);
+            setToastMessage('❌ Failed to mark manual upload');
+            setToastVisible(true);
+        } finally {
+            setManualUploadLoading(false);
+        }
+    };
+
+    const handleRevertManualUpload = async (jobId: string, campaignId: string, campaignName: string) => {
+        if (!confirm(`Are you sure you want to revert the manual upload to "${campaignName}"?`)) {
+            return;
+        }
+
+        try {
+            const token = await user?.getIdToken();
+            
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/jobs/${jobId}/revert-manual-upload`,
+                {
+                    method: 'DELETE',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        idToken: token,
+                        campaignId,
+                        clientId
+                    })
+                }
+            );
+
+            const data = await response.json();
+            
+            if (data.success) {
+                setToastMessage(`✅ Reverted ${data.removedCount} manual uploads from ${campaignName}`);
+                setToastVisible(true);
+                fetchJobsUploadStatus();
+            } else {
+                setToastMessage(`❌ ${data.error || 'Failed to revert'}`);
+                setToastVisible(true);
+            }
+        } catch (error) {
+            console.error('Error reverting manual upload:', error);
+            setToastMessage('❌ Failed to revert manual upload');
+            setToastVisible(true);
+        }
+    };
+
     const uploadDisabled = !selectedFile || uploading;
 
     if (loading || !user) {
@@ -2487,360 +2674,7 @@ export default function ClientPage() {
                                 </div>
                             )}
 
-                            {pipelineVisible && jobState && (
-                                <div style={{ 
-                                    marginTop: '2rem',
-                                    background: 'rgba(255, 255, 255, 0.03)',
-                                    border: '1px solid rgba(255, 255, 255, 0.08)',
-                                    borderRadius: '16px',
-                                    padding: '2rem',
-                                    position: 'relative'
-                                }}>
-                                    <button
-                                        type="button"
-                                        onClick={() => {
-                                            userDeselectedRef.current = true;
-                                            setSelectedJobId(null);
-                                            setJobState(null);
-                                            closeJobStream();
-                                        }}
-                                        aria-label="Deselect job"
-                                        style={{
-                                            position: 'absolute',
-                                            top: '1rem',
-                                            right: '1rem',
-                                            background: 'rgba(255, 255, 255, 0.05)',
-                                            border: '1px solid rgba(255, 255, 255, 0.1)',
-                                            borderRadius: '8px',
-                                            width: '32px',
-                                            height: '32px',
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            justifyContent: 'center',
-                                            cursor: 'pointer',
-                                            color: 'rgba(255, 255, 255, 0.6)',
-                                            fontSize: '1.25rem',
-                                            transition: 'all 0.2s ease',
-                                            padding: 0
-                                        }}
-                                        onMouseEnter={(e) => {
-                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)';
-                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.2)';
-                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)';
-                                        }}
-                                        onMouseLeave={(e) => {
-                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
-                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.1)';
-                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.6)';
-                                        }}
-                                    >
-                                        ×
-                                    </button>
-                                <div className="pipeline-panel__header">
-                                    <div>
-                                        <p className="eyebrow eyebrow--muted">
-                                            {jobState ? "Live pipeline" : "Pipeline monitor"}
-                                        </p>
-                                        <h2 className="pipeline-panel__title">
-                                            {jobState
-                                                ? `${stageCompletionPercent || 0}% completed`
-                                                : "No runs yet"}
-                                        </h2>
-                                        {!jobState && (
-                                            <p className="pipeline-panel__subtitle">
-                                                Upload leads to see stage progress and pipeline status.
-                                            </p>
-                                        )}
-                                        {jobState && (
-                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem' }}>
-                                                Valid leads: {validLeadsCompleted.toLocaleString()}
-                                            </p>
-                                        )}
-                                        {jobState && (
-                                            <div className="pipeline-status-row">
-                                                <p className="pipeline-panel__subtitle pipeline-panel__subtitle--status">
-                                                    Viewing job: {jobState.fileName || jobState.id} · {jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status]}
-                                                </p>
-                                                {(jobState.status === 'running' || jobState.status === 'queued' || jobState.paused) && (
-                                                    <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
-                                                        {(jobState.status === 'running' || jobState.paused) && (
-                                                            <button
-                                                                type="button"
-                                                                className="primary-button"
-                                                                onClick={handlePauseResumeJob}
-                                                                disabled={pausingJob}
-                                                                style={{ 
-                                                                    minWidth: '120px',
-                                                                    display: 'flex',
-                                                                    alignItems: 'center',
-                                                                    justifyContent: 'center',
-                                                                    gap: '0.5rem'
-                                                                }}
-                                                            >
-                                                                {pausingJob ? (
-                                                                    jobState.paused ? 'Resuming...' : 'Pausing...'
-                                                                ) : (
-                                                                    <>
-                                                                        {jobState.paused ? (
-                                                                            <>
-                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
-                                                                                    <polygon points="5 3 19 12 5 21 5 3"/>
-                                                                                </svg>
-                                                                                Resume
-                                                                            </>
-                                                                        ) : (
-                                                                            <>
-                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
-                                                                                    <rect x="6" y="4" width="4" height="16"/>
-                                                                                    <rect x="14" y="4" width="4" height="16"/>
-                                                                                </svg>
-                                                                                Pause
-                                                                            </>
-                                                                        )}
-                                                                    </>
-                                                                )}
-                                                            </button>
-                                                        )}
-                                                        {!jobState.paused && (
-                                                            <button
-                                                                type="button"
-                                                                className="destructive-button"
-                                                                onClick={handleStopJob}
-                                                                disabled={stoppingJob}
-                                                                style={{ minWidth: '100px' }}
-                                                            >
-                                                                {stoppingJob ? 'Stopping...' : 'Stop run'}
-                                                            </button>
-                                                        )}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        )}
-                                        {activeStatusLabel && jobState && (
-                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.75rem' }}>
-                                                {activeStatusLabel}
-                                            </p>
-                                        )}
-                                    </div>
-                                    {(jobState?.status === 'completed' || canUploadToInstantly) && (
-                                        <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
-                                            <button
-                                                type="button"
-                                                className="secondary-button secondary-button--active"
-                                                onClick={() => {
-                                                    setDownloadScope('all');
-                                                    setDownloadModalOpen(true);
-                                                }}
-                                            >
-                                                Download CSV
-                                            </button>
-                                            {canUploadToInstantly ? (
-                                                <button
-                                                    type="button"
-                                                    className="primary-button"
-                                                    onClick={handleUploadToInstantly}
-                                                    disabled={uploading}
-                                                >
-                                                    {uploading ? 'Uploading...' : 'Upload to Instantly'}
-                                                </button>
-                                            ) : activeJobStatus === 'uploaded' ? (
-                                                <span
-                                                    style={{
-                                                        display: 'inline-flex',
-                                                        alignItems: 'center',
-                                                        padding: '0.35rem 0.75rem',
-                                                        borderRadius: '999px',
-                                                        fontSize: '0.75rem',
-                                                        fontWeight: 600,
-                                                        letterSpacing: '0.02em',
-                                                        background: 'rgba(34, 197, 94, 0.12)',
-                                                        color: '#22c55e',
-                                                        border: '1px solid rgba(34, 197, 94, 0.35)'
-                                                    }}
-                                                >
-                                                    {uploadedSummary}
-                                                </span>
-                                            ) : null}
-                                            {canDiscardJob && (
-                                                <button
-                                                    type="button"
-                                                    className="destructive-button"
-                                                    onClick={handleDiscardJob}
-                                                    style={{ color: 'rgba(239, 68, 68, 0.9)' }}
-                                                >
-                                                    Discard
-                                                </button>
-                                            )}
-                                        </div>
-                                    )}
-                                </div>
 
-                                {jobState ? (
-                                    <>
-                                        {/* Pipeline flow summary */}
-                                        {(() => {
-                                            const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
-                                            const foundersProcessed = deriveStageTotals(jobState.stages.founders).total ?? 0;
-                                            const emailsFound = (jobState.stages.emailDiscovery?.summary as any)?.Found ?? (jobState.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(jobState.stages.emailDiscovery).throughputNum ?? 0;
-                                            const safe = (jobState.stages.verification?.summary as any)?.Valid ?? (jobState.stages.verification?.summary as any)?.valid ?? 0;
-                                            const personalized = (jobState.stages.personalization?.summary as any)?.Personalized ?? (jobState.stages.personalization?.summary as any)?.personalized ?? (jobState.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
-                                            
-                                            return (
-                                                <div style={{ 
-                                                    display: 'flex', 
-                                                    alignItems: 'center', 
-                                                    gap: '0.75rem',
-                                                    padding: '1rem 1.5rem',
-                                                    background: 'rgba(255, 255, 255, 0.03)',
-                                                    borderRadius: '8px',
-                                                    border: '1px solid rgba(255, 255, 255, 0.08)',
-                                                    marginTop: '1.5rem',
-                                                    fontSize: '0.875rem',
-                                                    fontVariantNumeric: 'tabular-nums'
-                                                }}>
-                                                    <span style={{ opacity: 0.5, fontSize: '0.75rem' }}>Pipeline flow:</span>
-                                                    <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}>{foundersFound.toLocaleString()}</span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: '#22c55e' }}>{safe.toLocaleString()}</span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: '#3b82f6' }}>{personalized.toLocaleString()}</span>
-                                                </div>
-                                            );
-                                        })()}
-                                        
-                                        <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
-                                        {[...STAGE_ORDER].map((stageKey) => {
-                                            const stage = jobState.stages[stageKey];
-                                            const meta = STAGE_METADATA[stageKey];
-                                            const { throughputNum, total } = deriveStageTotals(stage);
-                                            const summary = stage?.summary as Record<string, unknown> | null;
-                                            const stats = stage?.progress?.stats as Record<string, unknown> | undefined;
-                                            
-                                            // Simplified metrics based on stage type
-                                            let heroNumber = null;
-                                            let heroLabel = "";
-                                            let subtext = "";
-                                            let costFooter = "";
-                                            
-                                            if (stageKey === "founders") {
-                                                const found = throughputNum ?? 0;
-                                                const processed = total ?? 0;
-                                                const cost = summary?.cost || stats?.cost;
-                                                heroNumber = found;
-                                                heroLabel = "Found";
-                                                subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
-                                                if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
-                                            } else if (stageKey === "emailDiscovery") {
-                                                const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
-                                                const attempted = total ?? 0;
-                                                heroNumber = found;
-                                                heroLabel = "Emails Found";
-                                                subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
-                                            } else if (stageKey === "verification") {
-                                                const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
-                                                const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
-                                                const verified = total ?? 0;
-                                                heroNumber = safe;
-                                                heroLabel = "Safe";
-                                                const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
-                                                subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
-                                            } else if (stageKey === "personalization") {
-                                                const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
-                                                const candidates = total ?? 0;
-                                                const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
-                                                heroNumber = personalized;
-                                                heroLabel = "Ready";
-                                                subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
-                                                if (failed > 0) subtext += ` • ${failed} failed`;
-                                            }
-                                            
-                                            return (
-                                                <article
-                                                    key={stageKey}
-                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""}`}
-                                                >
-                                                    <div className="stage-card__head">
-                                                        <div>
-                                                            <p className="stage-card__label">{meta.title}</p>
-                                                        </div>
-                                                        <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
-                                                    </div>
-                                                    
-                                                    {stage?.error === 'Add Credits to TryKitt' ? (
-                                                        <div style={{
-                                                            marginTop: '0.75rem',
-                                                            padding: '1rem',
-                                                            background: 'rgba(239, 68, 68, 0.15)',
-                                                            border: '1px solid rgba(239, 68, 68, 0.5)',
-                                                            borderRadius: '8px',
-                                                            color: '#ef4444',
-                                                            fontWeight: 600,
-                                                            fontSize: '0.95rem',
-                                                            textAlign: 'center'
-                                                        }}>
-                                                            ⚠️ Add Credits to TryKitt
-                                                        </div>
-                                                    ) : stage?.error ? (
-                                                        <p className="stage-card__error">{stage.error}</p>
-                                                    ) : heroNumber !== null ? (
-                                                        <>
-                                                            <div style={{ marginTop: '0.75rem' }}>
-                                                                <div style={{ fontSize: '2.25rem', fontWeight: '700', lineHeight: '1' }}>
-                                                                    {heroNumber.toLocaleString()}
-                                                                    <span style={{ fontSize: '1rem', fontWeight: '500', marginLeft: '0.5rem', opacity: 0.7 }}>{heroLabel}</span>
-                                                                </div>
-                                                                <div style={{ fontSize: '0.875rem', marginTop: '0.5rem', opacity: 0.65 }}>
-                                                                    {subtext}
-                                                                </div>
-                                                            </div>
-                                                            {costFooter && (
-                                                                <div style={{ fontSize: '0.75rem', marginTop: '0.75rem', opacity: 0.5 }}>
-                                                                    {costFooter}
-                                                                </div>
-                                                            )}
-                                                        </>
-                                                    ) : (
-                                                        <p className="stage-card__progress" style={{ marginTop: '0.75rem', opacity: 0.6 }}>
-                                                            {describeStageProgress(stage)}
-                                                        </p>
-                                                    )}
-                                                </article>
-                                            );
-                                        })}
-                                    </div>
-                                    </>
-                                ) : (
-                                    <div className="pipeline-panel__empty" style={{ marginTop: '1.5rem' }}>
-                                        <p>No pipeline runs yet.</p>
-                                        <p className="pipeline-panel__subtitle">
-                                            Upload a CSV to start processing leads.
-                                        </p>
-                                    </div>
-                                )}
-                                </div>
-                            )}
-
-                            {!pipelineVisible && jobState && (
-                                <div style={{ marginTop: '2rem', textAlign: 'center' }}>
-                                    <button
-                                        type="button"
-                                        onClick={() => setPipelineVisible(true)}
-                                        className="secondary-button secondary-button--active"
-                                        style={{
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            gap: '0.5rem'
-                                        }}
-                                    >
-                                        <span>Show Pipeline</span>
-                                        <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>({jobState.fileName || jobState.id})</span>
-                                    </button>
-                                </div>
-                            )}
 
                             <div style={{ marginTop: '2.5rem' }}>
                                 <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem' }}>
@@ -3053,6 +2887,265 @@ export default function ClientPage() {
                                                                     </div>
                                                                 )}
                                                             </div>
+
+                                                            {/* Pipeline Stages - Show when selected */}
+                                                            {isSelected && (
+                                                                <div style={{
+                                                                    marginTop: '1.5rem',
+                                                                    paddingTop: '1.5rem',
+                                                                    borderTop: '1px solid rgba(255, 255, 255, 0.1)'
+                                                                }}>
+                                                                    <p style={{
+                                                                        margin: '0 0 1rem 0',
+                                                                        fontSize: '0.7rem',
+                                                                        textTransform: 'uppercase',
+                                                                        letterSpacing: '0.05em',
+                                                                        color: 'rgba(255, 255, 255, 0.5)',
+                                                                        fontWeight: 600
+                                                                    }}>Live Pipeline</p>
+                                                                    
+                                                                    {/* Pipeline flow summary */}
+                                                                    {(() => {
+                                                                        const foundersFound = deriveStageTotals(job.stages.founders).throughputNum ?? 0;
+                                                                        const foundersProcessed = deriveStageTotals(job.stages.founders).total ?? 0;
+                                                                        const emailsFound = (job.stages.emailDiscovery?.summary as any)?.Found ?? (job.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(job.stages.emailDiscovery).throughputNum ?? 0;
+                                                                        const safe = (job.stages.verification?.summary as any)?.Valid ?? (job.stages.verification?.summary as any)?.valid ?? 0;
+                                                                        const personalized = (job.stages.personalization?.summary as any)?.Personalized ?? (job.stages.personalization?.summary as any)?.personalized ?? (job.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
+                                                                        
+                                                                        return (
+                                                                            <div style={{ 
+                                                                                display: 'flex', 
+                                                                                alignItems: 'center', 
+                                                                                gap: '0.75rem',
+                                                                                padding: '0.75rem 1rem',
+                                                                                background: 'rgba(255, 255, 255, 0.03)',
+                                                                                borderRadius: '8px',
+                                                                                border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                                                marginBottom: '1rem',
+                                                                                fontSize: '0.8rem',
+                                                                                fontVariantNumeric: 'tabular-nums',
+                                                                                flexWrap: 'wrap'
+                                                                            }}>
+                                                                                <span style={{ opacity: 0.5, fontSize: '0.7rem' }}>Flow:</span>
+                                                                                <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
+                                                                                <span style={{ opacity: 0.4 }}>→</span>
+                                                                                <span style={{ fontWeight: '600' }}>{foundersFound.toLocaleString()}</span>
+                                                                                <span style={{ opacity: 0.4 }}>→</span>
+                                                                                <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
+                                                                                <span style={{ opacity: 0.4 }}>→</span>
+                                                                                <span style={{ fontWeight: '600', color: '#22c55e' }}>{safe.toLocaleString()}</span>
+                                                                                <span style={{ opacity: 0.4 }}>→</span>
+                                                                                <span style={{ fontWeight: '600', color: '#3b82f6' }}>{personalized.toLocaleString()}</span>
+                                                                            </div>
+                                                                        );
+                                                                    })()}
+                                                                    
+                                                                    <div className="stage-grid" style={{ gap: '0.75rem' }}>
+                                                                        {[...STAGE_ORDER].map((stageKey) => {
+                                                                            const stage = job.stages[stageKey];
+                                                                            const meta = STAGE_METADATA[stageKey];
+                                                                            const { throughputNum, total } = deriveStageTotals(stage);
+                                                                            const summary = stage?.summary as Record<string, unknown> | null;
+                                                                            const stats = stage?.progress?.stats as Record<string, unknown> | undefined;
+                                                                            
+                                                                            // Simplified metrics based on stage type
+                                                                            let heroNumber = null;
+                                                                            let heroLabel = "";
+                                                                            let subtext = "";
+                                                                            let costFooter = "";
+                                                                            
+                                                                            if (stageKey === "founders") {
+                                                                                const found = throughputNum ?? 0;
+                                                                                const processed = total ?? 0;
+                                                                                const cost = summary?.cost || stats?.cost;
+                                                                                heroNumber = found;
+                                                                                heroLabel = "Found";
+                                                                                subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
+                                                                                if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
+                                                                            } else if (stageKey === "emailDiscovery") {
+                                                                                const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
+                                                                                const attempted = total ?? 0;
+                                                                                heroNumber = found;
+                                                                                heroLabel = "Emails Found";
+                                                                                subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
+                                                                            } else if (stageKey === "verification") {
+                                                                                const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
+                                                                                const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
+                                                                                const verified = total ?? 0;
+                                                                                heroNumber = safe;
+                                                                                heroLabel = "Safe";
+                                                                                const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
+                                                                                subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
+                                                                            } else if (stageKey === "personalization") {
+                                                                                const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
+                                                                                const candidates = total ?? 0;
+                                                                                const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
+                                                                                heroNumber = personalized;
+                                                                                heroLabel = "Ready";
+                                                                                subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
+                                                                                if (failed > 0) subtext += ` • ${failed} failed`;
+                                                                            }
+                                                                            
+                                                                            return (
+                                                                                <article
+                                                                                    key={stageKey}
+                                                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""}`}
+                                                                                    style={{ padding: '0.875rem' }}
+                                                                                >
+                                                                                    <div className="stage-card__head">
+                                                                                        <div>
+                                                                                            <p className="stage-card__label" style={{ fontSize: '0.8rem' }}>{meta.title}</p>
+                                                                                        </div>
+                                                                                        <span className="stage-card__status" style={{ fontSize: '0.65rem' }}>{formatStageStatus(stage?.status)}</span>
+                                                                                    </div>
+                                                                                    
+                                                                                    {stage?.error === 'Add Credits to TryKitt' ? (
+                                                                                        <div style={{
+                                                                                            marginTop: '0.5rem',
+                                                                                            padding: '0.75rem',
+                                                                                            background: 'rgba(239, 68, 68, 0.15)',
+                                                                                            border: '1px solid rgba(239, 68, 68, 0.5)',
+                                                                                            borderRadius: '8px',
+                                                                                            color: '#ef4444',
+                                                                                            fontWeight: 600,
+                                                                                            fontSize: '0.75rem',
+                                                                                            textAlign: 'center'
+                                                                                        }}>
+                                                                                            ⚠️ Add Credits to TryKitt
+                                                                                        </div>
+                                                                                    ) : stage?.error ? (
+                                                                                        <p className="stage-card__error" style={{ fontSize: '0.75rem' }}>{stage.error}</p>
+                                                                                    ) : heroNumber !== null ? (
+                                                                                        <>
+                                                                                            <div style={{ marginTop: '0.5rem' }}>
+                                                                                                <div style={{ fontSize: '1.75rem', fontWeight: '700', lineHeight: '1' }}>
+                                                                                                    {heroNumber.toLocaleString()}
+                                                                                                    <span style={{ fontSize: '0.8rem', fontWeight: '500', marginLeft: '0.4rem', opacity: 0.7 }}>{heroLabel}</span>
+                                                                                                </div>
+                                                                                                <div style={{ fontSize: '0.75rem', marginTop: '0.4rem', opacity: 0.65 }}>
+                                                                                                    {subtext}
+                                                                                                </div>
+                                                                                            </div>
+                                                                                            {costFooter && (
+                                                                                                <div style={{ fontSize: '0.65rem', marginTop: '0.5rem', opacity: 0.5 }}>
+                                                                                                    {costFooter}
+                                                                                                </div>
+                                                                                            )}
+                                                                                        </>
+                                                                                    ) : (
+                                                                                        <p className="stage-card__progress" style={{ marginTop: '0.5rem', opacity: 0.6, fontSize: '0.75rem' }}>
+                                                                                            {describeStageProgress(stage)}
+                                                                                        </p>
+                                                                                    )}
+                                                                                </article>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Upload Status Badges */}
+                                                            {jobUploadStatus[job.id] && jobUploadStatus[job.id].length > 0 && (
+                                                                <div style={{
+                                                                    marginTop: '1rem',
+                                                                    paddingTop: '1rem',
+                                                                    borderTop: '1px solid rgba(255, 255, 255, 0.06)'
+                                                                }}>
+                                                                    <p style={{
+                                                                        margin: '0 0 0.75rem 0',
+                                                                        fontSize: '0.7rem',
+                                                                        textTransform: 'uppercase',
+                                                                        letterSpacing: '0.05em',
+                                                                        color: 'rgba(255, 255, 255, 0.5)',
+                                                                        fontWeight: 600
+                                                                    }}>Instantly Uploads</p>
+                                                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                                                                        {jobUploadStatus[job.id].map((upload, idx) => (
+                                                                            <div
+                                                                                key={idx}
+                                                                                style={{
+                                                                                    display: 'inline-flex',
+                                                                                    alignItems: 'center',
+                                                                                    gap: '0.5rem',
+                                                                                    padding: '0.5rem 0.75rem',
+                                                                                    borderRadius: '6px',
+                                                                                    fontSize: '0.75rem',
+                                                                                    fontWeight: 500,
+                                                                                    backgroundColor: upload.upload_source === 'manual' ? '#1e3a8a' : '#065f46',
+                                                                                    color: '#fff',
+                                                                                    border: `1px solid ${upload.upload_source === 'manual' ? '#3b82f6' : '#10b981'}`
+                                                                                }}
+                                                                            >
+                                                                                <span>{upload.upload_source === 'manual' ? '📝' : '🤖'}</span>
+                                                                                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                                                                    <span style={{ fontWeight: 600 }}>{upload.campaign_name}</span>
+                                                                                    <span style={{ fontSize: '0.65rem', opacity: 0.8 }}>
+                                                                                        {upload.contact_count} contact{upload.contact_count !== 1 ? 's' : ''}
+                                                                                    </span>
+                                                                                </div>
+                                                                                {upload.upload_source === 'manual' && (
+                                                                                    <button
+                                                                                        onClick={(e) => {
+                                                                                            e.stopPropagation();
+                                                                                            handleRevertManualUpload(job.id, upload.campaign_id, upload.campaign_name);
+                                                                                        }}
+                                                                                        style={{
+                                                                                            padding: '2px 6px',
+                                                                                            fontSize: '0.65rem',
+                                                                                            fontWeight: 600,
+                                                                                            backgroundColor: '#dc2626',
+                                                                                            color: '#fff',
+                                                                                            border: 'none',
+                                                                                            borderRadius: '4px',
+                                                                                            cursor: 'pointer',
+                                                                                            transition: 'background-color 0.2s'
+                                                                                        }}
+                                                                                        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#b91c1c'}
+                                                                                        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#dc2626'}
+                                                                                    >
+                                                                                        Undo
+                                                                                    </button>
+                                                                                )}
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Manual Upload Button - Only for completed jobs */}
+                                                            {job.status === 'completed' && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        handleOpenManualUpload(job);
+                                                                    }}
+                                                                    style={{
+                                                                        width: '100%',
+                                                                        marginTop: '1rem',
+                                                                        padding: '0.75rem 1rem',
+                                                                        fontSize: '0.85rem',
+                                                                        fontWeight: 600,
+                                                                        backgroundColor: '#2563eb',
+                                                                        color: 'white',
+                                                                        border: 'none',
+                                                                        borderRadius: '8px',
+                                                                        cursor: 'pointer',
+                                                                        transition: 'all 0.2s',
+                                                                        boxShadow: '0 2px 4px rgba(37, 99, 235, 0.2)'
+                                                                    }}
+                                                                    onMouseEnter={(e) => {
+                                                                        e.currentTarget.style.backgroundColor = '#1d4ed8';
+                                                                        e.currentTarget.style.boxShadow = '0 4px 8px rgba(37, 99, 235, 0.3)';
+                                                                    }}
+                                                                    onMouseLeave={(e) => {
+                                                                        e.currentTarget.style.backgroundColor = '#2563eb';
+                                                                        e.currentTarget.style.boxShadow = '0 2px 4px rgba(37, 99, 235, 0.2)';
+                                                                    }}
+                                                                >
+                                                                    📝 Confirm Manual Upload to Instantly
+                                                                </button>
+                                                            )}
 
                                                             {/* Delete button */}
                                                             <button
@@ -5181,6 +5274,166 @@ export default function ClientPage() {
                     }}
                 >
                     {toastMessage}
+                </div>
+            )}
+
+            {/* Manual Upload Modal */}
+            {showManualUploadModal && selectedJobForManual && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 10001,
+                    }}
+                    onClick={() => {
+                        setShowManualUploadModal(false);
+                        setSelectedJobForManual(null);
+                        setSelectedManualCampaign('');
+                        setManualUploadNotes('');
+                        setQualifiedContactsCount(null);
+                    }}
+                >
+                    <div
+                        style={{
+                            backgroundColor: '#1e1e1e',
+                            borderRadius: '8px',
+                            padding: '24px',
+                            maxWidth: '500px',
+                            width: '90%',
+                            maxHeight: '80vh',
+                            overflowY: 'auto',
+                            boxShadow: '0 4px 20px rgba(0, 0, 0, 0.5)',
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <h3 style={{ margin: '0 0 16px 0', fontSize: '18px', fontWeight: 600 }}>
+                            Confirm Manual Instantly Upload
+                        </h3>
+                        
+                        <p style={{ margin: '0 0 20px 0', color: '#888', fontSize: '14px' }}>
+                            Job: <strong style={{ color: '#fff' }}>{selectedJobForManual.name}</strong>
+                        </p>
+
+                        {qualifiedContactsCount !== null && (
+                            <div
+                                style={{
+                                    padding: '12px',
+                                    backgroundColor: '#2a2a2a',
+                                    borderRadius: '6px',
+                                    marginBottom: '20px',
+                                    fontSize: '14px',
+                                }}
+                            >
+                                <strong>{qualifiedContactsCount.qualified || 0}</strong> qualified contact{qualifiedContactsCount.qualified !== 1 ? 's' : ''} will be marked as uploaded
+                                <div style={{ marginTop: '6px', fontSize: '12px', color: '#888' }}>
+                                    (Valid/Risky email + Valid personalization)
+                                </div>
+                            </div>
+                        )}
+
+                        <div style={{ marginBottom: '16px' }}>
+                            <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px', fontWeight: 500 }}>
+                                Select Campaign *
+                            </label>
+                            <select
+                                value={selectedManualCampaign}
+                                onChange={(e) => setSelectedManualCampaign(e.target.value)}
+                                disabled={manualUploadLoading}
+                                style={{
+                                    width: '100%',
+                                    padding: '10px',
+                                    backgroundColor: '#2a2a2a',
+                                    border: '1px solid #444',
+                                    borderRadius: '6px',
+                                    color: '#fff',
+                                    fontSize: '14px',
+                                    cursor: manualUploadLoading ? 'not-allowed' : 'pointer',
+                                }}
+                            >
+                                <option value="">-- Select a campaign --</option>
+                                {manualUploadCampaigns.map((campaign) => (
+                                    <option key={campaign.id} value={campaign.id}>
+                                        {campaign.name}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+
+                        <div style={{ marginBottom: '20px' }}>
+                            <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px', fontWeight: 500 }}>
+                                Notes (Optional)
+                            </label>
+                            <textarea
+                                value={manualUploadNotes}
+                                onChange={(e) => setManualUploadNotes(e.target.value)}
+                                disabled={manualUploadLoading}
+                                placeholder="Add any notes about this manual upload..."
+                                rows={3}
+                                style={{
+                                    width: '100%',
+                                    padding: '10px',
+                                    backgroundColor: '#2a2a2a',
+                                    border: '1px solid #444',
+                                    borderRadius: '6px',
+                                    color: '#fff',
+                                    fontSize: '14px',
+                                    fontFamily: 'inherit',
+                                    resize: 'vertical',
+                                    cursor: manualUploadLoading ? 'not-allowed' : 'text',
+                                }}
+                            />
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+                            <button
+                                onClick={() => {
+                                    setShowManualUploadModal(false);
+                                    setSelectedJobForManual(null);
+                                    setSelectedManualCampaign('');
+                                    setManualUploadNotes('');
+                                    setQualifiedContactsCount(null);
+                                }}
+                                disabled={manualUploadLoading}
+                                style={{
+                                    padding: '10px 20px',
+                                    backgroundColor: '#2a2a2a',
+                                    border: '1px solid #444',
+                                    borderRadius: '6px',
+                                    color: '#fff',
+                                    fontSize: '14px',
+                                    fontWeight: 500,
+                                    cursor: manualUploadLoading ? 'not-allowed' : 'pointer',
+                                    opacity: manualUploadLoading ? 0.5 : 1,
+                                }}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleConfirmManualUpload}
+                                disabled={manualUploadLoading || !selectedManualCampaign}
+                                style={{
+                                    padding: '10px 20px',
+                                    backgroundColor: selectedManualCampaign && !manualUploadLoading ? '#4CAF50' : '#2a2a2a',
+                                    border: 'none',
+                                    borderRadius: '6px',
+                                    color: '#fff',
+                                    fontSize: '14px',
+                                    fontWeight: 500,
+                                    cursor: !selectedManualCampaign || manualUploadLoading ? 'not-allowed' : 'pointer',
+                                    opacity: !selectedManualCampaign || manualUploadLoading ? 0.5 : 1,
+                                }}
+                            >
+                                {manualUploadLoading ? 'Processing...' : 'Confirm Upload'}
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
         </>

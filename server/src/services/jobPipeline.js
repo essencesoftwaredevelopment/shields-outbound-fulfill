@@ -395,7 +395,7 @@ async function processJob(job) {
                 console.warn(`[${job.id}] Failed to write placeholder personalized.csv`, err?.message || err);
             }
             try {
-                fs.writeFileSync(job.paths.upload, 'domain,founder_name,email,email_status,first_name,last_name,personalization,personalization_first_line,personalization_title,personalization_url,product_title\n');
+                fs.writeFileSync(job.paths.upload, 'domain,founder_name,email,email_status,first_name,last_name,personalization\n');
             } catch (err) {
                 console.warn(`[${job.id}] Failed to write placeholder upload.csv`, err?.message || err);
             }
@@ -470,7 +470,7 @@ async function processJob(job) {
                 })
             );
             // Upsert leads with founder info (only when actually found)
-            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.founders, type: 'founders' });
+            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.founders, type: 'founders', jobId: job.id });
         }
         computeJobCost(job);
 
@@ -534,7 +534,7 @@ async function processJob(job) {
                 })
             );
             // Upsert leads with email lookup results (only when actually found)
-            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.emails, type: 'emails' });
+            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.emails, type: 'emails', jobId: job.id });
         }
         computeJobCost(job);
 
@@ -627,7 +627,7 @@ async function processJob(job) {
         }
 
         // Upsert leads with verification status
-        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.final, type: 'verification' });
+        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.final, type: 'verification', jobId: job.id });
 
         if (job.cancelled) {
             markCancelled(job);
@@ -655,7 +655,7 @@ async function processJob(job) {
         }
 
         // Upsert leads with personalization data
-        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.personalized, type: 'personalization' });
+        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.personalized, type: 'personalization', jobId: job.id });
 
         // Build upload-ready CSV (complete leads with founder, email, and personalization)
         try {

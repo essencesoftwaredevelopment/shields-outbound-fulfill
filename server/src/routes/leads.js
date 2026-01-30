@@ -142,8 +142,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             // Email finder ran (has status) but no email found
             whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND (c.email IS NULL OR c.email = '')`;
         } else if (emailFilter === 'not_run') {
-            // Email finder never ran (no status)
-            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '')`;
+            // Email finder never ran (no status) AND no email exists (not backfilled from Instantly)
+            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '') AND (c.email IS NULL OR c.email = '')`;
         }
 
         // Date filters

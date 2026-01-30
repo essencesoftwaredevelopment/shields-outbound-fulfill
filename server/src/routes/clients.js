@@ -13,6 +13,8 @@
 
 import express from 'express';
 import { admin, firestore } from '../config/firebase.js';
+import { pool } from '../config/db.js';
+import { getOrCreateClient } from '../services/db/queries.js';
 
 const router = express.Router();
 
@@ -186,6 +188,55 @@ router.post('/clients/:id/campaigns', async (req, res) => {
         await batch.commit();
         console.log('[campaigns] upsert complete', { uid, clientId, wrote: campaigns.length });
 
+        // Sync campaigns to SQL (instantly_campaigns table)
+        try {
+            if (campaigns.length > 0) {
+                // First, get the SQL client_id
+                const clientResult = await pool.query(
+                    'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+                    [uid, clientId]
+                );
+                
+                if (clientResult.rows.length > 0) {
+                    const sqlClientId = clientResult.rows[0].id;
+                    
+                    // Build bulk upsert query
+                    const values = [];
+                    const params = [];
+                    let paramIndex = 1;
+                    
+                    campaigns.forEach((c) => {
+                        const instantlyId = (c.id || c.campaignId || c.uuid || c._id || '').toString();
+                        const name = c.name || c.title || c.campaign_name || '';
+                        const created = c.timestamp_created || c.createdAt || c.created_at || c.created || c.created_at_utc || null;
+                        const startDate = created ? new Date(created) : null;
+                        
+                        params.push(uid, sqlClientId, instantlyId, name, startDate);
+                        values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4})`);
+                        paramIndex += 5;
+                    });
+                    
+                    const query = `
+                        INSERT INTO instantly_campaigns (agency_id, client_id, instantly_campaign_id, name, start_date)
+                        VALUES ${values.join(', ')}
+                        ON CONFLICT (agency_id, client_id, instantly_campaign_id)
+                        DO UPDATE SET 
+                            name = EXCLUDED.name,
+                            start_date = COALESCE(EXCLUDED.start_date, instantly_campaigns.start_date),
+                            created_at = COALESCE(instantly_campaigns.created_at, now())
+                    `;
+                    
+                    await pool.query(query, params);
+                    console.log('[campaigns] synced to SQL', { count: campaigns.length, sqlClientId });
+                } else {
+                    console.warn('[campaigns] SQL client not found, skipping SQL sync', { uid, clientId });
+                }
+            }
+        } catch (sqlErr) {
+            console.error('[campaigns] failed to sync to SQL', sqlErr?.message || sqlErr);
+            // Don't fail the request if SQL sync fails
+        }
+
         // Update client doc with active campaigns count (status === 1)
         try {
             const activeCount = campaigns.filter(c => {
@@ -206,6 +257,40 @@ router.post('/clients/:id/campaigns', async (req, res) => {
     } catch (error) {
         console.error('Client campaigns sync error:', error);
         res.status(500).json({ error: 'Failed to sync campaigns.' });
+    }
+});
+
+// GET /api/clients/:id/campaigns/list - Fetch campaigns from SQL for dropdown
+router.get('/clients/:clientId/campaigns/list', async (req, res) => {
+    try {
+        const { clientId } = req.params;
+        const agencyId = req.query.agencyId;
+        
+        console.log('[campaigns/list] Request:', { clientId, agencyId });
+        
+        if (!agencyId) {
+            return res.status(400).json({ error: 'Missing agencyId query parameter.' });
+        }
+        
+        // Get or create SQL client_id using the Firestore client slug
+        const sqlClientId = await getOrCreateClient(agencyId, clientId);
+        console.log('[campaigns/list] SQL client_id:', sqlClientId);
+        
+        // Fetch campaigns from SQL
+        const campaignsResult = await pool.query(
+            `SELECT id, name, instantly_campaign_id, start_date
+             FROM instantly_campaigns
+             WHERE client_id = $1 AND agency_id = $2
+             ORDER BY start_date DESC NULLS LAST, name ASC`,
+            [sqlClientId, agencyId]
+        );
+        
+        console.log('[campaigns/list] Found campaigns:', campaignsResult.rows.length);
+        
+        res.json({ campaigns: campaignsResult.rows });
+    } catch (error) {
+        console.error('Error fetching campaigns list:', error);
+        res.status(500).json({ error: 'Failed to fetch campaigns list.' });
     }
 });
 

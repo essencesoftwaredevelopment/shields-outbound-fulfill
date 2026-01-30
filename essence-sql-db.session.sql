@@ -1,1 +1,6 @@
-select * from contact_instantly_campaigns limit 300;
+select
+    *
+from
+    instantly_campaigns
+limit
+    10;

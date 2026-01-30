@@ -135,23 +135,25 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
         full_name = null,
         email = null,
         email_status = null,
-        confidence = null
+        confidence = null,
+        job_id = null
     } = data;
 
     const query = `
         INSERT INTO contacts (
-            agency_id, company_id, role_type, full_name, email, email_status, confidence
+            agency_id, company_id, role_type, full_name, email, email_status, confidence, job_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (company_id, role_type)
         DO UPDATE SET
             full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
             email = COALESCE(EXCLUDED.email, contacts.email),
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
+            job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
             updated_at = now()
         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                  last_verified_at, last_contacted_at, confidence, created_at, updated_at
+                  last_verified_at, last_contacted_at, confidence, job_id, created_at, updated_at
     `;
     
     try {
@@ -162,7 +164,8 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
             full_name,
             email,
             email_status,
-            confidence
+            confidence,
+            job_id
         ]);
         return result.rows[0];
     } catch (err) {
@@ -180,10 +183,11 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
                     full_name = COALESCE($3, full_name),
                     email_status = COALESCE($4, email_status),
                     confidence = COALESCE($5, confidence),
+                    job_id = COALESCE($6, job_id),
                     updated_at = now()
-                WHERE agency_id = $6 AND email = $7
+                WHERE agency_id = $7 AND email = $8
                 RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                          last_verified_at, last_contacted_at, confidence, created_at, updated_at
+                          last_verified_at, last_contacted_at, confidence, job_id, created_at, updated_at
             `;
             const updateResult = await pool.query(updateQuery, [
                 companyId,
@@ -191,6 +195,7 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
                 full_name,
                 email_status,
                 confidence,
+                job_id,
                 agencyId,
                 email
             ]);
