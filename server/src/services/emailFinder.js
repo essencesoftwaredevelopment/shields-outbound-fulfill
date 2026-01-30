@@ -7,8 +7,8 @@ import http from 'http';
 
 dotenv.config();
 
-const CONCURRENCY = 3; // Reduced from 10 to prevent overwhelming the server
-const MAX_RETRIES = 5;
+const CONCURRENCY = 5;
+const MAX_RETRIES = 1;
 const INITIAL_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT = 30000; // 30 second timeout
 

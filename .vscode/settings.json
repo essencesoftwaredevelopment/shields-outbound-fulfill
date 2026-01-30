@@ -11,5 +11,17 @@
             "approve": true,
             "matchCommandLine": true
         }
-    }
+    },
+    "sqltools.connections": [
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "34.175.30.3",
+            "port": 5432,
+            "driver": "PostgreSQL",
+            "name": "essence-sql-db",
+            "database": "shields_outbound",
+            "username": "postgres"
+        }
+    ]
 }

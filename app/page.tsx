@@ -8,7 +8,7 @@ import { getIdToken, signOut } from "firebase/auth";
 import { firebaseAuth } from "@/lib/firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
-import { createPipelineJob, getJobResultUrl, getJobStreamUrl } from "@/lib/pipeline/client";
+import { createPipelineJob, getJobResultUrl, getJobStreamUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import {
   PipelineJob,
@@ -111,6 +111,7 @@ function HomeContent() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVisible, setToastVisible] = useState(false);
   const [clients, setClients] = useState<Array<{ id: string; name: string; totalLeads?: number }>>([]);
+  const [companiesCount, setCompaniesCount] = useState<number>(0);
   const shouldShowKeys = searchParams?.get("showKeys") === "1";
 
   const showToast = useCallback((message: string) => {
@@ -162,6 +163,50 @@ function HomeContent() {
       router.replace("/auth");
     }
   }, [loading, user, router]);
+
+  // Fetch total companies count from SQL database
+  useEffect(() => {
+    if (!user) {
+      setCompaniesCount(0);
+      return;
+    }
+    
+    let cancelled = false;
+    
+    (async () => {
+      try {
+        const currentUser = firebaseAuth.currentUser;
+        const idToken = currentUser ? await getIdToken(currentUser) : null;
+        if (!idToken || cancelled) return;
+        
+        const url = `${getPipelineBaseUrl()}/api/stats/companies-count`;
+        console.log('🔍 Fetching companies count from:', url);
+        
+        const response = await fetch(
+          url,
+          {
+            headers: { 
+              'Authorization': `Bearer ${idToken}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        console.log('📊 Companies count response:', response.status, response.ok);
+        
+        if (response.ok && !cancelled) {
+          const data = await response.json();
+          console.log('✅ Companies count data:', data);
+          setCompaniesCount(data.count || 0);
+        }
+      } catch (error) {
+        console.error('Failed to fetch companies count:', error);
+        if (!cancelled) setCompaniesCount(0);
+      }
+    })();
+    
+    return () => { cancelled = true; };
+  }, [user]);
 
   // Resolve client name for current job by looking up clients list or fetching the doc
   useEffect(() => {
@@ -436,9 +481,9 @@ function HomeContent() {
                   <div className="niche-card__text">
                     <p className="niche-card__label">{client.name}</p>
                     <p className="niche-card__detail">
-                      <strong className="card-big-data">{(client.totalLeads || 0).toLocaleString()}</strong>
+                      <strong className="card-big-data">{companiesCount.toLocaleString()}</strong>
                       <br />
-                      total leads
+                      companies in database
                     </p>
                   </div>
                   <span className="niche-card__cta">View leads →</span>

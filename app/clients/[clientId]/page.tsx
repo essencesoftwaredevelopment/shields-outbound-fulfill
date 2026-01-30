@@ -69,10 +69,18 @@ type Lead = {
     verified?: boolean;
     firstLine?: string;
     founderName?: string;
+    roleType?: string;
     personalizationUrl?: string;
     personalizationTitle?: string;
     updatedAt?: string;
+    createdAt?: string;
+    lastVerifiedAt?: string;
     campaigns?: string[];
+    campaignsData?: Array<{
+        campaignId: string;
+        campaignName: string;
+        addedAt: string;
+    }>;
 };
 
 type Campaign = {
@@ -89,7 +97,8 @@ type Segment = {
     description?: string;
     filters: {
         fullName?: string;
-        email?: 'found' | 'not_found';
+        founder?: 'exists' | 'not_found';
+        email?: 'found' | 'not_found' | 'not_run';
         emailStatus?: string[];
         createdAfter?: string;
         createdBefore?: string;
@@ -502,6 +511,8 @@ export default function ClientPage() {
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
     const [syncingCampaigns, setSyncingCampaigns] = useState(false);
     const [campaignSyncMessage, setCampaignSyncMessage] = useState("");
+    const [instantlyCampaigns, setInstantlyCampaigns] = useState<Array<{ id: string; name: string }>>([]);
+    const [instantlyCampaignsLoading, setInstantlyCampaignsLoading] = useState(false);
 
     // Segments state
     const [segments, setSegments] = useState<Segment[]>([]);
@@ -511,7 +522,8 @@ export default function ClientPage() {
     const [segmentName, setSegmentName] = useState("");
     const [segmentDescription, setSegmentDescription] = useState("");
     const [segmentFullName, setSegmentFullName] = useState("");
-    const [segmentEmail, setSegmentEmail] = useState<'' | 'found' | 'not_found'>('');
+    const [segmentFounder, setSegmentFounder] = useState<'' | 'exists' | 'not_found'>('');
+    const [segmentEmail, setSegmentEmail] = useState<'' | 'found' | 'not_found' | 'not_run'>('');
     const [segmentEmailStatus, setSegmentEmailStatus] = useState<string[]>([]);
     const [segmentCreatedAfter, setSegmentCreatedAfter] = useState("");
     const [segmentCreatedBefore, setSegmentCreatedBefore] = useState("");
@@ -686,6 +698,24 @@ export default function ClientPage() {
         }
     }, [loading, user, router]);
 
+    // Helper function to display email
+    const displayEmail = (email: string | undefined, emailStatus: string | undefined) => {
+        // If email_status is empty, the email finder hasn't run yet
+        if (!emailStatus || emailStatus.trim() === '') return 'Not Run';
+        // If email is empty but status exists, it was not found
+        if (!email || email.trim() === '') return 'Not Found';
+        const emailLower = email.toLowerCase().trim();
+        if (emailLower === 'not found' || emailLower === 'not_found' || emailLower.includes('not found')) return 'Not Found';
+        return email;
+    };
+
+    // Helper function to display email status
+    const displayEmailStatus = (emailStatus: string | undefined) => {
+        // If email_status is empty, the email finder hasn't run yet
+        if (!emailStatus || emailStatus.trim() === '') return 'Not Run';
+        return emailStatus;
+    };
+
     useEffect(() => {
         if (!user || !clientId) return;
         let cancelled = false;
@@ -771,6 +801,38 @@ export default function ClientPage() {
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user, clientId, leadSearch, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
+
+    // Fetch instantly campaigns for filtering
+    useEffect(() => {
+        if (!user || !clientId) return;
+
+        const fetchInstantlyCampaigns = async () => {
+            setInstantlyCampaignsLoading(true);
+            try {
+                const idToken = await getIdToken(user);
+                const params = new URLSearchParams();
+                params.append('clientId', clientId);
+
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/instantly-campaigns?${params.toString()}`, {
+                    headers: { 'Authorization': `Bearer ${idToken}` }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch campaigns: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                setInstantlyCampaigns(data.campaigns || []);
+            } catch (error) {
+                console.error('Failed to fetch instantly campaigns:', error);
+                setInstantlyCampaigns([]);
+            } finally {
+                setInstantlyCampaignsLoading(false);
+            }
+        };
+
+        fetchInstantlyCampaigns();
+    }, [user, clientId]);
 
     // Fetch segment counts when segments change
     useEffect(() => {
@@ -916,6 +978,10 @@ export default function ClientPage() {
                 params.append('emailFilter', emailFilter);
             }
 
+            if (campaignFilterId) {
+                params.append('instantlyCampaignId', campaignFilterId);
+            }
+
             // Send search term to backend for SQL filtering
             if (leadSearch.trim()) {
                 params.append('search', leadSearch.trim());
@@ -946,10 +1012,14 @@ export default function ClientPage() {
                 verified: row.verified,
                 firstLine: row.firstLine || "",
                 founderName: row.founderName || "",
+                roleType: row.roleType || "",
                 personalizationUrl: row.personalizationUrl || "",
                 personalizationTitle: row.personalizationTitle || "",
                 updatedAt: row.updatedAt || "",
-                campaigns: row.campaigns || []
+                createdAt: row.createdAt || "",
+                lastVerifiedAt: row.lastVerifiedAt || "",
+                campaigns: row.campaigns || [],
+                campaignsData: row.campaignsData || []
             }));
 
             // Deduplicate leads by ID to prevent React key conflicts
@@ -997,15 +1067,10 @@ export default function ClientPage() {
         fetchLeads(false);
     }, [fetchLeads, leadsHasMore, leadsLoading]);
 
-    // Most filters are applied server-side, but campaign filter is applied client-side
+    // All filters are now applied server-side
     const filteredLeads = useMemo(() => {
-        if (!campaignFilterId) {
-            return leads;
-        }
-        return leads.filter((lead) => {
-            return lead.campaigns && lead.campaigns.includes(campaignFilterId);
-        });
-    }, [leads, campaignFilterId]);
+        return leads;
+    }, [leads]);
 
     const displayedStats = useMemo(() => {
         // Stats come from server with filters applied
@@ -1809,6 +1874,7 @@ export default function ClientPage() {
             setSegmentName(segment.name);
             setSegmentDescription(segment.description || "");
             setSegmentFullName(segment.filters.fullName || "");
+            setSegmentFounder(segment.filters.founder || '');
             setSegmentEmail(segment.filters.email || '');
             setSegmentEmailStatus(segment.filters.emailStatus || []);
             setSegmentCreatedAfter(segment.filters.createdAfter || "");
@@ -1818,6 +1884,7 @@ export default function ClientPage() {
             setSegmentName("");
             setSegmentDescription("");
             setSegmentFullName("");
+            setSegmentFounder('');
             setSegmentEmail('');
             setSegmentEmailStatus([]);
             setSegmentCreatedAfter("");
@@ -1840,6 +1907,7 @@ export default function ClientPage() {
                 description: segmentDescription.trim(),
                 filters: {
                     ...(segmentFullName && { fullName: segmentFullName }),
+                    ...(segmentFounder && { founder: segmentFounder }),
                     ...(segmentEmail && { email: segmentEmail }),
                     ...(segmentEmailStatus.length > 0 && { emailStatus: segmentEmailStatus }),
                     ...(segmentCreatedAfter && { createdAfter: segmentCreatedAfter }),
@@ -1902,8 +1970,11 @@ export default function ClientPage() {
 
             // Apply segment filters
             if (segment.filters.fullName) params.append('fullName', segment.filters.fullName);
+            if (segment.filters.founder === 'exists') params.append('founderFilter', 'exists');
+            else if (segment.filters.founder === 'not_found') params.append('founderFilter', 'not_found');
             if (segment.filters.email === 'found') params.append('emailFilter', 'exists');
             else if (segment.filters.email === 'not_found') params.append('emailFilter', 'not_found');
+            else if (segment.filters.email === 'not_run') params.append('emailFilter', 'not_run');
             if (segment.filters.emailStatus && segment.filters.emailStatus.length > 0) {
                 params.append('emailStatusMulti', segment.filters.emailStatus.join(','));
             }
@@ -1996,6 +2067,8 @@ export default function ClientPage() {
                 params.append('emailFilter', 'exists');
             } else if (segment.filters.email === 'not_found') {
                 params.append('emailFilter', 'not_found');
+            } else if (segment.filters.email === 'not_run') {
+                params.append('emailFilter', 'not_run');
             }
             if (segment.filters.emailStatus && segment.filters.emailStatus.length > 0) {
                 params.append('emailStatusMulti', segment.filters.emailStatus.join(','));
@@ -3157,9 +3230,10 @@ export default function ClientPage() {
                                     <select
                                         value={campaignFilterId}
                                         onChange={(e) => setCampaignFilterId(e.target.value)}
+                                        disabled={instantlyCampaignsLoading}
                                     >
                                         <option value="">All campaigns</option>
-                                        {campaigns.map((c) => (
+                                        {instantlyCampaigns.map((c) => (
                                             <option key={c.id} value={c.id}>{c.name}</option>
                                         ))}
                                     </select>
@@ -3203,6 +3277,7 @@ export default function ClientPage() {
                                         <option value="">All</option>
                                         <option value="exists">Exists</option>
                                         <option value="not_found">Not Found</option>
+                                        <option value="not_run">Not Run</option>
                                     </select>
                                 </label>
                                 <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
@@ -3212,9 +3287,10 @@ export default function ClientPage() {
                                         onChange={(e) => setEmailStatusFilter(e.target.value)}
                                     >
                                         <option value="">All</option>
+                                        <option value="not_run">Not Run</option>
+                                        <option value="not_found">Not Found</option>
                                         <option value="valid">Valid</option>
                                         <option value="valid-risky">Valid-Risky</option>
-                                        <option value="not_found">Not Found</option>
                                         <option value="invalid">Invalid</option>
                                         <option value="skipped_no_founder">Skipped (No Founder)</option>
                                     </select>
@@ -3336,24 +3412,40 @@ export default function ClientPage() {
                                             // Email filter
                                             if (emailFilter === "exists") {
                                                 filtered = filtered.filter((lead) => {
+                                                    const status = (lead.status || "").trim();
                                                     const email = (lead.email || "").trim();
                                                     const emailLower = email.toLowerCase();
-                                                    return email.length > 0 && !emailLower.includes("not found") && emailLower !== "not_found";
+                                                    // Email finder ran (status exists) and email found
+                                                    return status.length > 0 && email.length > 0 && !emailLower.includes("not found") && emailLower !== "not_found";
                                                 });
                                             } else if (emailFilter === "not_found") {
                                                 filtered = filtered.filter((lead) => {
+                                                    const status = (lead.status || "").trim();
                                                     const email = (lead.email || "").trim();
-                                                    const emailLower = email.toLowerCase();
-                                                    return email.length === 0 || emailLower.includes("not found") || emailLower === "not_found";
+                                                    // Email finder ran (status exists) but no email found
+                                                    return status.length > 0 && email.length === 0;
+                                                });
+                                            } else if (emailFilter === "not_run") {
+                                                filtered = filtered.filter((lead) => {
+                                                    const status = (lead.status || "").trim();
+                                                    // Email finder never ran (no status)
+                                                    return status.length === 0;
                                                 });
                                             }
                                             
                                             // Email status filter (already applied in DB if used)
                                             if (emailStatusFilter && allLeadsCached) {
-                                                filtered = filtered.filter((lead) => {
-                                                    const status = (lead.status || "").toLowerCase();
-                                                    return status === emailStatusFilter.toLowerCase();
-                                                });
+                                                if (emailStatusFilter === 'not_run') {
+                                                    filtered = filtered.filter((lead) => {
+                                                        const status = (lead.status || "").trim();
+                                                        return status.length === 0;
+                                                    });
+                                                } else {
+                                                    filtered = filtered.filter((lead) => {
+                                                        const status = (lead.status || "").toLowerCase();
+                                                        return status === emailStatusFilter.toLowerCase();
+                                                    });
+                                                }
                                             }
                                             
                                             // Generate CSV
@@ -3564,14 +3656,14 @@ export default function ClientPage() {
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
                                                                 whiteSpace: 'nowrap'
-                                                            }}>{lead.email || '—'}</td>
+                                                            }}>{displayEmail(lead.email, lead.status)}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
                                                                 maxWidth: '140px',
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
                                                                 whiteSpace: 'nowrap'
-                                                            }}>{lead.status || '—'}</td>
+                                                            }}>{displayEmailStatus(lead.status)}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
                                                                 maxWidth: '220px',
@@ -3742,8 +3834,11 @@ export default function ClientPage() {
                                                     {segment.filters.fullName && (
                                                         <div><strong>Name contains:</strong> {segment.filters.fullName}</div>
                                                     )}
+                                                    {segment.filters.founder && (
+                                                        <div><strong>Founder:</strong> {segment.filters.founder === 'exists' ? 'Exists' : 'Not Found'}</div>
+                                                    )}
                                                     {segment.filters.email && (
-                                                        <div><strong>Email:</strong> {segment.filters.email === 'found' ? 'Found' : 'Not Found'}</div>
+                                                        <div><strong>Email:</strong> {segment.filters.email === 'found' ? 'Found' : segment.filters.email === 'not_found' ? 'Not Found' : 'Not Run'}</div>
                                                     )}
                                                     {segment.filters.emailStatus && segment.filters.emailStatus.length > 0 && (
                                                         <div><strong>Status:</strong> {segment.filters.emailStatus.join(', ')}</div>
@@ -3865,14 +3960,14 @@ export default function ClientPage() {
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
                                                                 whiteSpace: 'nowrap'
-                                                            }}>{lead.email || '—'}</td>
+                                                            }}>{displayEmail(lead.email, lead.status)}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
                                                                 maxWidth: '140px',
                                                                 overflow: 'hidden',
                                                                 textOverflow: 'ellipsis',
                                                                 whiteSpace: 'nowrap'
-                                                            }}>{lead.status || '—'}</td>
+                                                            }}>{displayEmailStatus(lead.status)}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
                                                                 maxWidth: '220px',
@@ -4733,14 +4828,27 @@ export default function ClientPage() {
                                     </label>
 
                                     <label className="settings-field">
+                                        <span className="settings-field__label">Founder</span>
+                                        <select
+                                            value={segmentFounder}
+                                            onChange={(e) => setSegmentFounder(e.target.value as '' | 'exists' | 'not_found')}
+                                        >
+                                            <option value="">Any</option>
+                                            <option value="exists">Founder Exists</option>
+                                            <option value="not_found">Founder Not Found</option>
+                                        </select>
+                                    </label>
+
+                                    <label className="settings-field">
                                         <span className="settings-field__label">Email Status</span>
                                         <select
                                             value={segmentEmail}
-                                            onChange={(e) => setSegmentEmail(e.target.value as '' | 'found' | 'not_found')}
+                                            onChange={(e) => setSegmentEmail(e.target.value as '' | 'found' | 'not_found' | 'not_run')}
                                         >
                                             <option value="">Any</option>
                                             <option value="found">Email Found</option>
                                             <option value="not_found">Email Not Found</option>
+                                            <option value="not_run">Email Not Run</option>
                                         </select>
                                     </label>
 
@@ -4872,7 +4980,41 @@ export default function ClientPage() {
                         <div className="modal__header">
                             <div>
                                 <p className="eyebrow eyebrow--muted">Lead Details</p>
-                                <h2 className="modal__title">{selectedLead.domain}</h2>
+                                <div style={{ 
+                                    display: 'flex', 
+                                    alignItems: 'center', 
+                                    gap: '0.75rem',
+                                    flexWrap: 'wrap'
+                                }}>
+                                    {selectedLead.domain && (
+                                        <img 
+                                            src={`https://www.google.com/s2/favicons?domain=${selectedLead.domain}&sz=64`}
+                                            alt={`${selectedLead.domain} favicon`}
+                                            style={{
+                                                width: '32px',
+                                                height: '32px',
+                                                borderRadius: '6px',
+                                                background: 'rgba(255, 255, 255, 0.1)',
+                                                padding: '4px',
+                                                flexShrink: 0
+                                            }}
+                                            onError={(e) => {
+                                                // Hide image on error
+                                                e.currentTarget.style.display = 'none';
+                                            }}
+                                        />
+                                    )}
+                                    <h2 style={{ 
+                                        margin: 0, 
+                                        wordBreak: 'break-word',
+                                        fontSize: '1.5rem',
+                                        fontWeight: 600,
+                                        color: '#ffffff',
+                                        flex: '1 1 auto'
+                                    }}>
+                                        {selectedLead.domain}
+                                    </h2>
+                                </div>
                             </div>
                             <button
                                 onClick={() => setSelectedLead(null)}
@@ -4920,7 +5062,7 @@ export default function ClientPage() {
                             <label className="settings-field">
                                 <span className="settings-field__label">Email</span>
                                 <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)', wordBreak: 'break-all' }}>
-                                    {selectedLead.email || '—'}
+                                    {displayEmail(selectedLead.email, selectedLead.status)}
                                 </div>
                             </label>
 
@@ -4930,11 +5072,79 @@ export default function ClientPage() {
                                     padding: '0.625rem 0',
                                     color: selectedLead.verified ? '#16a34a' : 'rgba(255, 255, 255, 0.7)'
                                 }}>
-                                    {selectedLead.status || '—'}
+                                    {displayEmailStatus(selectedLead.status)}
                                 </div>
                             </label>
 
-                            {(selectedLead.firstLine || selectedLead.personalizationTitle) && (
+                            <label className="settings-field">
+                                <span className="settings-field__label">Role</span>
+                                <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                    {selectedLead.roleType === 'founder' ? 'Founder' : selectedLead.roleType === 'dm' ? 'Decision Maker' : selectedLead.roleType || '—'}
+                                </div>
+                            </label>
+
+                            {selectedLead.createdAt && (
+                                <label className="settings-field">
+                                    <span className="settings-field__label">Created At</span>
+                                    <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.6)', fontSize: '0.875rem' }}>
+                                        {new Date(selectedLead.createdAt).toLocaleString()}
+                                    </div>
+                                </label>
+                            )}
+
+                            {selectedLead.lastVerifiedAt && (
+                                <label className="settings-field">
+                                    <span className="settings-field__label">Last Verified At</span>
+                                    <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.6)', fontSize: '0.875rem' }}>
+                                        {new Date(selectedLead.lastVerifiedAt).toLocaleString()}
+                                    </div>
+                                </label>
+                            )}
+
+                            {selectedLead.campaignsData && selectedLead.campaignsData.length > 0 && (
+                                <label className="settings-field">
+                                    <span className="settings-field__label">Instantly Campaigns</span>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.5rem' }}>
+                                        {selectedLead.campaignsData.map((campaign, idx) => (
+                                            <div
+                                                key={idx}
+                                                style={{
+                                                    padding: '0.75rem',
+                                                    background: 'rgba(59, 130, 246, 0.1)',
+                                                    borderRadius: '8px',
+                                                    border: '1px solid rgba(59, 130, 246, 0.25)'
+                                                }}
+                                            >
+                                                <div style={{ fontWeight: 600, color: '#bfdbfe', marginBottom: '0.25rem' }}>
+                                                    {campaign.campaignName}
+                                                </div>
+                                                <div style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.5)' }}>
+                                                    Added: {new Date(campaign.addedAt).toLocaleString()}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </label>
+                            )}
+
+                            {selectedLead.firstLine && (
+                                <label className="settings-field">
+                                    <span className="settings-field__label">Personalization First Line</span>
+                                    <div style={{
+                                        padding: '0.75rem',
+                                        backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                                        borderRadius: '6px',
+                                        borderLeft: '3px solid rgba(34, 197, 94, 0.5)',
+                                        fontStyle: 'italic',
+                                        color: 'rgba(255, 255, 255, 0.9)',
+                                        marginTop: '0.5rem'
+                                    }}>
+                                        "{selectedLead.firstLine}"
+                                    </div>
+                                </label>
+                            )}
+
+                            {(selectedLead.personalizationTitle || selectedLead.personalizationUrl) && (
                                 <>
                                     <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.1)', margin: '1.5rem 0' }} />
 
@@ -4964,23 +5174,6 @@ export default function ClientPage() {
                                             >
                                                 {selectedLead.personalizationUrl}
                                             </a>
-                                        </label>
-                                    )}
-
-                                    {selectedLead.firstLine && (
-                                        <label className="settings-field">
-                                            <span className="settings-field__label">AI First Line</span>
-                                            <div style={{
-                                                padding: '0.75rem',
-                                                backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                                                borderRadius: '6px',
-                                                borderLeft: '3px solid rgba(59, 130, 246, 0.5)',
-                                                fontStyle: 'italic',
-                                                color: 'rgba(255, 255, 255, 0.9)',
-                                                marginTop: '0.5rem'
-                                            }}>
-                                                "{selectedLead.firstLine}"
-                                            </div>
                                         </label>
                                     )}
                                 </>

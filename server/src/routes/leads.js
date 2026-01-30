@@ -53,6 +53,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             emailFilter,
             createdAfter,
             createdBefore,
+            instantlyCampaignId,
             limit = 200,
             offset = 0
         } = req.query;
@@ -80,9 +81,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
 
         // Single email status filter
         if (emailStatus) {
-            whereClause += ` AND c.email_status = $${paramIndex}`;
-            params.push(emailStatus);
-            paramIndex++;
+            if (emailStatus === 'not_run') {
+                whereClause += ` AND (c.email_status IS NULL OR c.email_status = '')`;
+            } else {
+                whereClause += ` AND c.email_status = $${paramIndex}`;
+                params.push(emailStatus);
+                paramIndex++;
+            }
         }
 
         // Multi-select email status filter (for segments)
@@ -131,9 +136,14 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
 
         // Filter by email existence
         if (emailFilter === 'exists') {
-            whereClause += ` AND c.email IS NOT NULL AND c.email != '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+            // Email finder ran (has status) and email found
+            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND c.email IS NOT NULL AND c.email != '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
         } else if (emailFilter === 'not_found') {
-            whereClause += ` AND (c.email IS NULL OR c.email = '' OR LOWER(c.email) LIKE '%not found%' OR LOWER(c.email) = 'not_found')`;
+            // Email finder ran (has status) but no email found
+            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND (c.email IS NULL OR c.email = '')`;
+        } else if (emailFilter === 'not_run') {
+            // Email finder never ran (no status)
+            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '')`;
         }
 
         // Date filters
@@ -149,17 +159,30 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramIndex++;
         }
 
+        // Campaign filter (requires join with contact_instantly_campaigns and instantly_campaigns)
+        let joinClause = '';
+        if (instantlyCampaignId) {
+            joinClause = `
+                JOIN contact_instantly_campaigns cic ON cic.contact_id = c.id
+                JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+            `;
+            whereClause += ` AND ic.instantly_campaign_id = $${paramIndex}`;
+            params.push(instantlyCampaignId);
+            paramIndex++;
+        }
+
         // Get total count with filters applied
         const countQuery = `
             SELECT COUNT(*) as count
             FROM contacts c
             JOIN companies co ON c.company_id = co.id
+            ${joinClause}
             WHERE ${whereClause}
         `;
         const countResult = await pool.query(countQuery, params);
         const total = parseInt(countResult.rows[0]?.count || 0, 10);
 
-        // Fetch contacts with pagination
+        // Fetch contacts with pagination and campaign data
         const contactsQuery = `
             SELECT
                 c.id,
@@ -175,9 +198,22 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 c.personalization_first_line,
                 c.created_at,
                 c.updated_at,
-                co.domain_normalized
+                co.domain_normalized,
+                (
+                    SELECT json_agg(
+                        json_build_object(
+                            'campaignId', ic.instantly_campaign_id,
+                            'campaignName', ic.name,
+                            'addedAt', cic.added_at
+                        )
+                    )
+                    FROM contact_instantly_campaigns cic
+                    JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+                    WHERE cic.contact_id = c.id
+                ) as campaigns_data
             FROM contacts c
             JOIN companies co ON c.company_id = co.id
+            ${joinClause}
             WHERE ${whereClause}
             ORDER BY c.created_at DESC
             LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
@@ -199,7 +235,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             lastContactedAt: row.last_contacted_at,
             firstLine: row.personalization_first_line,
             createdAt: row.created_at,
-            updatedAt: row.updated_at
+            updatedAt: row.updated_at,
+            campaignsData: row.campaigns_data || []
         }));
 
         res.json({
@@ -325,6 +362,86 @@ router.get('/leads/stats', verifyFirebaseToken, async (req, res) => {
     } catch (error) {
         console.error('Error fetching lead stats:', error);
         res.status(500).json({ error: 'Failed to fetch lead stats' });
+    }
+});
+
+/**
+ * GET /stats/companies-count
+ *
+ * Get total company count for authenticated agency.
+ *
+ * Returns:
+ *   - count: Total number of companies
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        
+        const countResult = await pool.query(
+            `SELECT COUNT(*) as count FROM companies WHERE agency_id = $1`,
+            [agencyId]
+        );
+        
+        const count = parseInt(countResult.rows[0]?.count || 0, 10);
+
+        res.json({ count });
+    } catch (error) {
+        console.error('Error fetching companies count:', error);
+        res.status(500).json({ error: 'Failed to fetch companies count' });
+    }
+});
+
+/**
+ * GET /instantly-campaigns
+ *
+ * Fetch Instantly campaigns for a specific client.
+ *
+ * Query parameters:
+ *   - clientId: Client slug to resolve to numeric SQL client_id (required)
+ *
+ * Returns:
+ *   - campaigns: Array of { id: instantly_campaign_id, name: campaign_name }
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.get('/instantly-campaigns', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId: clientSlug } = req.query;
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId parameter is required' });
+        }
+
+        // Resolve client slug to numeric SQL ID
+        let clientId;
+        try {
+            clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        } catch (error) {
+            console.error('Failed to resolve client ID:', error);
+            return res.status(500).json({ error: 'Failed to resolve client ID' });
+        }
+
+        // Fetch campaigns from instantly_campaigns table
+        const campaignsQuery = `
+            SELECT 
+                instantly_campaign_id as id,
+                name
+            FROM instantly_campaigns
+            WHERE agency_id = $1 AND client_id = $2
+            ORDER BY created_at DESC
+        `;
+
+        const result = await pool.query(campaignsQuery, [agencyId, clientId]);
+
+        res.json({
+            campaigns: result.rows
+        });
+    } catch (error) {
+        console.error('Error fetching instantly campaigns:', error);
+        res.status(500).json({ error: 'Failed to fetch campaigns' });
     }
 });
 

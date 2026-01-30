@@ -1,0 +1,1 @@
+select * from contact_instantly_campaigns limit 300;

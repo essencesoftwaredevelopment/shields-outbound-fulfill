@@ -7,6 +7,7 @@ import { getIdToken } from "firebase/auth";
 import { firebaseAuth } from "@/lib/firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
+import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 
 // Helper function to retry fetch on connection errors
@@ -65,6 +66,7 @@ export default function ClientsPage() {
     const [campaigns, setCampaigns] = useState<Array<{ id: string; name: string; status?: string; createdAt?: string }>>([]);
     const [syncingCampaigns, setSyncingCampaigns] = useState(false);
     const [syncMessage, setSyncMessage] = useState<string>("");
+    const [companiesCount, setCompaniesCount] = useState<number>(0);
     const modalRef = useRef<HTMLDivElement>(null);
 
     const niches = useMemo<Niche[]>(
@@ -87,6 +89,44 @@ export default function ClientsPage() {
             router.replace("/auth");
         }
     }, [loading, user, router]);
+
+    // Fetch total companies count from SQL database
+    useEffect(() => {
+        if (!user) {
+            setCompaniesCount(0);
+            return;
+        }
+        
+        let cancelled = false;
+        
+        (async () => {
+            try {
+                const currentUser = firebaseAuth.currentUser;
+                const idToken = currentUser ? await getIdToken(currentUser) : null;
+                if (!idToken || cancelled) return;
+                
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/stats/companies-count`,
+                    {
+                        headers: { 
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        }
+                    }
+                );
+                
+                if (response.ok && !cancelled) {
+                    const data = await response.json();
+                    setCompaniesCount(data.count || 0);
+                }
+            } catch (error) {
+                console.error('Failed to fetch companies count:', error);
+                if (!cancelled) setCompaniesCount(0);
+            }
+        })();
+        
+        return () => { cancelled = true; };
+    }, [user]);
 
     useEffect(() => {
         if (!user) {
@@ -283,9 +323,9 @@ export default function ClientsPage() {
                                     <div className="niche-card__text">
                                         <p className="niche-card__label">{client.name}</p>
                                         <p className="niche-card__detail">
-                                            <strong className="card-big-data">{(campaignCounts[client.id] ?? client.activeCampaigns ?? 0).toLocaleString()}</strong>
+                                            <strong className="card-big-data">{companiesCount.toLocaleString()}</strong>
                                             <br />
-                                            active campaigns
+                                            companies in database
                                         </p>
                                     </div>
                                     <span className="niche-card__cta">View details →</span>

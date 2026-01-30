@@ -145,7 +145,7 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (company_id, role_type)
         DO UPDATE SET
-            full_name = EXCLUDED.full_name,
+            full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
             email = COALESCE(EXCLUDED.email, contacts.email),
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
