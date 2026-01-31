@@ -133,7 +133,8 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
             email = null, 
             email_status = null, 
             confidence = null,
-            personalization_first_line = null
+            personalization_first_line = null,
+            job_id = null
         } = row;
 
         if (!company_id || !role_type) {
@@ -141,18 +142,18 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
             continue; // Skip invalid rows
         }
 
-        params.push(company_id, role_type, full_name, email, email_status, confidence, agencyId, personalization_first_line);
-        valuesList.push(`($1, $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`);
-        paramIndex += 8;
+        params.push(company_id, role_type, full_name, email, email_status, confidence, agencyId, personalization_first_line, job_id);
+        valuesList.push(`($1, $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, $${paramIndex + 8})`);
+        paramIndex += 9;
         
         // Store metadata for potential fallback update
-        rowsMetadata.push({ company_id, role_type, full_name, email, email_status, confidence, personalization_first_line });
+        rowsMetadata.push({ company_id, role_type, full_name, email, email_status, confidence, personalization_first_line, job_id });
     }
 
     if (!valuesList.length) return [];
 
     const query = `
-        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
+        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line, job_id)
         VALUES ${valuesList.join(', ')}
         ON CONFLICT (company_id, role_type)
         DO UPDATE SET
@@ -161,9 +162,10 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
+            job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
             updated_at = now()
         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                  last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
+                  last_verified_at, last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
     `;
 
     try {
@@ -179,8 +181,8 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
             for (const row of rowsMetadata) {
                 try {
                     const individualQuery = `
-                        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, confidence, agency_id, personalization_first_line, job_id)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                         ON CONFLICT (company_id, role_type)
                         DO UPDATE SET
                             full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
@@ -188,13 +190,14 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
                             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
                             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
                             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
+                            job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
                             updated_at = now()
                         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                                  last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
+                                  last_verified_at, last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
                     `;
                     const individualResult = await txClient.query(individualQuery, [
                         clientId, row.company_id, row.role_type, row.full_name, 
-                        row.email, row.email_status, row.confidence, agencyId, row.personalization_first_line
+                        row.email, row.email_status, row.confidence, agencyId, row.personalization_first_line, row.job_id
                     ]);
                     results.push(individualResult.rows[0]);
                 } catch (innerErr) {
@@ -210,14 +213,15 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows) {
                                 email_status = COALESCE($4, email_status),
                                 confidence = COALESCE($5, confidence),
                                 personalization_first_line = COALESCE($6, personalization_first_line),
+                                job_id = COALESCE($7, job_id),
                                 updated_at = now()
-                            WHERE client_id = $7 AND email = $8
+                            WHERE client_id = $8 AND email = $9
                             RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                                      last_verified_at, last_contacted_at, confidence, personalization_first_line, created_at, updated_at
+                                      last_verified_at, last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
                         `;
                         const updateResult = await txClient.query(updateQuery, [
                             row.company_id, row.role_type, row.full_name, 
-                            row.email_status, row.confidence, row.personalization_first_line,
+                            row.email_status, row.confidence, row.personalization_first_line, row.job_id,
                             clientId, row.email
                         ]);
                         if (updateResult.rows[0]) {

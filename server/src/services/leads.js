@@ -75,7 +75,7 @@ function buildContactPayload(row, type) {
 /**
  * Upsert an in-memory batch of lead rows (no CSV needed)
  */
-export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type }) {
+export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobId = null }) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     if (!agencyId || !clientId) return;
 
@@ -100,7 +100,8 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type }) {
                 email_status: p.emailStatus || null,
                 confidence: p.confidence || null,
                 personalization_first_line: p.personalizationFirstLine || null,
-                last_verified_at: p.lastVerifiedAt || null
+                last_verified_at: p.lastVerifiedAt || null,
+                job_id: jobId
             };
         }).filter((r) => r.company_id);
         
@@ -279,7 +280,8 @@ export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, sta
                                 full_name: p.fullName || null,
                                 email: p.email || null,
                                 email_status: p.emailStatus || null,
-                                confidence: p.confidence || null
+                                confidence: p.confidence || null,
+                                job_id: jobId
                             })).filter((r) => r.company_id);
 
                             if (contactRows.length > 0) {
@@ -311,7 +313,8 @@ export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, sta
                     full_name: p.fullName || null,
                     email: p.email || null,
                     email_status: p.emailStatus || null,
-                    confidence: p.confidence || null
+                    confidence: p.confidence || null,
+                    job_id: jobId
                 })).filter((r) => r.company_id);
 
                 if (contactRows.length > 0) {

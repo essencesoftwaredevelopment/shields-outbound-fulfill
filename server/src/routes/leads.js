@@ -196,6 +196,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 c.last_contacted_at,
                 c.confidence,
                 c.personalization_first_line,
+                c.job_id,
                 c.created_at,
                 c.updated_at,
                 co.domain_normalized,
@@ -234,6 +235,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             lastVerifiedAt: row.last_verified_at,
             lastContactedAt: row.last_contacted_at,
             firstLine: row.personalization_first_line,
+            jobId: row.job_id,
             createdAt: row.created_at,
             updatedAt: row.updated_at,
             campaignsData: row.campaigns_data || []

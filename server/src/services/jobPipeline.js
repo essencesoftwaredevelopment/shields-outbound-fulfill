@@ -528,7 +528,8 @@ async function processJob(job) {
                             agencyId: job.uid,
                             clientId: job.sqlClientId,
                             rows,
-                            type: 'emails'
+                            type: 'emails',
+                            jobId: job.id
                         });
                     }
                 })

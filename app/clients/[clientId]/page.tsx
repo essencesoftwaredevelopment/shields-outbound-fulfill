@@ -75,6 +75,7 @@ type Lead = {
     updatedAt?: string;
     createdAt?: string;
     lastVerifiedAt?: string;
+    jobId?: string;
     campaigns?: string[];
     campaignsData?: Array<{
         campaignId: string;
@@ -968,6 +969,7 @@ export default function ClientPage() {
                 updatedAt: row.updatedAt || "",
                 createdAt: row.createdAt || "",
                 lastVerifiedAt: row.lastVerifiedAt || "",
+                jobId: row.jobId || "",
                 campaigns: row.campaigns || [],
                 campaignsData: row.campaignsData || []
             }));
@@ -2059,6 +2061,7 @@ export default function ClientPage() {
                 personalizationUrl: row.personalizationUrl || "",
                 personalizationTitle: row.personalizationTitle || "",
                 updatedAt: row.updatedAt || "",
+                jobId: row.jobId || "",
                 campaigns: row.campaigns || []
             }));
 
@@ -3783,6 +3786,7 @@ export default function ClientPage() {
                                                         updatedAt: row.updatedAt || "",
                                                         createdAt: row.createdAt || "",
                                                         lastVerifiedAt: row.lastVerifiedAt || "",
+                                                        jobId: row.jobId || "",
                                                         campaigns: row.campaigns || [],
                                                         campaignsData: row.campaignsData || []
                                                     }));
@@ -5546,6 +5550,18 @@ export default function ClientPage() {
                                     fontSize: '0.875rem'
                                 }}>
                                     {selectedLead.id}
+                                </div>
+                            </label>
+
+                            <label className="settings-field">
+                                <span className="settings-field__label">Job ID</span>
+                                <div style={{
+                                    padding: '0.625rem 0',
+                                    color: 'rgba(255, 255, 255, 0.6)',
+                                    fontFamily: 'monospace',
+                                    fontSize: '0.875rem'
+                                }}>
+                                    {selectedLead.jobId || '—'}
                                 </div>
                             </label>
 
