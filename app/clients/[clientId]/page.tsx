@@ -344,8 +344,12 @@ export default function ClientPage() {
     const [isDeletingClient, setIsDeletingClient] = useState(false);
     const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
     const [pausingJob, setPausingJob] = useState(false);
+    const [stoppingJob, setStoppingJob] = useState(false);
     const [pipelineVisible, setPipelineVisible] = useState(true);
     const [expandedErrorJobId, setExpandedErrorJobId] = useState<string | null>(null);
+    const [downloadScope, setDownloadScope] = useState<'all' | 'valid'>('valid');
+    const [downloadModalOpen, setDownloadModalOpen] = useState(false);
+    const [jobPendingUpload, setJobPendingUpload] = useState<string | null>(null);
 
     // Manual upload modal state
     const [showManualUploadModal, setShowManualUploadModal] = useState(false);
@@ -495,10 +499,6 @@ export default function ClientPage() {
     const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
     const [csvPreviewRows, setCsvPreviewRows] = useState<Record<string, string>[]>([]);
     const [columnMapping, setColumnMapping] = useState<Record<string, { column: string; isCustom: boolean }>>({});
-    const [jobPendingUpload, setJobPendingUpload] = useState<string | null>(null);
-    const [downloadModalOpen, setDownloadModalOpen] = useState(false);
-    const [downloadScope, setDownloadScope] = useState<'all' | 'valid'>('all');
-    const [stoppingJob, setStoppingJob] = useState(false);
     const leadsContainerRef = useRef<HTMLDivElement | null>(null);
 
     // Leads state
@@ -544,6 +544,47 @@ export default function ClientPage() {
     const [deletingSegmentId, setDeletingSegmentId] = useState<string | null>(null);
     const [downloadingSegmentId, setDownloadingSegmentId] = useState<string | null>(null);
 
+    // Computed values for pipeline panel
+    const stageCompletionPercent = useMemo(() => {
+        if (!jobState) return 0;
+        const completedStages = STAGE_ORDER.filter(k => jobState.stages[k]?.status === 'completed').length;
+        return Math.round((completedStages / STAGE_ORDER.length) * 100);
+    }, [jobState]);
+
+    const validLeadsCompleted = useMemo(() => {
+        if (!jobState) return 0;
+        return (jobState.stages?.verification?.summary as any)?.valid 
+            || (jobState.stages?.verification?.summary as any)?.Valid 
+            || 0;
+    }, [jobState]);
+
+    const activeStatusLabel = useMemo(() => {
+        if (!jobState) return null;
+        if (jobState.paused) return 'Job paused';
+        if (jobState.status === 'running') {
+            const runningStage = STAGE_ORDER.find(k => jobState.stages[k]?.status === 'running');
+            if (runningStage) {
+                return `Running ${STAGE_METADATA[runningStage]?.title || runningStage}...`;
+            }
+        }
+        return null;
+    }, [jobState]);
+
+    const canUploadToInstantly = useMemo(() => {
+        return jobState?.status === 'completed' && activeJobStatus !== 'uploaded';
+    }, [jobState, activeJobStatus]);
+
+    const canDiscardJob = useMemo(() => {
+        return jobState && ['completed', 'pending-upload'].includes(jobState.status) && activeJobStatus !== 'uploaded';
+    }, [jobState, activeJobStatus]);
+
+    const uploadedSummary = useMemo(() => {
+        if (!uploadMetrics) return 'Uploaded';
+        const { count, total } = uploadMetrics;
+        if (count === total) return `${count.toLocaleString()} uploaded`;
+        return `${count.toLocaleString()}/${total.toLocaleString()} uploaded`;
+    }, [uploadMetrics]);
+
     const niches = useMemo<Niche[]>(
         () => [
             {
@@ -577,110 +618,6 @@ export default function ClientPage() {
         ],
         [],
     );
-
-    const canUploadToInstantly = useMemo(() => {
-        // Only show upload button when job is truly completed
-        // Backend should have generated output files by this point
-        return jobState?.status === "completed";
-    }, [jobState]);
-
-    const stageCompletionPercent = useMemo(() => {
-        if (!jobState?.stages) return 0;
-        const totalStages = STAGE_ORDER.length;
-        const completedStages = STAGE_ORDER.filter((key) => jobState.stages[key]?.status === 'completed').length;
-        return Math.round((completedStages / totalStages) * 100);
-    }, [jobState?.stages]);
-
-    const validLeadsCompleted = useMemo(() => {
-        if (!jobState?.stages) return 0;
-        
-        // Check final pipeline stage in reverse order
-        const personalizationProcessed = jobState.stages.personalization?.summary?.processed;
-        if (typeof personalizationProcessed === 'number' && personalizationProcessed > 0) {
-            return personalizationProcessed;
-        }
-        
-        // Check verification stage for valid + valid-risky
-        const verValid = (jobState.stages.verification?.summary?.valid as number) || 0;
-        const verValidRisky = (jobState.stages.verification?.summary?.['valid-risky'] as number) || 0;
-        const verificationTotal = verValid + verValidRisky;
-        if (verificationTotal > 0) {
-            return verificationTotal;
-        }
-        
-        // Fallback to email discovery found count
-        const emailFound = jobState.stages.emailDiscovery?.summary?.found;
-        if (typeof emailFound === 'number') return emailFound;
-        
-        return 0;
-    }, [jobState?.stages]);
-
-    const activeStatusLabel = useMemo(() => {
-        if (!activeJobStatus) {
-            return "";
-        }
-
-        const formatNumber = (value: unknown) =>
-            typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : null;
-
-        // activeJobStatus can still be: pending-upload, uploaded, discarded, failed
-        // These are secondary states tracked in the activeJob doc
-
-        if (activeJobStatus === "uploaded") {
-            const uploadedCount = formatNumber(uploadMetrics?.count);
-            const uploadedTotal = formatNumber(uploadMetrics?.total);
-            if (uploadedCount && uploadedTotal && uploadedCount !== uploadedTotal) {
-                return `Uploaded ${uploadedCount} of ${uploadedTotal} leads to Instantly.`;
-            }
-            if (uploadedCount) {
-                return `Uploaded ${uploadedCount} leads to Instantly.`;
-            }
-            return "Leads uploaded to Instantly.";
-        }
-
-        if (activeJobStatus === "discarded") {
-            return "Job discarded. Download CSV if you still need the leads.";
-        }
-
-        if (activeJobStatus === "failed") {
-            return jobState?.error || instantlyUploadError || "Pipeline failed.";
-        }
-
-        if (activeJobStatus === "running") {
-            // Check if job is paused
-            if (jobState?.paused) {
-                return "Pipeline paused.";
-            }
-            return "Pipeline running.";
-        }
-
-        if (activeJobStatus === "queued") {
-            return "Pipeline queued.";
-        }
-
-        if (activeJobStatus === "completed") {
-            return "Pipeline completed.";
-        }
-
-        return "";
-    }, [activeJobStatus, uploadMetrics, instantlyUploadError, jobState]);
-
-    const uploadedSummary = useMemo(() => {
-        if (activeJobStatus !== "uploaded") {
-            return "";
-        }
-        const count = uploadMetrics?.count;
-        const total = uploadMetrics?.total;
-        if (typeof count === "number" && Number.isFinite(count)) {
-            if (typeof total === "number" && Number.isFinite(total) && total !== count) {
-                return `${count.toLocaleString()} / ${total.toLocaleString()} leads uploaded`;
-            }
-            return `${count.toLocaleString()} leads uploaded`;
-        }
-        return "Uploaded to Instantly";
-    }, [activeJobStatus, uploadMetrics]);
-
-    const canDiscardJob = activeJobStatus === "pending-upload";
 
     useEffect(() => {
         if (user?.uid) {
@@ -2490,6 +2427,26 @@ export default function ClientPage() {
         }
     };
 
+    const handleDownloadJobCsv = async (jobId: string, scope: 'all' | 'valid' = 'valid') => {
+        try {
+            const url = `${getPipelineBaseUrl()}/api/jobs/${jobId}/result?scope=${scope}`;
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `job-${jobId}-${scope}.csv`;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            setToastMessage('Downloading CSV...');
+            setToastVisible(true);
+        } catch (error) {
+            console.error('Failed to download CSV:', error);
+            setToastMessage('Failed to download CSV');
+            setToastVisible(true);
+        }
+    };
+
     const uploadDisabled = !selectedFile || uploading;
 
     if (loading || !user) {
@@ -2674,7 +2631,361 @@ export default function ClientPage() {
                                 </div>
                             )}
 
+                            {/* Pipeline Panel */}
+                            {pipelineVisible && jobState && (
+                                <div style={{ 
+                                    marginTop: '2rem',
+                                    background: 'rgba(255, 255, 255, 0.03)',
+                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                    borderRadius: '16px',
+                                    padding: '2rem',
+                                    position: 'relative'
+                                }}>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            userDeselectedRef.current = true;
+                                            setSelectedJobId(null);
+                                            setJobState(null);
+                                            closeJobStream();
+                                        }}
+                                        aria-label="Deselect job"
+                                        style={{
+                                            position: 'absolute',
+                                            top: '1rem',
+                                            right: '1rem',
+                                            background: 'rgba(255, 255, 255, 0.05)',
+                                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                                            borderRadius: '8px',
+                                            width: '32px',
+                                            height: '32px',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            cursor: 'pointer',
+                                            color: 'rgba(255, 255, 255, 0.6)',
+                                            fontSize: '1.25rem',
+                                            transition: 'all 0.2s ease',
+                                            padding: 0
+                                        }}
+                                        onMouseEnter={(e) => {
+                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)';
+                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)';
+                                        }}
+                                        onMouseLeave={(e) => {
+                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
+                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.6)';
+                                        }}
+                                    >
+                                        ×
+                                    </button>
+                                <div className="pipeline-panel__header">
+                                    <div>
+                                        <p className="eyebrow eyebrow--muted">
+                                            {jobState ? "Live pipeline" : "Pipeline monitor"}
+                                        </p>
+                                        <h2 className="pipeline-panel__title">
+                                            {jobState
+                                                ? `${stageCompletionPercent || 0}% completed`
+                                                : "No runs yet"}
+                                        </h2>
+                                        {!jobState && (
+                                            <p className="pipeline-panel__subtitle">
+                                                Upload leads to see stage progress and pipeline status.
+                                            </p>
+                                        )}
+                                        {jobState && (
+                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem' }}>
+                                                Valid leads: {validLeadsCompleted.toLocaleString()}
+                                            </p>
+                                        )}
+                                        {jobState && (
+                                            <div className="pipeline-status-row">
+                                                <p className="pipeline-panel__subtitle pipeline-panel__subtitle--status">
+                                                    Viewing job: {jobState.fileName || jobState.id} · {jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status]}
+                                                </p>
+                                                {(jobState.status === 'running' || jobState.status === 'queued' || jobState.paused) && (
+                                                    <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
+                                                        {(jobState.status === 'running' || jobState.paused) && (
+                                                            <button
+                                                                type="button"
+                                                                className="primary-button"
+                                                                onClick={handlePauseResumeJob}
+                                                                disabled={pausingJob}
+                                                                style={{ 
+                                                                    minWidth: '120px',
+                                                                    display: 'flex',
+                                                                    alignItems: 'center',
+                                                                    justifyContent: 'center',
+                                                                    gap: '0.5rem'
+                                                                }}
+                                                            >
+                                                                {pausingJob ? (
+                                                                    jobState.paused ? 'Resuming...' : 'Pausing...'
+                                                                ) : (
+                                                                    <>
+                                                                        {jobState.paused ? (
+                                                                            <>
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
+                                                                                    <polygon points="5 3 19 12 5 21 5 3"/>
+                                                                                </svg>
+                                                                                Resume
+                                                                            </>
+                                                                        ) : (
+                                                                            <>
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
+                                                                                    <rect x="6" y="4" width="4" height="16"/>
+                                                                                    <rect x="14" y="4" width="4" height="16"/>
+                                                                                </svg>
+                                                                                Pause
+                                                                            </>
+                                                                        )}
+                                                                    </>
+                                                                )}
+                                                            </button>
+                                                        )}
+                                                        {!jobState.paused && (
+                                                            <button
+                                                                type="button"
+                                                                className="destructive-button"
+                                                                onClick={handleStopJob}
+                                                                disabled={stoppingJob}
+                                                                style={{ minWidth: '100px' }}
+                                                            >
+                                                                {stoppingJob ? 'Stopping...' : 'Stop run'}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                        {activeStatusLabel && jobState && (
+                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.75rem' }}>
+                                                {activeStatusLabel}
+                                            </p>
+                                        )}
+                                    </div>
+                                    {(jobState?.status === 'completed' || canUploadToInstantly) && (
+                                        <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
+                                            <button
+                                                type="button"
+                                                className="secondary-button secondary-button--active"
+                                                onClick={() => {
+                                                    setDownloadScope('all');
+                                                    setDownloadModalOpen(true);
+                                                }}
+                                            >
+                                                Download CSV
+                                            </button>
+                                            {canUploadToInstantly ? (
+                                                <button
+                                                    type="button"
+                                                    className="primary-button"
+                                                    onClick={handleUploadToInstantly}
+                                                    disabled={uploading}
+                                                >
+                                                    {uploading ? 'Uploading...' : 'Upload to Instantly'}
+                                                </button>
+                                            ) : activeJobStatus === 'uploaded' ? (
+                                                <span
+                                                    style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        padding: '0.35rem 0.75rem',
+                                                        borderRadius: '999px',
+                                                        fontSize: '0.75rem',
+                                                        fontWeight: 600,
+                                                        letterSpacing: '0.02em',
+                                                        background: 'rgba(34, 197, 94, 0.12)',
+                                                        color: '#22c55e',
+                                                        border: '1px solid rgba(34, 197, 94, 0.35)'
+                                                    }}
+                                                >
+                                                    {uploadedSummary}
+                                                </span>
+                                            ) : null}
+                                            {canDiscardJob && (
+                                                <button
+                                                    type="button"
+                                                    className="destructive-button"
+                                                    onClick={handleDiscardJob}
+                                                    style={{ color: 'rgba(239, 68, 68, 0.9)' }}
+                                                >
+                                                    Discard
+                                                </button>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
 
+                                {jobState ? (
+                                    <>
+                                        {/* Pipeline flow summary */}
+                                        {(() => {
+                                            const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
+                                            const foundersProcessed = deriveStageTotals(jobState.stages.founders).total ?? 0;
+                                            const emailsFound = (jobState.stages.emailDiscovery?.summary as any)?.Found ?? (jobState.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(jobState.stages.emailDiscovery).throughputNum ?? 0;
+                                            const safe = (jobState.stages.verification?.summary as any)?.Valid ?? (jobState.stages.verification?.summary as any)?.valid ?? 0;
+                                            const personalized = (jobState.stages.personalization?.summary as any)?.Personalized ?? (jobState.stages.personalization?.summary as any)?.personalized ?? (jobState.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
+                                            
+                                            return (
+                                                <div style={{ 
+                                                    display: 'flex', 
+                                                    alignItems: 'center', 
+                                                    gap: '0.75rem',
+                                                    padding: '1rem 1.5rem',
+                                                    background: 'rgba(255, 255, 255, 0.03)',
+                                                    borderRadius: '8px',
+                                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                    marginTop: '1.5rem',
+                                                    fontSize: '0.875rem',
+                                                    fontVariantNumeric: 'tabular-nums'
+                                                }}>
+                                                    <span style={{ opacity: 0.5, fontSize: '0.75rem' }}>Pipeline flow:</span>
+                                                    <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600' }}>{foundersFound.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600', color: '#22c55e' }}>{safe.toLocaleString()}</span>
+                                                    <span style={{ opacity: 0.4 }}>→</span>
+                                                    <span style={{ fontWeight: '600', color: '#3b82f6' }}>{personalized.toLocaleString()}</span>
+                                                </div>
+                                            );
+                                        })()}
+                                        
+                                        <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
+                                        {[...STAGE_ORDER].map((stageKey) => {
+                                            const stage = jobState.stages[stageKey];
+                                            const meta = STAGE_METADATA[stageKey];
+                                            const { throughputNum, total } = deriveStageTotals(stage);
+                                            const summary = stage?.summary as Record<string, unknown> | null;
+                                            const stats = stage?.progress?.stats as Record<string, unknown> | undefined;
+                                            
+                                            // Simplified metrics based on stage type
+                                            let heroNumber = null;
+                                            let heroLabel = "";
+                                            let subtext = "";
+                                            let costFooter = "";
+                                            
+                                            if (stageKey === "founders") {
+                                                const found = throughputNum ?? 0;
+                                                const processed = total ?? 0;
+                                                const cost = summary?.cost || stats?.cost;
+                                                heroNumber = found;
+                                                heroLabel = "Found";
+                                                subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
+                                                if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
+                                            } else if (stageKey === "emailDiscovery") {
+                                                const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
+                                                const attempted = total ?? 0;
+                                                heroNumber = found;
+                                                heroLabel = "Emails Found";
+                                                subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
+                                            } else if (stageKey === "verification") {
+                                                const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
+                                                const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
+                                                const verified = total ?? 0;
+                                                heroNumber = safe;
+                                                heroLabel = "Safe";
+                                                const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
+                                                subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
+                                            } else if (stageKey === "personalization") {
+                                                const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
+                                                const candidates = total ?? 0;
+                                                const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
+                                                heroNumber = personalized;
+                                                heroLabel = "Ready";
+                                                subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
+                                                if (failed > 0) subtext += ` • ${failed} failed`;
+                                            }
+                                            
+                                            return (
+                                                <article
+                                                    key={stageKey}
+                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""}`}
+                                                >
+                                                    <div className="stage-card__head">
+                                                        <div>
+                                                            <p className="stage-card__label">{meta.title}</p>
+                                                        </div>
+                                                        <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
+                                                    </div>
+                                                    
+                                                    {stage?.error === 'Add Credits to TryKitt' ? (
+                                                        <div style={{
+                                                            marginTop: '0.75rem',
+                                                            padding: '1rem',
+                                                            background: 'rgba(239, 68, 68, 0.15)',
+                                                            border: '1px solid rgba(239, 68, 68, 0.5)',
+                                                            borderRadius: '8px',
+                                                            color: '#ef4444',
+                                                            fontWeight: 600,
+                                                            fontSize: '0.95rem',
+                                                            textAlign: 'center'
+                                                        }}>
+                                                            ⚠️ Add Credits to TryKitt
+                                                        </div>
+                                                    ) : stage?.error ? (
+                                                        <p className="stage-card__error">{stage.error}</p>
+                                                    ) : heroNumber !== null ? (
+                                                        <>
+                                                            <div style={{ marginTop: '0.75rem' }}>
+                                                                <div style={{ fontSize: '2.25rem', fontWeight: '700', lineHeight: '1' }}>
+                                                                    {heroNumber.toLocaleString()}
+                                                                    <span style={{ fontSize: '1rem', fontWeight: '500', marginLeft: '0.5rem', opacity: 0.7 }}>{heroLabel}</span>
+                                                                </div>
+                                                                <div style={{ fontSize: '0.875rem', marginTop: '0.5rem', opacity: 0.65 }}>
+                                                                    {subtext}
+                                                                </div>
+                                                            </div>
+                                                            {costFooter && (
+                                                                <div style={{ fontSize: '0.75rem', marginTop: '0.75rem', opacity: 0.5 }}>
+                                                                    {costFooter}
+                                                                </div>
+                                                            )}
+                                                        </>
+                                                    ) : (
+                                                        <p className="stage-card__progress" style={{ marginTop: '0.75rem', opacity: 0.6 }}>
+                                                            {describeStageProgress(stage)}
+                                                        </p>
+                                                    )}
+                                                </article>
+                                            );
+                                        })}
+                                    </div>
+                                    </>
+                                ) : (
+                                    <div className="pipeline-panel__empty" style={{ marginTop: '1.5rem' }}>
+                                        <p>No pipeline runs yet.</p>
+                                        <p className="pipeline-panel__subtitle">
+                                            Upload a CSV to start processing leads.
+                                        </p>
+                                    </div>
+                                )}
+                                </div>
+                            )}
+
+                            {!pipelineVisible && jobState && (
+                                <div style={{ marginTop: '2rem', textAlign: 'center' }}>
+                                    <button
+                                        type="button"
+                                        onClick={() => setPipelineVisible(true)}
+                                        className="secondary-button secondary-button--active"
+                                        style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '0.5rem'
+                                        }}
+                                    >
+                                        <span>Show Pipeline</span>
+                                        <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>({jobState.fileName || jobState.id})</span>
+                                    </button>
+                                </div>
+                            )}
 
                             <div style={{ marginTop: '2.5rem' }}>
                                 <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem' }}>
