@@ -10,7 +10,7 @@ import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
 import { runEmailVerifier } from './emailVerifier.js';
 import { runPersonalization } from './personalization/index.js';
-import { withTx, batchUpsertCompanies } from '../lib/db.js';
+import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
 import { parse as csvParse } from 'csv-parse';
 
 export const jobs = new Map();
@@ -379,6 +379,19 @@ async function processJob(job) {
             log(job, `Deduplication: ${dedupeStats.total} total, ${dedupeStats.skipped} skipped, ${dedupeStats.new} new domains to process`);
         }
 
+        // Dedupe domains before heavy stages to avoid ON CONFLICT churn
+        const { path: dedupedPath, removedDuplicates, totalRows } = await dedupeDomainsCsv(
+            filteredDomainsPath,
+            job.columnMapping?.domain || 'domain'
+        );
+        filteredDomainsPath = dedupedPath;
+        job.dedupeStats = {
+            ...(job.dedupeStats || {}),
+            duplicateRows: removedDuplicates,
+            totalRows
+        };
+        log(job, `Domain dedupe: removed ${removedDuplicates} duplicate row(s) from ${totalRows} total`);
+
         // Immediately upsert domains into SQL so the UI reflects new companies right after upload
         await upsertDomainsImmediately(job, filteredDomainsPath);
 
@@ -729,13 +742,69 @@ async function upsertDomainsImmediately(job, domainsPath) {
         const start = Date.now();
         await withTx(async (client) => {
             const payloads = uniqueDomains.map((domain) => ({ domain }));
-            await batchUpsertCompanies(client, job.uid, job.sqlClientId, payloads);
+            const domainMap = await batchUpsertCompanies(client, job.uid, job.sqlClientId, payloads);
+
+            // Create placeholder contacts (role founder) so UI can show empty leads immediately
+            const contactPayloads = Array.from(domainMap.values()).map((companyId) => ({
+                company_id: companyId,
+                role_type: 'founder'
+            }));
+            if (contactPayloads.length) {
+                await batchUpsertContacts(client, job.uid, job.sqlClientId, contactPayloads);
+            }
         });
         log(job, `Domain upsert completed: ${uniqueDomains.length} domains in ${Date.now() - start}ms`);
     } catch (err) {
         console.error(`[${job?.id || 'unknown'}] Domain upsert failed:`, err?.message || err);
         log(job, 'Domain upsert failed', { error: err?.message || err });
     }
+}
+
+/**
+ * Deduplicate a domains CSV by domain column. Returns path to deduped file.
+ * If no duplicates are found, original path is returned.
+ */
+async function dedupeDomainsCsv(inputPath, domainColumn = 'domain') {
+    if (!inputPath || !fs.existsSync(inputPath)) {
+        return { path: inputPath, removedDuplicates: 0, totalRows: 0 };
+    }
+
+    const seen = new Set();
+    const rows = [];
+    let totalRows = 0;
+    let removedDuplicates = 0;
+
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(inputPath)
+            .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
+            .on('data', (row) => {
+                const domain = String(row[domainColumn] || row.domain || '').trim().toLowerCase();
+                if (!domain) return;
+                totalRows += 1;
+                if (seen.has(domain)) {
+                    removedDuplicates += 1;
+                    return;
+                }
+                seen.add(domain);
+                rows.push(domain);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    if (removedDuplicates === 0) {
+        return { path: inputPath, removedDuplicates, totalRows };
+    }
+
+    const ext = path.extname(inputPath);
+    const dedupPath = inputPath.replace(ext, `-dedup${ext}`);
+    const writer = fs.createWriteStream(dedupPath);
+    writer.write('domain\n');
+    rows.forEach((d) => writer.write(`${d}\n`));
+    writer.end();
+    await new Promise((resolve) => writer.on('finish', resolve));
+
+    return { path: dedupPath, removedDuplicates, totalRows };
 }
 
 

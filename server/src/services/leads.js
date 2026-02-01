@@ -351,7 +351,7 @@ export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId
         return { filtered: domainsCsvPath, stats: { total: 0, skipped: 0, new: 0 } };
     }
 
-    // Read domains from CSV
+    // Read domains from CSV (raw, may include duplicates)
     const domains = [];
     await new Promise((resolve, reject) => {
         fs.createReadStream(domainsCsvPath)
@@ -364,36 +364,45 @@ export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId
             .on('error', reject);
     });
 
-    const stats = { total: domains.length, skipped: 0, new: 0 };
+    const totalRaw = domains.length;
+    const uniqueDomains = Array.from(new Set(domains));
+    const duplicatesRemoved = totalRaw - uniqueDomains.length;
 
-    if (domains.length === 0) return { filtered: domainsCsvPath, stats };
+    const stats = {
+        total: totalRaw,
+        unique: uniqueDomains.length,
+        duplicatesRemoved,
+        skipped: 0,
+        existing: 0,
+        new: 0
+    };
 
-    // Get existing domains from SQL
-    const existingSet = await getExistingDomainsSet(clientId, domains);
+    if (uniqueDomains.length === 0) return { filtered: domainsCsvPath, stats };
 
-    let filteredDomains = domains;
+    // Get existing domains from SQL (unique list only)
+    const existingSet = await getExistingDomainsSet(clientId, uniqueDomains);
+    stats.existing = existingSet.size;
+
+    let filteredDomains = uniqueDomains;
     if (dedupeStrategy === 'skip') {
-        filteredDomains = domains.filter((d) => !existingSet.has(d));
-        stats.skipped = domains.length - filteredDomains.length;
+        filteredDomains = uniqueDomains.filter((d) => !existingSet.has(d));
+        stats.skipped = existingSet.size;
         stats.new = filteredDomains.length;
     } else {
-        const uniqueDomains = Array.from(new Set(domains));
+        // include strategy: keep unique list but still compute new vs existing
         stats.skipped = 0;
-        stats.new = uniqueDomains.filter((d) => !existingSet.has(d)).length;
+        stats.new = uniqueDomains.length - existingSet.size;
     }
 
-    // Write filtered CSV if skipping and has results
-    if (dedupeStrategy === 'skip' && stats.skipped > 0) {
-        const filteredPath = domainsCsvPath.replace('.csv', '-filtered.csv');
-        const writer = fs.createWriteStream(filteredPath);
-        writer.write('domain\n');
-        filteredDomains.forEach((domain) => writer.write(`${domain}\n`));
-        writer.end();
-        await new Promise((resolve) => writer.on('finish', resolve));
-        return { filtered: filteredPath, stats };
-    }
+    // Always write a deduped/filtered CSV for downstream stages
+    const filteredPath = domainsCsvPath.replace('.csv', '-dedup.csv');
+    const writer = fs.createWriteStream(filteredPath);
+    writer.write('domain\n');
+    filteredDomains.forEach((domain) => writer.write(`${domain}\n`));
+    writer.end();
+    await new Promise((resolve) => writer.on('finish', resolve));
 
-    return { filtered: domainsCsvPath, stats };
+    return { filtered: filteredPath, stats };
 }
 
 /**
@@ -450,4 +459,3 @@ export default {
     upsertLeadRowsBatch,
     incrementCampaignLeadCount
 };
-

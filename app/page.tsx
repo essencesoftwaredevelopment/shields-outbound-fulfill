@@ -437,7 +437,7 @@ function HomeContent() {
         <div className="hero-panel__layout">
           <div className="hero-panel__content">
             <p className="eyebrow">Good evening, Jacques</p>
-            <h1 className="hero-panel__title">Shields Outbound</h1>
+            <h1 className="hero-panel__title">ESSENCE Outbound</h1>
             <p className="hero-panel__description">
               Kick off a fresh outbound motion.
               Pick a niche preset, drop your CSV, and we&apos;ll do the rest.

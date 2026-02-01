@@ -265,7 +265,8 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
 const calculateJobProgress = (job: PipelineJob): { processed: number; total: number; percent: number } => {
     // Find the currently active or last completed stage to get the most accurate progress
     let processed = 0;
-    let total = job.dedupeStats?.total || 0;
+    const dedupedTotal = (job.dedupeStats?.unique ?? job.dedupeStats?.new ?? job.dedupeStats?.total);
+    let total = dedupedTotal ?? 0;
     
     // Check stages in order for progress
     for (const stageKey of STAGE_ORDER) {
@@ -313,6 +314,8 @@ export default function ClientPage() {
     const [findEmail, setFindEmail] = useState(true);
     const [verifyEmail, setVerifyEmail] = useState(true);
     const [filterStats, setFilterStats] = useState<{ raw: number; normalized: number; inBatchDupes: number; crossRunDupes: number; willProcess: number } | null>(null);
+    const [domainCheckStats, setDomainCheckStats] = useState<{ total: number; unique: number; existing: number; new: number } | null>(null);
+    const [checkingDomains, setCheckingDomains] = useState(false);
 
     // Step 3: Personalization options
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
@@ -499,8 +502,11 @@ export default function ClientPage() {
     const [uploadModalOpen, setUploadModalOpen] = useState(false);
     const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
     const [csvPreviewRows, setCsvPreviewRows] = useState<Record<string, string>[]>([]);
-    const [columnMapping, setColumnMapping] = useState<Record<string, { column: string; isCustom: boolean }>>({});
+    const [columnMapping, setColumnMapping] = useState<Record<string, { column: string; isCustom: boolean; customName?: string }>>({});
     const leadsContainerRef = useRef<HTMLDivElement | null>(null);
+    const [skipWorkspaceDupes, setSkipWorkspaceDupes] = useState<boolean>(true);
+    const [skipCampaignDupes, setSkipCampaignDupes] = useState<boolean>(false);
+    const [skipListDupes, setSkipListDupes] = useState<boolean>(false);
 
     // Leads state
     const [leads, setLeads] = useState<Lead[]>([]);
@@ -783,7 +789,24 @@ export default function ClientPage() {
         };
 
         fetchInstantlyCampaigns();
-    }, [user, clientId]);
+    }, [user, clientId, uploadModalOpen]);
+
+    // Reset column mapping custom flags when modal opens
+    useEffect(() => {
+        if (!uploadModalOpen) return;
+        setColumnMapping((prev) => {
+            const next = { ...prev };
+            Object.keys(next).forEach((k) => {
+                if (next[k]?.isCustom) {
+                    next[k] = { ...next[k], column: '', customName: '' };
+                }
+            });
+            return next;
+        });
+        setSkipWorkspaceDupes(true);
+        setSkipCampaignDupes(false);
+        setSkipListDupes(false);
+    }, [uploadModalOpen]);
 
     // Fetch segment counts when segments change
     useEffect(() => {
@@ -1432,6 +1455,43 @@ export default function ClientPage() {
         }
     }, [jobHistory, jobState, jobStreamConnected, selectedJobId]);
 
+    // Fetch upload status for all jobs in a single batch request
+    const fetchJobsUploadStatus = useCallback(async () => {
+        if (!user || !clientId || jobHistory.length === 0) {
+            return;
+        }
+
+        try {
+            const token = await user.getIdToken();
+            const jobIds = jobHistory.map(job => job.id);
+            
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/jobs/batch/upload-status`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        jobIds,
+                        clientId,
+                        agencyId: user.uid
+                    })
+                }
+            );
+            
+            if (!response.ok) {
+                throw new Error(`Failed to fetch upload status: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            setJobUploadStatus(data.statusMap || {});
+        } catch (error) {
+            console.error('Error fetching upload status:', error);
+        }
+    }, [user, clientId, jobHistory]);
+
     useEffect(() => {
         if (jobState) {
             setSelectedJobId(jobState.id);
@@ -1440,10 +1500,8 @@ export default function ClientPage() {
 
     // Fetch upload status when job history changes
     useEffect(() => {
-        if (jobHistory.length > 0 && user) {
-            fetchJobsUploadStatus();
-        }
-    }, [jobHistory.length, user]);
+        fetchJobsUploadStatus();
+    }, [fetchJobsUploadStatus]);
 
     useEffect(() => {
         if (!jobState || !user || !clientId) {
@@ -1527,6 +1585,7 @@ export default function ClientPage() {
         const file = event.target.files?.[0] ?? null;
         setSelectedFile(file);
         setUploadError("");
+        setDomainCheckStats(null);
 
         // Reset mappings when a new file is chosen
         setCsvColumns([]);
@@ -1538,8 +1597,10 @@ export default function ClientPage() {
 
         try {
             const text = await file.text();
-            const headerLine = text.split(/\r?\n/).find((line) => line.trim().length > 0) || "";
-            if (!headerLine) return;
+            const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+            if (!lines.length) return;
+            
+            const headerLine = lines[0];
             const columns = headerLine
                 .split(",")
                 .map((col) => col.trim().replace(/^"|"$/g, ""))
@@ -1549,9 +1610,59 @@ export default function ClientPage() {
             const detectedDomain = guessColumn(columns, ["domain", "website", "url", "company"]);
             const detectedFounder = guessColumn(columns, ["founder_name", "founder", "owner", "ceo", "name"]);
             const detectedEmail = guessColumn(columns, ["email", "email_address", "contact_email", "mail"]);
+            
             if (detectedDomain) {
                 setDomainColumn(detectedDomain);
+                
+                // Extract domains from CSV and check against database
+                const domainColumnIndex = columns.indexOf(detectedDomain);
+                if (domainColumnIndex >= 0 && user && clientId) {
+                    setCheckingDomains(true);
+                    
+                    try {
+                        // Parse domains from all rows
+                        const domains = lines.slice(1) // Skip header
+                            .map(line => {
+                                const values = line.split(",").map(v => v.trim().replace(/^"|"$/g, ""));
+                                return values[domainColumnIndex];
+                            })
+                            .filter(Boolean);
+
+                        // Check domains against database
+                        const token = await user.getIdToken();
+                        const response = await fetch(
+                            `${getPipelineBaseUrl()}/api/jobs/check-domains`,
+                            {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${token}`
+                                },
+                                body: JSON.stringify({
+                                    domains,
+                                    clientId,
+                                    agencyId: user.uid
+                                })
+                            }
+                        );
+
+                        if (response.ok) {
+                            const data = await response.json();
+                            setDomainCheckStats({
+                                total: data.totalDomains,
+                                unique: data.uniqueDomains ?? data.totalDomains,
+                                existing: data.existingDomains,
+                                new: data.newDomains
+                            });
+                        }
+                    } catch (error) {
+                        console.error('Error checking domains:', error);
+                    } finally {
+                        setCheckingDomains(false);
+                    }
+                }
             }
+            
             if (detectedFounder) {
                 setFounderColumn(detectedFounder);
             }
@@ -1616,7 +1727,9 @@ export default function ClientPage() {
 
             // Show toast with deduplication stats
             if (freshJob.dedupeStats) {
-                const { total, skipped, new: newCount } = freshJob.dedupeStats;
+                const { total, skipped, new: newCount, existing, unique } = freshJob.dedupeStats as any;
+                const uniqueCount = typeof unique === 'number' ? unique : total;
+                const existingCount = typeof existing === 'number' ? existing : Math.max(0, uniqueCount - newCount);
 
                 // Check if no domains will be processed (skip strategy with 0 new domains)
                 if (dedupeStrategy === 'skip' && newCount === 0) {
@@ -1631,26 +1744,13 @@ export default function ClientPage() {
                 }
 
                 if (dedupeStrategy === 'include') {
-                    const existing = total - newCount;
-                    if (existing > 0) {
-                        const msg = `✓ Normalized & validated. Processing all ${total} domain${total !== 1 ? 's' : ''} (${newCount} new, ${existing} existing).`;
-                        setToastMessage(msg);
-                        setToastVisible(true);
-                    } else {
-                        const msg = `✓ Normalized & validated. Processing ${total} new domain${total !== 1 ? 's' : ''}.`;
-                        setToastMessage(msg);
-                        setToastVisible(true);
-                    }
+                    const msg = `✓ Normalized & validated. Processing ${uniqueCount} unique domain${uniqueCount !== 1 ? 's' : ''} (${newCount} new, ${existingCount} existing).`;
+                    setToastMessage(msg);
+                    setToastVisible(true);
                 } else {
-                    if (skipped > 0) {
-                        const msg = `✓ Filtered ${skipped} duplicate${skipped !== 1 ? 's' : ''}. Processing ${newCount} unique domain${newCount !== 1 ? 's' : ''}.`;
-                        setToastMessage(msg);
-                        setToastVisible(true);
-                    } else {
-                        const msg = `✓ All ${total} domain${total !== 1 ? 's are' : ' is'} unique. Processing started.`;
-                        setToastMessage(msg);
-                        setToastVisible(true);
-                    }
+                    const msg = `✓ Filtered ${existingCount} already-processed + ${Math.max(0, total - uniqueCount)} duplicate${Math.max(0, total - uniqueCount) !== 1 ? 's' : ''}. Processing ${newCount} unique domain${newCount !== 1 ? 's' : ''}.`;
+                    setToastMessage(msg);
+                    setToastVisible(true);
                 }
 
                 // Store filter stats for display
@@ -2178,8 +2278,26 @@ export default function ClientPage() {
             return;
         }
 
+        // Require email mapping to a column (non-custom)
+        const emailMapping = columnMapping.email;
+        if (!emailMapping || !emailMapping.column || emailMapping.isCustom) {
+            alert('Please map Email to a CSV column.');
+            return;
+        }
+
         try {
             setUploading(true);
+            // Build separate payloads: standard mappings and custom variables
+            const customVariablesPayload = Object.entries(columnMapping)
+                .filter(([_, v]) => v?.isCustom && v.customName && v.column)
+                .map(([_, v]) => ({ name: v.customName!.trim(), column: v.column }));
+
+            const standardMapping = Object.entries(columnMapping).reduce((acc, [key, val]) => {
+                if (!val || val.isCustom) return acc;
+                acc[key] = { column: val.column, isCustom: false };
+                return acc;
+            }, {} as Record<string, { column: string; isCustom: boolean }>);
+
             const idToken = await getIdToken(user);
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/upload-to-instantly`, {
                 method: 'POST',
@@ -2188,7 +2306,13 @@ export default function ClientPage() {
                     idToken,
                     clientId,
                     campaignId: selectedCampaignId,
-                    columnMapping
+                    columnMapping: standardMapping,
+                    customVariables: customVariablesPayload,
+                    skipOptions: {
+                        skip_if_in_workspace: skipWorkspaceDupes,
+                        skip_if_in_campaign: skipCampaignDupes,
+                        skip_if_in_list: skipListDupes
+                    }
                 })
             });
 
@@ -2276,28 +2400,6 @@ export default function ClientPage() {
         } catch (error) {
             console.error('Error fetching qualified count:', error);
             return { qualifiedCount: 0, totalCount: 0 };
-        }
-    };
-
-    const fetchJobsUploadStatus = async () => {
-        try {
-            const token = await user?.getIdToken();
-            const statusMap: Record<string, any[]> = {};
-            
-            for (const job of jobHistory) {
-                const response = await fetch(
-                    `${getPipelineBaseUrl()}/api/jobs/${job.id}/upload-status?clientId=${clientId}&agencyId=${user?.uid}`,
-                    { headers: { Authorization: `Bearer ${token}` } }
-                );
-                const data = await response.json();
-                if (data.uploads && data.uploads.length > 0) {
-                    statusMap[job.id] = data.uploads;
-                }
-            }
-            
-            setJobUploadStatus(statusMap);
-        } catch (error) {
-            console.error('Error fetching upload status:', error);
         }
     };
 
@@ -2828,7 +2930,10 @@ export default function ClientPage() {
                                         {/* Pipeline flow summary */}
                                         {(() => {
                                             const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
-                                            const foundersProcessed = deriveStageTotals(jobState.stages.founders).total ?? 0;
+                                            const dedupedTotal = (jobState.dedupeStats?.unique ?? jobState.dedupeStats?.new ?? jobState.dedupeStats?.total ?? null);
+                                            const foundersProcessedRaw = deriveStageTotals(jobState.stages.founders).total ?? 0;
+                                            const foundersProcessed = dedupedTotal ?? foundersProcessedRaw;
+                                            const foundersFoundDisplay = dedupedTotal ? Math.min(foundersFound, dedupedTotal) : foundersFound;
                                             const emailsFound = (jobState.stages.emailDiscovery?.summary as any)?.Found ?? (jobState.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(jobState.stages.emailDiscovery).throughputNum ?? 0;
                                             const safe = (jobState.stages.verification?.summary as any)?.Valid ?? (jobState.stages.verification?.summary as any)?.valid ?? 0;
                                             const personalized = (jobState.stages.personalization?.summary as any)?.Personalized ?? (jobState.stages.personalization?.summary as any)?.personalized ?? (jobState.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
@@ -2849,7 +2954,7 @@ export default function ClientPage() {
                                                     <span style={{ opacity: 0.5, fontSize: '0.75rem' }}>Pipeline flow:</span>
                                                     <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}>{foundersFound.toLocaleString()}</span>
+                                                    <span style={{ fontWeight: '600' }}>{foundersFoundDisplay.toLocaleString()}</span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
                                                     <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
@@ -2875,8 +2980,10 @@ export default function ClientPage() {
                                             let costFooter = "";
                                             
                                             if (stageKey === "founders") {
-                                                const found = throughputNum ?? 0;
-                                                const processed = total ?? 0;
+                                                const dedupedTotal = (jobState?.dedupeStats?.unique ?? jobState?.dedupeStats?.new ?? jobState?.dedupeStats?.total ?? null);
+                                                const processedRaw = total ?? 0;
+                                                const processed = dedupedTotal ?? processedRaw;
+                                                const found = dedupedTotal ? Math.min(throughputNum ?? 0, dedupedTotal) : (throughputNum ?? 0);
                                                 const cost = summary?.cost || stats?.cost;
                                                 heroNumber = found;
                                                 heroLabel = "Found";
@@ -2884,7 +2991,9 @@ export default function ClientPage() {
                                                 if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
                                             } else if (stageKey === "emailDiscovery") {
                                                 const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
-                                                const attempted = total ?? 0;
+                                                const attempted = typeof stage?.progress?.processed === "number"
+                                                    ? stage.progress.processed
+                                                    : total ?? 0;
                                                 heroNumber = found;
                                                 heroLabel = "Emails Found";
                                                 subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
@@ -3125,83 +3234,6 @@ export default function ClientPage() {
                                                                 </div>
                                                             )}
 
-                                                            {/* Metrics row */}
-                                                            <div style={{
-                                                                display: 'grid',
-                                                                gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))',
-                                                                gap: '1rem',
-                                                                marginTop: job.status === 'running' ? '1rem' : '1.25rem',
-                                                                paddingTop: '1rem',
-                                                                borderTop: '1px solid rgba(255, 255, 255, 0.06)'
-                                                            }}>
-                                                                <div>
-                                                                    <p style={{
-                                                                        margin: 0,
-                                                                        fontSize: '0.7rem',
-                                                                        textTransform: 'uppercase',
-                                                                        letterSpacing: '0.05em',
-                                                                        color: 'rgba(255, 255, 255, 0.5)',
-                                                                        fontWeight: 600
-                                                                    }}>Valid</p>
-                                                                    <p style={{
-                                                                        margin: '0.25rem 0 0',
-                                                                        fontSize: '1.1rem',
-                                                                        fontWeight: 700,
-                                                                        color: '#22c55e'
-                                                                    }}>{validLeads.toLocaleString()}</p>
-                                                                </div>
-                                                                <div>
-                                                                    <p style={{
-                                                                        margin: 0,
-                                                                        fontSize: '0.7rem',
-                                                                        textTransform: 'uppercase',
-                                                                        letterSpacing: '0.05em',
-                                                                        color: 'rgba(255, 255, 255, 0.5)',
-                                                                        fontWeight: 600
-                                                                    }}>Invalid</p>
-                                                                    <p style={{
-                                                                        margin: '0.25rem 0 0',
-                                                                        fontSize: '1.1rem',
-                                                                        fontWeight: 700,
-                                                                        color: 'rgba(255, 255, 255, 0.5)'
-                                                                    }}>{invalidLeads.toLocaleString()}</p>
-                                                                </div>
-                                                                <div>
-                                                                    <p style={{
-                                                                        margin: 0,
-                                                                        fontSize: '0.7rem',
-                                                                        textTransform: 'uppercase',
-                                                                        letterSpacing: '0.05em',
-                                                                        color: 'rgba(255, 255, 255, 0.5)',
-                                                                        fontWeight: 600
-                                                                    }}>Total</p>
-                                                                    <p style={{
-                                                                        margin: '0.25rem 0 0',
-                                                                        fontSize: '1.1rem',
-                                                                        fontWeight: 700,
-                                                                        color: '#ffffff'
-                                                                    }}>{totalProcessed.toLocaleString()}</p>
-                                                                </div>
-                                                                {job.status === 'completed' && job.completedAt && (
-                                                                    <div>
-                                                                        <p style={{
-                                                                            margin: 0,
-                                                                            fontSize: '0.7rem',
-                                                                            textTransform: 'uppercase',
-                                                                            letterSpacing: '0.05em',
-                                                                            color: 'rgba(255, 255, 255, 0.5)',
-                                                                            fontWeight: 600
-                                                                        }}>Finished</p>
-                                                                        <p style={{
-                                                                            margin: '0.25rem 0 0',
-                                                                            fontSize: '0.85rem',
-                                                                            fontWeight: 500,
-                                                                            color: 'rgba(255, 255, 255, 0.7)'
-                                                                        }}>{formatJobDate(job.completedAt)}</p>
-                                                                    </div>
-                                                                )}
-                                                            </div>
-
                                                             {/* Pipeline Stages - Show when selected */}
                                                             {isSelected && (
                                                                 <div style={{
@@ -3278,7 +3310,11 @@ export default function ClientPage() {
                                                                                 if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
                                                                             } else if (stageKey === "emailDiscovery") {
                                                                                 const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
-                                                                                const attempted = total ?? 0;
+                                                                                const dedupedTotal = (job?.dedupeStats?.unique ?? job?.dedupeStats?.new ?? job?.dedupeStats?.total ?? null);
+                                                                                const attemptedRaw = typeof stage?.progress?.processed === "number"
+                                                                                    ? stage.progress.processed
+                                                                                    : total ?? 0;
+                                                                                const attempted = dedupedTotal ?? attemptedRaw;
                                                                                 heroNumber = found;
                                                                                 heroLabel = "Emails Found";
                                                                                 subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
@@ -4515,6 +4551,53 @@ export default function ClientPage() {
                                             onChange={handleFileChange}
                                         />
                                     </label>
+                                    
+                                    {/* Domain Check Stats */}
+                                    {selectedFile && (
+                                        <div style={{
+                                            marginTop: '1rem',
+                                            padding: '0.75rem 1rem',
+                                            background: 'rgba(59, 130, 246, 0.1)',
+                                            border: '1px solid rgba(59, 130, 246, 0.3)',
+                                            borderRadius: '8px',
+                                            fontSize: '0.875rem'
+                                        }}>
+                                            {checkingDomains ? (
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'rgba(255, 255, 255, 0.7)' }}>
+                                                    <div style={{
+                                                        width: '14px',
+                                                        height: '14px',
+                                                        border: '2px solid rgba(255, 255, 255, 0.3)',
+                                                        borderTopColor: '#3b82f6',
+                                                        borderRadius: '50%',
+                                                        animation: 'spin 0.8s linear infinite'
+                                                    }} />
+                                                    Checking domains...
+                                                </div>
+                                            ) : domainCheckStats ? (
+                                                <div style={{ color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>
+                                                        📊 Domain Analysis
+                                                    </div>
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap' }}>
+                                                        <span>
+                                                            <strong style={{ color: 'rgba(255, 255, 255, 0.9)' }}>{domainCheckStats.total.toLocaleString()}</strong> total
+                                                        </span>
+                                                        <span>
+                                                            <strong style={{ color: '#60a5fa' }}>{domainCheckStats.unique.toLocaleString()}</strong> unique
+                                                        </span>
+                                                        <span>
+                                                            <strong style={{ color: '#f59e0b' }}>{domainCheckStats.existing.toLocaleString()}</strong> existing
+                                                        </span>
+                                                        <span>
+                                                            <strong style={{ color: '#10b981' }}>{domainCheckStats.new.toLocaleString()}</strong> new
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            ) : null}
+                                        </div>
+                                    )}
+                                    
                                     {uploadError && (
                                         <p className="form-error" role="alert">
                                             {uploadError}
@@ -5001,7 +5084,7 @@ export default function ClientPage() {
                                     onChange={(e) => setSelectedCampaignId(e.target.value)}
                                 >
                                     <option value="">Select campaign...</option>
-                                    {campaigns.filter(c => c.status === 1).map((campaign) => (
+                                    {(instantlyCampaigns.length ? instantlyCampaigns : campaigns).map((campaign) => (
                                         <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
                                     ))}
                                 </select>
@@ -5009,18 +5092,74 @@ export default function ClientPage() {
 
                             <div style={{ marginBottom: '2rem' }}>
                                 <h3 style={{ fontSize: '1rem', marginBottom: '1rem', color: 'rgba(255, 255, 255, 0.9)' }}>Standard Variables</h3>
-                                {['email', 'firstName', 'lastName', 'website', 'personalization'].map((field) => {
-                                    const displayName = field === 'firstName' ? 'First Name' : field === 'lastName' ? 'Last Name' : field === 'companyName' ? 'Company Name' : field.charAt(0).toUpperCase() + field.slice(1);
+                                {['email', 'personalization', 'lastName', 'firstName', 'companyName', 'assignedTo'].map((field) => {
+                                    const displayName =
+                                        field === 'firstName' ? 'First Name' :
+                                        field === 'lastName' ? 'Last Name' :
+                                        field === 'companyName' ? 'Company Name' :
+                                        field === 'assignedTo' ? 'Assigned To' :
+                                        field.charAt(0).toUpperCase() + field.slice(1);
                                     return (
                                         <div key={field} style={{ marginBottom: '1.5rem' }}>
                                             <label className="settings-field">
                                                 <span className="settings-field__label">{displayName} {field === 'email' && '*'}</span>
-                                                <select value={columnMapping[field]?.column || ''} onChange={(e) => setColumnMapping({ ...columnMapping, [field]: { column: e.target.value, isCustom: false } })}>
+                                                <select
+                                                    value={
+                                                        columnMapping[field]?.isCustom
+                                                            ? '__custom__'
+                                                            : columnMapping[field]?.column || ''
+                                                    }
+                                                    onChange={(e) => {
+                                                        const val = e.target.value;
+                                                        if (val === '__custom__') {
+                                                            setColumnMapping({
+                                                                ...columnMapping,
+                                                                [field]: { column: '', isCustom: true, customName: columnMapping[field]?.customName || '' }
+                                                            });
+                                                        } else {
+                                                            setColumnMapping({
+                                                                ...columnMapping,
+                                                                [field]: { column: val, isCustom: false, customName: undefined }
+                                                            });
+                                                        }
+                                                    }}
+                                                >
                                                     <option value="">-- Not mapped --</option>
+                                                    <option value="__custom__">🔧 Use custom variable name</option>
                                                     {csvHeaders.map((header) => (<option key={header} value={header}>{header}</option>))}
                                                 </select>
                                             </label>
-                                            {columnMapping[field]?.column && csvPreviewRows.length > 0 && (
+                                            {columnMapping[field]?.isCustom && (
+                                                <div style={{ marginTop: '0.75rem', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                                                    <label className="settings-field">
+                                                        <span className="settings-field__label">Custom variable label</span>
+                                                        <input
+                                                            className="input"
+                                                            type="text"
+                                                            placeholder="e.g., Unique Opener"
+                                                            value={columnMapping[field]?.customName || ''}
+                                                            onChange={(e) => setColumnMapping({
+                                                                ...columnMapping,
+                                                                [field]: { ...(columnMapping[field] || { isCustom: true, column: '' }), customName: e.target.value }
+                                                            })}
+                                                        />
+                                                    </label>
+                                                    <label className="settings-field">
+                                                        <span className="settings-field__label">Map to column</span>
+                                                        <select
+                                                            value={columnMapping[field]?.column || ''}
+                                                            onChange={(e) => setColumnMapping({
+                                                                ...columnMapping,
+                                                                [field]: { ...(columnMapping[field] || { isCustom: true }), column: e.target.value }
+                                                            })}
+                                                        >
+                                                            <option value="">-- Not mapped --</option>
+                                                            {csvHeaders.map((header) => (<option key={header} value={header}>{header}</option>))}
+                                                        </select>
+                                                    </label>
+                                                </div>
+                                            )}
+                                        {columnMapping[field]?.column && csvPreviewRows.length > 0 && (
                                                 <div style={{ marginTop: '0.5rem', padding: '0.75rem', background: 'rgba(255, 255, 255, 0.03)', borderRadius: '6px', fontSize: '0.875rem' }}>
                                                     <div style={{ color: 'rgba(255, 255, 255, 0.6)', marginBottom: '0.5rem' }}>Preview:</div>
                                                     {csvPreviewRows.slice(0, 3).map((row, idx) => (
@@ -5034,6 +5173,36 @@ export default function ClientPage() {
                                     );
                                 })}
                             </div>
+
+                            <div style={{ marginBottom: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                                <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'rgba(255,255,255,0.9)' }}>Duplicate handling</div>
+                                <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={skipWorkspaceDupes}
+                                        onChange={(e) => setSkipWorkspaceDupes(e.target.checked)}
+                                    />
+                                    <span className="settings-field__label" style={{ margin: 0 }}>Skip if in workspace (recommended)</span>
+                                </label>
+                                <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={skipCampaignDupes}
+                                        onChange={(e) => setSkipCampaignDupes(e.target.checked)}
+                                    />
+                                    <span className="settings-field__label" style={{ margin: 0 }}>Skip if in any campaign</span>
+                                </label>
+                                <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={skipListDupes}
+                                        onChange={(e) => setSkipListDupes(e.target.checked)}
+                                    />
+                                    <span className="settings-field__label" style={{ margin: 0 }}>Skip if in any list</span>
+                                </label>
+                            </div>
+
+                            {/* Custom variables are handled inline per field via the custom option */}
                         </div>
 
                         <div className="modal__actions">

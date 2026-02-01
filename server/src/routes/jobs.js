@@ -605,7 +605,7 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
     };
 
     try {
-        const { idToken, clientId, campaignId, columnMapping } = req.body || {};
+        const { idToken, clientId, campaignId, columnMapping, customVariables, skipOptions } = req.body || {};
         campaignIdParam = campaignId;
 
         if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
@@ -642,6 +642,14 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
         const batchSize = 100;
         let uploaded = 0;
 
+        const customVarsArray = Array.isArray(customVariables) ? customVariables : [];
+
+        const skipPayload = {
+            skip_if_in_workspace: !!skipOptions?.skip_if_in_workspace,
+            skip_if_in_campaign: !!skipOptions?.skip_if_in_campaign,
+            skip_if_in_list: !!skipOptions?.skip_if_in_list
+        };
+
         for (let i = 0; i < verified.length; i += batchSize) {
             const batch = verified.slice(i, i + batchSize);
             const leads = batch.map(row => {
@@ -676,6 +684,19 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
                     lead.website = row.domain || '';
                 }
 
+                // Custom variables (exact user-provided keys)
+                if (customVarsArray.length > 0) {
+                    const cvPayload = {};
+                    customVarsArray.forEach((cv) => {
+                        if (!cv?.name || !cv?.column) return;
+                        const val = row[cv.column] || '';
+                        cvPayload[cv.name] = val;
+                    });
+                    if (Object.keys(cvPayload).length > 0) {
+                        lead.custom_variables = cvPayload;
+                    }
+                }
+
                 return lead;
             });
 
@@ -694,7 +715,8 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
                     },
                     body: JSON.stringify({
                         campaign_id: campaignId,
-                        leads
+                        leads,
+                        ...skipPayload
                     })
                 });
 
@@ -925,7 +947,73 @@ router.post('/jobs/:jobId/mark-manual-upload', async (req, res) => {
     }
 });
 
-// GET /api/jobs/:jobId/upload-status - Get upload status for a job
+// GET /api/jobs/batch/upload-status - Get upload status for multiple jobs
+router.post('/jobs/batch/upload-status', async (req, res) => {
+    try {
+        const { jobIds, clientId, agencyId } = req.body;
+
+        if (!Array.isArray(jobIds) || jobIds.length === 0) {
+            return res.status(400).json({ error: 'jobIds must be a non-empty array.' });
+        }
+
+        if (!clientId || !agencyId) {
+            return res.status(400).json({ error: 'Missing clientId or agencyId.' });
+        }
+
+        // Get SQL client_id
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+
+        if (clientResult.rows.length === 0) {
+            return res.json({ statusMap: {} });
+        }
+
+        const sqlClientId = clientResult.rows[0].id;
+
+        // Get upload status for all jobs in a single query
+        const uploadsResult = await pool.query(
+            `SELECT 
+                cic.job_id,
+                ic.id as campaign_id,
+                ic.name as campaign_name,
+                ic.instantly_campaign_id,
+                cic.upload_source,
+                COUNT(cic.contact_id) as contact_count,
+                MIN(cic.added_at) as first_uploaded_at,
+                MAX(cic.added_at) as last_uploaded_at,
+                cic.notes
+             FROM contact_instantly_campaigns cic
+             JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+             JOIN contacts c ON c.id = cic.contact_id
+             WHERE cic.job_id = ANY($1::text[])
+             AND ic.agency_id = $2 
+             AND c.client_id = $3
+             GROUP BY cic.job_id, ic.id, ic.name, ic.instantly_campaign_id, cic.upload_source, cic.notes
+             ORDER BY cic.job_id, last_uploaded_at DESC`,
+            [jobIds, agencyId, sqlClientId]
+        );
+
+        // Group results by job ID
+        const statusMap = {};
+        for (const row of uploadsResult.rows) {
+            const jobId = row.job_id;
+            if (!statusMap[jobId]) {
+                statusMap[jobId] = [];
+            }
+            statusMap[jobId].push(row);
+        }
+
+        res.json({ statusMap });
+
+    } catch (error) {
+        console.error('Error fetching batch upload status:', error);
+        res.status(500).json({ error: 'Failed to fetch upload status.' });
+    }
+});
+
+// GET /api/jobs/:jobId/upload-status - Get upload status for a job (legacy, prefer batch endpoint)
 router.get('/jobs/:jobId/upload-status', async (req, res) => {
     try {
         const { jobId } = req.params;
@@ -1050,6 +1138,75 @@ router.delete('/jobs/:jobId/revert-manual-upload', async (req, res) => {
     } catch (error) {
         console.error('Error reverting manual upload:', error);
         res.status(500).json({ error: 'Failed to revert manual upload.' });
+    }
+});
+
+// POST /api/jobs/check-domains - Check which domains already exist in the database
+router.post('/jobs/check-domains', async (req, res) => {
+    try {
+        const { domains, clientId, agencyId } = req.body;
+
+        if (!Array.isArray(domains) || domains.length === 0) {
+            return res.status(400).json({ error: 'domains must be a non-empty array.' });
+        }
+
+        if (!clientId || !agencyId) {
+            return res.status(400).json({ error: 'Missing clientId or agencyId.' });
+        }
+
+        // Normalize domains (lowercase, trim, remove protocols) and dedupe
+        const normalizedDomainsRaw = domains.map(d => {
+            if (!d) return '';
+            return String(d)
+                .toLowerCase()
+                .trim()
+                .replace(/^https?:\/\//, '')
+                .replace(/^www\./, '')
+                .split('/')[0]
+                .split('?')[0];
+        }).filter(Boolean);
+        const uniqueDomains = Array.from(new Set(normalizedDomainsRaw));
+
+        // Get SQL client_id
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+
+        if (clientResult.rows.length === 0) {
+            // Client doesn't exist yet, all domains are new
+            return res.json({
+                totalDomains: normalizedDomainsRaw.length,
+                uniqueDomains: uniqueDomains.length,
+                existingDomains: 0,
+                newDomains: uniqueDomains.length
+            });
+        }
+
+        const sqlClientId = clientResult.rows[0].id;
+
+        // Check which domains exist for this client
+        const existingResult = await pool.query(
+            `SELECT DISTINCT c.domain_normalized 
+             FROM companies c
+             WHERE c.client_id = $1 
+             AND c.domain_normalized = ANY($2::text[])`,
+            [sqlClientId, uniqueDomains]
+        );
+
+        const existingDomains = existingResult.rows.length;
+        const newDomains = uniqueDomains.length - existingDomains;
+
+        res.json({
+            totalDomains: normalizedDomainsRaw.length,
+            uniqueDomains: uniqueDomains.length,
+            existingDomains,
+            newDomains
+        });
+
+    } catch (error) {
+        console.error('Error checking domains:', error);
+        res.status(500).json({ error: 'Failed to check domains.' });
     }
 });
 
