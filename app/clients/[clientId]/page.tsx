@@ -265,7 +265,7 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
 const calculateJobProgress = (job: PipelineJob): { processed: number; total: number; percent: number } => {
     // Find the currently active or last completed stage to get the most accurate progress
     let processed = 0;
-    const dedupedTotal = (job.dedupeStats?.unique ?? job.dedupeStats?.new ?? job.dedupeStats?.total);
+    const dedupedTotal = (job.dedupeStats?.new ?? job.dedupeStats?.total);
     let total = dedupedTotal ?? 0;
     
     // Check stages in order for progress
@@ -2930,7 +2930,7 @@ export default function ClientPage() {
                                         {/* Pipeline flow summary */}
                                         {(() => {
                                             const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
-                                            const dedupedTotal = (jobState.dedupeStats?.unique ?? jobState.dedupeStats?.new ?? jobState.dedupeStats?.total ?? null);
+                                            const dedupedTotal = (jobState.dedupeStats?.new ?? jobState.dedupeStats?.total ?? null);
                                             const foundersProcessedRaw = deriveStageTotals(jobState.stages.founders).total ?? 0;
                                             const foundersProcessed = dedupedTotal ?? foundersProcessedRaw;
                                             const foundersFoundDisplay = dedupedTotal ? Math.min(foundersFound, dedupedTotal) : foundersFound;
@@ -2980,7 +2980,7 @@ export default function ClientPage() {
                                             let costFooter = "";
                                             
                                             if (stageKey === "founders") {
-                                                const dedupedTotal = (jobState?.dedupeStats?.unique ?? jobState?.dedupeStats?.new ?? jobState?.dedupeStats?.total ?? null);
+                                                const dedupedTotal = (jobState?.dedupeStats?.new ?? jobState?.dedupeStats?.total ?? null);
                                                 const processedRaw = total ?? 0;
                                                 const processed = dedupedTotal ?? processedRaw;
                                                 const found = dedupedTotal ? Math.min(throughputNum ?? 0, dedupedTotal) : (throughputNum ?? 0);
@@ -3310,7 +3310,7 @@ export default function ClientPage() {
                                                                                 if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
                                                                             } else if (stageKey === "emailDiscovery") {
                                                                                 const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
-                                                                                const dedupedTotal = (job?.dedupeStats?.unique ?? job?.dedupeStats?.new ?? job?.dedupeStats?.total ?? null);
+                                                                                const dedupedTotal = (job?.dedupeStats?.new ?? job?.dedupeStats?.total ?? null);
                                                                                 const attemptedRaw = typeof stage?.progress?.processed === "number"
                                                                                     ? stage.progress.processed
                                                                                     : total ?? 0;
