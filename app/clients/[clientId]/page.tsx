@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, startAt, endAt, DocumentSnapshot, deleteDoc } from "firebase/firestore";
+import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, startAt, endAt, DocumentSnapshot, deleteDoc, updateDoc } from "firebase/firestore";
 import { getIdToken } from "firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
@@ -291,13 +291,29 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
 
-    const [activeTab, setActiveTab] = useState<"info" | "campaigns" | "leads" | "segments">(
-        (searchParams?.get("tab") as "info" | "campaigns" | "leads" | "segments") || "campaigns"
+    const [activeTab, setActiveTab] = useState<"info" | "campaigns" | "leads" | "segments" | "personalizer">(
+        (searchParams?.get("tab") as "info" | "campaigns" | "leads" | "segments" | "personalizer") || "campaigns"
     );
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
     const [clientInstantlyKey, setClientInstantlyKey] = useState<string>("");
     const [emailProvider, setEmailProvider] = useState<'trykitt' | 'self_hosted'>('trykitt');
+
+    // Personalizer state
+    const [personalizerWizardStep, setPersonalizerWizardStep] = useState<1 | 2>(1);
+    const [personalizerFile, setPersonalizerFile] = useState<File | null>(null);
+    const [checkKlaviyo, setCheckKlaviyo] = useState(false);
+    const [productsToPull, setProductsToPull] = useState(3);
+    const [removeB2B, setRemoveB2B] = useState(false);
+    const [personalizerDomainStats, setPersonalizerDomainStats] = useState<{
+        total: number;
+        normalized: number;
+        withWww: number;
+    } | null>(null);
+    const [processingPersonalizerFile, setProcessingPersonalizerFile] = useState(false);
+    const [personalizerJobState, setPersonalizerJobState] = useState<any | null>(null);
+    const [personalizerJobId, setPersonalizerJobId] = useState<string | null>(null);
+    const [uploadingPersonalizer, setUploadingPersonalizer] = useState(false);
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -1503,6 +1519,37 @@ export default function ClientPage() {
         fetchJobsUploadStatus();
     }, [fetchJobsUploadStatus]);
 
+    // Track personalizer job status
+    useEffect(() => {
+        if (!user || !clientId || !personalizerJobId) {
+            return;
+        }
+
+        const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "jobs", personalizerJobId);
+        const unsubscribe = onSnapshot(jobRef, (snap) => {
+            if (!snap.exists()) {
+                return;
+            }
+            const jobData = snap.data();
+            setPersonalizerJobState(jobData);
+
+            // Show toast on completion
+            if (jobData.status === 'completed' && !jobData.__toastShown) {
+                setToastMessage(`Personalizer complete! ${jobData.result?.personalized || 0} leads personalized`);
+                setToastVisible(true);
+                // Mark that we showed the toast
+                updateDoc(jobRef, { __toastShown: true }).catch(() => {});
+            } else if (jobData.status === 'failed') {
+                setToastMessage(`Personalizer failed: ${jobData.error || 'Unknown error'}`);
+                setToastVisible(true);
+            }
+        }, (error) => {
+            console.error("Personalizer job subscription error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [user, clientId, personalizerJobId]);
+
     useEffect(() => {
         if (!jobState || !user || !clientId) {
             return;
@@ -1832,6 +1879,49 @@ export default function ClientPage() {
         }
     }, [findFounder, skipFounderFinder, findEmail, skipEmailFinder]);
 
+    const handlePersonalizerSubmit = async () => {
+        if (!personalizerFile || !user || !clientId) {
+            return;
+        }
+
+        setUploadingPersonalizer(true);
+        try {
+            const idToken = await getIdToken(user);
+            const formData = new FormData();
+            formData.append('file', personalizerFile);
+            formData.append('idToken', idToken);
+            formData.append('clientId', clientId);
+            formData.append('productsToPull', productsToPull.toString());
+            formData.append('checkKlaviyo', checkKlaviyo.toString());
+            formData.append('removeB2B', removeB2B.toString());
+
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/personalizer`, {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to start personalizer (${response.status})`);
+            }
+
+            const data = await response.json();
+            setPersonalizerJobId(data.jobId);
+            setToastMessage('Personalizer job started!');
+            setToastVisible(true);
+
+            // Reset wizard
+            setPersonalizerWizardStep(1);
+            setPersonalizerFile(null);
+            setPersonalizerDomainStats(null);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to start personalizer');
+            setToastVisible(true);
+        } finally {
+            setUploadingPersonalizer(false);
+        }
+    };
+
     const handleDownloadResults = (scope: 'all' | 'valid') => {
         if (!jobState || jobState.status !== "completed") {
             return;
@@ -1839,6 +1929,72 @@ export default function ClientPage() {
         const url = getJobResultUrl(jobState.id, scope);
         window.open(url, "_blank", "noopener,noreferrer");
         setDownloadModalOpen(false);
+    };
+
+    const handlePersonalizerFileUpload = async (file: File) => {
+        setPersonalizerFile(file);
+        setProcessingPersonalizerFile(true);
+        setPersonalizerDomainStats(null);
+
+        try {
+            const text = await file.text();
+            const lines = text.split('\n').filter(line => line.trim());
+            
+            if (lines.length === 0) {
+                throw new Error('CSV file is empty');
+            }
+
+            // Parse CSV header to find domain column
+            const header = lines[0].split(',').map(col => col.trim().replace(/^"|"$/g, ''));
+            const domainColumnIndex = header.findIndex(col => 
+                col.toLowerCase().includes('domain') || 
+                col.toLowerCase().includes('website') ||
+                col.toLowerCase().includes('url')
+            );
+
+            if (domainColumnIndex === -1) {
+                setToastMessage('⚠️ No domain column found. Looking for columns with "domain", "website", or "url"');
+                setToastVisible(true);
+                setProcessingPersonalizerFile(false);
+                return;
+            }
+
+            // Count domains and normalize
+            let totalDomains = 0;
+            let normalizedCount = 0;
+            const domains = new Set<string>();
+
+            for (let i = 1; i < lines.length; i++) {
+                const cells = lines[i].split(',').map(cell => cell.trim().replace(/^"|"$/g, ''));
+                if (cells.length > domainColumnIndex) {
+                    let domain = cells[domainColumnIndex].trim();
+                    if (domain) {
+                        totalDomains++;
+                        // Normalize: remove protocol, www., trailing slashes
+                        const original = domain;
+                        domain = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '').toLowerCase();
+                        
+                        if (original !== domain && original.toLowerCase().includes('www.')) {
+                            normalizedCount++;
+                        }
+                        domains.add(domain);
+                    }
+                }
+            }
+
+            setPersonalizerDomainStats({
+                total: totalDomains,
+                normalized: domains.size,
+                withWww: normalizedCount
+            });
+
+        } catch (error) {
+            console.error('Error processing personalizer file:', error);
+            setToastMessage('Failed to process CSV file');
+            setToastVisible(true);
+        } finally {
+            setProcessingPersonalizerFile(false);
+        }
     };
 
     const handleStopJob = async () => {
@@ -2610,6 +2766,12 @@ export default function ClientPage() {
                             onClick={() => setActiveTab("segments")}
                         >
                             Segments
+                        </button>
+                        <button
+                            className={`tab-nav__button ${activeTab === "personalizer" ? "tab-nav__button--active" : ""}`}
+                            onClick={() => setActiveTab("personalizer")}
+                        >
+                            🧠 Personalizer
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
@@ -4387,6 +4549,435 @@ export default function ClientPage() {
                                 </div>
                             )}
                         </>
+                    )}
+
+                    {/* Personalizer Tab */}
+                    {activeTab === "personalizer" && (
+                        <div style={{ marginTop: '2rem', maxWidth: '720px' }}>
+                            {/* Show wizard if no active job */}
+                            {!personalizerJobState && (
+                                <>
+                                    <p className="eyebrow eyebrow--muted">Step {personalizerWizardStep} / 2</p>
+                                    <h2 className="pipeline-panel__title" style={{ fontSize: '1.5rem', marginTop: '0.5rem' }}>
+                                        {personalizerWizardStep === 1 ? '📤 Upload CSV' : '⚙️ Configure Options'}
+                                    </h2>
+                            <p style={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.95rem', marginTop: '0.5rem' }}>
+                                {personalizerWizardStep === 1 
+                                    ? 'Upload a CSV file with your leads to personalize' 
+                                    : 'Configure personalization settings for your Shopify store'}
+                            </p>
+
+                            {/* Step Progress Indicator */}
+                            <div style={{
+                                display: 'flex',
+                                gap: '0.5rem',
+                                marginTop: '1.5rem',
+                                marginBottom: '2rem'
+                            }}>
+                                {[1, 2].map((step) => (
+                                    <div
+                                        key={step}
+                                        style={{
+                                            flex: 1,
+                                            height: '4px',
+                                            borderRadius: '2px',
+                                            background: step <= personalizerWizardStep ? '#3b82f6' : 'rgba(255, 255, 255, 0.15)',
+                                            transition: 'background 0.3s ease'
+                                        }}
+                                    />
+                                ))}
+                            </div>
+
+                            {/* Step 1: Upload CSV */}
+                            {personalizerWizardStep === 1 && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+                                    <label className="upload-area">
+                                        <span className="upload-area__title">Drop CSV or click to browse</span>
+                                        <span className="upload-area__hint">Must contain domain or company data</span>
+                                        {personalizerFile && (
+                                            <span className="upload-area__file" title={personalizerFile.name}>
+                                                📄 {personalizerFile.name}
+                                            </span>
+                                        )}
+                                        <input
+                                            type="file"
+                                            accept=".csv"
+                                            className="sr-only"
+                                            onChange={(e) => {
+                                                const file = e.target.files?.[0];
+                                                if (file) {
+                                                    handlePersonalizerFileUpload(file);
+                                                }
+                                            }}
+                                        />
+                                    </label>
+
+                                    {personalizerFile && (
+                                        <div style={{
+                                            padding: '1rem',
+                                            background: 'rgba(34, 197, 94, 0.1)',
+                                            border: '1px solid rgba(34, 197, 94, 0.3)',
+                                            borderRadius: '8px',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.75rem'
+                                        }}>
+                                            <span style={{ fontSize: '1.25rem' }}>✅</span>
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 600, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    {processingPersonalizerFile ? 'Processing file...' : 'File ready'}
+                                                </div>
+                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                    {personalizerFile.name} ({(personalizerFile.size / 1024).toFixed(2)} KB)
+                                                </div>
+                                                {personalizerDomainStats && (
+                                                    <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.8)', marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
+                                                        📊 {personalizerDomainStats.total} domains found{personalizerDomainStats.withWww > 0 && ` • ${personalizerDomainStats.withWww} normalized (www. removed)`}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <button
+                                                type="button"
+                                                className="secondary-button secondary-button--active"
+                                                onClick={() => {
+                                                    setPersonalizerFile(null);
+                                                    setPersonalizerDomainStats(null);
+                                                }}
+                                                style={{ fontSize: '0.85rem' }}
+                                                disabled={processingPersonalizerFile}
+                                            >
+                                                Remove
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* Step 2: Configuration Options */}
+                            {personalizerWizardStep === 2 && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+                                    {/* Platform - Shopify (unchangeable) */}
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Platform</span>
+                                        <div style={{
+                                            padding: '0.75rem 1rem',
+                                            background: 'rgba(255, 255, 255, 0.05)',
+                                            border: '1px solid rgba(255, 255, 255, 0.15)',
+                                            borderRadius: '8px',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.5rem',
+                                            color: 'rgba(255, 255, 255, 0.9)',
+                                            fontWeight: 500
+                                        }}>
+                                            <span style={{ fontSize: '1.25rem' }}>🛍️</span>
+                                            Shopify
+                                            <span style={{
+                                                marginLeft: 'auto',
+                                                fontSize: '0.8rem',
+                                                padding: '0.25rem 0.5rem',
+                                                background: 'rgba(59, 130, 246, 0.2)',
+                                                borderRadius: '4px',
+                                                color: '#93c5fd'
+                                            }}>Required</span>
+                                        </div>
+                                        <span className="settings-field__hint">Currently only Shopify stores are supported</span>
+                                    </label>
+
+                                    {/* Check Klaviyo */}
+                                    <label className="settings-field">
+                                        <div style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.75rem',
+                                            cursor: 'pointer',
+                                            padding: '0.75rem',
+                                            background: checkKlaviyo ? 'rgba(59, 130, 246, 0.1)' : 'transparent',
+                                            border: '1px solid ' + (checkKlaviyo ? 'rgba(59, 130, 246, 0.3)' : 'rgba(255, 255, 255, 0.1)'),
+                                            borderRadius: '8px',
+                                            transition: 'all 0.2s ease'
+                                        }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={checkKlaviyo}
+                                                onChange={(e) => setCheckKlaviyo(e.target.checked)}
+                                                style={{ width: '20px', height: '20px', cursor: 'pointer' }}
+                                            />
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)', fontSize: '1rem' }}>
+                                                    Check Klaviyo Integration
+                                                </div>
+                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                    Verify if the store has Klaviyo email marketing installed
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </label>
+
+                                    {/* Products to Pull */}
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Products to Pull</span>
+                                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                            {[1, 2, 3, 4, 5].map((num) => (
+                                                <button
+                                                    key={num}
+                                                    type="button"
+                                                    onClick={() => setProductsToPull(num)}
+                                                    style={{
+                                                        flex: 1,
+                                                        padding: '0.75rem',
+                                                        background: productsToPull === num ? 'rgba(59, 130, 246, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                                                        border: '1px solid ' + (productsToPull === num ? 'rgba(59, 130, 246, 0.5)' : 'rgba(255, 255, 255, 0.15)'),
+                                                        borderRadius: '6px',
+                                                        color: productsToPull === num ? '#93c5fd' : 'rgba(255, 255, 255, 0.7)',
+                                                        cursor: 'pointer',
+                                                        fontWeight: 600,
+                                                        fontSize: '1rem',
+                                                        transition: 'all 0.2s ease'
+                                                    }}
+                                                >
+                                                    {num}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <span className="settings-field__hint">Number of products to extract from each store (1-5)</span>
+                                    </label>
+
+                                    {/* Remove B2B Content */}
+                                    <label className="settings-field">
+                                        <div style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.75rem',
+                                            cursor: 'pointer',
+                                            padding: '0.75rem',
+                                            background: removeB2B ? 'rgba(59, 130, 246, 0.1)' : 'transparent',
+                                            border: '1px solid ' + (removeB2B ? 'rgba(59, 130, 246, 0.3)' : 'rgba(255, 255, 255, 0.1)'),
+                                            borderRadius: '8px',
+                                            transition: 'all 0.2s ease'
+                                        }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={removeB2B}
+                                                onChange={(e) => setRemoveB2B(e.target.checked)}
+                                                style={{ width: '20px', height: '20px', cursor: 'pointer' }}
+                                            />
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)', fontSize: '1rem' }}>
+                                                    Remove B2B Content
+                                                </div>
+                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                    Filter out business-to-business products and focus on B2C items
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </label>
+                                </div>
+                            )}
+
+                            {/* Navigation Buttons */}
+                            <div className="modal__actions" style={{ marginTop: '2rem' }}>
+                                {personalizerWizardStep > 1 && (
+                                    <button
+                                        type="button"
+                                        className="secondary-button secondary-button--active"
+                                        onClick={() => setPersonalizerWizardStep(1)}
+                                    >
+                                        Back
+                                    </button>
+                                )}
+                                {personalizerWizardStep < 2 ? (
+                                    <button
+                                        type="button"
+                                        className="primary-button"
+                                        disabled={!personalizerFile || processingPersonalizerFile}
+                                        onClick={() => setPersonalizerWizardStep(2)}
+                                    >
+                                        {processingPersonalizerFile ? 'Processing...' : 'Next'}
+                                    </button>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        className="primary-button"
+                                        disabled={uploadingPersonalizer}
+                                        onClick={handlePersonalizerSubmit}
+                                    >
+                                        {uploadingPersonalizer ? 'Starting...' : 'Start Processing'}
+                                    </button>
+                                )}
+                            </div>
+                                </>
+                            )}
+
+                            {/* Show pipeline view if job exists */}
+                            {personalizerJobState && (
+                                <div style={{ marginTop: '2rem' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
+                                        <div>
+                                            <p className="eyebrow eyebrow--muted">Personalizer Pipeline</p>
+                                            <h2 className="pipeline-panel__title" style={{ fontSize: '1.5rem', marginTop: '0.5rem' }}>
+                                                {personalizerJobState.status === 'completed' ? 'Completed' : 
+                                                 personalizerJobState.status === 'failed' ? 'Failed' : 'Processing...'}
+                                            </h2>
+                                            <p style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                {personalizerJobState.fileName}
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            className="secondary-button secondary-button--active"
+                                            onClick={() => {
+                                                setPersonalizerJobState(null);
+                                                setPersonalizerJobId(null);
+                                            }}
+                                        >
+                                            New Job
+                                        </button>
+                                    </div>
+
+                                    {/* Pipeline stages */}
+                                    <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1rem' }}>
+                                        {['shopifyDetection', 'klaviyoDetection', 'productFetch', 'personalization'].map((stageKey) => {
+                                            const stage = personalizerJobState.stages?.[stageKey];
+                                            if (!stage) return null;
+                                            
+                                            const stageNames: Record<string, string> = {
+                                                shopifyDetection: '1. Shopify Detection',
+                                                klaviyoDetection: '2. Klaviyo Detection',
+                                                productFetch: '3. Product Fetch',
+                                                personalization: '4. AI Personalization'
+                                            };
+
+                                            return (
+                                                <div
+                                                    key={stageKey}
+                                                    style={{
+                                                        padding: '1.25rem',
+                                                        background: 'rgba(255, 255, 255, 0.03)',
+                                                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                        borderRadius: '12px'
+                                                    }}
+                                                >
+                                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                                                        <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: 0 }}>
+                                                            {stageNames[stageKey] || stageKey}
+                                                        </h3>
+                                                        <span style={{
+                                                            padding: '0.25rem 0.5rem',
+                                                            borderRadius: '4px',
+                                                            fontSize: '0.75rem',
+                                                            fontWeight: 600,
+                                                            textTransform: 'uppercase',
+                                                            background: stage.status === 'completed' ? 'rgba(34, 197, 94, 0.2)' :
+                                                                       stage.status === 'running' ? 'rgba(59, 130, 246, 0.2)' :
+                                                                       stage.status === 'failed' ? 'rgba(239, 68, 68, 0.2)' :
+                                                                       'rgba(255, 255, 255, 0.1)',
+                                                            color: stage.status === 'completed' ? '#22c55e' :
+                                                                   stage.status === 'running' ? '#3b82f6' :
+                                                                   stage.status === 'failed' ? '#ef4444' :
+                                                                   'rgba(255, 255, 255, 0.6)'
+                                                        }}>
+                                                            {stage.status}
+                                                        </span>
+                                                    </div>
+                                                    {stage.summary?.skipped && (
+                                                        <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', fontStyle: 'italic' }}>
+                                                            Skipped: {stage.summary.reason || 'N/A'}
+                                                        </div>
+                                                    )}
+                                                    {stage.progress && !stage.summary?.skipped && (
+                                                        <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.7)' }}>
+                                                            Progress: {stage.progress.processed || 0} / {stage.progress.total || 0}
+                                                        </div>
+                                                    )}
+                                                    {stage.summary && !stage.summary.skipped && (
+                                                        <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.7)', marginTop: '0.5rem' }}>
+                                                            {stage.summary.total && <div>Total: {stage.summary.total}</div>}
+                                                            {stage.summary.shopifyStores !== undefined && <div>Shopify Stores: {stage.summary.shopifyStores}</div>}
+                                                            {stage.summary.klaviyoStores !== undefined && <div>Klaviyo Stores: {stage.summary.klaviyoStores}</div>}
+                                                            {stage.summary.fetched !== undefined && <div>Fetched: {stage.summary.fetched}</div>}
+                                                            {stage.summary.failed !== undefined && <div>Failed: {stage.summary.failed}</div>}
+                                                            {stage.summary.personalized !== undefined && <div>Personalized: {stage.summary.personalized}</div>}
+                                                        </div>
+                                                    )}
+                                                    {stage.error && (
+                                                        <div style={{ marginTop: '0.5rem', padding: '0.75rem', background: 'rgba(239, 68, 68, 0.1)', borderRadius: '6px', fontSize: '0.875rem', color: '#ef4444' }}>
+                                                            {stage.error}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+
+                                    {/* Results summary */}
+                                    {personalizerJobState.status === 'completed' && personalizerJobState.result && (
+                                        <div style={{
+                                            marginTop: '1.5rem',
+                                            padding: '1.25rem',
+                                            background: 'rgba(34, 197, 94, 0.1)',
+                                            border: '1px solid rgba(34, 197, 94, 0.3)',
+                                            borderRadius: '12px'
+                                        }}>
+                                            <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 1rem 0', color: '#22c55e' }}>
+                                                ✓ Results
+                                            </h3>
+                                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem', fontSize: '0.875rem' }}>
+                                                <div>
+                                                    <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Shopify Stores:</span>
+                                                    <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                        {personalizerJobState.result.shopifyStores}
+                                                    </strong>
+                                                </div>
+                                                {personalizerJobState.config?.checkKlaviyo && (
+                                                    <div>
+                                                        <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Klaviyo Stores:</span>
+                                                        <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                            {personalizerJobState.result.klaviyoStores}
+                                                        </strong>
+                                                    </div>
+                                                )}
+                                                <div>
+                                                    <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Products Fetched:</span>
+                                                    <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                        {personalizerJobState.result.productsFetched}
+                                                    </strong>
+                                                </div>
+                                                <div>
+                                                    <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Personalized:</span>
+                                                    <strong style={{ marginLeft: '0.5rem', color: '#22c55e' }}>
+                                                        {personalizerJobState.result.personalized}
+                                                    </strong>
+                                                </div>
+                                                {personalizerJobState.result.estimatedCost && (
+                                                    <div>
+                                                        <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Estimated Cost:</span>
+                                                        <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                            ${personalizerJobState.result.estimatedCost.toFixed(4)}
+                                                        </strong>
+                                                    </div>
+                                                )}
+                                            </div>
+                                            
+                                            {/* Download button */}
+                                            <div style={{ marginTop: '1rem', display: 'flex', gap: '0.75rem' }}>
+                                                <button
+                                                    type="button"
+                                                    className="primary-button"
+                                                    onClick={() => {
+                                                        const url = `${getPipelineBaseUrl()}/api/jobs/personalizer/${personalizerJobState.id}/result`;
+                                                        window.open(url, '_blank', 'noopener,noreferrer');
+                                                    }}
+                                                    style={{ fontSize: '0.875rem' }}
+                                                >
+                                                    📥 Download CSV
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
                     )}
 
                     {/* Info Tab */}

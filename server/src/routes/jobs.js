@@ -23,6 +23,9 @@ import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaig
 import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, processJob, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import { pool } from '../config/db.js';
+import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
+import path from 'path';
+import { TMP_ROOT } from '../config/paths.js';
 
 const router = express.Router();
 
@@ -1207,6 +1210,189 @@ router.post('/jobs/check-domains', async (req, res) => {
     } catch (error) {
         console.error('Error checking domains:', error);
         res.status(500).json({ error: 'Failed to check domains.' });
+    }
+});
+
+// Personalizer endpoint - simplified pipeline for Shopify personalization
+const personalizerFields = upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'idToken', maxCount: 1 },
+    { name: 'clientId', maxCount: 1 },
+    { name: 'productsToPull', maxCount: 1 },
+    { name: 'checkKlaviyo', maxCount: 1 },
+    { name: 'removeB2B', maxCount: 1 }
+]);
+
+router.post('/jobs/personalizer', personalizerFields, async (req, res) => {
+    try {
+        if (!req.files?.file || !req.files.file[0]) {
+            return res.status(400).json({ error: 'Missing CSV file upload.' });
+        }
+
+        const idToken = req.body.idToken;
+        if (!idToken) {
+            return res.status(400).json({ error: 'Missing ID token.' });
+        }
+
+        // Verify the ID token
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        const uid = decodedToken.uid;
+
+        // Fetch API keys from Firestore
+        const userDoc = await firestore.collection('users').doc(uid).get();
+        if (!userDoc.exists) {
+            return res.status(400).json({ error: 'User not found.' });
+        }
+        const userData = userDoc.data();
+        const apiKeys = {
+            openai: userData?.openai_key || '',
+            serper: userData?.serper_key || '',
+            kitt: userData?.trykitt_key || ''
+        };
+
+        if (!apiKeys.openai) {
+            return res.status(400).json({ error: 'Missing OpenAI API key in user vault.' });
+        }
+
+        const file = req.files.file[0];
+        const clientId = (req.body.clientId || '').toString().trim();
+        const productsToPull = parseInt(req.body.productsToPull || '3', 10);
+        const checkKlaviyo = String(req.body.checkKlaviyo || '').toLowerCase() === 'true';
+        const removeB2B = String(req.body.removeB2B || '').toLowerCase() === 'true';
+
+        // Create job ID and paths
+        const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const jobDir = path.join(TMP_ROOT, 'jobs', jobId);
+        fs.mkdirSync(jobDir, { recursive: true });
+
+        const inputCsv = path.join(jobDir, 'input.csv');
+        const outputCsv = path.join(jobDir, 'personalized.csv');
+
+        // Write uploaded file
+        fs.writeFileSync(inputCsv, file.buffer);
+
+        // Create job record in Firestore
+        const jobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('jobs').doc(jobId);
+        await jobRef.set({
+            id: jobId,
+            fileName: file.originalname,
+            status: 'running',
+            stages: {
+                shopifyDetection: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null },
+                klaviyoDetection: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null },
+                productFetch: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null },
+                personalization: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null }
+            },
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            completedAt: null,
+            clientId,
+            config: {
+                productsToPull,
+                checkKlaviyo,
+                removeB2B
+            }
+        });
+
+        // Helper to update stage status
+        const updateStage = async (stage, updates) => {
+            const updateData = {};
+            Object.entries(updates).forEach(([key, value]) => {
+                if (key === 'startedAt' || key === 'completedAt') {
+                    updateData[`stages.${stage}.${key}`] = admin.firestore.FieldValue.serverTimestamp();
+                } else {
+                    updateData[`stages.${stage}.${key}`] = value;
+                }
+            });
+            await jobRef.update(updateData).catch(err => {
+                console.error(`[${jobId}] Failed to update stage ${stage}:`, err);
+            });
+        };
+
+        // Run pipeline asynchronously
+        (async () => {
+            try {
+                // Stage 1: Shopify Detection
+                await updateStage('shopifyDetection', { status: 'running', startedAt: true });
+
+                const log = (message, meta) => {
+                    console.log(`[${jobId}] ${message || ''}`);
+                    // Update progress in Firestore if meta contains progress
+                    if (meta?.progress) {
+                        const stage = meta.progress.stage;
+                        updateStage(stage, { progress: meta.progress }).catch(() => {});
+                    }
+                };
+
+                const result = await runPersonalizerPipeline({
+                    inputCsv,
+                    outputCsv,
+                    apiKeys,
+                    log,
+                    productsToPull,
+                    checkKlaviyo,
+                    removeB2B,
+                    jobRef,
+                    updateStage
+                });
+
+                // Update final status
+                await jobRef.update({
+                    status: 'completed',
+                    completedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    result: {
+                        shopifyStores: result.shopifyStores,
+                        klaviyoStores: result.klaviyoStores,
+                        productsFetched: result.productsFetched,
+                        personalized: result.personalized,
+                        estimatedCost: result.estimatedCost
+                    }
+                });
+
+                console.log(`[${jobId}] ✓ Pipeline completed successfully`);
+
+            } catch (error) {
+                console.error(`[${jobId}] Pipeline error:`, error);
+                await jobRef.update({
+                    status: 'failed',
+                    error: error.message,
+                    completedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            }
+        })();
+
+        res.status(201).json({ 
+            jobId,
+            message: 'Personalizer job started'
+        });
+
+    } catch (error) {
+        console.error('Personalizer job creation error:', error);
+        res.status(500).json({ error: 'Failed to create personalizer job.' });
+    }
+});
+
+// Download personalizer results
+router.get('/jobs/personalizer/:jobId/result', async (req, res) => {
+    const { jobId } = req.params;
+    
+    try {
+        const jobDir = path.join(TMP_ROOT, 'jobs', jobId);
+        const outputCsv = path.join(jobDir, 'personalized.csv');
+        
+        if (!fs.existsSync(outputCsv)) {
+            return res.status(404).json({ error: 'Personalization results not found' });
+        }
+        
+        const filename = `personalized-${jobId}.csv`;
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        
+        const fileStream = fs.createReadStream(outputCsv);
+        fileStream.pipe(res);
+        
+    } catch (error) {
+        console.error('Personalizer result download error:', error);
+        res.status(500).json({ error: 'Failed to download results' });
     }
 });
 

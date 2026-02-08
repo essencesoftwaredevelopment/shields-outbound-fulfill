@@ -40,7 +40,7 @@ function normalizeHostname(urlOrDomain) {
     return hostname;
 }
 
-async function detectShopify(domain, log) {
+export async function detectShopify(domain, log) {
     try {
         // Check A records for Shopify IPs (23.227.38.*)
         try {
