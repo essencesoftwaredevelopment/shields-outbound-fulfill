@@ -309,6 +309,11 @@ export default function ClientPage() {
         total: number;
         normalized: number;
         withWww: number;
+        run: number;
+        notRun: number;
+        withFounders: number;
+        withEmails: number;
+        withPersonalization: number;
     } | null>(null);
     const [processingPersonalizerFile, setProcessingPersonalizerFile] = useState(false);
     const [personalizerJobState, setPersonalizerJobState] = useState<any | null>(null);
@@ -330,7 +335,17 @@ export default function ClientPage() {
     const [findEmail, setFindEmail] = useState(true);
     const [verifyEmail, setVerifyEmail] = useState(true);
     const [filterStats, setFilterStats] = useState<{ raw: number; normalized: number; inBatchDupes: number; crossRunDupes: number; willProcess: number } | null>(null);
-    const [domainCheckStats, setDomainCheckStats] = useState<{ total: number; unique: number; existing: number; new: number } | null>(null);
+    const [domainCheckStats, setDomainCheckStats] = useState<{ 
+        total: number; 
+        unique: number; 
+        existing: number; 
+        new: number;
+        run: number;
+        notRun: number;
+        withFounders: number;
+        withEmails: number;
+        withPersonalization: number;
+    } | null>(null);
     const [checkingDomains, setCheckingDomains] = useState(false);
 
     // Step 3: Personalization options
@@ -1699,7 +1714,12 @@ export default function ClientPage() {
                                 total: data.totalDomains,
                                 unique: data.uniqueDomains ?? data.totalDomains,
                                 existing: data.existingDomains,
-                                new: data.newDomains
+                                new: data.newDomains,
+                                run: data.run || 0,
+                                notRun: data.notRun || 0,
+                                withFounders: data.withFounders || 0,
+                                withEmails: data.withEmails || 0,
+                                withPersonalization: data.withPersonalization || 0
                             });
                         }
                     } catch (error) {
@@ -1959,10 +1979,10 @@ export default function ClientPage() {
                 return;
             }
 
-            // Count domains and normalize
+            // Extract and normalize domains
             let totalDomains = 0;
             let normalizedCount = 0;
-            const domains = new Set<string>();
+            const domains: string[] = [];
 
             for (let i = 1; i < lines.length; i++) {
                 const cells = lines[i].split(',').map(cell => cell.trim().replace(/^"|"$/g, ''));
@@ -1977,16 +1997,66 @@ export default function ClientPage() {
                         if (original !== domain && original.toLowerCase().includes('www.')) {
                             normalizedCount++;
                         }
-                        domains.add(domain);
+                        domains.push(domain);
                     }
                 }
             }
 
-            setPersonalizerDomainStats({
-                total: totalDomains,
-                normalized: domains.size,
-                withWww: normalizedCount
-            });
+            const uniqueDomains = [...new Set(domains)];
+
+            // Call backend to get enriched domain statistics
+            if (user && clientId && uniqueDomains.length > 0) {
+                const idToken = await getIdToken(user);
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/domains/analyze`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${idToken}`
+                    },
+                    body: JSON.stringify({
+                        clientId,
+                        domains: uniqueDomains
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    setPersonalizerDomainStats({
+                        total: totalDomains,
+                        normalized: uniqueDomains.length,
+                        withWww: normalizedCount,
+                        run: data.run || 0,
+                        notRun: data.notRun || 0,
+                        withFounders: data.withFounders || 0,
+                        withEmails: data.withEmails || 0,
+                        withPersonalization: data.withPersonalization || 0
+                    });
+                } else {
+                    // Fallback to basic stats if backend call fails
+                    setPersonalizerDomainStats({
+                        total: totalDomains,
+                        normalized: uniqueDomains.length,
+                        withWww: normalizedCount,
+                        run: 0,
+                        notRun: uniqueDomains.length,
+                        withFounders: 0,
+                        withEmails: 0,
+                        withPersonalization: 0
+                    });
+                }
+            } else {
+                // No domains or no user - show basic stats only
+                setPersonalizerDomainStats({
+                    total: totalDomains,
+                    normalized: uniqueDomains.length,
+                    withWww: normalizedCount,
+                    run: 0,
+                    notRun: uniqueDomains.length,
+                    withFounders: 0,
+                    withEmails: 0,
+                    withPersonalization: 0
+                });
+            }
 
         } catch (error) {
             console.error('Error processing personalizer file:', error);
@@ -4625,14 +4695,70 @@ export default function ClientPage() {
                                             <span style={{ fontSize: '1.25rem' }}>✅</span>
                                             <div style={{ flex: 1 }}>
                                                 <div style={{ fontWeight: 600, color: 'rgba(255, 255, 255, 0.9)' }}>
-                                                    {processingPersonalizerFile ? 'Processing file...' : 'File ready'}
+                                                    {processingPersonalizerFile ? 'Analyzing domains...' : 'File ready'}
                                                 </div>
                                                 <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
                                                     {personalizerFile.name} ({(personalizerFile.size / 1024).toFixed(2)} KB)
                                                 </div>
                                                 {personalizerDomainStats && (
-                                                    <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.8)', marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
-                                                        📊 {personalizerDomainStats.total} domains found{personalizerDomainStats.withWww > 0 && ` • ${personalizerDomainStats.withWww} normalized (www. removed)`}
+                                                    <div style={{ fontSize: '0.875rem', marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
+                                                        <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                            📊 Domain Analysis
+                                                        </div>
+                                                        
+                                                        {/* Row 1: Basic counts */}
+                                                        <div style={{ display: 'flex', gap: '1rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                                    {personalizerDomainStats.total.toLocaleString()}
+                                                                </strong> total
+                                                            </span>
+                                                            <span>
+                                                                <strong style={{ color: '#60a5fa' }}>
+                                                                    {personalizerDomainStats.normalized.toLocaleString()}
+                                                                </strong> unique
+                                                            </span>
+                                                            {personalizerDomainStats.withWww > 0 && (
+                                                                <span>
+                                                                    <strong style={{ color: '#f59e0b' }}>
+                                                                        {personalizerDomainStats.withWww.toLocaleString()}
+                                                                    </strong> normalized
+                                                                </span>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Row 2: Run status */}
+                                                        <div style={{ display: 'flex', gap: '1rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)', marginBottom: '0.5rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: '#22c55e' }}>
+                                                                    {personalizerDomainStats.run.toLocaleString()}
+                                                                </strong> run
+                                                            </span>
+                                                            <span>
+                                                                <strong style={{ color: '#94a3b8' }}>
+                                                                    {personalizerDomainStats.notRun.toLocaleString()}
+                                                                </strong> not run
+                                                            </span>
+                                                        </div>
+
+                                                        {/* Row 3: Data enrichment */}
+                                                        <div style={{ display: 'flex', gap: '1rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                                                            <span>
+                                                                <strong style={{ color: '#8b5cf6' }}>
+                                                                    {personalizerDomainStats.withFounders.toLocaleString()}
+                                                                </strong> w/ founders
+                                                            </span>
+                                                            <span>
+                                                                <strong style={{ color: '#ec4899' }}>
+                                                                    {personalizerDomainStats.withEmails.toLocaleString()}
+                                                                </strong> w/ emails
+                                                            </span>
+                                                            <span>
+                                                                <strong style={{ color: '#06b6d4' }}>
+                                                                    {personalizerDomainStats.withPersonalization.toLocaleString()}
+                                                                </strong> w/ personalization
+                                                            </span>
+                                                        </div>
                                                     </div>
                                                 )}
                                             </div>
@@ -5167,10 +5293,12 @@ export default function ClientPage() {
                                                 </div>
                                             ) : domainCheckStats ? (
                                                 <div style={{ color: 'rgba(255, 255, 255, 0.9)' }}>
-                                                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>
+                                                    <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>
                                                         📊 Domain Analysis
                                                     </div>
-                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap' }}>
+                                                    
+                                                    {/* Row 1: Basic counts */}
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
                                                         <span>
                                                             <strong style={{ color: 'rgba(255, 255, 255, 0.9)' }}>{domainCheckStats.total.toLocaleString()}</strong> total
                                                         </span>
@@ -5182,6 +5310,29 @@ export default function ClientPage() {
                                                         </span>
                                                         <span>
                                                             <strong style={{ color: '#10b981' }}>{domainCheckStats.new.toLocaleString()}</strong> new
+                                                        </span>
+                                                    </div>
+
+                                                    {/* Row 2: Run status */}
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)', marginBottom: '0.5rem' }}>
+                                                        <span>
+                                                            <strong style={{ color: '#22c55e' }}>{domainCheckStats.run.toLocaleString()}</strong> run
+                                                        </span>
+                                                        <span>
+                                                            <strong style={{ color: '#94a3b8' }}>{domainCheckStats.notRun.toLocaleString()}</strong> not run
+                                                        </span>
+                                                    </div>
+
+                                                    {/* Row 3: Data enrichment */}
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                                                        <span>
+                                                            <strong style={{ color: '#8b5cf6' }}>{domainCheckStats.withFounders.toLocaleString()}</strong> w/ founders
+                                                        </span>
+                                                        <span>
+                                                            <strong style={{ color: '#ec4899' }}>{domainCheckStats.withEmails.toLocaleString()}</strong> w/ emails
+                                                        </span>
+                                                        <span>
+                                                            <strong style={{ color: '#06b6d4' }}>{domainCheckStats.withPersonalization.toLocaleString()}</strong> w/ personalization
                                                         </span>
                                                     </div>
                                                 </div>

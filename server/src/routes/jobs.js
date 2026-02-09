@@ -1182,29 +1182,102 @@ router.post('/jobs/check-domains', async (req, res) => {
                 totalDomains: normalizedDomainsRaw.length,
                 uniqueDomains: uniqueDomains.length,
                 existingDomains: 0,
-                newDomains: uniqueDomains.length
+                newDomains: uniqueDomains.length,
+                run: 0,
+                notRun: 0,
+                withFounders: 0,
+                withEmails: 0,
+                withPersonalization: 0
             });
         }
 
         const sqlClientId = clientResult.rows[0].id;
 
-        // Check which domains exist for this client
-        const existingResult = await pool.query(
-            `SELECT DISTINCT c.domain_normalized 
-             FROM companies c
-             WHERE c.client_id = $1 
-             AND c.domain_normalized = ANY($2::text[])`,
-            [sqlClientId, uniqueDomains]
-        );
+        // First, find which domains exist in the database
+        const existingDomainsQuery = `
+            SELECT DISTINCT domain_normalized 
+            FROM companies 
+            WHERE client_id = $1 
+            AND domain_normalized = ANY($2::text[])
+        `;
+        const existingResult = await pool.query(existingDomainsQuery, [sqlClientId, uniqueDomains]);
+        const existingDomainsList = existingResult.rows.map(row => row.domain_normalized);
+        const existingCount = existingDomainsList.length;
+        const newCount = uniqueDomains.length - existingCount;
 
-        const existingDomains = existingResult.rows.length;
-        const newDomains = uniqueDomains.length - existingDomains;
+        // If no existing domains, return zeros for all enrichment stats
+        if (existingCount === 0) {
+            return res.json({
+                totalDomains: normalizedDomainsRaw.length,
+                uniqueDomains: uniqueDomains.length,
+                existingDomains: 0,
+                newDomains: newCount,
+                run: 0,
+                notRun: 0,
+                withFounders: 0,
+                withEmails: 0,
+                withPersonalization: 0
+            });
+        }
+
+        // Now check enrichment stats for ONLY the existing domains
+        const enrichmentQuery = `
+            SELECT 
+                COUNT(DISTINCT CASE 
+                    WHEN EXISTS (
+                        SELECT 1 FROM contacts ct 
+                        WHERE ct.company_id = c.id 
+                        AND ct.job_id IS NOT NULL
+                    ) THEN c.domain_normalized 
+                END) as run_count,
+                COUNT(DISTINCT CASE 
+                    WHEN EXISTS (
+                        SELECT 1 FROM contacts ct 
+                        WHERE ct.company_id = c.id 
+                        AND ct.full_name IS NOT NULL 
+                        AND ct.full_name != ''
+                        AND ct.job_id IS NOT NULL
+                    ) THEN c.domain_normalized 
+                END) as with_founders_count,
+                COUNT(DISTINCT CASE 
+                    WHEN EXISTS (
+                        SELECT 1 FROM contacts ct 
+                        WHERE ct.company_id = c.id 
+                        AND ct.email IS NOT NULL 
+                        AND ct.email != ''
+                        AND ct.job_id IS NOT NULL
+                    ) THEN c.domain_normalized 
+                END) as with_emails_count,
+                COUNT(DISTINCT CASE 
+                    WHEN EXISTS (
+                        SELECT 1 FROM contacts ct 
+                        WHERE ct.company_id = c.id 
+                        AND ct.personalization_first_line IS NOT NULL 
+                        AND ct.personalization_first_line != ''
+                        AND ct.job_id IS NOT NULL
+                    ) THEN c.domain_normalized 
+                END) as with_personalization_count
+            FROM companies c
+            WHERE c.client_id = $1 
+            AND c.domain_normalized = ANY($2::text[])
+        `;
+
+        const enrichmentResult = await pool.query(enrichmentQuery, [sqlClientId, existingDomainsList]);
+        const enrichment = enrichmentResult.rows[0];
+
+        const runCount = parseInt(enrichment.run_count) || 0;
+        const notRunCount = existingCount - runCount;
 
         res.json({
             totalDomains: normalizedDomainsRaw.length,
             uniqueDomains: uniqueDomains.length,
-            existingDomains,
-            newDomains
+            existingDomains: existingCount,
+            newDomains: newCount,
+            run: runCount,
+            notRun: notRunCount,
+            withFounders: parseInt(enrichment.with_founders_count) || 0,
+            withEmails: parseInt(enrichment.with_emails_count) || 0,
+            withPersonalization: parseInt(enrichment.with_personalization_count) || 0
         });
 
     } catch (error) {

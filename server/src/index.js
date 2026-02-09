@@ -19,6 +19,7 @@ import jobsRouter from './routes/jobs.js';
 import clientsRouter from './routes/clients.js';
 import leadsRouter from './routes/leads.js';
 import webhooksRouter from './routes/webhooks.js';
+import domainsRouter from './routes/domains.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
@@ -68,6 +69,7 @@ app.use((err, req, res, next) => {
 app.use('/api', jobsRouter);
 app.use('/api', clientsRouter);
 app.use('/api', leadsRouter);
+app.use('/api', domainsRouter);
 app.use('/webhook', webhooksRouter);
 
 // Health check
