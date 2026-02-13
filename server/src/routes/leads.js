@@ -380,18 +380,201 @@ router.get('/leads/stats', verifyFirebaseToken, async (req, res) => {
 router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
     try {
         const agencyId = req.agencyId;
-        
+        const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        const clientName = typeof req.query.clientName === 'string' ? req.query.clientName.trim() : '';
+        const normalizedSlug = clientSlug.toLowerCase().replace(/[^a-z0-9]+/g, '');
+        const normalizedName = clientName.toLowerCase().replace(/[^a-z0-9]+/g, '');
+        console.log('[stats/companies-count] request', {
+            agencyId,
+            clientSlug,
+            clientName,
+            normalizedSlug,
+            normalizedName
+        });
+
+        if (clientSlug) {
+            const matchedResult = await pool.query(
+                `
+                    WITH client_candidates AS (
+                        SELECT
+                            id,
+                            name,
+                            REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g') AS slug_name,
+                            REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '', 'g') AS compact_name
+                        FROM clients
+                        WHERE agency_id = $1
+                    ),
+                    matched_clients AS (
+                        SELECT id, name
+                        FROM client_candidates
+                        WHERE
+                            ($2 <> '' AND (
+                                LOWER(name) = LOWER($2)
+                                OR slug_name = LOWER($2)
+                                OR ($4 <> '' AND compact_name LIKE '%' || $4 || '%')
+                            ))
+                            OR
+                            ($3 <> '' AND (
+                                LOWER(name) = LOWER($3)
+                                OR slug_name = LOWER($3)
+                                OR ($5 <> '' AND compact_name LIKE '%' || $5 || '%')
+                            ))
+                    )
+                    SELECT
+                        COUNT(co.id)::int AS count,
+                        COALESCE(
+                            json_agg(
+                                DISTINCT jsonb_build_object(
+                                    'id', mc.id,
+                                    'name', mc.name
+                                )
+                            ) FILTER (WHERE mc.id IS NOT NULL),
+                            '[]'::json
+                        ) AS matched_clients
+                    FROM matched_clients mc
+                    LEFT JOIN companies co
+                        ON co.client_id = mc.id
+                       AND co.agency_id = $1
+                `,
+                [agencyId, clientSlug, clientName, normalizedSlug, normalizedName]
+            );
+
+            const matchedPayload = matchedResult.rows[0] || {};
+            const count = parseInt(matchedPayload.count || 0, 10);
+            const matchedClients = Array.isArray(matchedPayload.matched_clients)
+                ? matchedPayload.matched_clients
+                : [];
+
+            if (matchedClients.length === 0) {
+                const topClientsResult = await pool.query(
+                    `
+                        SELECT
+                            cl.id,
+                            cl.name,
+                            COUNT(co.id)::int AS company_count
+                        FROM clients cl
+                        LEFT JOIN companies co
+                            ON co.client_id = cl.id
+                           AND co.agency_id = $1
+                        WHERE cl.agency_id = $1
+                        GROUP BY cl.id, cl.name
+                        ORDER BY company_count DESC, cl.name ASC
+                        LIMIT 10
+                    `,
+                    [agencyId]
+                );
+                console.warn('[stats/companies-count] no SQL client match', {
+                    agencyId,
+                    clientSlug,
+                    clientName,
+                    normalizedSlug,
+                    normalizedName,
+                    topClients: topClientsResult.rows
+                });
+                return res.json({
+                    count: 0,
+                    clientId: clientSlug,
+                    matchedClients: [],
+                    debug: {
+                        reason: 'no_sql_client_match',
+                        topClients: topClientsResult.rows
+                    }
+                });
+            }
+
+            console.log('[stats/companies-count] scoped result', {
+                agencyId,
+                clientSlug,
+                clientName,
+                matchedClients,
+                count,
+            });
+            return res.json({
+                count,
+                clientId: clientSlug,
+                matchedClients
+            });
+        }
+
         const countResult = await pool.query(
             `SELECT COUNT(*) as count FROM companies WHERE agency_id = $1`,
             [agencyId]
         );
-        
-        const count = parseInt(countResult.rows[0]?.count || 0, 10);
 
+        const count = parseInt(countResult.rows[0]?.count || 0, 10);
+        console.log('[stats/companies-count] agency-wide result', {
+            agencyId,
+            count
+        });
         res.json({ count });
     } catch (error) {
         console.error('Error fetching companies count:', error);
         res.status(500).json({ error: 'Failed to fetch companies count' });
+    }
+});
+
+/**
+ * GET /stats/companies-counts
+ *
+ * Get company counts for multiple client slugs in one request.
+ *
+ * Query parameters:
+ *   - clientIds: Comma-separated client slugs (required)
+ *
+ * Returns:
+ *   - counts: Object map of { [clientSlug]: number }
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.get('/stats/companies-counts', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const rawClientIds = typeof req.query.clientIds === 'string'
+            ? req.query.clientIds
+            : Array.isArray(req.query.clientIds)
+                ? req.query.clientIds.join(',')
+                : '';
+
+        const clientSlugs = [...new Set(
+            rawClientIds
+                .split(',')
+                .map((value) => value.trim())
+                .filter(Boolean)
+        )];
+
+        if (clientSlugs.length === 0) {
+            return res.json({ counts: {} });
+        }
+
+        const result = await pool.query(
+            `
+                SELECT
+                    cl.name AS client_slug,
+                    COUNT(co.id)::int AS count
+                FROM clients cl
+                LEFT JOIN companies co
+                    ON co.client_id = cl.id
+                    AND co.agency_id = $1
+                WHERE cl.agency_id = $1
+                    AND cl.name = ANY($2::text[])
+                GROUP BY cl.name
+            `,
+            [agencyId, clientSlugs]
+        );
+
+        const counts = clientSlugs.reduce((acc, slug) => {
+            acc[slug] = 0;
+            return acc;
+        }, {});
+
+        result.rows.forEach((row) => {
+            counts[row.client_slug] = Number(row.count) || 0;
+        });
+
+        res.json({ counts });
+    } catch (error) {
+        console.error('Error fetching companies counts by client:', error);
+        res.status(500).json({ error: 'Failed to fetch companies counts' });
     }
 });
 

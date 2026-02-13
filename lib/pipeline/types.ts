@@ -1,4 +1,4 @@
-export type PipelineStageKey = "founders" | "emailDiscovery" | "verification" | "personalization";
+export type PipelineStageKey = "domainPrep" | "founders" | "emailDiscovery" | "verification" | "personalization";
 
 export type PipelineStageStatus = "pending" | "running" | "completed" | "error";
 
@@ -30,7 +30,19 @@ export interface PipelineJob {
     createdAt: string;
     completedAt: string | null;
     stages: Record<PipelineStageKey, PipelineStageState>;
-    dedupeStats?: { total: number; skipped: number; new: number } | null;
+    dedupeStats?: {
+        total?: number;
+        unique?: number;
+        skipped?: number;
+        new?: number;
+        duplicatesRemoved?: number;
+        duplicateRows?: number;
+        dnsChecked?: number;
+        dnsLive?: number;
+        dnsDead?: number;
+        dnsUnknown?: number;
+        processable?: number;
+    } | null;
     cost?: number;
     clientId?: string;
     // Secondary metadata - not part of primary lifecycle

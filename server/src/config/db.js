@@ -36,15 +36,15 @@ pool.on('error', (err) => {
 });
 
 pool.on('connect', () => {
-    console.log('✅ [DB] New connection established');
+    // console.log('✅ [DB] New connection established');
 });
 
 pool.on('acquire', () => {
-    console.log('🔵 [DB] Client acquired from pool');
+    // console.log('🔵 [DB] Client acquired from pool');
 });
 
 pool.on('remove', () => {
-    console.log('🔴 [DB] Client removed from pool');
+    // console.log('🔴 [DB] Client removed from pool');
 });
 
 export async function testConnection() {

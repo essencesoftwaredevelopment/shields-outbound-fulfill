@@ -96,12 +96,12 @@ async function verifyEmailWithTryKitt(email, apiKey) {
             });
 
             // Debug logging
-            console.log(`[EMAIL VERIFIER DEBUG] Request to TryKitt for email: ${email}`);
-            console.log(`[EMAIL VERIFIER DEBUG] Response Status: ${res.status} ${res.statusText}`);
-            console.log(`[EMAIL VERIFIER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
+            // console.log(`[EMAIL VERIFIER DEBUG] Request to TryKitt for email: ${email}`);
+            // console.log(`[EMAIL VERIFIER DEBUG] Response Status: ${res.status} ${res.statusText}`);
+            // console.log(`[EMAIL VERIFIER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
 
             const text = await res.text();
-            console.log(`[EMAIL VERIFIER DEBUG] Response Body:`, text);
+            // console.log(`[EMAIL VERIFIER DEBUG] Response Body:`, text);
             
             let parsed;
 
@@ -352,10 +352,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
                     controller.abort();
                     throw error; // Re-throw to stop execution
                 }
-                // Other errors - record as unknown status for this row
-                console.error(`[EMAIL_VERIFIER] Error verifying ${item.row.email}:`, error.message);
-                rows[item.index].email_status = 'unknown';
-                stats.unknown += 1;
+                throw new Error(`Email verification failed for ${item.row.email}: ${error?.message || error}`);
             }
 
             completed += 1;

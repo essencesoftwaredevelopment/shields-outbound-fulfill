@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { promises as dns } from 'dns';
 import { env } from '../config/env.js';
 import { admin, firestore } from '../config/firebase.js';
 import { TMP_ROOT } from '../config/paths.js';
@@ -12,6 +13,7 @@ import { runEmailVerifier } from './emailVerifier.js';
 import { runPersonalization } from './personalization/index.js';
 import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
 import { parse as csvParse } from 'csv-parse';
+import { normalizeDomain } from '../utils/domain.js';
 
 export const jobs = new Map();
 
@@ -28,6 +30,8 @@ export const jobs = new Map();
 const FIRESTORE_UPDATE_INTERVAL = 5; // Update every N processed items
 const FIRESTORE_MIN_INTERVAL_MS = 2000; // Minimum 2 seconds between updates
 const REALTIME_STAGE_MIN_INTERVAL_MS = 500; // Faster updates for realtime stages (emailDiscovery, verification)
+const DNS_QUERY_TIMEOUT_MS = 2500;
+const DNS_CHECK_CONCURRENCY = 25;
 
 function shouldUpdateFirestore(job) {
     // Always update on status changes or completion
@@ -230,21 +234,23 @@ async function runStage(job, stageKey, handler) {
         updateStage(job, stageKey, { status: 'completed', completedAt: new Date().toISOString(), summary: safeSummary });
         return summary;
     } catch (err) {
+        if (err?.code === 'JOB_PAUSED') {
+            throw err;
+        }
+
         const message = err?.message || 'Unknown error';
         
         // Check for credit exhaustion error
         if (err?.code === 'CREDIT_EXHAUSTED') {
             console.log(`[${job.id}] Credit exhausted at stage ${stageKey}, pausing job`);
             updateStage(job, stageKey, { status: 'error', error: 'Add Credits to TryKitt' });
-            markPaused(job, 'Add Credits to TryKitt');
-            // Throw a special error that processJob will catch and handle gracefully
-            const pauseError = new Error('Job paused due to credit exhaustion');
-            pauseError.code = 'JOB_PAUSED';
-            throw pauseError;
+            await pauseJobWithError(job, 'Add Credits to TryKitt');
+            throw createJobPausedError('Job paused due to credit exhaustion');
         }
         
         updateStage(job, stageKey, { status: 'error', completedAt: new Date().toISOString(), error: message });
-        throw err;
+        await pauseJobWithError(job, `Paused due to ${stageKey} stage error`, message);
+        throw createJobPausedError(`Job paused due to ${stageKey} error: ${message}`);
     }
 }
 
@@ -272,6 +278,33 @@ function markResumed(job) {
     job.resumedAt = new Date().toISOString();
     log(job, 'Job resumed.');
     pushState(job);
+}
+
+function createJobPausedError(message = 'Job paused') {
+    const pauseError = new Error(message);
+    pauseError.code = 'JOB_PAUSED';
+    return pauseError;
+}
+
+async function pauseJobWithError(job, reason, errorMessage = null) {
+    const resolvedReason = reason || 'Paused due to pipeline error';
+    const resolvedError = errorMessage || resolvedReason;
+
+    job.error = resolvedError;
+
+    if (!job.paused) {
+        markPaused(job, resolvedReason);
+    } else {
+        log(job, resolvedReason);
+        pushState(job, true);
+    }
+
+    await updateActiveJob(job, 'paused', {
+        error: resolvedError,
+        uploadError: resolvedError,
+        uploadMetrics: null,
+        pausedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 }
 
 function resolveJobPaths(jobId) {
@@ -321,6 +354,7 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
         cost: 0,
         stages: {
+            domainPrep: initialStageState(),
             founders: initialStageState(),
             emailDiscovery: initialStageState(),
             verification: initialStageState(),
@@ -351,69 +385,99 @@ async function processJob(job) {
 
     try {
         // Load pricing configuration
-        try {
-            job.pricing = await loadPricing(job.uid);
-        } catch (err) {
-            console.warn(`[${job.id}] Pricing load warning:`, err?.message || err);
-            job.pricing = DEFAULT_PRICING;
-        }
+        job.pricing = await loadPricing(job.uid);
 
         if (job.cancelled) {
             markCancelled(job, 'Cancelled before start');
             return;
         }
 
-        // Use pre-calculated filtered path if available (from job creation), otherwise calculate now
+        // Stage 1: normalize/remove www, dedupe, DNS-check, and keep processable domains.
         let filteredDomainsPath = job.paths.filtered;
-        if (!filteredDomainsPath) {
-            const { filtered, stats: dedupeStats } = await filterAndWriteProcessedDomains({
-                agencyId: job.uid,
-                clientId: job.sqlClientId,
-                jobId: job.id,
-                domainsCsvPath: job.paths.domains,
-                dedupeStrategy: job.dedupeStrategy,
-                domainColumn: job.columnMapping?.domain || 'domain'
-            });
-            filteredDomainsPath = filtered;
-            job.dedupeStats = dedupeStats;
-            log(job, `Deduplication: ${dedupeStats.total} total, ${dedupeStats.skipped} skipped, ${dedupeStats.new} new domains to process`);
-        }
+        let preparedDomainsPath = filteredDomainsPath;
+        await runStage(job, 'domainPrep', async () => {
+            if (!preparedDomainsPath) {
+                const { filtered, stats: dedupeStats } = await filterAndWriteProcessedDomains({
+                    agencyId: job.uid,
+                    clientId: job.sqlClientId,
+                    jobId: job.id,
+                    domainsCsvPath: job.paths.domains,
+                    dedupeStrategy: job.dedupeStrategy,
+                    domainColumn: job.columnMapping?.domain || 'domain'
+                });
+                preparedDomainsPath = filtered;
+                job.dedupeStats = dedupeStats;
+            }
 
-        // Dedupe domains before heavy stages to avoid ON CONFLICT churn
-        const { path: dedupedPath, removedDuplicates, totalRows } = await dedupeDomainsCsv(
-            filteredDomainsPath,
-            job.columnMapping?.domain || 'domain'
-        );
-        filteredDomainsPath = dedupedPath;
-        job.dedupeStats = {
-            ...(job.dedupeStats || {}),
-            duplicateRows: removedDuplicates,
-            totalRows
-        };
-        log(job, `Domain dedupe: removed ${removedDuplicates} duplicate row(s) from ${totalRows} total`);
+            const { path: dedupedPath, removedDuplicates, totalRows } = await dedupeDomainsCsv(
+                preparedDomainsPath,
+                job.columnMapping?.domain || 'domain'
+            );
+            preparedDomainsPath = dedupedPath;
+
+            const dnsStats = await dnsFilterDomainsCsv(
+                preparedDomainsPath,
+                job.columnMapping?.domain || 'domain'
+            );
+            preparedDomainsPath = dnsStats.path;
+
+            const normalized = typeof job.dedupeStats?.unique === 'number'
+                ? job.dedupeStats.unique
+                : totalRows;
+            const duplicatesRemoved = (typeof job.dedupeStats?.duplicatesRemoved === 'number'
+                ? job.dedupeStats.duplicatesRemoved
+                : 0) + removedDuplicates;
+
+            job.dedupeStats = {
+                ...(job.dedupeStats || {}),
+                totalRows,
+                unique: normalized,
+                duplicateRows: removedDuplicates,
+                duplicatesRemoved,
+                dnsChecked: dnsStats.checked,
+                dnsLive: dnsStats.live,
+                dnsDead: dnsStats.dead,
+                dnsUnknown: dnsStats.unknown,
+                processable: dnsStats.processable
+            };
+
+            log(
+                job,
+                `Domain prep: normalized ${normalized}, deduped ${duplicatesRemoved}, DNS checked ${dnsStats.checked} (${dnsStats.live} live, ${dnsStats.dead} dead, ${dnsStats.unknown} unknown), ${dnsStats.processable} processable`
+            );
+
+            return {
+                total: typeof job.dedupeStats?.total === 'number' ? job.dedupeStats.total : totalRows,
+                normalized,
+                deduped: duplicatesRemoved,
+                checked: dnsStats.checked,
+                live: dnsStats.live,
+                dead: dnsStats.dead,
+                unknown: dnsStats.unknown,
+                processable: dnsStats.processable,
+                skippedExisting: typeof job.dedupeStats?.skipped === 'number' ? job.dedupeStats.skipped : 0,
+                new: typeof job.dedupeStats?.new === 'number' ? job.dedupeStats.new : dnsStats.processable
+            };
+        });
+        filteredDomainsPath = preparedDomainsPath;
+        job.paths.prepared = filteredDomainsPath;
 
         // Immediately upsert domains into SQL so the UI reflects new companies right after upload
         await upsertDomainsImmediately(job, filteredDomainsPath);
 
-        // If all domains were filtered out AND we're using skip strategy, complete early
-        if (job.dedupeStats && job.dedupeStats.new === 0 && job.dedupeStrategy === 'skip') {
-            try {
-                fs.writeFileSync(job.paths.final, 'domain,email,email_status,founder_name\n');
-            } catch (err) {
-                console.warn(`[${job.id}] Failed to write placeholder final.csv`, err?.message || err);
-            }
-            try {
-                fs.writeFileSync(job.paths.personalized, 'domain,url,title,description,date,first_line\n');
-            } catch (err) {
-                console.warn(`[${job.id}] Failed to write placeholder personalized.csv`, err?.message || err);
-            }
-            try {
-                fs.writeFileSync(job.paths.upload, 'domain,founder_name,email,email_status,first_name,last_name,personalization\n');
-            } catch (err) {
-                console.warn(`[${job.id}] Failed to write placeholder upload.csv`, err?.message || err);
-            }
+        // If no domains are left after domain prep, complete early.
+        const processableCount = typeof job.dedupeStats?.processable === 'number'
+            ? job.dedupeStats.processable
+            : (typeof job.dedupeStats?.new === 'number' ? job.dedupeStats.new : 0);
+        if (processableCount === 0) {
+            fs.writeFileSync(job.paths.final, 'domain,email,email_status,founder_name\n');
+            fs.writeFileSync(job.paths.personalized, 'domain,url,title,description,date,first_line\n');
+            fs.writeFileSync(job.paths.upload, 'domain,founder_name,email,email_status,first_name,last_name,personalization\n');
 
             Object.entries(job.stages).forEach(([stageKey, stage]) => {
+                if (stage.status === 'completed') {
+                    return;
+                }
                 job.stages[stageKey] = {
                     ...stage,
                     status: 'completed',
@@ -436,7 +500,7 @@ async function processJob(job) {
             job.completedAt = new Date().toISOString();
             pushState(job);
             await updateActiveJob(job, 'completed', { uploadError: null, uploadMetrics: null });
-            log(job, 'Job completed: All domains were already processed (duplicates)');
+            log(job, 'Job completed: No processable domains after normalization/dedupe/DNS checks');
             return;
         }
 
@@ -453,7 +517,11 @@ async function processJob(job) {
                     outputPath: job.paths.founders,
                     columnMapping: job.columnMapping
                 });
-                const processed = job.dedupeStats?.total || 0;
+                const processed = (typeof job.dedupeStats?.processable === 'number' ? job.dedupeStats.processable : null)
+                    ?? job.dedupeStats?.new
+                    ?? job.dedupeStats?.unique
+                    ?? job.dedupeStats?.total
+                    ?? 0;
                 updateStage(job, 'founders', {
                     status: 'completed',
                     completedAt: new Date().toISOString(),
@@ -672,13 +740,9 @@ async function processJob(job) {
         await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.personalized, type: 'personalization', jobId: job.id });
 
         // Build upload-ready CSV (complete leads with founder, email, and personalization)
-        try {
-            const uploadRows = await buildUnifiedRows({ jobId: job.id, scope: 'complete', resolveJobPaths });
-            await writeUploadCsv(job.paths.upload, uploadRows);
-            log(job, `Upload CSV ready at ${job.paths.upload} (${uploadRows.length} rows)`);
-        } catch (err) {
-            console.warn(`[${job.id}] Failed to build upload.csv`, err?.message || err);
-        }
+        const uploadRows = await buildUnifiedRows({ jobId: job.id, scope: 'complete', resolveJobPaths });
+        await writeUploadCsv(job.paths.upload, uploadRows);
+        log(job, `Upload CSV ready at ${job.paths.upload} (${uploadRows.length} rows)`);
 
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
@@ -698,11 +762,9 @@ async function processJob(job) {
             closeStreams(job);
             return;
         }
-        job.status = 'failed';
-        job.error = err?.message || 'Unexpected pipeline error';
-        pushState(job);
-        await updateActiveJob(job, 'failed', { error: job.error, uploadError: null, uploadMetrics: null });
-        log(job, `Job failed: ${job.error}`);
+        console.error(`[${job.id}] Pipeline error, pausing job:`, err?.message || err);
+        await pauseJobWithError(job, 'Paused due to pipeline error', err?.message || 'Unexpected pipeline error');
+        closeStreams(job);
     }
 
 }
@@ -724,7 +786,7 @@ async function upsertDomainsImmediately(job, domainsPath) {
         fs.createReadStream(domainsPath)
             .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
             .on('data', (row) => {
-                const domain = String(row[domainColumn] || row.domain || '').trim().toLowerCase();
+                const domain = normalizeDomain(row[domainColumn] || row.domain);
                 if (domain) domains.push(domain);
             })
             .on('end', resolve)
@@ -757,6 +819,7 @@ async function upsertDomainsImmediately(job, domainsPath) {
     } catch (err) {
         console.error(`[${job?.id || 'unknown'}] Domain upsert failed:`, err?.message || err);
         log(job, 'Domain upsert failed', { error: err?.message || err });
+        throw err;
     }
 }
 
@@ -778,7 +841,7 @@ async function dedupeDomainsCsv(inputPath, domainColumn = 'domain') {
         fs.createReadStream(inputPath)
             .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
             .on('data', (row) => {
-                const domain = String(row[domainColumn] || row.domain || '').trim().toLowerCase();
+                const domain = normalizeDomain(row[domainColumn] || row.domain);
                 if (!domain) return;
                 totalRows += 1;
                 if (seen.has(domain)) {
@@ -805,6 +868,151 @@ async function dedupeDomainsCsv(inputPath, domainColumn = 'domain') {
     await new Promise((resolve) => writer.on('finish', resolve));
 
     return { path: dedupPath, removedDuplicates, totalRows };
+}
+
+function withTimeout(promise, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            const err = new Error(`DNS lookup timeout after ${timeoutMs}ms`);
+            err.code = 'DNS_TIMEOUT';
+            reject(err);
+        }, timeoutMs);
+
+        promise.then(
+            (value) => {
+                clearTimeout(timeout);
+                resolve(value);
+            },
+            (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            }
+        );
+    });
+}
+
+function isDnsMiss(error) {
+    const code = String(error?.code || '').toUpperCase();
+    return (
+        code === 'ENOTFOUND'
+        || code === 'ENODATA'
+        || code === 'ENONAME'
+        || code === 'EAI_NONAME'
+        || code === 'NXDOMAIN'
+        || code === 'NOTFOUND'
+        || code === 'NODATA'
+    );
+}
+
+async function checkDomainDns(domain) {
+    const lookups = [
+        dns.resolve4(domain),
+        dns.resolve6(domain),
+        dns.resolveCname(domain),
+        dns.resolveMx(domain)
+    ].map((lookup) => withTimeout(lookup, DNS_QUERY_TIMEOUT_MS));
+
+    const settled = await Promise.allSettled(lookups);
+    const hasAnyRecord = settled.some(
+        (result) => result.status === 'fulfilled' && Array.isArray(result.value) && result.value.length > 0
+    );
+    if (hasAnyRecord) {
+        return { domain, status: 'live' };
+    }
+
+    const errors = settled
+        .filter((result) => result.status === 'rejected')
+        .map((result) => result.reason);
+    if (errors.length > 0 && errors.every((error) => isDnsMiss(error))) {
+        return { domain, status: 'dead' };
+    }
+
+    return { domain, status: 'unknown' };
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+    if (!Array.isArray(items) || items.length === 0) return [];
+
+    const results = new Array(items.length);
+    let cursor = 0;
+
+    const runWorker = async () => {
+        while (true) {
+            const index = cursor;
+            cursor += 1;
+            if (index >= items.length) {
+                return;
+            }
+            results[index] = await worker(items[index], index);
+        }
+    };
+
+    const workerCount = Math.min(Math.max(concurrency, 1), items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    return results;
+}
+
+async function dnsFilterDomainsCsv(inputPath, domainColumn = 'domain') {
+    if (!inputPath || !fs.existsSync(inputPath)) {
+        return { path: inputPath, checked: 0, live: 0, dead: 0, unknown: 0, processable: 0 };
+    }
+
+    const domains = [];
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(inputPath)
+            .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
+            .on('data', (row) => {
+                const domain = normalizeDomain(row[domainColumn] || row.domain);
+                if (domain) domains.push(domain);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    const uniqueDomains = Array.from(new Set(domains));
+    if (!uniqueDomains.length) {
+        return { path: inputPath, checked: 0, live: 0, dead: 0, unknown: 0, processable: 0 };
+    }
+
+    const checks = await mapWithConcurrency(uniqueDomains, DNS_CHECK_CONCURRENCY, (domain) => checkDomainDns(domain));
+
+    let live = 0;
+    let dead = 0;
+    let unknown = 0;
+    const processableDomains = [];
+
+    for (const result of checks) {
+        if (result?.status === 'live') {
+            live += 1;
+            processableDomains.push(result.domain);
+            continue;
+        }
+        if (result?.status === 'dead') {
+            dead += 1;
+            continue;
+        }
+        unknown += 1;
+        if (result?.domain) {
+            processableDomains.push(result.domain);
+        }
+    }
+
+    const ext = path.extname(inputPath) || '.csv';
+    const dnsPath = inputPath.replace(ext, `-dns${ext}`);
+    const writer = fs.createWriteStream(dnsPath);
+    writer.write('domain\n');
+    processableDomains.forEach((domain) => writer.write(`${domain}\n`));
+    writer.end();
+    await new Promise((resolve) => writer.on('finish', resolve));
+
+    return {
+        path: dnsPath,
+        checked: uniqueDomains.length,
+        live,
+        dead,
+        unknown,
+        processable: processableDomains.length
+    };
 }
 
 

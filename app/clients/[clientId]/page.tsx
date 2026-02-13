@@ -111,8 +111,12 @@ type Segment = {
 type JobStatus = PipelineJob["status"];
 type StageStatus = PipelineStageStatus;
 
-const STAGE_ORDER: PipelineStageKey[] = ["founders", "emailDiscovery", "verification", "personalization"];
+const STAGE_ORDER: PipelineStageKey[] = ["domainPrep", "founders", "emailDiscovery", "verification", "personalization"];
 const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }> = {
+    domainPrep: {
+        title: "Domain Prep",
+        detail: "Normalize, dedupe, and DNS checks",
+    },
     founders: {
         title: "Founder Finder",
         detail: "Serper batches + OpenAI reasoning",
@@ -243,7 +247,10 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
     // if it's the founders stage, or email find stage, use found
     // if it's the verification stage, use verified/valid
     const throughputNum =
-        stageName === "founders" || stageName === "emailDiscovery" ?
+        stageName === "domainPrep" ?
+            extractNumberFrom(summary, ["processable", "live"])
+            ?? extractNumberFrom(stats, ["processable", "live"])
+            : stageName === "founders" || stageName === "emailDiscovery" ?
             (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
             ?? extractNumberFrom(stats, ["Found", "processed", "completed", "personalized"])
             ?? extractNumberFrom(summary, ["Found", "processed", "completed", "personalized"])
@@ -262,10 +269,29 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
     return { throughputNum, total };
 };
 
+const deriveDedupedDomainBaseline = (job?: PipelineJob | null) => {
+    const dedupe = job?.dedupeStats as (Record<string, unknown> | null | undefined);
+    if (!dedupe) return null;
+
+    // Prefer post-DNS processable domains when available.
+    const processable = extractNumberFrom(dedupe, ["processable"]);
+    if (processable !== null) return processable;
+
+    // Prefer unique normalized domain count when available.
+    const unique = extractNumberFrom(dedupe, ["unique"]);
+    if (unique !== null) return unique;
+
+    // Fallback: if "new" is zero, keep total as baseline instead of collapsing to zero.
+    const newCount = extractNumberFrom(dedupe, ["new"]);
+    const total = extractNumberFrom(dedupe, ["total"]);
+    if (newCount !== null && newCount > 0) return newCount;
+    return total ?? newCount;
+};
+
 const calculateJobProgress = (job: PipelineJob): { processed: number; total: number; percent: number } => {
     // Find the currently active or last completed stage to get the most accurate progress
     let processed = 0;
-    const dedupedTotal = (job.dedupeStats?.new ?? job.dedupeStats?.total);
+    const dedupedTotal = deriveDedupedDomainBaseline(job);
     let total = dedupedTotal ?? 0;
     
     // Check stages in order for progress
@@ -414,6 +440,7 @@ export default function ClientPage() {
     const normalizeStages = useCallback((raw: unknown): Record<PipelineStageKey, PipelineStageState> => {
         const source = (raw && typeof raw === "object") ? raw as Record<string, Partial<PipelineStageState>> : {};
         const stages: Record<PipelineStageKey, PipelineStageState> = {
+            domainPrep: createEmptyStageState(),
             founders: createEmptyStageState(),
             emailDiscovery: createEmptyStageState(),
             verification: createEmptyStageState(),
@@ -702,6 +729,28 @@ export default function ClientPage() {
         // If email_status is empty, the email finder hasn't run yet
         if (!emailStatus || emailStatus.trim() === '') return 'Not Run';
         return emailStatus;
+    };
+
+    type LeadStatusChipVariant =
+        | "valid"
+        | "valid-risky"
+        | "invalid"
+        | "not-found"
+        | "not-run"
+        | "skipped"
+        | "default";
+
+    const getLeadStatusChipMeta = (emailStatus: string | undefined): { label: string; variant: LeadStatusChipVariant } => {
+        const normalized = (emailStatus || '').trim().toLowerCase();
+
+        if (!normalized) return { label: "Not Run", variant: "not-run" };
+        if (normalized === "valid") return { label: "Valid", variant: "valid" };
+        if (normalized === "valid-risky" || normalized === "risky") return { label: "Valid-Risky", variant: "valid-risky" };
+        if (normalized === "invalid") return { label: "Invalid", variant: "invalid" };
+        if (normalized === "not_found" || normalized.includes("not found")) return { label: "Not Found", variant: "not-found" };
+        if (normalized === "skipped_no_founder") return { label: "Skipped", variant: "skipped" };
+
+        return { label: displayEmailStatus(emailStatus), variant: "default" };
     };
 
     useEffect(() => {
@@ -1811,7 +1860,7 @@ export default function ClientPage() {
                 }
 
                 if (dedupeStrategy === 'include') {
-                    const msg = `✓ Normalized & validated. Processing ${uniqueCount} unique domain${uniqueCount !== 1 ? 's' : ''} (${newCount} new, ${existingCount} existing).`;
+                    const msg = `✓ Normalized & validated. Processing ${uniqueCount} unique domain${uniqueCount !== 1 ? 's' : ''} (${newCount} new, ${existingCount} existing). Existing domains will merge non-empty updates.`;
                     setToastMessage(msg);
                     setToastVisible(true);
                 } else {
@@ -2094,7 +2143,7 @@ export default function ClientPage() {
                 setToastMessage(data.message || 'Stale job reference cleared.');
                 setToastVisible(true);
             } else {
-                setJobState((prev) => prev ? { ...prev, status: 'failed', cancelled: true, error: 'Cancelled by user' } : prev);
+                setJobState((prev) => prev ? { ...prev, status: 'failed', paused: false, cancelled: true, error: 'Cancelled by user' } : prev);
                 setJobStatusMessage('Job cancelled.');
             }
         } catch (error) {
@@ -3083,17 +3132,17 @@ export default function ClientPage() {
                                                                 )}
                                                             </button>
                                                         )}
-                                                        {!jobState.paused && (
-                                                            <button
-                                                                type="button"
-                                                                className="destructive-button"
-                                                                onClick={handleStopJob}
-                                                                disabled={stoppingJob}
-                                                                style={{ minWidth: '100px' }}
-                                                            >
-                                                                {stoppingJob ? 'Stopping...' : 'Stop run'}
-                                                            </button>
-                                                        )}
+                                                        <button
+                                                            type="button"
+                                                            className="destructive-button"
+                                                            onClick={handleStopJob}
+                                                            disabled={stoppingJob}
+                                                            style={{ minWidth: '100px' }}
+                                                        >
+                                                            {stoppingJob
+                                                                ? (jobState.paused ? 'Cancelling...' : 'Stopping...')
+                                                                : (jobState.paused ? 'Cancel run' : 'Stop run')}
+                                                        </button>
                                                     </div>
                                                 )}
                                             </div>
@@ -3162,10 +3211,10 @@ export default function ClientPage() {
                                         {/* Pipeline flow summary */}
                                         {(() => {
                                             const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
-                                            const dedupedTotal = (jobState.dedupeStats?.new ?? jobState.dedupeStats?.total ?? null);
+                                            const dedupedTotal = deriveDedupedDomainBaseline(jobState);
                                             const foundersProcessedRaw = deriveStageTotals(jobState.stages.founders).total ?? 0;
-                                            const foundersProcessed = dedupedTotal ?? foundersProcessedRaw;
-                                            const foundersFoundDisplay = dedupedTotal ? Math.min(foundersFound, dedupedTotal) : foundersFound;
+                                            const foundersProcessed = foundersProcessedRaw > 0 ? foundersProcessedRaw : (dedupedTotal ?? 0);
+                                            const foundersFoundDisplay = foundersProcessed > 0 ? Math.min(foundersFound, foundersProcessed) : foundersFound;
                                             const emailsFound = (jobState.stages.emailDiscovery?.summary as any)?.Found ?? (jobState.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(jobState.stages.emailDiscovery).throughputNum ?? 0;
                                             const safe = (jobState.stages.verification?.summary as any)?.Valid ?? (jobState.stages.verification?.summary as any)?.valid ?? 0;
                                             const personalized = (jobState.stages.personalization?.summary as any)?.Personalized ?? (jobState.stages.personalization?.summary as any)?.personalized ?? (jobState.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
@@ -3211,11 +3260,22 @@ export default function ClientPage() {
                                             let subtext = "";
                                             let costFooter = "";
                                             
-                                            if (stageKey === "founders") {
-                                                const dedupedTotal = (jobState?.dedupeStats?.new ?? jobState?.dedupeStats?.total ?? null);
+                                            if (stageKey === "domainPrep") {
+                                                const checked = (summary?.checked as number) ?? (summary?.normalized as number) ?? total ?? 0;
+                                                const live = (summary?.live as number) ?? 0;
+                                                const dead = (summary?.dead as number) ?? 0;
+                                                const unknown = (summary?.unknown as number) ?? 0;
+                                                const processable = (summary?.processable as number) ?? throughputNum ?? live;
+                                                heroNumber = processable;
+                                                heroLabel = "Processable";
+                                                subtext = checked > 0
+                                                    ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
+                                                    : "Awaiting...";
+                                            } else if (stageKey === "founders") {
+                                                const dedupedTotal = deriveDedupedDomainBaseline(jobState);
                                                 const processedRaw = total ?? 0;
-                                                const processed = dedupedTotal ?? processedRaw;
-                                                const found = dedupedTotal ? Math.min(throughputNum ?? 0, dedupedTotal) : (throughputNum ?? 0);
+                                                const processed = processedRaw > 0 ? processedRaw : (dedupedTotal ?? 0);
+                                                const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
                                                 const cost = summary?.cost || stats?.cost;
                                                 heroNumber = found;
                                                 heroLabel = "Found";
@@ -3233,10 +3293,10 @@ export default function ClientPage() {
                                                 const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
                                                 const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
                                                 const verified = total ?? 0;
-                                                heroNumber = safe;
-                                                heroLabel = "Safe";
+                                                heroNumber = verified;
+                                                heroLabel = "Verfified";
                                                 const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
-                                                subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
+                                                subtext = safe > 0 ? `${safe.toLocaleString()} safe${riskyText}` : "Awaiting...";
                                             } else if (stageKey === "personalization") {
                                                 const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
                                                 const candidates = total ?? 0;
@@ -3485,7 +3545,9 @@ export default function ClientPage() {
                                                                     {/* Pipeline flow summary */}
                                                                     {(() => {
                                                                         const foundersFound = deriveStageTotals(job.stages.founders).throughputNum ?? 0;
-                                                                        const foundersProcessed = deriveStageTotals(job.stages.founders).total ?? 0;
+                                                                        const dedupedTotal = deriveDedupedDomainBaseline(job);
+                                                                        const foundersProcessedRaw = deriveStageTotals(job.stages.founders).total ?? 0;
+                                                                        const foundersProcessed = foundersProcessedRaw > 0 ? foundersProcessedRaw : (dedupedTotal ?? 0);
                                                                         const emailsFound = (job.stages.emailDiscovery?.summary as any)?.Found ?? (job.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(job.stages.emailDiscovery).throughputNum ?? 0;
                                                                         const safe = (job.stages.verification?.summary as any)?.Valid ?? (job.stages.verification?.summary as any)?.valid ?? 0;
                                                                         const personalized = (job.stages.personalization?.summary as any)?.Personalized ?? (job.stages.personalization?.summary as any)?.personalized ?? (job.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
@@ -3532,9 +3594,22 @@ export default function ClientPage() {
                                                                             let subtext = "";
                                                                             let costFooter = "";
                                                                             
-                                                                            if (stageKey === "founders") {
-                                                                                const found = throughputNum ?? 0;
-                                                                                const processed = total ?? 0;
+                                                                            if (stageKey === "domainPrep") {
+                                                                                const checked = (summary?.checked as number) ?? (summary?.normalized as number) ?? total ?? 0;
+                                                                                const live = (summary?.live as number) ?? 0;
+                                                                                const dead = (summary?.dead as number) ?? 0;
+                                                                                const unknown = (summary?.unknown as number) ?? 0;
+                                                                                const processable = (summary?.processable as number) ?? throughputNum ?? live;
+                                                                                heroNumber = processable;
+                                                                                heroLabel = "Processable";
+                                                                                subtext = checked > 0
+                                                                                    ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
+                                                                                    : "Awaiting...";
+                                                                            } else if (stageKey === "founders") {
+                                                                                const dedupedTotal = deriveDedupedDomainBaseline(job);
+                                                                                const processedRaw = total ?? 0;
+                                                                                const processed = processedRaw > 0 ? processedRaw : (dedupedTotal ?? 0);
+                                                                                const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
                                                                                 const cost = summary?.cost || stats?.cost;
                                                                                 heroNumber = found;
                                                                                 heroLabel = "Found";
@@ -4287,11 +4362,17 @@ export default function ClientPage() {
                                                             }}>{displayEmail(lead.email, lead.status)}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
-                                                                maxWidth: '140px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{displayEmailStatus(lead.status)}</td>
+                                                                minWidth: '140px'
+                                                            }}>
+                                                                {(() => {
+                                                                    const meta = getLeadStatusChipMeta(lead.status);
+                                                                    return (
+                                                                        <span className={`lead-pastel-chip lead-pastel-chip--status-${meta.variant}`}>
+                                                                            {meta.label}
+                                                                        </span>
+                                                                    );
+                                                                })()}
+                                                            </td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
                                                                 maxWidth: '220px',
@@ -4301,11 +4382,29 @@ export default function ClientPage() {
                                                             }}>{lead.domain || '—'}</td>
                                                             <td style={{
                                                                 padding: '0.75rem 1rem',
-                                                                maxWidth: '220px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{getCampaignNamesForLead(lead).join(', ') || '—'}</td>
+                                                                minWidth: '200px'
+                                                            }}>
+                                                                {(() => {
+                                                                    const names = getCampaignNamesForLead(lead);
+                                                                    if (!names.length) return '—';
+                                                                    const visibleNames = names.slice(0, 2);
+                                                                    const hiddenCount = names.length - visibleNames.length;
+                                                                    return (
+                                                                        <div className="lead-pastel-chip-list">
+                                                                            {visibleNames.map((name, chipIndex) => (
+                                                                                <span key={`${name}-${chipIndex}`} className="lead-pastel-chip lead-pastel-chip--campaign">
+                                                                                    {name}
+                                                                                </span>
+                                                                            ))}
+                                                                            {hiddenCount > 0 && (
+                                                                                <span className="lead-pastel-chip lead-pastel-chip--campaign-more">
+                                                                                    +{hiddenCount}
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                })()}
+                                                            </td>
                                                         </tr>
                                                     ))}
                                                 </tbody>
@@ -5422,9 +5521,13 @@ export default function ClientPage() {
                                             onChange={(e) => setDedupeStrategy(e.target.value as 'skip' | 'include')}
                                         >
                                             <option value="skip">Skip domains already tried</option>
-                                            <option value="include">Re-process domains</option>
+                                            <option value="include">Re-process existing domains (merge non-empty updates)</option>
                                         </select>
-                                        <span className="settings-field__hint">Deduplication is scoped to this client.</span>
+                                        <span className="settings-field__hint">
+                                            {dedupeStrategy === 'include'
+                                                ? 'Existing leads are reprocessed and only non-empty incoming fields are merged into SQL.'
+                                                : 'Deduplication is scoped to this client.'}
+                                        </span>
                                     </label>
 
                                     <div style={{

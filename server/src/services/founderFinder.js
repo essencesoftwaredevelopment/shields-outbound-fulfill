@@ -460,7 +460,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                                 fatalQuotaError = fatalQuotaError || err;
                                 throw err;
                             }
-                            name = 'Not Found';
+                            throw new Error(`Founder lookup failed for ${domain}: ${err?.message || err}`);
                         }
                     }
 

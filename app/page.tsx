@@ -5,7 +5,6 @@ import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { createPortal } from "react-dom";
 import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, onSnapshot } from "firebase/firestore";
 import { getIdToken, signOut } from "firebase/auth";
-import { firebaseAuth } from "@/lib/firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
 import { firestore } from "@/lib/firebase/firestore";
 import { createPipelineJob, getJobResultUrl, getJobStreamUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
@@ -110,8 +109,9 @@ function HomeContent() {
   const [jobClientId, setJobClientId] = useState<string>("");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVisible, setToastVisible] = useState(false);
-  const [clients, setClients] = useState<Array<{ id: string; name: string; totalLeads?: number }>>([]);
-  const [companiesCount, setCompaniesCount] = useState<number>(0);
+  const [clients, setClients] = useState<Array<{ id: string; name: string }>>([]);
+  const [companyCountsByClient, setCompanyCountsByClient] = useState<Record<string, number>>({});
+  const [companyCountsLoadingByClient, setCompanyCountsLoadingByClient] = useState<Record<string, boolean>>({});
   const shouldShowKeys = searchParams?.get("showKeys") === "1";
 
   const showToast = useCallback((message: string) => {
@@ -164,49 +164,146 @@ function HomeContent() {
     }
   }, [loading, user, router]);
 
-  // Fetch total companies count from SQL database
+  // Fetch SQL company counts per client slug
   useEffect(() => {
-    if (!user) {
-      setCompaniesCount(0);
+    if (!user || clients.length === 0) {
+      setCompanyCountsByClient({});
+      setCompanyCountsLoadingByClient({});
       return;
     }
-    
+
     let cancelled = false;
-    
+
     (async () => {
       try {
-        const currentUser = firebaseAuth.currentUser;
-        const idToken = currentUser ? await getIdToken(currentUser) : null;
+        const idToken = await getIdToken(user);
         if (!idToken || cancelled) return;
-        
-        const url = `${getPipelineBaseUrl()}/api/stats/companies-count`;
-        console.log('🔍 Fetching companies count from:', url);
-        
-        const response = await fetch(
-          url,
-          {
-            headers: { 
-              'Authorization': `Bearer ${idToken}`,
-              'Content-Type': 'application/json'
-            }
+
+        const clientRows = clients.filter((client) => client.id);
+        if (clientRows.length === 0) {
+          if (!cancelled) {
+            setCompanyCountsByClient({});
+            setCompanyCountsLoadingByClient({});
           }
+          return;
+        }
+
+        if (!cancelled) {
+          const loadingByClient = clientRows.reduce<Record<string, boolean>>((acc, client) => {
+            acc[client.id] = true;
+            return acc;
+          }, {});
+          setCompanyCountsByClient({});
+          setCompanyCountsLoadingByClient(loadingByClient);
+        }
+
+        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+        const readJsonSafely = async (response: Response) => {
+          try {
+            return await response.json();
+          } catch {
+            return null;
+          }
+        };
+
+        const entries = await Promise.all(
+          clientRows.map(async (client) => {
+            let authToken = idToken;
+            const params = new URLSearchParams({
+              clientId: client.id,
+              clientName: client.name,
+            }).toString();
+            const url = `${getPipelineBaseUrl()}/api/stats/companies-count?${params}`;
+
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              try {
+                console.log("[home-company-counts] requesting", {
+                  clientId: client.id,
+                  clientName: client.name,
+                  attempt,
+                  uid: user.uid,
+                });
+
+                const response = await fetch(url, {
+                  headers: {
+                    Authorization: `Bearer ${authToken}`,
+                    "Content-Type": "application/json",
+                  },
+                  cache: "no-store",
+                });
+                const payload = await readJsonSafely(response);
+
+                console.log("[home-company-counts] response", {
+                  clientId: client.id,
+                  status: response.status,
+                  ok: response.ok,
+                  payload,
+                });
+
+                if (response.ok) {
+                  return [client.id, Number((payload as { count?: number } | null)?.count) || 0] as const;
+                }
+
+                if (response.status === 401 && attempt < 3) {
+                  authToken = await getIdToken(user, true);
+                  continue;
+                }
+
+                if (attempt < 3) {
+                  await delay(400 * attempt);
+                  continue;
+                }
+              } catch (error) {
+                console.error("[home-company-counts] request error", {
+                  clientId: client.id,
+                  attempt,
+                  error,
+                });
+
+                if (attempt < 3) {
+                  await delay(400 * attempt);
+                  continue;
+                }
+              }
+            }
+
+            return [client.id, 0] as const;
+          }),
         );
-        
-        console.log('📊 Companies count response:', response.status, response.ok);
-        
-        if (response.ok && !cancelled) {
-          const data = await response.json();
-          console.log('✅ Companies count data:', data);
-          setCompaniesCount(data.count || 0);
+
+        if (!cancelled) {
+          const counts = entries.reduce<Record<string, number>>((acc, [clientId, count]) => {
+            acc[clientId] = count;
+            return acc;
+          }, {});
+          const loadingByClient = clientRows.reduce<Record<string, boolean>>((acc, client) => {
+            acc[client.id] = false;
+            return acc;
+          }, {});
+          console.log("[home-company-counts] final counts", {
+            uid: user.uid,
+            counts,
+          });
+          setCompanyCountsByClient(counts);
+          setCompanyCountsLoadingByClient(loadingByClient);
         }
       } catch (error) {
-        console.error('Failed to fetch companies count:', error);
-        if (!cancelled) setCompaniesCount(0);
+        console.error("Failed to fetch company counts:", error);
+        if (!cancelled) {
+          const loadingByClient = clients.reduce<Record<string, boolean>>((acc, client) => {
+            acc[client.id] = false;
+            return acc;
+          }, {});
+          setCompanyCountsByClient({});
+          setCompanyCountsLoadingByClient(loadingByClient);
+        }
       }
     })();
-    
-    return () => { cancelled = true; };
-  }, [user]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clients, user]);
 
   // Resolve client name for current job by looking up clients list or fetching the doc
   useEffect(() => {
@@ -243,6 +340,8 @@ function HomeContent() {
       setVaultLoading(false);
       setApiKeys(createEmptyKeys());
       setLastSavedKeys(createEmptyKeys());
+      setCompanyCountsByClient({});
+      setCompanyCountsLoadingByClient({});
       setClients([]);
       return;
     }
@@ -292,7 +391,6 @@ function HomeContent() {
         const rows = snap.docs.map((d) => ({
           id: d.id,
           name: (d.data().name as string) || d.id,
-          totalLeads: (d.data().totalLeads as number) || 0
         }));
         if (!cancelled) setClients(rows);
       } catch {
@@ -306,7 +404,6 @@ function HomeContent() {
       const rows = snap.docs.map((d) => ({
         id: d.id,
         name: (d.data().name as string) || d.id,
-        totalLeads: (d.data().totalLeads as number) || 0
       }));
       setClients(rows);
     }, () => {
@@ -405,7 +502,6 @@ function HomeContent() {
         setClients(snap.docs.map((d) => ({
           id: d.id,
           name: (d.data().name as string) || d.id,
-          totalLeads: (d.data().totalLeads as number) || 0
         })));
       } catch { }
 
@@ -436,8 +532,8 @@ function HomeContent() {
       <section className="hero-panel">
         <div className="hero-panel__layout">
           <div className="hero-panel__content">
-            <p className="eyebrow">Good evening, Jacques</p>
-            <h1 className="hero-panel__title">ESSENCE Outbound</h1>
+            <p className="eyebrow">Good evening</p>
+            <h1 className="hero-panel__title">{user?.uid === 'Z7pPTvd8FDWlNEsSrlayVM2Md3G3' ? 'Shields Outbound' : 'ESSENCE Outbound'}</h1>
             <p className="hero-panel__description">
               Kick off a fresh outbound motion.
               Pick a niche preset, drop your CSV, and we&apos;ll do the rest.
@@ -481,7 +577,15 @@ function HomeContent() {
                   <div className="niche-card__text">
                     <p className="niche-card__label">{client.name}</p>
                     <p className="niche-card__detail">
-                      <strong className="card-big-data">{companiesCount.toLocaleString()}</strong>
+                      {companyCountsLoadingByClient[client.id] ? (
+                        <span
+                          className="card-big-data card-big-data--loading spinner"
+                          aria-label="Loading company count"
+                          role="status"
+                        />
+                      ) : (
+                        <strong className="card-big-data">{(companyCountsByClient[client.id] || 0).toLocaleString()}</strong>
+                      )}
                       <br />
                       companies in database
                     </p>

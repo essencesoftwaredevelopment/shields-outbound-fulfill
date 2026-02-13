@@ -548,6 +548,84 @@ body {
   cursor: not-allowed;
 }
 
+.lead-pastel-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.lead-pastel-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 100%;
+  padding: 0.2rem 0.65rem;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lead-pastel-chip--status-valid {
+  color: #86efac;
+  background: rgba(134, 239, 172, 0.14);
+  border-color: rgba(134, 239, 172, 0.42);
+}
+
+.lead-pastel-chip--status-valid-risky {
+  color: #fcd34d;
+  background: rgba(252, 211, 77, 0.14);
+  border-color: rgba(252, 211, 77, 0.42);
+}
+
+.lead-pastel-chip--status-invalid {
+  color: #fda4af;
+  background: rgba(253, 164, 175, 0.14);
+  border-color: rgba(253, 164, 175, 0.42);
+}
+
+.lead-pastel-chip--status-not-found {
+  color: #cbd5e1;
+  background: rgba(203, 213, 225, 0.12);
+  border-color: rgba(203, 213, 225, 0.35);
+}
+
+.lead-pastel-chip--status-not-run {
+  color: #bfdbfe;
+  background: rgba(191, 219, 254, 0.14);
+  border-color: rgba(191, 219, 254, 0.42);
+}
+
+.lead-pastel-chip--status-skipped {
+  color: #ddd6fe;
+  background: rgba(221, 214, 254, 0.14);
+  border-color: rgba(221, 214, 254, 0.42);
+}
+
+.lead-pastel-chip--status-default {
+  color: #e5e7eb;
+  background: rgba(229, 231, 235, 0.12);
+  border-color: rgba(229, 231, 235, 0.3);
+}
+
+.lead-pastel-chip--campaign {
+  color: #a7f3d0;
+  background: rgba(167, 243, 208, 0.12);
+  border-color: rgba(167, 243, 208, 0.35);
+  max-width: 200px;
+}
+
+.lead-pastel-chip--campaign-more {
+  color: #d1d5db;
+  background: rgba(209, 213, 219, 0.12);
+  border-color: rgba(209, 213, 219, 0.3);
+}
+
 .pipeline-panel__log-stream {
   max-height: 280px;
   overflow-y: auto;
@@ -1201,6 +1279,16 @@ body {
   font-size: 2rem;
   font-weight: 700;
   color: #8ac480;
+}
+
+.card-big-data--loading {
+  display: inline-block;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 50%;
+  border: 2px solid rgba(138, 196, 128, 0.25);
+  border-top-color: #8ac480;
+  vertical-align: middle;
 }
 
 .client-edit-btn:hover {

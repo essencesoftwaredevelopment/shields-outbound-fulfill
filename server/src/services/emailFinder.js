@@ -379,10 +379,13 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
         if (!force && pendingBatch.length < BATCH_SIZE) return;
         const batch = pendingBatch.splice(0, pendingBatch.length);
         if (batch.length === 0) return;
-        flushPromise = flushPromise.then(() => onBatch(batch)).catch((err) => {
-            console.error('[EMAIL_FINDER] onBatch error:', err?.message || err);
-        });
-        await flushPromise;
+        flushPromise = flushPromise.then(() => onBatch(batch));
+        try {
+            await flushPromise;
+        } catch (err) {
+            controller.abort();
+            throw new Error(`Email batch upsert failed: ${err?.message || err}`);
+        }
     };
 
     // Pre-fill rows that should be skipped or error out without hitting the API
@@ -453,10 +456,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
                     controller.abort();
                     throw error; // Re-throw to stop execution
                 }
-                // Other errors - record as error status for this row
-                console.error(`[EMAIL_FINDER] Error looking up ${domain}:`, error.message);
-                email = '';
-                status = `error: ${error.message}`;
+                throw new Error(`Email lookup failed for ${domain}: ${error?.message || error}`);
             }
 
             if (email) {

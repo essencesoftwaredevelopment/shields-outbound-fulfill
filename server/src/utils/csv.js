@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { parse as csvParse } from 'csv-parse';
 import { VALID_UPLOAD_STATUSES } from './constants.js';
+import { normalizeDomain } from './domain.js';
 
 export async function readCsvToArray(filePath) {
     const rows = [];
@@ -23,7 +24,7 @@ export async function buildFoundersCsvFromInput({ filteredDomainsPath, originalI
         fs.createReadStream(filteredDomainsPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', row => {
-                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                const domain = normalizeDomain(row[domainCol] || row.domain);
                 if (domain) domainSet.add(domain);
             })
             .on('end', resolve)
@@ -35,7 +36,7 @@ export async function buildFoundersCsvFromInput({ filteredDomainsPath, originalI
         fs.createReadStream(originalInputPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', row => {
-                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                const domain = normalizeDomain(row[domainCol] || row.domain);
                 const founder = String(row[founderCol] || row.founder_name || row.founder || '').trim();
                 if (domain) domainToFounder.set(domain, founder);
             })
@@ -63,7 +64,7 @@ export async function buildEmailsCsvFromInput({ filteredDomainsPath, originalInp
         fs.createReadStream(filteredDomainsPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', row => {
-                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                const domain = normalizeDomain(row[domainCol] || row.domain);
                 if (domain) domainSet.add(domain);
             })
             .on('end', resolve)
@@ -75,7 +76,7 @@ export async function buildEmailsCsvFromInput({ filteredDomainsPath, originalInp
         fs.createReadStream(originalInputPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', row => {
-                const domain = String(row[domainCol] || row.domain || '').toLowerCase();
+                const domain = normalizeDomain(row[domainCol] || row.domain);
                 const founder = String(row[founderCol] || row.founder_name || row.founder || '').trim();
                 const email = String(row[emailCol] || row.email || row.email_address || row.contact_email || row.mail || '').trim();
                 if (domain) {
@@ -114,37 +115,33 @@ export async function buildUnifiedRows({ jobId, scope = 'all', resolveJobPaths }
     if (fs.existsSync(personalizedPath)) {
         const personalizedRows = await readCsvToArray(personalizedPath);
         personalizedRows.forEach((row) => {
-            const domainKey = String(row.domain || '').toLowerCase();
+            const domainKey = normalizeDomain(row.domain);
             if (domainKey) personalizedByDomain.set(domainKey, row);
         });
     }
 
     const unified = finalRows.map((r) => {
-        const domainKey = String(r.domain || '').toLowerCase();
+        const domainKey = normalizeDomain(r.domain);
         const founder = String(r.founder_name || '').trim();
         const parts = founder.split(/\s+/);
         const first_name = parts[0] || '';
         const last_name = parts.length > 1 ? parts.slice(1).join(' ') : '';
         const personal = personalizedByDomain.get(domainKey) || {};
         return {
-            domain: r.domain || '',
+            domain: domainKey || (r.domain || ''),
             founder_name: r.founder_name || '',
             email: r.email || '',
             email_status: r.email_status || r.lookup_status || '',
             first_name,
             last_name,
-            personalization: personal.first_line || personal.personalization_first_line || '',
-            personalization_first_line: personal.first_line || personal.personalization_first_line || '',
-            personalization_title: personal.title || personal.personalization_title || '',
-            personalization_url: personal.url || personal.personalization_url || '',
-            product_title: personal.title || personal.personalization_title || ''
+            personalization: personal.first_line || personal.personalization_first_line || ''
         };
     });
 
     if (scope === 'valid') {
         return unified.filter(r => {
             const hasValidStatus = VALID_UPLOAD_STATUSES.has((r.email_status || '').toLowerCase());
-            const personalizationNotInvalid = (r.personalization_first_line || '').toLowerCase() !== 'invalid';
+            const personalizationNotInvalid = (r.personalization || '').toLowerCase() !== 'invalid';
             return hasValidStatus && personalizationNotInvalid;
         });
     }

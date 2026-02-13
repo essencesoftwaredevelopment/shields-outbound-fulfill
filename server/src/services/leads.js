@@ -20,6 +20,7 @@
 import fs from 'fs';
 import { parse as csvParse } from 'csv-parse';
 import { pool, withTx, batchUpsertCompanies, batchUpsertContacts, writeCheckpoint, getExistingDomainsSet, markEmailsContacted } from '../lib/db.js';
+import { normalizeDomain } from '../utils/domain.js';
 import * as queries from './db/queries.js';
 
 /**
@@ -47,7 +48,7 @@ function normalizeEmailStatus(rawStatus) {
  * Handles multiple CSV formats (founders, emails, verification, personalization)
  */
 function buildContactPayload(row, type) {
-    const domain = String(row.domain || '').trim().toLowerCase();
+    const domain = normalizeDomain(row.domain);
     const founderName = String(row.founder_name || row.full_name || row.name || '').trim() || null;
     const confidence = row.confidence ? Number(row.confidence) : null;
     const email = String(row.email || '').trim() || null;
@@ -182,8 +183,9 @@ async function upsertContact({ agencyId, companyId, roleType = 'founder', fullNa
  * Legacy function kept for backward compatibility
  */
 export async function upsertLead(agencyId, domain, data) {
-    if (!agencyId || !domain) return;
-    const company = await queries.upsertCompany(agencyId, domain.toLowerCase());
+    const normalizedDomain = normalizeDomain(domain);
+    if (!agencyId || !normalizedDomain) return;
+    const company = await queries.upsertCompany(agencyId, normalizedDomain);
     const fullName = typeof data?.name === 'string' ? data.name : null;
     const email = typeof data?.email === 'string' ? data.email : null;
     await upsertContact({ agencyId, companyId: company.id, roleType: 'founder', fullName, email });
@@ -357,8 +359,8 @@ export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId
         fs.createReadStream(domainsCsvPath)
             .pipe(csvParse({ columns: true, trim: true }))
             .on('data', (row) => {
-                const domain = String(row[domainColumn] || row.domain || '').trim();
-                if (domain) domains.push(domain.toLowerCase());
+                const domain = normalizeDomain(row[domainColumn] || row.domain);
+                if (domain) domains.push(domain);
             })
             .on('end', resolve)
             .on('error', reject);
