@@ -3771,37 +3771,33 @@ export default function ClientPage() {
 
                                                             {/* Manual Upload Button - Only for completed jobs */}
                                                             {job.status === 'completed' && (
-                                                                <button
-                                                                    type="button"
-                                                                    onClick={(e) => {
-                                                                        e.stopPropagation();
-                                                                        handleOpenManualUpload(job);
-                                                                    }}
+                                                                <div
                                                                     style={{
-                                                                        width: '100%',
                                                                         marginTop: '1rem',
-                                                                        padding: '0.75rem 1rem',
-                                                                        fontSize: '0.85rem',
-                                                                        fontWeight: 600,
-                                                                        backgroundColor: '#2563eb',
-                                                                        color: 'white',
-                                                                        border: 'none',
-                                                                        borderRadius: '8px',
-                                                                        cursor: 'pointer',
-                                                                        transition: 'all 0.2s',
-                                                                        boxShadow: '0 2px 4px rgba(37, 99, 235, 0.2)'
-                                                                    }}
-                                                                    onMouseEnter={(e) => {
-                                                                        e.currentTarget.style.backgroundColor = '#1d4ed8';
-                                                                        e.currentTarget.style.boxShadow = '0 4px 8px rgba(37, 99, 235, 0.3)';
-                                                                    }}
-                                                                    onMouseLeave={(e) => {
-                                                                        e.currentTarget.style.backgroundColor = '#2563eb';
-                                                                        e.currentTarget.style.boxShadow = '0 2px 4px rgba(37, 99, 235, 0.2)';
+                                                                        display: 'flex',
+                                                                        justifyContent: 'flex-end'
                                                                     }}
                                                                 >
-                                                                    📝 Confirm Manual Upload to Instantly
-                                                                </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        className="primary-button"
+                                                                        onClick={(e) => {
+                                                                            e.stopPropagation();
+                                                                            handleOpenManualUpload(job);
+                                                                        }}
+                                                                        style={{
+                                                                            flex: '0 0 auto',
+                                                                            width: 'auto',
+                                                                            minWidth: '260px',
+                                                                            height: '40px',
+                                                                            minHeight: '40px',
+                                                                            fontSize: '0.8rem',
+                                                                            whiteSpace: 'nowrap'
+                                                                        }}
+                                                                    >
+                                                                        📝 Confirm Manual Upload to Instantly
+                                                                    </button>
+                                                                </div>
                                                             )}
 
                                                             {/* Delete button */}
