@@ -24,6 +24,61 @@
 
 import { pool } from '../../config/db.js';
 
+function safeDecodeURIComponent(value = '') {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function safeEncodeURIComponent(value = '') {
+    try {
+        return encodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function buildClientLookupVariants(clientName) {
+    const textVariants = new Set();
+    const slugVariants = new Set();
+    const compactVariants = new Set();
+
+    const addValue = (value) => {
+        const raw = String(value || '').trim();
+        if (!raw) return;
+
+        const decoded = safeDecodeURIComponent(raw);
+        const encodedRaw = safeEncodeURIComponent(raw);
+        const encodedDecoded = safeEncodeURIComponent(decoded);
+
+        const variants = [raw, decoded, encodedRaw, encodedDecoded]
+            .map((variant) => String(variant || '').trim().toLowerCase())
+            .filter(Boolean);
+
+        for (const variant of variants) {
+            textVariants.add(variant);
+
+            const slug = variant
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-+|-+$/g, '');
+            if (slug) slugVariants.add(slug);
+
+            const compact = variant.replace(/[^a-z0-9]+/g, '');
+            if (compact) compactVariants.add(compact);
+        }
+    };
+
+    addValue(clientName);
+
+    return {
+        textVariants: Array.from(textVariants),
+        slugVariants: Array.from(slugVariants),
+        compactVariants: Array.from(compactVariants)
+    };
+}
+
 /**
  * Get or create a client by name for an agency
  * Returns the numeric client ID
@@ -37,13 +92,41 @@ export async function getOrCreateClient(agencyId, clientName) {
         throw new Error('agencyId and clientName are required');
     }
 
+    const normalizedClientName = String(clientName).trim();
+    const variants = buildClientLookupVariants(normalizedClientName);
+
     // Try to find existing client
     const findQuery = `
-        SELECT id FROM clients
-        WHERE agency_id = $1 AND name = $2
+        WITH client_candidates AS (
+            SELECT
+                id,
+                LOWER(name) AS lower_name,
+                REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.') AS decoded_name,
+                REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g') AS slug_name,
+                REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '', 'g') AS compact_name,
+                REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '-', 'g') AS decoded_slug_name,
+                REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '', 'g') AS decoded_compact_name
+            FROM clients
+            WHERE agency_id = $1
+        )
+        SELECT id
+        FROM client_candidates
+        WHERE
+            lower_name = ANY($2::text[])
+            OR decoded_name = ANY($2::text[])
+            OR slug_name = ANY($3::text[])
+            OR decoded_slug_name = ANY($3::text[])
+            OR compact_name = ANY($4::text[])
+            OR decoded_compact_name = ANY($4::text[])
+        ORDER BY id ASC
         LIMIT 1
     `;
-    const findResult = await pool.query(findQuery, [agencyId, clientName]);
+    const findResult = await pool.query(findQuery, [
+        agencyId,
+        variants.textVariants,
+        variants.slugVariants,
+        variants.compactVariants
+    ]);
     
     if (findResult.rows.length > 0) {
         return findResult.rows[0].id;
@@ -55,7 +138,7 @@ export async function getOrCreateClient(agencyId, clientName) {
         VALUES ($1, $2)
         RETURNING id
     `;
-    const insertResult = await pool.query(insertQuery, [agencyId, clientName]);
+    const insertResult = await pool.query(insertQuery, [agencyId, normalizedClientName]);
     return insertResult.rows[0].id;
 }
 

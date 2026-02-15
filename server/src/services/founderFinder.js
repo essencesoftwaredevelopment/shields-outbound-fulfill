@@ -29,6 +29,36 @@ function jitter(ms) {
     return ms + Math.floor(Math.random() * 250);
 }
 
+function truncateForLog(value, maxLen = 320) {
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    if (!text) return '';
+    return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
+}
+
+function getHttpErrorStatus(err) {
+    return err?.response?.status ?? err?.status ?? err?.statusCode ?? null;
+}
+
+function formatRequestError(err, { includePayload = true, payloadMaxLen = 320 } = {}) {
+    const status = getHttpErrorStatus(err);
+    const payload = err?.response?.data;
+    const payloadErr = payload?.error || err?.error;
+    const message = payload?.message || payloadErr?.message || err?.message || String(err);
+    const type = payloadErr?.type || err?.type;
+    const code = payloadErr?.code || err?.code;
+    const pieces = [];
+
+    if (status) pieces.push(`HTTP ${status}`);
+    if (message) pieces.push(String(message).trim());
+    if (type) pieces.push(`type=${type}`);
+    if (code) pieces.push(`code=${code}`);
+    if (includePayload && payload) {
+        pieces.push(`payload=${truncateForLog(payload, payloadMaxLen)}`);
+    }
+
+    return pieces.join(' | ');
+}
+
 function chunkWithIndex(arr, size) {
     const chunks = [];
     for (let i = 0; i < arr.length; i += size) {
@@ -108,7 +138,7 @@ async function withRetry(fn, label, shouldBackoff = () => true, logger = () => {
         try {
             return await fn();
         } catch (err) {
-            const status = err?.response?.status ?? err?.status ?? err?.statusCode;
+            const status = getHttpErrorStatus(err);
             const payload = err?.response?.data;
             const payloadErr = payload?.error || err?.error;
             const dataMsg = payload?.message || payloadErr?.message;
@@ -120,22 +150,19 @@ async function withRetry(fn, label, shouldBackoff = () => true, logger = () => {
 
             if (insufficientQuota) {
                 err.isQuotaExceeded = true;
-                logger(`${label} aborted: ${status || ''} ${msg}`);
+                logger(`${label} aborted: ${formatRequestError(err)}`);
                 throw err;
             }
 
             if (attempt === MAX_RETRIES || !shouldBackoff(status, err)) {
-                // Log detailed error information for debugging
-                const errorDetails = payload ? JSON.stringify(payload) : msg;
-                logger(`${label} failed after ${attempt} attempts: ${status || ''} ${msg}`);
-                if (payload) {
-                    logger(`${label} error details: ${errorDetails}`);
-                }
+                const detailed = formatRequestError(err);
+                logger(`${label} failed after ${attempt} attempts: ${detailed}`);
+                err.message = `${label} failed: ${formatRequestError(err, { includePayload: false })}`;
                 throw err;
             }
 
             const backoff = jitter(BASE_DELAY_MS * Math.pow(2, attempt - 1));
-            logger(`${label} error, retry ${attempt} in ${backoff}ms: ${status || ''} ${msg}`);
+            logger(`${label} error, retry ${attempt} in ${backoff}ms: ${formatRequestError(err, { includePayload: false })}`);
             await sleep(backoff);
         }
     }
@@ -349,6 +376,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
     const aiTasks = [];
     let notFoundCount = 0;
     let foundCount = 0;
+    let errorCount = 0;
     let stageCost = 0;
     let serperCostTotal = 0;
     let openaiCostTotal = 0;
@@ -460,7 +488,18 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                                 fatalQuotaError = fatalQuotaError || err;
                                 throw err;
                             }
-                            throw new Error(`Founder lookup failed for ${domain}: ${err?.message || err}`);
+                            const status = getHttpErrorStatus(err);
+                            const recoverableClientError = status >= 400 && status < 500 && status !== 401 && status !== 403 && status !== 429;
+
+                            if (recoverableClientError) {
+                                errorCount++;
+                                log(`Founders: ${domain} lookup failed, defaulting to Not Found (${formatRequestError(err)})`);
+                                name = 'Not Found';
+                                tokensIn = 0;
+                                tokensOut = 0;
+                            } else {
+                                throw new Error(`Founder lookup failed for ${domain}: ${formatRequestError(err)}`);
+                            }
                         }
                     }
 
@@ -490,6 +529,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                                 'Processed': processed,
                                 'Found': foundCount,
                                 'Not Found': notFoundCount,
+                                'Errors': errorCount,
                                 'RPM': currentRpm,
                                 'Cost': `$${costNumber}`
                             }
@@ -536,6 +576,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
         processed: foundCount,
         'Found': foundCount,
         'Not Found': notFoundCount,
+        'Errors': errorCount,
         'Cost': `$${stageCost.toFixed(2)}`
     };
 

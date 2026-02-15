@@ -18,6 +18,79 @@ import { pool } from '../lib/db.js';
 
 const router = express.Router();
 
+function safeDecodeURIComponent(value = '') {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function safeEncodeURIComponent(value = '') {
+    try {
+        return encodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function buildClientMatchers(...values) {
+    const textVariants = new Set();
+    const slugVariants = new Set();
+    const compactVariants = new Set();
+
+    const addValue = (input) => {
+        const raw = String(input || '').trim();
+        if (!raw) return;
+
+        const decoded = safeDecodeURIComponent(raw);
+        const encodedRaw = safeEncodeURIComponent(raw);
+        const encodedDecoded = safeEncodeURIComponent(decoded);
+
+        const variants = [raw, decoded, encodedRaw, encodedDecoded]
+            .map((variant) => String(variant || '').trim().toLowerCase())
+            .filter(Boolean);
+
+        for (const variant of variants) {
+            textVariants.add(variant);
+
+            const slug = variant
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-+|-+$/g, '');
+            if (slug) slugVariants.add(slug);
+
+            const compact = variant.replace(/[^a-z0-9]+/g, '');
+            if (compact) compactVariants.add(compact);
+        }
+    };
+
+    values.forEach(addValue);
+
+    return {
+        textVariants: Array.from(textVariants),
+        slugVariants: Array.from(slugVariants),
+        compactVariants: Array.from(compactVariants),
+        sets: {
+            text: textVariants,
+            slug: slugVariants,
+            compact: compactVariants
+        }
+    };
+}
+
+function setsIntersect(leftSet, rightSet) {
+    for (const value of leftSet) {
+        if (rightSet.has(value)) return true;
+    }
+    return false;
+}
+
+function clientMatchersOverlap(left, right) {
+    return setsIntersect(left.sets.text, right.sets.text)
+        || setsIntersect(left.sets.slug, right.sets.slug)
+        || setsIntersect(left.sets.compact, right.sets.compact);
+}
+
 /**
  * GET /leads
  *
@@ -382,14 +455,14 @@ router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
         const agencyId = req.agencyId;
         const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
         const clientName = typeof req.query.clientName === 'string' ? req.query.clientName.trim() : '';
-        const normalizedSlug = clientSlug.toLowerCase().replace(/[^a-z0-9]+/g, '');
-        const normalizedName = clientName.toLowerCase().replace(/[^a-z0-9]+/g, '');
+        const matchers = buildClientMatchers(clientSlug, clientName);
         console.log('[stats/companies-count] request', {
             agencyId,
             clientSlug,
             clientName,
-            normalizedSlug,
-            normalizedName
+            textVariants: matchers.textVariants,
+            slugVariants: matchers.slugVariants,
+            compactVariants: matchers.compactVariants
         });
 
         if (clientSlug) {
@@ -399,8 +472,12 @@ router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
                         SELECT
                             id,
                             name,
+                            LOWER(name) AS lower_name,
+                            REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.') AS decoded_name,
                             REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g') AS slug_name,
-                            REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '', 'g') AS compact_name
+                            REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '', 'g') AS compact_name,
+                            REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '-', 'g') AS decoded_slug_name,
+                            REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '', 'g') AS decoded_compact_name
                         FROM clients
                         WHERE agency_id = $1
                     ),
@@ -408,17 +485,12 @@ router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
                         SELECT id, name
                         FROM client_candidates
                         WHERE
-                            ($2 <> '' AND (
-                                LOWER(name) = LOWER($2)
-                                OR slug_name = LOWER($2)
-                                OR ($4 <> '' AND compact_name LIKE '%' || $4 || '%')
-                            ))
-                            OR
-                            ($3 <> '' AND (
-                                LOWER(name) = LOWER($3)
-                                OR slug_name = LOWER($3)
-                                OR ($5 <> '' AND compact_name LIKE '%' || $5 || '%')
-                            ))
+                            lower_name = ANY($2::text[])
+                            OR decoded_name = ANY($2::text[])
+                            OR slug_name = ANY($3::text[])
+                            OR decoded_slug_name = ANY($3::text[])
+                            OR compact_name = ANY($4::text[])
+                            OR decoded_compact_name = ANY($4::text[])
                     )
                     SELECT
                         COUNT(co.id)::int AS count,
@@ -436,7 +508,7 @@ router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
                         ON co.client_id = mc.id
                        AND co.agency_id = $1
                 `,
-                [agencyId, clientSlug, clientName, normalizedSlug, normalizedName]
+                [agencyId, matchers.textVariants, matchers.slugVariants, matchers.compactVariants]
             );
 
             const matchedPayload = matchedResult.rows[0] || {};
@@ -467,8 +539,9 @@ router.get('/stats/companies-count', verifyFirebaseToken, async (req, res) => {
                     agencyId,
                     clientSlug,
                     clientName,
-                    normalizedSlug,
-                    normalizedName,
+                    textVariants: matchers.textVariants,
+                    slugVariants: matchers.slugVariants,
+                    compactVariants: matchers.compactVariants,
                     topClients: topClientsResult.rows
                 });
                 return res.json({
@@ -549,17 +622,17 @@ router.get('/stats/companies-counts', verifyFirebaseToken, async (req, res) => {
         const result = await pool.query(
             `
                 SELECT
-                    cl.name AS client_slug,
+                    cl.id,
+                    cl.name AS client_name,
                     COUNT(co.id)::int AS count
                 FROM clients cl
                 LEFT JOIN companies co
                     ON co.client_id = cl.id
                     AND co.agency_id = $1
                 WHERE cl.agency_id = $1
-                    AND cl.name = ANY($2::text[])
-                GROUP BY cl.name
+                GROUP BY cl.id, cl.name
             `,
-            [agencyId, clientSlugs]
+            [agencyId]
         );
 
         const counts = clientSlugs.reduce((acc, slug) => {
@@ -567,9 +640,44 @@ router.get('/stats/companies-counts', verifyFirebaseToken, async (req, res) => {
             return acc;
         }, {});
 
-        result.rows.forEach((row) => {
-            counts[row.client_slug] = Number(row.count) || 0;
-        });
+        const requestedMatchers = clientSlugs.map((slug) => ({
+            slug,
+            matchers: buildClientMatchers(slug)
+        }));
+        const sqlClients = result.rows.map((row) => ({
+            id: row.id,
+            name: row.client_name,
+            count: Number(row.count) || 0,
+            matchers: buildClientMatchers(row.client_name)
+        }));
+
+        for (const requested of requestedMatchers) {
+            let totalCount = 0;
+            for (const sqlClient of sqlClients) {
+                if (clientMatchersOverlap(requested.matchers, sqlClient.matchers)) {
+                    totalCount += sqlClient.count;
+                }
+            }
+            counts[requested.slug] = totalCount;
+        }
+
+        const unmatched = requestedMatchers
+            .filter((requested) => counts[requested.slug] === 0)
+            .map((requested) => requested.slug);
+        if (unmatched.length > 0) {
+            console.warn('[stats/companies-counts] unmatched slugs', {
+                agencyId,
+                unmatched,
+                topClients: sqlClients
+                    .sort((a, b) => b.count - a.count)
+                    .slice(0, 10)
+                    .map((client) => ({
+                        id: client.id,
+                        name: client.name,
+                        company_count: client.count
+                    }))
+            });
+        }
 
         res.json({ counts });
     } catch (error) {
