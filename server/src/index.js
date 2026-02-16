@@ -20,9 +20,13 @@ import clientsRouter from './routes/clients.js';
 import leadsRouter from './routes/leads.js';
 import webhooksRouter from './routes/webhooks.js';
 import domainsRouter from './routes/domains.js';
+import { startEmbeddedQueueWorker } from './worker/embeddedWorker.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
+const embeddedWorker = startEmbeddedQueueWorker({
+    enabled: process.env.DISABLE_EMBEDDED_QUEUE_WORKER !== 'true'
+});
 
 // Middleware
 app.use(cors());
@@ -85,4 +89,12 @@ app.listen(PORT, async () => {
     } catch (err) {
         console.error('Database connectivity check failed:', err.message);
     }
+});
+
+process.on('SIGINT', () => {
+    embeddedWorker?.stop();
+});
+
+process.on('SIGTERM', () => {
+    embeddedWorker?.stop();
 });

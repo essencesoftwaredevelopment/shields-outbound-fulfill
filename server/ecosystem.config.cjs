@@ -18,6 +18,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 4000,
+        DISABLE_EMBEDDED_QUEUE_WORKER: 'true',
         PGHOST: '127.0.0.1',
         PGPORT: 5432,
         PGDATABASE: 'shields_outbound',

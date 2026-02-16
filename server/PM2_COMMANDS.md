@@ -13,9 +13,11 @@ pm2 list
 
 # Restart the server
 pm2 restart shields-outbound-server
+pm2 restart shields-outbound-worker
 
 # Stop the server
 pm2 stop shields-outbound-server
+pm2 stop shields-outbound-worker
 
 # Save process list for auto-restart on reboot
 pm2 save

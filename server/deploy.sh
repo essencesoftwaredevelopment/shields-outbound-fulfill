@@ -17,12 +17,13 @@ sudo npm install -g pm2
 cd /root/shields-outbound/server
 npm install
 
-# 5. Start the server with PM2
+# 5. Start API + queue worker with PM2
 pm2 start src/index.js --name shields-outbound-server
+pm2 start src/worker/queueWorker.js --name shields-outbound-worker -i 2
 
 # 6. Save PM2 process list and configure startup
 pm2 save
 pm2 startup
 # The above command will output another command to run as root. Copy and run it.
 
-echo "Deployment complete. Use 'pm2 logs shields-outbound-server' to view logs."
+echo "Deployment complete. Use 'pm2 logs shields-outbound-server' and 'pm2 logs shields-outbound-worker' to view logs."
