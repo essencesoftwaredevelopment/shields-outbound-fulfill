@@ -37,13 +37,18 @@ async function processClaimedJob(claimed) {
     const jobId = claimed.jobId;
     console.log(`[worker:${WORKER_ID}] Processing queued job ${jobId}`);
     const exitCode = await runChild(jobId);
+    console.log(`[worker:${WORKER_ID}] Child finished for job ${jobId} with exit code ${exitCode}`);
 
     if (exitCode === 0) {
+        console.log(`[worker:${WORKER_ID}] Job ${jobId} completed successfully`);
         return;
     }
 
     const latest = await getQueueJob(jobId);
     if (!latest) return;
+    console.warn(
+        `[worker:${WORKER_ID}] Job ${jobId} child failed, latest queue status=${latest.status}, paused=${!!latest.control?.paused}, cancelled=${!!latest.control?.cancelled}`
+    );
     if (latest.status === 'completed' || latest.status === 'paused' || latest.status === 'cancelled' || latest.status === 'failed') {
         return;
     }
@@ -54,6 +59,9 @@ async function processClaimedJob(claimed) {
 }
 
 async function workerLoop() {
+    if (!process.env.PGPASSWORD) {
+        console.warn(`[worker:${WORKER_ID}] Warning: PGPASSWORD is empty; database auth may fail`);
+    }
     console.log(`[worker:${WORKER_ID}] Queue worker started (poll ${POLL_INTERVAL_MS}ms)`);
     while (!shutdownRequested) {
         try {
@@ -84,4 +92,3 @@ workerLoop().catch((error) => {
     console.error(`[worker:${WORKER_ID}] Fatal worker error:`, error);
     process.exit(1);
 });
-

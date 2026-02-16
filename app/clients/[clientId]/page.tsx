@@ -577,6 +577,7 @@ export default function ClientPage() {
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
     const [leadSearch, setLeadSearch] = useState<string>("");
+    const [jobIdFilter, setJobIdFilter] = useState<string>("");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
     const [founderFilter, setFounderFilter] = useState<string>("");
     const [emailFilter, setEmailFilter] = useState<string>("");
@@ -832,13 +833,13 @@ export default function ClientPage() {
     useEffect(() => {
         if (!user || !clientId) return;
         
-        // Reset and refetch when search, email status filter, founder filter, email filter, or campaign changes
+        // Reset and refetch when lead filters change
         setLeads([]);
         setLeadsCursor(0);
         setLeadsHasMore(true);
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, leadSearch, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
+    }, [user, clientId, leadSearch, jobIdFilter, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -1037,6 +1038,10 @@ export default function ClientPage() {
                 params.append('instantlyCampaignId', campaignFilterId);
             }
 
+            if (jobIdFilter.trim()) {
+                params.append('jobId', jobIdFilter.trim());
+            }
+
             // Send search term to backend for SQL filtering
             if (leadSearch.trim()) {
                 params.append('search', leadSearch.trim());
@@ -1116,7 +1121,7 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, leadSearch, leadsCursor, emailStatusFilter, founderFilter, emailFilter]);
+    }, [user, clientId, leadSearch, jobIdFilter, leadsCursor, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
 
     const loadMoreLeads = useCallback(() => {
         if (leadsLoading || !leadsHasMore) return;
@@ -3950,7 +3955,7 @@ export default function ClientPage() {
                                 marginTop: '2rem',
                                 flexWrap: 'wrap'
                             }}>
-                                {campaignFilterId || leadSearch.trim() ? (
+                                {campaignFilterId || leadSearch.trim() || jobIdFilter.trim() ? (
                                     <>
                                         <div className="metric-chip">
                                             <span className="metric-chip__label">Filtered Total</span>
@@ -4000,6 +4005,15 @@ export default function ClientPage() {
                                         value={leadSearch}
                                         onChange={(e) => setLeadSearch(e.target.value)}
                                         placeholder="Search by domain, email, or founder name"
+                                    />
+                                </label>
+                                <label className="settings-field" style={{ flex: '1 1 220px', minWidth: '220px' }}>
+                                    <span className="settings-field__label">Job ID</span>
+                                    <input
+                                        type="text"
+                                        value={jobIdFilter}
+                                        onChange={(e) => setJobIdFilter(e.target.value)}
+                                        placeholder="Filter by exact job ID"
                                     />
                                 </label>
                             </div>
@@ -4090,6 +4104,9 @@ export default function ClientPage() {
                                                 }
                                                 if (leadSearch.trim()) {
                                                     params.append('search', leadSearch.trim());
+                                                }
+                                                if (jobIdFilter.trim()) {
+                                                    params.append('jobId', jobIdFilter.trim());
                                                 }
                                                 if (founderFilter) {
                                                     params.append('founderFilter', founderFilter);
@@ -4208,7 +4225,7 @@ export default function ClientPage() {
                                         `📥 Export CSV (${allLeadsCached ? filteredLeads.length : displayedStats.total})`
                                     )}
                                 </button>
-                                {(founderFilter || emailFilter || emailStatusFilter || leadSearch.trim() || campaignFilterId) && (
+                                {(founderFilter || emailFilter || emailStatusFilter || leadSearch.trim() || jobIdFilter.trim() || campaignFilterId) && (
                                     <button
                                         type="button"
                                         className="secondary-button secondary-button--active"
@@ -4217,6 +4234,7 @@ export default function ClientPage() {
                                             setEmailFilter("");
                                             setEmailStatusFilter("");
                                             setLeadSearch("");
+                                            setJobIdFilter("");
                                             setCampaignFilterId("");
                                         }}
                                         style={{ flex: '0 0 auto' }}

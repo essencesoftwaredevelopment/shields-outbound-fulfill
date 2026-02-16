@@ -12,6 +12,10 @@ const sslConfig = sslEnabled
       }
     : undefined;
 
+if (!env.PGPASSWORD) {
+    console.warn('⚠️ [DB] PGPASSWORD is empty; PostgreSQL password authentication may fail');
+}
+
 export const pool = new Pool({
     host: env.PGHOST,
     port: env.PGPORT,

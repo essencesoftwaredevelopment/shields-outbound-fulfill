@@ -114,6 +114,7 @@ async function main() {
         console.error('runJobChild requires a jobId argument');
         process.exit(1);
     }
+    console.log(`[${jobId}] Child process starting`);
 
     const queueJob = await getQueueJob(jobId);
     if (!queueJob) {
@@ -128,11 +129,19 @@ async function main() {
 
     let job = null;
     try {
+        console.log(`[${jobId}] Queue job loaded (status=${queueJob.status}, attempts=${Number(queueJob.attempts || 0)})`);
         const apiKeys = await loadApiKeys(queueJob.uid);
+        console.log(`[${jobId}] API keys loaded`);
         job = buildRuntimeJob(queueJob, apiKeys);
+        console.log(
+            `[${jobId}] Runtime job built: skipFounderFinder=${job.skipFounderFinder}, skipEmailFinder=${job.skipEmailFinder}, ` +
+            `skipVerification=${job.skipVerification}, skipDomainCheck=${job.skipDomainCheck}, findFounder=${job.findFounder}`
+        );
         jobs.set(job.id, job);
 
+        console.log(`[${jobId}] Starting processJob`);
         await processJob(job);
+        console.log(`[${jobId}] processJob returned with status=${job.status}, paused=${job.paused}, cancelled=${job.cancelled}`);
 
         let finalStatus = 'failed';
         if (job.cancelled) {
@@ -146,6 +155,7 @@ async function main() {
         await setQueueStatus(jobId, finalStatus, {
             error: job.error || null
         });
+        console.log(`[${jobId}] Queue status updated to ${finalStatus}`);
 
         process.exit(finalStatus === 'failed' ? 1 : 0);
     } catch (error) {
@@ -153,6 +163,7 @@ async function main() {
         await setQueueStatus(jobId, 'failed', {
             error: error?.message || String(error)
         });
+        console.error(`[${jobId}] Queue status updated to failed`);
         process.exit(1);
     } finally {
         if (job?.id) {

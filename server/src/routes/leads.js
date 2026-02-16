@@ -105,6 +105,7 @@ function clientMatchersOverlap(left, right) {
  *   - fullName: Specific full name search (contains, for segments)
  *   - founderFilter: Filter founder existence (exists, not_found)
  *   - emailFilter: Filter email existence (exists, not_found)
+ *   - jobId: Filter by exact job_id
  *   - createdAfter: Filter leads created after date (ISO 8601 format)
  *   - createdBefore: Filter leads created before date (ISO 8601 format)
  *   - limit: Max results (default 200, max 500)
@@ -124,6 +125,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             fullName,
             founderFilter,
             emailFilter,
+            jobId,
             createdAfter,
             createdBefore,
             instantlyCampaignId,
@@ -217,6 +219,12 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         } else if (emailFilter === 'not_run') {
             // Email finder never ran (no status) AND no email exists (not backfilled from Instantly)
             whereClause += ` AND (c.email_status IS NULL OR c.email_status = '') AND (c.email IS NULL OR c.email = '')`;
+        }
+
+        if (typeof jobId === 'string' && jobId.trim()) {
+            whereClause += ` AND c.job_id = $${paramIndex}`;
+            params.push(jobId.trim());
+            paramIndex++;
         }
 
         // Date filters

@@ -269,7 +269,7 @@ function computeFounderCost({ tokensIn = 0, tokensOut = 0, pricing }) {
     return { serperCost, openaiCost, leadCost };
 }
 
-export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, log = () => { }, checkpointDir = null }) {
+export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, log = () => { }, checkpointDir = null, onBatch = null }) {
     const OPENAI_API_KEY = apiKeys.openai;
     const SERPER_API_KEY = apiKeys.serper;
 
@@ -378,6 +378,18 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
     let stageCost = 0;
     let serperCostTotal = 0;
     let openaiCostTotal = 0;
+    const pendingBatch = [];
+    let flushPromise = Promise.resolve();
+    const UPSERT_BATCH_SIZE = 100;
+
+    const flushBatch = async (force = false) => {
+        if (!onBatch) return;
+        if (!force && pendingBatch.length < UPSERT_BATCH_SIZE) return;
+        const batch = pendingBatch.splice(0, pendingBatch.length);
+        if (batch.length === 0) return;
+        flushPromise = flushPromise.then(() => onBatch(batch));
+        await flushPromise;
+    };
 
     const serperTasks = chunks.map((chunk, batchIdx) =>
         serperLimit(async () => {
@@ -542,6 +554,15 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
                     const safe = (name || '').replace(/"/g, '""');
                     writer.write(`${domain},"${safe}"\n`);
+
+                    if (onBatch) {
+                        pendingBatch.push({
+                            domain,
+                            founder_name: name,
+                            confidence: null
+                        });
+                        await flushBatch(false);
+                    }
                     
                     // Mark as processed and save checkpoint
                     processedDomains.add(domain);
@@ -555,8 +576,20 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
         })
     );
 
-    await Promise.all(serperTasks);
-    await Promise.all(aiTasks);
+    try {
+        await Promise.all(serperTasks);
+        await Promise.all(aiTasks);
+        await flushBatch(true);
+        await flushPromise;
+    } catch (err) {
+        try {
+            await flushBatch(true);
+            await flushPromise;
+        } catch {
+            // If flush also fails, preserve original error cause.
+        }
+        throw err;
+    }
 
     writer.end();
     await new Promise(res => writer.on('finish', res));

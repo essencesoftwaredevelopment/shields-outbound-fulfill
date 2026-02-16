@@ -17,9 +17,8 @@ sudo npm install -g pm2
 cd /root/shields-outbound/server
 npm install
 
-# 5. Start API + queue worker with PM2
-pm2 start src/index.js --name shields-outbound-server
-pm2 start src/worker/queueWorker.js --name shields-outbound-worker -i 2
+# 5. Start all PM2 apps via ecosystem config (loads DB env vars consistently)
+pm2 start ecosystem.config.cjs
 
 # 6. Save PM2 process list and configure startup
 pm2 save

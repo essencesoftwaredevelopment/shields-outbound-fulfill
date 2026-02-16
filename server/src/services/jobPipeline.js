@@ -603,11 +603,18 @@ async function processJob(job) {
                     apiKeys: job.apiKeys,
                     pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
                     log: (message, meta) => log(job, message, meta),
-                    checkpointDir: job.tmpDir
+                    checkpointDir: job.tmpDir,
+                    onBatch: async (rows) => {
+                        await upsertLeadRowsBatch({
+                            agencyId: job.uid,
+                            clientId: job.sqlClientId,
+                            rows,
+                            type: 'founders',
+                            jobId: job.id
+                        });
+                    }
                 })
             );
-            // Upsert leads with founder info (only when actually found)
-            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.founders, type: 'founders', jobId: job.id });
         }
         computeJobCost(job);
 
