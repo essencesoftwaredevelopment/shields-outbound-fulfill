@@ -6,6 +6,7 @@ import { claimNextQueuedJob, getQueueJob, setQueueStatus } from '../services/job
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const SERVER_CWD = path.resolve(__dirname, '../..');
 
 const WORKER_ID = `${os.hostname()}-${process.pid}`;
 const POLL_INTERVAL_MS = Math.max(parseInt(process.env.JOB_QUEUE_POLL_MS || '1500', 10), 250);
@@ -20,7 +21,8 @@ function runChild(jobId) {
     return new Promise((resolve) => {
         const childPath = path.join(__dirname, 'runJobChild.js');
         const child = fork(childPath, [jobId], {
-            stdio: 'inherit'
+            stdio: 'inherit',
+            cwd: SERVER_CWD
         });
 
         child.on('exit', (code) => {

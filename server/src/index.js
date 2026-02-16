@@ -24,9 +24,9 @@ import { startEmbeddedQueueWorker } from './worker/embeddedWorker.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
-const embeddedWorker = startEmbeddedQueueWorker({
-    enabled: process.env.DISABLE_EMBEDDED_QUEUE_WORKER !== 'true'
-});
+const JOB_EXECUTION_MODE = String(process.env.JOB_EXECUTION_MODE || 'inline').toLowerCase();
+const queueExecutionEnabled = JOB_EXECUTION_MODE === 'queue';
+let embeddedWorker = null;
 
 // Middleware
 app.use(cors());
@@ -82,7 +82,10 @@ app.get('/health', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
+    embeddedWorker = startEmbeddedQueueWorker({
+        enabled: process.env.DISABLE_EMBEDDED_QUEUE_WORKER !== 'true' && queueExecutionEnabled
+    });
     try {
         const ok = await testConnection();
         console.log(`Server running on port ${PORT} (db:${ok ? 'ok' : 'error'})`);
@@ -91,10 +94,18 @@ app.listen(PORT, async () => {
     }
 });
 
+server.on('error', (err) => {
+    console.error('Failed to start API server:', err?.message || err);
+    embeddedWorker?.stop();
+    process.exit(1);
+});
+
 process.on('SIGINT', () => {
     embeddedWorker?.stop();
+    server.close?.();
 });
 
 process.on('SIGTERM', () => {
     embeddedWorker?.stop();
+    server.close?.();
 });

@@ -4,6 +4,7 @@ import { fork } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const SERVER_CWD = path.resolve(__dirname, '../..');
 
 export function startEmbeddedQueueWorker(options = {}) {
     const enabled = options.enabled !== false;
@@ -19,6 +20,7 @@ export function startEmbeddedQueueWorker(options = {}) {
     const spawn = () => {
         child = fork(workerPath, [], {
             stdio: 'inherit',
+            cwd: SERVER_CWD,
             env: {
                 ...process.env,
                 QUEUE_WORKER_EMBEDDED: '1'

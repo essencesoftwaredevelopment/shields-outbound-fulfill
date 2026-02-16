@@ -1,6 +1,23 @@
 import dotenv from 'dotenv';
+import { existsSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SERVER_ROOT = path.resolve(__dirname, '../..');
+const ENV_PATHS = [
+    path.join(SERVER_ROOT, '.secrets', '.env'),
+    path.join(SERVER_ROOT, '.env')
+];
+
+// Load from server/.secrets/.env first, then fallback to server/.env.
+for (const envPath of ENV_PATHS) {
+    if (existsSync(envPath)) {
+        dotenv.config({ path: envPath });
+        break;
+    }
+}
 
 export const env = {
     PORT: process.env.PORT || 4000,

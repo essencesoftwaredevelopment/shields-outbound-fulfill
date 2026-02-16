@@ -20,7 +20,7 @@ import fs from 'fs';
 import { admin, firestore } from '../config/firebase.js';
 import { buildUnifiedRows } from '../utils/csv.js';
 import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaignLeadCount } from '../services/leads.js';
-import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
+import { createJobRecord, processJob, jobs, logJob, markCancelled, markPaused, markResumed, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
@@ -30,6 +30,8 @@ import { ensureJobControl, writeJobControl } from '../services/jobControl.js';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
 
 const router = express.Router();
+const JOB_EXECUTION_MODE = String(process.env.JOB_EXECUTION_MODE || 'inline').toLowerCase();
+const USE_QUEUE_EXECUTION = JOB_EXECUTION_MODE === 'queue';
 
 function buildQueuePayload(job) {
     return {
@@ -205,7 +207,7 @@ router.post('/jobs', uploadFields, async (req, res) => {
                 email: emailColumn
             }
         });
-        logJob(job, `Job queued with file ${job.fileName} for user ${uid}`);
+        logJob(job, `Job ${USE_QUEUE_EXECUTION ? 'queued' : 'started inline'} with file ${job.fileName} for user ${uid}`);
 
         // Calculate dedupe stats synchronously before responding
         try {
@@ -225,12 +227,14 @@ router.post('/jobs', uploadFields, async (req, res) => {
             // Continue with job processing even if deduplication fails
         }
 
-        await enqueuePipelineJob({
-            jobId: job.id,
-            uid,
-            clientId: job.clientId,
-            payload: buildQueuePayload(job)
-        });
+        if (USE_QUEUE_EXECUTION) {
+            await enqueuePipelineJob({
+                jobId: job.id,
+                uid,
+                clientId: job.clientId,
+                payload: buildQueuePayload(job)
+            });
+        }
 
         await firestore
             .collection('users').doc(uid)
@@ -249,7 +253,7 @@ router.post('/jobs', uploadFields, async (req, res) => {
             .collection('activeJob').doc('current')
             .set({
                 jobId: job.id,
-                status: 'queued',
+                status: USE_QUEUE_EXECUTION ? 'queued' : 'running',
                 error: null,
                 uploadError: null,
                 uploadMetrics: null,
@@ -257,8 +261,23 @@ router.post('/jobs', uploadFields, async (req, res) => {
             }, { merge: true });
 
         ensureJobControl(job.id, { paused: false, cancelled: false });
-        closeStreams(job);
-        jobs.delete(job.id);
+
+        if (USE_QUEUE_EXECUTION) {
+            closeStreams(job);
+            jobs.delete(job.id);
+        } else {
+            setImmediate(() => {
+                processJob(job)
+                    .catch((err) => {
+                        console.error(`[${job.id}] Inline job execution failed:`, err?.message || err);
+                    })
+                    .finally(() => {
+                        closeStreams(job);
+                        jobs.delete(job.id);
+                    });
+            });
+        }
+
         res.status(201).json({ jobId: job.id, job: serializeJob(job) });
     } catch (error) {
         console.error('Job creation error:', error);
