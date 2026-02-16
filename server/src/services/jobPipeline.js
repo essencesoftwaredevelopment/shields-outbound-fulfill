@@ -32,6 +32,10 @@ const FIRESTORE_MIN_INTERVAL_MS = 2000; // Minimum 2 seconds between updates
 const REALTIME_STAGE_MIN_INTERVAL_MS = 500; // Faster updates for realtime stages (emailDiscovery, verification)
 const DNS_QUERY_TIMEOUT_MS = 2500;
 const DNS_CHECK_CONCURRENCY = 25;
+const PLACEHOLDER_CONTACT_MAX_DOMAINS = Math.max(
+    0,
+    parseInt(process.env.PLACEHOLDER_CONTACT_MAX_DOMAINS || '5000', 10)
+);
 
 function shouldUpdateFirestore(job) {
     // Always update on status changes or completion
@@ -495,6 +499,10 @@ async function processJob(job) {
                 );
             }
 
+            // Keep this work inside Domain Prep so the next stage does not appear "stuck pending"
+            // while we bulk-upsert domains/placeholders for large uploads.
+            await upsertDomainsImmediately(job, preparedDomainsPath);
+
             return {
                 total: typeof job.dedupeStats?.total === 'number' ? job.dedupeStats.total : totalRows,
                 normalized,
@@ -511,9 +519,6 @@ async function processJob(job) {
         });
         filteredDomainsPath = preparedDomainsPath;
         job.paths.prepared = filteredDomainsPath;
-
-        // Immediately upsert domains into SQL so the UI reflects new companies right after upload
-        await upsertDomainsImmediately(job, filteredDomainsPath);
 
         // If no domains are left after domain prep, complete early.
         const processableCount = typeof job.dedupeStats?.processable === 'number'
@@ -866,17 +871,26 @@ async function upsertDomainsImmediately(job, domainsPath) {
 
     try {
         const start = Date.now();
+        log(job, `Domain upsert starting: ${uniqueDomains.length} unique domains`);
         await withTx(async (client) => {
             const payloads = uniqueDomains.map((domain) => ({ domain }));
             const domainMap = await batchUpsertCompanies(client, job.uid, job.sqlClientId, payloads);
 
             // Create placeholder contacts (role founder) so UI can show empty leads immediately
-            const contactPayloads = Array.from(domainMap.values()).map((companyId) => ({
-                company_id: companyId,
-                role_type: 'founder'
-            }));
-            if (contactPayloads.length) {
-                await batchUpsertContacts(client, job.uid, job.sqlClientId, contactPayloads);
+            // For very large jobs this can significantly delay Founder Finder start.
+            if (uniqueDomains.length <= PLACEHOLDER_CONTACT_MAX_DOMAINS) {
+                const contactPayloads = Array.from(domainMap.values()).map((companyId) => ({
+                    company_id: companyId,
+                    role_type: 'founder'
+                }));
+                if (contactPayloads.length) {
+                    await batchUpsertContacts(client, job.uid, job.sqlClientId, contactPayloads);
+                }
+            } else {
+                log(
+                    job,
+                    `Domain upsert: skipped placeholder contacts for ${uniqueDomains.length} domains (threshold ${PLACEHOLDER_CONTACT_MAX_DOMAINS})`
+                );
             }
         });
         log(job, `Domain upsert completed: ${uniqueDomains.length} domains in ${Date.now() - start}ms`);
