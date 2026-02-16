@@ -5,6 +5,7 @@
     "type": "module",
     "scripts": {
         "dev": "node src/index.js",
+        "worker": "node src/worker/queueWorker.js",
         "db:ping": "node scripts/db-ping.js"
     },
     "dependencies": {

@@ -3084,7 +3084,7 @@ export default function ClientPage() {
                                         )}
                                         {jobState && (
                                             <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem' }}>
-                                                Valid leads: {validLeadsCompleted.toLocaleString()}
+                                                Valid leads: {validLeadsCompleted.toLocaleString()} · Job ID: {jobState.id}
                                             </p>
                                         )}
                                         {jobState && (

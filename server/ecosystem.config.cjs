@@ -26,6 +26,23 @@ module.exports = {
         PGSSLMODE: 'disable'
       },
       autorestart: true
+    },
+    {
+      name: 'shields-outbound-worker',
+      script: 'src/worker/queueWorker.js',
+      cwd: '/root/shields-outbound/server',
+      instances: 2,
+      exec_mode: 'fork',
+      env: {
+        NODE_ENV: 'production',
+        PGHOST: '127.0.0.1',
+        PGPORT: 5432,
+        PGDATABASE: 'shields_outbound',
+        PGUSER: 'postgres',
+        PGPASSWORD: 'Rinn2015!',
+        PGSSLMODE: 'disable'
+      },
+      autorestart: true
     }
   ]
 };

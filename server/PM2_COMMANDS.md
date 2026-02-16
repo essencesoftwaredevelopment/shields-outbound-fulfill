@@ -2,9 +2,11 @@
 
 # Start the server
 pm2 start src/index.js --name shields-outbound-server
+pm2 start src/worker/queueWorker.js --name shields-outbound-worker -i 2
 
 # View logs
 pm2 logs shields-outbound-server
+pm2 logs shields-outbound-worker
 
 # List all processes
 pm2 list

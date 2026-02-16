@@ -131,8 +131,6 @@ class AdaptiveRateLimiter {
     }
 }
 
-let aiRateLimiter = null; // Will be initialized in runFounderFinder
-
 async function withRetry(fn, label, shouldBackoff = () => true, logger = () => { }) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
@@ -314,7 +312,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
     }
     
     // Initialize adaptive rate limiter with saved RPM if available
-    aiRateLimiter = new AdaptiveRateLimiter(120, AI_MAX_RPM, savedRpm);
+    const aiRateLimiter = new AdaptiveRateLimiter(120, AI_MAX_RPM, savedRpm);
     log(`Founders: initialized adaptive rate limiter at ${aiRateLimiter.getCurrentRpm()} RPM`);
 
     // Only delete output if starting fresh

@@ -20,14 +20,49 @@ import fs from 'fs';
 import { admin, firestore } from '../config/firebase.js';
 import { buildUnifiedRows } from '../utils/csv.js';
 import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaignLeadCount } from '../services/leads.js';
-import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, processJob, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
+import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
 import { TMP_ROOT } from '../config/paths.js';
+import { ensureJobControl, writeJobControl } from '../services/jobControl.js';
+import { deleteQueueJob, enqueuePipelineJob, getQueueJob, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
 
 const router = express.Router();
+
+function buildQueuePayload(job) {
+    return {
+        id: job.id,
+        fileName: job.fileName,
+        createdAt: job.createdAt,
+        dedupeStrategy: job.dedupeStrategy,
+        sqlClientId: job.sqlClientId,
+        skipFounderFinder: !!job.skipFounderFinder,
+        skipEmailFinder: !!job.skipEmailFinder,
+        skipVerification: !!job.skipVerification,
+        findFounder: job.findFounder !== false,
+        industry: job.industry || null,
+        nicheId: job.nicheId || null,
+        nicheLabel: job.nicheLabel || null,
+        personalizeFirstLine: !!job.personalizeFirstLine,
+        emailVerificationProvider: job.emailVerificationProvider || 'trykitt',
+        columnMapping: job.columnMapping || { domain: 'domain', founder: '', email: '' },
+        dedupeStats: job.dedupeStats || null,
+        cost: typeof job.cost === 'number' ? job.cost : 0,
+        stages: job.stages || null,
+        filteredPath: job.paths?.filtered || null
+    };
+}
+
+async function verifyQueuedJobOwnership({ jobId, uid, clientId }) {
+    const queueJob = await getQueueJob(jobId);
+    if (!queueJob) return { queueJob: null, error: 'Job not found.' };
+    if (queueJob.uid !== uid || queueJob.clientId !== clientId) {
+        return { queueJob: null, error: 'Unauthorized.' };
+    }
+    return { queueJob, error: null };
+}
 
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -60,8 +95,7 @@ router.post('/jobs/:id/csv-preview', async (req, res) => {
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        await admin.auth().verifyIdToken(idToken);
 
         const unified = await buildUnifiedRows({ jobId, scope: 'valid', resolveJobPaths });
         if (!unified.length) {
@@ -187,7 +221,40 @@ router.post('/jobs', uploadFields, async (req, res) => {
             // Continue with job processing even if deduplication fails
         }
 
-        processJob(job);
+        await enqueuePipelineJob({
+            jobId: job.id,
+            uid,
+            clientId: job.clientId,
+            payload: buildQueuePayload(job)
+        });
+
+        await firestore
+            .collection('users').doc(uid)
+            .collection('clients').doc(job.clientId)
+            .collection('jobs').doc(job.id)
+            .set({
+                ...serializeJob(job),
+                logs: Array.isArray(job.logs) ? job.logs.slice(-200) : [],
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                createdAtServer: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+        await firestore
+            .collection('users').doc(uid)
+            .collection('clients').doc(job.clientId)
+            .collection('activeJob').doc('current')
+            .set({
+                jobId: job.id,
+                status: 'queued',
+                error: null,
+                uploadError: null,
+                uploadMetrics: null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+        ensureJobControl(job.id, { paused: false, cancelled: false });
+        closeStreams(job);
+        jobs.delete(job.id);
         res.status(201).json({ jobId: job.id, job: serializeJob(job) });
     } catch (error) {
         console.error('Job creation error:', error);
@@ -248,36 +315,42 @@ router.post('/jobs/:id/stop', async (req, res) => {
         const decoded = await admin.auth().verifyIdToken(idToken);
         const uid = decoded.uid;
 
-        const job = jobs.get(jobId);
-        if (!job) {
-            // Job not in memory - could be stale Firestore doc. Clean it up.
-            try {
-                const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
-                const activeJobSnap = await activeJobRef.get();
-                
-                if (activeJobSnap.exists && activeJobSnap.data()?.jobId === jobId) {
-                    // Clear the stale activeJob document
-                    await activeJobRef.delete();
-                    console.log(`Cleaned up stale activeJob document for job ${jobId}`);
-                    return res.json({ 
-                        status: 'cleaned', 
-                        message: 'Stale job reference removed. The job has already completed or was cleaned up.' 
-                    });
-                }
-            } catch (err) {
-                console.warn('Failed to clean up stale activeJob document:', err?.message || err);
-            }
-            return res.status(404).json({ error: 'Job not found.' });
-        }
-        if (job.uid !== uid || job.clientId !== clientId) {
+        const localJob = jobs.get(jobId);
+        if (localJob && (localJob.uid !== uid || localJob.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to stop this job.' });
         }
-        if (job.cancelled || job.status === 'cancelled') {
+
+        let queueJob = null;
+        if (!localJob) {
+            const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
+            if (ownership.error) {
+                if (ownership.error === 'Unauthorized.') return res.status(403).json({ error: 'Unauthorized to stop this job.' });
+                return res.status(404).json({ error: 'Job not found.' });
+            }
+            queueJob = ownership.queueJob;
+        } else {
+            queueJob = await getQueueJob(jobId);
+        }
+
+        if (queueJob?.status === 'completed') {
+            return res.json({ status: 'completed', message: 'Job already completed.' });
+        }
+        if (queueJob?.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job already cancelled.' });
         }
 
-        job.cancelled = true;
-        markCancelled(job, 'Cancelled by user');
+        writeJobControl(jobId, { cancelled: true, paused: false });
+        if (queueJob) {
+            await updateQueueControl(jobId, { cancelled: true, paused: false });
+        }
+        if (queueJob?.status === 'queued' || queueJob?.status === 'paused') {
+            await setQueueStatus(jobId, 'cancelled', { error: 'Cancelled by user' });
+        }
+
+        if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
+            localJob.cancelled = true;
+            markCancelled(localJob, 'Cancelled by user');
+        }
 
         // Update activeJob doc to reflect cancellation
         try {
@@ -312,37 +385,41 @@ router.post('/jobs/:id/pause', async (req, res) => {
         const decoded = await admin.auth().verifyIdToken(idToken);
         const uid = decoded.uid;
 
-        const job = jobs.get(jobId);
-        if (!job) {
-            // Job not in memory - could be stale Firestore doc. Clean it up.
-            try {
-                const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
-                const activeJobSnap = await activeJobRef.get();
-                
-                if (activeJobSnap.exists && activeJobSnap.data()?.jobId === jobId) {
-                    await activeJobRef.delete();
-                    console.log(`Cleaned up stale activeJob document for job ${jobId}`);
-                    return res.json({ 
-                        status: 'cleaned', 
-                        message: 'Stale job reference removed. The job has already completed or was cleaned up.' 
-                    });
-                }
-            } catch (err) {
-                console.warn('Failed to clean up stale activeJob document:', err?.message || err);
-            }
-            return res.status(404).json({ error: 'Job not found.' });
-        }
-        if (job.uid !== uid || job.clientId !== clientId) {
+        const localJob = jobs.get(jobId);
+        if (localJob && (localJob.uid !== uid || localJob.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to pause this job.' });
         }
-        if (job.cancelled || job.status === 'cancelled') {
+
+        let queueJob = null;
+        if (!localJob) {
+            const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
+            if (ownership.error) {
+                if (ownership.error === 'Unauthorized.') return res.status(403).json({ error: 'Unauthorized to pause this job.' });
+                return res.status(404).json({ error: 'Job not found.' });
+            }
+            queueJob = ownership.queueJob;
+        } else {
+            queueJob = await getQueueJob(jobId);
+        }
+
+        if (queueJob?.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot pause.' });
         }
-        if (job.paused || job.status === 'paused') {
+        if (queueJob?.status === 'paused' || queueJob?.control?.paused || localJob?.paused) {
             return res.json({ status: 'paused', message: 'Job already paused.' });
         }
 
-        markPaused(job, 'Paused by user');
+        writeJobControl(jobId, { paused: true });
+        if (queueJob) {
+            await updateQueueControl(jobId, { paused: true });
+        }
+        if (queueJob?.status === 'queued') {
+            await setQueueStatus(jobId, 'paused');
+        }
+
+        if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
+            markPaused(localJob, 'Paused by user');
+        }
 
         // Update activeJob doc
         try {
@@ -376,33 +453,55 @@ router.post('/jobs/:id/resume', async (req, res) => {
         const decoded = await admin.auth().verifyIdToken(idToken);
         const uid = decoded.uid;
 
-        const job = jobs.get(jobId);
-        if (!job) {
-            return res.status(404).json({ error: 'Job not found.' });
-        }
-        if (job.uid !== uid || job.clientId !== clientId) {
+        const localJob = jobs.get(jobId);
+        if (localJob && (localJob.uid !== uid || localJob.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to resume this job.' });
         }
-        if (job.cancelled || job.status === 'cancelled') {
+
+        let queueJob = null;
+        if (!localJob) {
+            const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
+            if (ownership.error) {
+                if (ownership.error === 'Unauthorized.') return res.status(403).json({ error: 'Unauthorized to resume this job.' });
+                return res.status(404).json({ error: 'Job not found.' });
+            }
+            queueJob = ownership.queueJob;
+        } else {
+            queueJob = await getQueueJob(jobId);
+        }
+
+        if (queueJob?.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
         }
-        if (!job.paused && job.status !== 'paused') {
-            return res.json({ status: job.status, message: 'Job is not paused.' });
+        if (queueJob && queueJob.status !== 'paused' && !queueJob.control?.paused && !localJob?.paused) {
+            return res.json({ status: queueJob.status, message: 'Job is not paused.' });
+        }
+        if (!queueJob && !localJob?.paused) {
+            return res.json({ status: localJob?.status || 'unknown', message: 'Job is not paused.' });
         }
 
-        markResumed(job);
+        writeJobControl(jobId, { paused: false });
+        if (queueJob) {
+            await updateQueueControl(jobId, { paused: false });
+        }
+        if (queueJob?.status === 'paused') {
+            await setQueueStatus(jobId, 'queued', { error: null });
+        }
 
-        // Resume processing (it will continue from checkpoints)
-        processJob(job).catch((err) => {
-            console.error(`[${job.id}] Resume job error:`, err);
-        });
+        if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
+            markResumed(localJob);
+        }
+
+        const resumedStatus = queueJob?.status === 'running'
+            ? 'running'
+            : (localJob ? 'running' : 'queued');
 
         // Update activeJob doc
         try {
             const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
             await activeJobRef.set({
                 jobId,
-                status: 'running',
+                status: resumedStatus,
                 resumedAt: admin.firestore.FieldValue.serverTimestamp(),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
@@ -410,7 +509,7 @@ router.post('/jobs/:id/resume', async (req, res) => {
             console.warn('Failed to persist resumed status to Firestore', err?.message || err);
         }
 
-        return res.json({ status: 'running' });
+        return res.json({ status: resumedStatus });
     } catch (error) {
         console.error('Resume job error:', error);
         return res.status(500).json({ error: 'Failed to resume job.' });
@@ -430,6 +529,10 @@ router.post('/jobs/:id/delete', async (req, res) => {
         const uid = decoded.uid;
 
         const job = jobs.get(jobId);
+        const queueJob = await getQueueJob(jobId);
+        if (queueJob && (queueJob.uid !== uid || queueJob.clientId !== clientId)) {
+            return res.status(403).json({ error: 'Unauthorized to delete this job.' });
+        }
         if (job && (job.uid !== uid || job.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to delete this job.' });
         }
@@ -449,6 +552,12 @@ router.post('/jobs/:id/delete', async (req, res) => {
             }
         } catch (err) {
             console.warn(`[${jobId}] Failed to clean job files`, err?.message || err);
+        }
+
+        try {
+            await deleteQueueJob(jobId);
+        } catch (err) {
+            console.warn(`[${jobId}] Failed to delete queue record`, err?.message || err);
         }
 
         try {
@@ -528,8 +637,74 @@ router.get('/jobs/:id/stream', (req, res) => {
 
     const job = jobs.get(req.params.id);
     if (!job) {
-        res.write(`data: ${JSON.stringify({ type: 'error', error: 'Job not found' })}\n\n`);
-        return res.end();
+        (async () => {
+            const jobId = req.params.id;
+            let queueJob = await getQueueJob(jobId);
+            if (!queueJob?.uid || !queueJob?.clientId) {
+                const cg = await firestore.collectionGroup('jobs')
+                    .where('id', '==', jobId)
+                    .limit(1)
+                    .get();
+                if (!cg.empty) {
+                    const [jobDoc] = cg.docs;
+                    const parent = jobDoc.ref.parent?.parent; // clients/{clientId}
+                    const userRef = parent?.parent?.parent?.parent; // users/{uid}
+                    if (parent?.id && userRef?.id) {
+                        queueJob = { uid: userRef.id, clientId: parent.id };
+                    }
+                }
+            }
+
+            if (!queueJob?.uid || !queueJob?.clientId) {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: 'Job not found' })}\n\n`);
+                return res.end();
+            }
+
+            const jobRef = firestore
+                .collection('users').doc(queueJob.uid)
+                .collection('clients').doc(queueJob.clientId)
+                .collection('jobs').doc(jobId);
+
+            let sentLogCount = 0;
+            const unsubscribe = jobRef.onSnapshot(
+                (snap) => {
+                    if (!snap.exists) {
+                        res.write(`data: ${JSON.stringify({ type: 'error', error: 'Job not found' })}\n\n`);
+                        return;
+                    }
+
+                    const state = snap.data() || {};
+                    const logs = Array.isArray(state.logs) ? state.logs : [];
+                    if (logs.length > sentLogCount) {
+                        for (let i = sentLogCount; i < logs.length; i += 1) {
+                            res.write(`data: ${JSON.stringify({ type: 'log', log: logs[i] })}\n\n`);
+                        }
+                        sentLogCount = logs.length;
+                    }
+
+                    res.write(`data: ${JSON.stringify({ type: 'state', state })}\n\n`);
+                },
+                (error) => {
+                    console.error(`[${jobId}] Firestore stream error:`, error?.message || error);
+                    res.write(`data: ${JSON.stringify({ type: 'error', error: 'Stream disconnected' })}\n\n`);
+                }
+            );
+
+            const keepAlive = setInterval(() => {
+                res.write(': keep-alive\n\n');
+            }, 25000);
+
+            req.on('close', () => {
+                clearInterval(keepAlive);
+                unsubscribe();
+                res.end();
+            });
+        })().catch((error) => {
+            console.error('Job stream setup error:', error);
+            res.write(`data: ${JSON.stringify({ type: 'error', error: 'Failed to open job stream' })}\n\n`);
+            res.end();
+        });
+        return;
     }
 
     job.logs.forEach(entry => {
@@ -1111,7 +1286,7 @@ router.get('/jobs/:jobId/qualified-count', async (req, res) => {
 router.delete('/jobs/:jobId/revert-manual-upload', async (req, res) => {
     try {
         const { jobId } = req.params;
-        const { idToken, clientId, campaignId } = req.body;
+        const { idToken, campaignId } = req.body;
 
         if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });

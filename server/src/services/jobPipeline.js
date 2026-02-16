@@ -1,7 +1,6 @@
 import fs from 'fs';
 import path from 'path';
 import { promises as dns } from 'dns';
-import { env } from '../config/env.js';
 import { admin, firestore } from '../config/firebase.js';
 import { TMP_ROOT } from '../config/paths.js';
 import { DEFAULT_PRICING, loadPricing, computeJobCost } from '../utils/pricing.js';
@@ -11,6 +10,7 @@ import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
 import { runEmailVerifier } from './emailVerifier.js';
 import { runPersonalization } from './personalization/index.js';
+import { ensureJobControl, readJobControl, writeJobControl } from './jobControl.js';
 import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
 import { parse as csvParse } from 'csv-parse';
 import { normalizeDomain } from '../utils/domain.js';
@@ -169,6 +169,16 @@ function updateStage(job, stageKey, updates) {
     pushState(job, forceUpdate);
 }
 
+function syncJobControl(job) {
+    if (!job?.id) return null;
+    const control = readJobControl(job.id);
+    if (control) {
+        job.paused = !!control.paused;
+        job.cancelled = !!control.cancelled;
+    }
+    return control;
+}
+
 async function persistJobState(job) {
     if (!job?.uid || !job?.clientId) {
         console.error(`[${job?.id || 'unknown'}] Cannot persist: missing uid or clientId`, { uid: job?.uid, clientId: job?.clientId });
@@ -183,6 +193,7 @@ async function persistJobState(job) {
 
         const payload = {
             ...serializeJob(job),
+            logs: Array.isArray(job.logs) ? job.logs.slice(-200) : [],
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         };
 
@@ -256,6 +267,7 @@ async function runStage(job, stageKey, handler) {
 
 function markCancelled(job, reason = 'Cancelled by user') {
     job.cancelled = true;
+    writeJobControl(job.id, { cancelled: true, paused: false });
     job.status = 'failed';  // Cancelled jobs are treated as failed in primary status
     job.error = reason;
     job.completedAt = job.completedAt || new Date().toISOString();
@@ -265,6 +277,7 @@ function markCancelled(job, reason = 'Cancelled by user') {
 
 function markPaused(job, reason = 'Paused by user') {
     job.paused = true;
+    writeJobControl(job.id, { paused: true });
     job.status = 'running';  // Paused jobs keep running status (can be resumed)
     job.pausedAt = new Date().toISOString();
     console.log(`[${job.id}] Job paused. paused=${job.paused}, status=${job.status}`);
@@ -274,6 +287,7 @@ function markPaused(job, reason = 'Paused by user') {
 
 function markResumed(job) {
     job.paused = false;
+    writeJobControl(job.id, { paused: false });
     job.status = 'running';
     job.resumedAt = new Date().toISOString();
     log(job, 'Job resumed.');
@@ -374,19 +388,32 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         }
     };
 
+    ensureJobControl(id, { paused: false, cancelled: false });
     jobs.set(id, job);
     return job;
 }
 
 async function processJob(job) {
+    syncJobControl(job);
+    if (job.cancelled) {
+        markCancelled(job, 'Cancelled before start');
+        return;
+    }
+
     job.status = 'running';
     pushState(job);
+    await updateActiveJob(job, 'running', {
+        uploadError: null,
+        uploadMetrics: null,
+        pausedAt: null
+    });
     log(job, 'Job started.');
 
     try {
         // Load pricing configuration
         job.pricing = await loadPricing(job.uid);
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job, 'Cancelled before start');
             return;
@@ -504,6 +531,7 @@ async function processJob(job) {
             return;
         }
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -555,11 +583,13 @@ async function processJob(job) {
         }
         computeJobCost(job);
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
         }
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -603,7 +633,10 @@ async function processJob(job) {
                     provider: job.emailVerificationProvider,
                     log: (message, meta) => log(job, message, meta),
                     job,
-                    checkPaused: () => job.paused,
+                    checkPaused: () => {
+                        syncJobControl(job);
+                        return job.paused || job.cancelled;
+                    },
                     onBatch: async (rows) => {
                         await upsertLeadRowsBatch({
                             agencyId: job.uid,
@@ -620,11 +653,13 @@ async function processJob(job) {
         }
         computeJobCost(job);
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
         }
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -697,12 +732,16 @@ async function processJob(job) {
                     provider: job.emailVerificationProvider,
                     log: (message, meta) => log(job, message, meta),
                     job,
-                    checkPaused: () => job.paused
+                    checkPaused: () => {
+                        syncJobControl(job);
+                        return job.paused || job.cancelled;
+                    }
                 })
             );
         }
         computeJobCost(job);
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -711,6 +750,7 @@ async function processJob(job) {
         // Upsert leads with verification status
         await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.final, type: 'verification', jobId: job.id });
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
@@ -731,6 +771,7 @@ async function processJob(job) {
         );
         computeJobCost(job);
 
+        syncJobControl(job);
         if (job.cancelled) {
             markCancelled(job);
             return;
