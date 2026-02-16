@@ -42,7 +42,9 @@ export interface PipelineJob {
         dnsDead?: number;
         dnsUnknown?: number;
         processable?: number;
+        domainCheckSkipped?: boolean;
     } | null;
+    skipDomainCheck?: boolean;
     cost?: number;
     clientId?: string;
     // Secondary metadata - not part of primary lifecycle

@@ -41,6 +41,7 @@ function buildQueuePayload(job) {
         skipFounderFinder: !!job.skipFounderFinder,
         skipEmailFinder: !!job.skipEmailFinder,
         skipVerification: !!job.skipVerification,
+        skipDomainCheck: !!job.skipDomainCheck,
         findFounder: job.findFounder !== false,
         industry: job.industry || null,
         nicheId: job.nicheId || null,
@@ -78,6 +79,7 @@ const uploadFields = upload.fields([
     { name: 'skipFounderFinder', maxCount: 1 },
     { name: 'skipEmailFinder', maxCount: 1 },
     { name: 'skipVerification', maxCount: 1 },
+    { name: 'skipDomainCheck', maxCount: 1 },
     { name: 'industry', maxCount: 1 },
     { name: 'personalizeFirstLine', maxCount: 1 },
     { name: 'domainColumn', maxCount: 1 },
@@ -181,6 +183,7 @@ router.post('/jobs', uploadFields, async (req, res) => {
         }
         
         const skipEmailFinder = String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
+        const skipDomainCheck = String(req.body.skipDomainCheck || '').toLowerCase() === 'true';
         const domainColumn = (req.body.domainColumn || 'domain').toString().trim();
         const founderColumn = (req.body.founderColumn || '').toString().trim();
         const emailColumn = (req.body.emailColumn || '').toString().trim();
@@ -188,6 +191,7 @@ router.post('/jobs', uploadFields, async (req, res) => {
             skipFounderFinder,
             skipEmailFinder,
             skipVerification,
+            skipDomainCheck,
             findFounder: rawFindFounder,
             industry,
             nicheId,

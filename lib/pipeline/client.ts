@@ -67,6 +67,7 @@ export interface CreatePipelineJobOptions {
     skipEmailFinder?: boolean;
     verifyEmail?: boolean;
     skipVerification?: boolean;
+    skipDomainCheck?: boolean;
     personalizeFirstLine?: boolean;
     domainColumn?: string;
     founderColumn?: string;
@@ -100,6 +101,7 @@ export async function createPipelineJob({
     skipEmailFinder,
     verifyEmail,
     skipVerification,
+    skipDomainCheck,
     personalizeFirstLine,
     domainColumn,
     founderColumn,
@@ -140,6 +142,9 @@ export async function createPipelineJob({
     }
     if (typeof skipVerification === 'boolean') {
         formData.append("skipVerification", String(skipVerification));
+    }
+    if (typeof skipDomainCheck === 'boolean') {
+        formData.append("skipDomainCheck", String(skipDomainCheck));
     }
     if (typeof personalizeFirstLine === 'boolean') {
         formData.append("personalizeFirstLine", String(personalizeFirstLine));

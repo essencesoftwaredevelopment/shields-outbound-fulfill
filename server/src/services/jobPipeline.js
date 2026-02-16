@@ -359,6 +359,7 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         skipFounderFinder: options.skipFounderFinder || false,
         skipEmailFinder: options.skipEmailFinder || false,
         skipVerification: options.skipVerification || false,
+        skipDomainCheck: options.skipDomainCheck === true,
         findFounder: options.findFounder !== false,
         industry: options.industry || options.nicheId || null,
         nicheId: options.nicheId || null,
@@ -419,7 +420,7 @@ async function processJob(job) {
             return;
         }
 
-        // Stage 1: normalize/remove www, dedupe, DNS-check, and keep processable domains.
+        // Stage 1: normalize/remove www, dedupe, and optionally DNS-check domains.
         let filteredDomainsPath = job.paths.filtered;
         let preparedDomainsPath = filteredDomainsPath;
         await runStage(job, 'domainPrep', async () => {
@@ -436,17 +437,30 @@ async function processJob(job) {
                 job.dedupeStats = dedupeStats;
             }
 
-            const { path: dedupedPath, removedDuplicates, totalRows } = await dedupeDomainsCsv(
+            const { path: dedupedPath, removedDuplicates, totalRows, uniqueRows } = await dedupeDomainsCsv(
                 preparedDomainsPath,
                 job.columnMapping?.domain || 'domain'
             );
             preparedDomainsPath = dedupedPath;
 
-            const dnsStats = await dnsFilterDomainsCsv(
-                preparedDomainsPath,
-                job.columnMapping?.domain || 'domain'
-            );
-            preparedDomainsPath = dnsStats.path;
+            const domainCheckSkipped = job.skipDomainCheck === true;
+            const dnsStats = domainCheckSkipped
+                ? {
+                    path: preparedDomainsPath,
+                    checked: 0,
+                    live: 0,
+                    dead: 0,
+                    unknown: 0,
+                    processable: uniqueRows
+                }
+                : await dnsFilterDomainsCsv(
+                    preparedDomainsPath,
+                    job.columnMapping?.domain || 'domain'
+                );
+
+            if (!domainCheckSkipped) {
+                preparedDomainsPath = dnsStats.path;
+            }
 
             const normalized = typeof job.dedupeStats?.unique === 'number'
                 ? job.dedupeStats.unique
@@ -465,13 +479,21 @@ async function processJob(job) {
                 dnsLive: dnsStats.live,
                 dnsDead: dnsStats.dead,
                 dnsUnknown: dnsStats.unknown,
-                processable: dnsStats.processable
+                processable: dnsStats.processable,
+                domainCheckSkipped
             };
 
-            log(
-                job,
-                `Domain prep: normalized ${normalized}, deduped ${duplicatesRemoved}, DNS checked ${dnsStats.checked} (${dnsStats.live} live, ${dnsStats.dead} dead, ${dnsStats.unknown} unknown), ${dnsStats.processable} processable`
-            );
+            if (domainCheckSkipped) {
+                log(
+                    job,
+                    `Domain prep: normalized ${normalized}, deduped ${duplicatesRemoved}, domain check skipped, ${dnsStats.processable} processable`
+                );
+            } else {
+                log(
+                    job,
+                    `Domain prep: normalized ${normalized}, deduped ${duplicatesRemoved}, DNS checked ${dnsStats.checked} (${dnsStats.live} live, ${dnsStats.dead} dead, ${dnsStats.unknown} unknown), ${dnsStats.processable} processable`
+                );
+            }
 
             return {
                 total: typeof job.dedupeStats?.total === 'number' ? job.dedupeStats.total : totalRows,
@@ -482,6 +504,7 @@ async function processJob(job) {
                 dead: dnsStats.dead,
                 unknown: dnsStats.unknown,
                 processable: dnsStats.processable,
+                domainCheckSkipped,
                 skippedExisting: typeof job.dedupeStats?.skipped === 'number' ? job.dedupeStats.skipped : 0,
                 new: typeof job.dedupeStats?.new === 'number' ? job.dedupeStats.new : dnsStats.processable
             };
@@ -527,7 +550,7 @@ async function processJob(job) {
             job.completedAt = new Date().toISOString();
             pushState(job);
             await updateActiveJob(job, 'completed', { uploadError: null, uploadMetrics: null });
-            log(job, 'Job completed: No processable domains after normalization/dedupe/DNS checks');
+            log(job, 'Job completed: No processable domains after normalization/dedupe/domain checks');
             return;
         }
 
@@ -870,7 +893,7 @@ async function upsertDomainsImmediately(job, domainsPath) {
  */
 async function dedupeDomainsCsv(inputPath, domainColumn = 'domain') {
     if (!inputPath || !fs.existsSync(inputPath)) {
-        return { path: inputPath, removedDuplicates: 0, totalRows: 0 };
+        return { path: inputPath, removedDuplicates: 0, totalRows: 0, uniqueRows: 0 };
     }
 
     const seen = new Set();
@@ -897,7 +920,7 @@ async function dedupeDomainsCsv(inputPath, domainColumn = 'domain') {
     });
 
     if (removedDuplicates === 0) {
-        return { path: inputPath, removedDuplicates, totalRows };
+        return { path: inputPath, removedDuplicates, totalRows, uniqueRows: rows.length };
     }
 
     const ext = path.extname(inputPath);
@@ -908,7 +931,7 @@ async function dedupeDomainsCsv(inputPath, domainColumn = 'domain') {
     writer.end();
     await new Promise((resolve) => writer.on('finish', resolve));
 
-    return { path: dedupPath, removedDuplicates, totalRows };
+    return { path: dedupPath, removedDuplicates, totalRows, uniqueRows: rows.length };
 }
 
 function withTimeout(promise, timeoutMs) {
@@ -1076,6 +1099,7 @@ function serializeJob(job) {
         nicheId: job.nicheId || null,
         nicheLabel: job.nicheLabel || null,
         personalizeFirstLine: !!job.personalizeFirstLine,
+        skipDomainCheck: !!job.skipDomainCheck,
         cost: typeof job.cost === 'number' ? job.cost : 0
     };
 }

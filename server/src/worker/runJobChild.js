@@ -77,6 +77,7 @@ function buildRuntimeJob(queueJob, apiKeys) {
         skipFounderFinder: !!payload.skipFounderFinder,
         skipEmailFinder: !!payload.skipEmailFinder,
         skipVerification: !!payload.skipVerification,
+        skipDomainCheck: !!payload.skipDomainCheck,
         findFounder: payload.findFounder !== false,
         industry: payload.industry || null,
         nicheId: payload.nicheId || null,
@@ -161,4 +162,3 @@ async function main() {
 }
 
 main();
-

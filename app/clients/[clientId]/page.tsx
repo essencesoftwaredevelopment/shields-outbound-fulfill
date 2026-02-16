@@ -115,7 +115,7 @@ const STAGE_ORDER: PipelineStageKey[] = ["domainPrep", "founders", "emailDiscove
 const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }> = {
     domainPrep: {
         title: "Domain Prep",
-        detail: "Normalize, dedupe, and DNS checks",
+        detail: "Normalize, dedupe, optional DNS checks",
     },
     founders: {
         title: "Founder Finder",
@@ -360,6 +360,7 @@ export default function ClientPage() {
     const [findFounder, setFindFounder] = useState(true);
     const [findEmail, setFindEmail] = useState(true);
     const [verifyEmail, setVerifyEmail] = useState(true);
+    const [runDomainCheck, setRunDomainCheck] = useState(true);
     const [filterStats, setFilterStats] = useState<{ raw: number; normalized: number; inBatchDupes: number; crossRunDupes: number; willProcess: number } | null>(null);
     const [domainCheckStats, setDomainCheckStats] = useState<{ 
         total: number; 
@@ -1831,6 +1832,7 @@ export default function ClientPage() {
                 skipEmailFinder,
                 verifyEmail,
                 skipVerification: !verifyEmail, // Invert: unchecked verifyEmail means skip verification
+                skipDomainCheck: !runDomainCheck,
                 personalizeFirstLine,
                 domainColumn,
                 founderColumn,
@@ -2916,6 +2918,7 @@ export default function ClientPage() {
                                             setFindFounder(true);
                                             setFindEmail(true);
                                             setVerifyEmail(true);
+                                            setRunDomainCheck(true);
                                             setSkipEmailFinder(false);
                                             setPersonalizeFirstLine(false);
                                             setSelectedCampaignId("");
@@ -3261,6 +3264,7 @@ export default function ClientPage() {
                                             let costFooter = "";
                                             
                                             if (stageKey === "domainPrep") {
+                                                const domainCheckSkipped = summary?.domainCheckSkipped === true;
                                                 const checked = (summary?.checked as number) ?? (summary?.normalized as number) ?? total ?? 0;
                                                 const live = (summary?.live as number) ?? 0;
                                                 const dead = (summary?.dead as number) ?? 0;
@@ -3268,7 +3272,9 @@ export default function ClientPage() {
                                                 const processable = (summary?.processable as number) ?? throughputNum ?? live;
                                                 heroNumber = processable;
                                                 heroLabel = "Processable";
-                                                subtext = checked > 0
+                                                subtext = domainCheckSkipped
+                                                    ? `${processable.toLocaleString()} processable • domain check skipped`
+                                                    : checked > 0
                                                     ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
                                                     : "Awaiting...";
                                             } else if (stageKey === "founders") {
@@ -3595,6 +3601,7 @@ export default function ClientPage() {
                                                                             let costFooter = "";
                                                                             
                                                                             if (stageKey === "domainPrep") {
+                                                                                const domainCheckSkipped = summary?.domainCheckSkipped === true;
                                                                                 const checked = (summary?.checked as number) ?? (summary?.normalized as number) ?? total ?? 0;
                                                                                 const live = (summary?.live as number) ?? 0;
                                                                                 const dead = (summary?.dead as number) ?? 0;
@@ -3602,7 +3609,9 @@ export default function ClientPage() {
                                                                                 const processable = (summary?.processable as number) ?? throughputNum ?? live;
                                                                                 heroNumber = processable;
                                                                                 heroLabel = "Processable";
-                                                                                subtext = checked > 0
+                                                                                subtext = domainCheckSkipped
+                                                                                    ? `${processable.toLocaleString()} processable • domain check skipped`
+                                                                                    : checked > 0
                                                                                     ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
                                                                                     : "Awaiting...";
                                                                             } else if (stageKey === "founders") {
@@ -5535,6 +5544,37 @@ export default function ClientPage() {
                                         borderRadius: '8px',
                                         border: '1px solid rgba(255, 255, 255, 0.1)'
                                     }}>
+                                        <label style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.75rem',
+                                            cursor: 'pointer',
+                                            padding: '0.5rem'
+                                        }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={runDomainCheck}
+                                                onChange={(e) => setRunDomainCheck(e.target.checked)}
+                                                style={{
+                                                    width: '16px',
+                                                    height: '16px',
+                                                    cursor: 'pointer',
+                                                    accentColor: '#3b82f6',
+                                                    flexShrink: 0
+                                                }}
+                                            />
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    Run domain DNS check
+                                                </div>
+                                                <div style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.15rem' }}>
+                                                    {runDomainCheck
+                                                        ? 'Filters obviously dead domains during Domain Prep.'
+                                                        : 'Skips DNS filtering; domains still get normalized and deduped.'}
+                                                </div>
+                                            </div>
+                                        </label>
+
                                         <label style={{
                                             display: 'flex',
                                             alignItems: 'center',
