@@ -370,6 +370,11 @@ FIREBASE_CLIENT_EMAIL=your_service_account_email
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 STRIPE_SECRET_KEY=sk_test_...
 OPENAI_FOUNDER_MODEL=gpt-4o-mini
+FOUNDER_AI_CONCURRENCY=15
+FOUNDER_AI_MIN_RPM=120
+FOUNDER_AI_MAX_RPM=900
+FOUNDER_AI_RECOVERY_SUCCESS_THRESHOLD=25
+FOUNDER_RESET_RPM_ON_RESUME=true
 ```
 
 ### Installation
@@ -516,7 +521,7 @@ Temporary files stored in `server/tmp/jobs/{jobId}/`:
 ## Performance Characteristics
 
 **Throughput:**
-- Founder finding: ~480 domains/hour (rate limited by APIs)
+- Founder finding: variable; typically constrained by OpenAI + Serper latency and configured concurrency/RPM caps
 - Email finding: ~2000 emails/hour
 - Verification: ~3000 emails/hour
 - Personalization: ~200-400 leads/hour (varies by strategy)

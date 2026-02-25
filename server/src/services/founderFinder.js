@@ -8,15 +8,34 @@ import pLimit from 'p-limit';
 
 dotenv.config();
 
-const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-5-nano';
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoolean(value, fallback = false) {
+    if (value === undefined || value === null || value === '') return fallback;
+    const normalized = String(value).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+}
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+}
+
+const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-4o-mini';
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
 const SERPER_CONCURRENCY = 8;
 
-const AI_CONCURRENCY_LIMIT = 8;
-const AI_MAX_RPS = 8;
-const AI_MAX_RPM = 480;
+const AI_CONCURRENCY_LIMIT = parsePositiveInt(process.env.FOUNDER_AI_CONCURRENCY, 15);
+const AI_MIN_RPM = parsePositiveInt(process.env.FOUNDER_AI_MIN_RPM, 120);
+const AI_MAX_RPM = Math.max(AI_MIN_RPM, parsePositiveInt(process.env.FOUNDER_AI_MAX_RPM, 900));
+const AI_SUCCESS_THRESHOLD = parsePositiveInt(process.env.FOUNDER_AI_RECOVERY_SUCCESS_THRESHOLD, 25);
+const AI_RESET_RPM_ON_RESUME = parseBoolean(process.env.FOUNDER_RESET_RPM_ON_RESUME, true);
 const AI_TRUNCATE_CHARS = 900;
 const AI_TOP_ORGANIC = 10;
 
@@ -68,13 +87,13 @@ function chunkWithIndex(arr, size) {
 }
 
 class AdaptiveRateLimiter {
-    constructor(minRpm, maxRpm, initialRpm = null) {
+    constructor(minRpm, maxRpm, initialRpm = null, options = {}) {
         this.minRpm = minRpm;
         this.maxRpm = maxRpm;
-        this.currentRpm = initialRpm || maxRpm;
+        this.currentRpm = clamp(initialRpm || maxRpm, minRpm, maxRpm);
         this.timestamps = [];
         this.recentSuccesses = 0;
-        this.successThreshold = 50; // successful requests before trying to increase
+        this.successThreshold = options.successThreshold || 50; // successful requests before trying to increase
         this.backoffFactor = 0.7; // reduce to 70% on 429
         this.recoveryFactor = 1.1; // increase to 110% on success streak
     }
@@ -89,7 +108,6 @@ class AdaptiveRateLimiter {
             // Clean old timestamps (older than 1 minute)
             this.timestamps = this.timestamps.filter(t => now - t < 60000);
 
-            const currentRps = this.currentRpm / 60;
             const allowedInLastMinute = Math.floor(this.currentRpm);
 
             if (this.timestamps.length < allowedInLastMinute) {
@@ -304,16 +322,28 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
         try {
             const progress = JSON.parse(fs.readFileSync(progressCheckpointFile, 'utf-8'));
             processedDomains = new Set(progress.processedDomains || []);
-            savedRpm = progress.currentRpm;
+            const parsedSavedRpm = Number.parseInt(String(progress.currentRpm ?? ''), 10);
+            savedRpm = Number.isFinite(parsedSavedRpm) && parsedSavedRpm > 0 ? parsedSavedRpm : null;
             log(`Founders: resuming from checkpoint with ${processedDomains.size} already processed${savedRpm ? ` at ${savedRpm} RPM` : ''}`);
         } catch (err) {
             log(`Founders: failed to load progress checkpoint: ${err.message}`);
         }
     }
-    
-    // Initialize adaptive rate limiter with saved RPM if available
-    const aiRateLimiter = new AdaptiveRateLimiter(120, AI_MAX_RPM, savedRpm);
-    log(`Founders: initialized adaptive rate limiter at ${aiRateLimiter.getCurrentRpm()} RPM`);
+
+    // Initialize adaptive rate limiter with restart-safe defaults.
+    let initialRpm = AI_MAX_RPM;
+    if (!AI_RESET_RPM_ON_RESUME && savedRpm) {
+        initialRpm = clamp(savedRpm, AI_MIN_RPM, AI_MAX_RPM);
+        if (initialRpm !== savedRpm) {
+            log(`Founders: clamped saved RPM from ${savedRpm} to ${initialRpm} (range ${AI_MIN_RPM}-${AI_MAX_RPM})`);
+        }
+    } else if (AI_RESET_RPM_ON_RESUME && savedRpm) {
+        log(`Founders: ignoring saved RPM ${savedRpm}; reset-on-resume enabled`);
+    }
+    const aiRateLimiter = new AdaptiveRateLimiter(AI_MIN_RPM, AI_MAX_RPM, initialRpm, {
+        successThreshold: AI_SUCCESS_THRESHOLD
+    });
+    log(`Founders: initialized adaptive rate limiter at ${aiRateLimiter.getCurrentRpm()} RPM (min ${AI_MIN_RPM}, max ${AI_MAX_RPM}, concurrency ${AI_CONCURRENCY_LIMIT})`);
 
     // Only delete output if starting fresh
     if (fs.existsSync(outputCsv) && processedDomains.size === 0) {
