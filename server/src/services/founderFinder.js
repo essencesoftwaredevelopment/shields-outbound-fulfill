@@ -58,6 +58,23 @@ function getHttpErrorStatus(err) {
     return err?.response?.status ?? err?.status ?? err?.statusCode ?? null;
 }
 
+function isRecoverableLookupFailure(err) {
+    const status = getHttpErrorStatus(err);
+    if (status === 401 || status === 403) {
+        return false;
+    }
+    if (status === null || status === undefined) {
+        return true;
+    }
+    if (status === 429) {
+        return true;
+    }
+    if (status >= 500) {
+        return true;
+    }
+    return status >= 400 && status < 500;
+}
+
 function formatRequestError(err, { includePayload = true, payloadMaxLen = 320 } = {}) {
     const status = getHttpErrorStatus(err);
     const payload = err?.response?.data;
@@ -395,6 +412,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
     let processed = 0;
     let fatalQuotaError = null;
+    let fatalTaskError = null;
 
     const queries = domains.map(d => `${d} founder`);
     const chunks = chunkWithIndex(queries, SERPER_BATCH_SIZE);
@@ -423,7 +441,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
     const serperTasks = chunks.map((chunk, batchIdx) =>
         serperLimit(async () => {
-            if (fatalQuotaError) {
+            if (fatalQuotaError || fatalTaskError) {
                 return;
             }
 
@@ -509,7 +527,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                 }));
 
                 const task = aiLimit(async () => {
-                    if (fatalQuotaError) {
+                    if (fatalQuotaError || fatalTaskError) {
                         return;
                     }
 
@@ -528,8 +546,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                                 fatalQuotaError = fatalQuotaError || err;
                                 throw err;
                             }
-                            const status = getHttpErrorStatus(err);
-                            const recoverableClientError = status >= 400 && status < 500 && status !== 401 && status !== 403 && status !== 429;
+                            const recoverableClientError = isRecoverableLookupFailure(err);
 
                             if (recoverableClientError) {
                                 errorCount++;
@@ -599,6 +616,8 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                     if (processed % 10 === 0) {
                         saveProgressCheckpoint();
                     }
+                }).catch((err) => {
+                    fatalTaskError = fatalTaskError || err;
                 });
 
                 aiTasks.push(task);
@@ -609,6 +628,9 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
     try {
         await Promise.all(serperTasks);
         await Promise.all(aiTasks);
+        if (fatalTaskError) {
+            throw fatalTaskError;
+        }
         await flushBatch(true);
         await flushPromise;
     } catch (err) {

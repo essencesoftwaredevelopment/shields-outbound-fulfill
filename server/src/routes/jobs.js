@@ -26,7 +26,7 @@ import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
 import { TMP_ROOT } from '../config/paths.js';
-import { ensureJobControl, writeJobControl } from '../services/jobControl.js';
+import { ensureJobControl, readJobControl, writeJobControl } from '../services/jobControl.js';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
 
 const router = express.Router();
@@ -65,6 +65,136 @@ async function verifyQueuedJobOwnership({ jobId, uid, clientId }) {
         return { queueJob: null, error: 'Unauthorized.' };
     }
     return { queueJob, error: null };
+}
+
+function initialStageState() {
+    return {
+        status: 'pending',
+        startedAt: null,
+        completedAt: null,
+        summary: null,
+        error: null,
+        progress: null
+    };
+}
+
+function buildStages(rawStages = null) {
+    const stageKeys = ['domainPrep', 'founders', 'emailDiscovery', 'verification', 'personalization'];
+    const stages = {};
+    for (const key of stageKeys) {
+        stages[key] = {
+            ...initialStageState(),
+            ...(rawStages?.[key] || {})
+        };
+    }
+    return stages;
+}
+
+function jobDocRef(uid, clientId, jobId) {
+    return firestore
+        .collection('users').doc(uid)
+        .collection('clients').doc(clientId)
+        .collection('jobs').doc(jobId);
+}
+
+async function getFirestoreOwnedJob({ jobId, uid, clientId }) {
+    const ref = jobDocRef(uid, clientId, jobId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+        return { job: null, ref, exists: false };
+    }
+    return { job: snap.data() || {}, ref, exists: true };
+}
+
+async function loadApiKeys(uid) {
+    const userDoc = await firestore.collection('users').doc(uid).get();
+    if (!userDoc.exists) {
+        throw new Error(`User not found for uid ${uid}`);
+    }
+    const data = userDoc.data() || {};
+    return {
+        openai: data.openai_key || '',
+        serper: data.serper_key || '',
+        kitt: data.trykitt_key || ''
+    };
+}
+
+async function startInlineResumeJob({ jobId, uid, clientId, persistedJob }) {
+    const jobDir = path.join(TMP_ROOT, jobId);
+    const domainsPath = path.join(jobDir, 'domains.csv');
+    if (!fs.existsSync(domainsPath)) {
+        throw new Error(`Job input file missing for ${jobId}`);
+    }
+
+    const filteredPath = (persistedJob?.filteredPath && fs.existsSync(persistedJob.filteredPath))
+        ? persistedJob.filteredPath
+        : (fs.existsSync(path.join(jobDir, 'domains-filtered.csv'))
+            ? path.join(jobDir, 'domains-filtered.csv')
+            : null);
+
+    const control = ensureJobControl(jobId, {
+        paused: false,
+        cancelled: false
+    });
+    const apiKeys = await loadApiKeys(uid);
+
+    const runtimeJob = {
+        id: jobId,
+        status: 'queued',
+        createdAt: persistedJob?.createdAt || new Date().toISOString(),
+        completedAt: null,
+        error: null,
+        fileName: persistedJob?.fileName || 'domains.csv',
+        apiKeys,
+        uid,
+        clientId,
+        sqlClientId: persistedJob?.sqlClientId || null,
+        dedupeStrategy: persistedJob?.dedupeStrategy || 'skip',
+        cancelled: !!control.cancelled,
+        paused: !!control.paused,
+        skipFounderFinder: !!persistedJob?.skipFounderFinder,
+        skipEmailFinder: !!persistedJob?.skipEmailFinder,
+        skipVerification: !!persistedJob?.skipVerification,
+        skipDomainCheck: !!persistedJob?.skipDomainCheck,
+        findFounder: persistedJob?.findFounder !== false,
+        industry: persistedJob?.industry || null,
+        nicheId: persistedJob?.nicheId || null,
+        nicheLabel: persistedJob?.nicheLabel || null,
+        personalizeFirstLine: !!persistedJob?.personalizeFirstLine,
+        emailVerificationProvider: persistedJob?.emailVerificationProvider || 'trykitt',
+        columnMapping: persistedJob?.columnMapping || { domain: 'domain', founder: '', email: '' },
+        cost: typeof persistedJob?.cost === 'number' ? persistedJob.cost : 0,
+        stages: buildStages(persistedJob?.stages || null),
+        logs: [],
+        streams: [],
+        dedupeStats: persistedJob?.dedupeStats || null,
+        __persistedOnce: true,
+        paths: {
+            dir: jobDir,
+            tmpDir: jobDir,
+            domains: domainsPath,
+            filtered: filteredPath,
+            founders: path.join(jobDir, 'founders.csv'),
+            emails: path.join(jobDir, 'emails.csv'),
+            final: path.join(jobDir, 'final.csv'),
+            personalized: path.join(jobDir, 'personalized.csv'),
+            upload: path.join(jobDir, 'upload.csv')
+        }
+    };
+
+    jobs.set(runtimeJob.id, runtimeJob);
+    setImmediate(() => {
+        processJob(runtimeJob)
+            .catch((err) => {
+                console.error(`[${runtimeJob.id}] Inline resumed job execution failed:`, err?.message || err);
+            })
+            .finally(() => {
+                closeStreams(runtimeJob);
+                jobs.delete(runtimeJob.id);
+            });
+    });
+
+    return runtimeJob;
 }
 
 const upload = multer({
@@ -344,13 +474,23 @@ router.post('/jobs/:id/stop', async (req, res) => {
         }
 
         let queueJob = null;
+        let persistedJob = null;
+        let persistedJobRef = null;
         if (!localJob) {
             const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
             if (ownership.error) {
-                if (ownership.error === 'Unauthorized.') return res.status(403).json({ error: 'Unauthorized to stop this job.' });
-                return res.status(404).json({ error: 'Job not found.' });
+                if (ownership.error === 'Unauthorized.') {
+                    return res.status(403).json({ error: 'Unauthorized to stop this job.' });
+                }
+                const persisted = await getFirestoreOwnedJob({ jobId, uid, clientId });
+                if (!persisted.exists) {
+                    return res.status(404).json({ error: 'Job not found.' });
+                }
+                persistedJob = persisted.job;
+                persistedJobRef = persisted.ref;
+            } else {
+                queueJob = ownership.queueJob;
             }
-            queueJob = ownership.queueJob;
         } else {
             queueJob = await getQueueJob(jobId);
         }
@@ -359,6 +499,12 @@ router.post('/jobs/:id/stop', async (req, res) => {
             return res.json({ status: 'completed', message: 'Job already completed.' });
         }
         if (queueJob?.status === 'cancelled') {
+            return res.json({ status: 'cancelled', message: 'Job already cancelled.' });
+        }
+        if (persistedJob?.status === 'completed') {
+            return res.json({ status: 'completed', message: 'Job already completed.' });
+        }
+        if (persistedJob?.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job already cancelled.' });
         }
 
@@ -375,6 +521,17 @@ router.post('/jobs/:id/stop', async (req, res) => {
             markCancelled(localJob, 'Cancelled by user');
         }
 
+        if (!localJob && !queueJob && persistedJobRef) {
+            await persistedJobRef.set({
+                status: 'cancelled',
+                cancelled: true,
+                paused: false,
+                error: 'Cancelled by user',
+                completedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        }
+
         // Update activeJob doc to reflect cancellation
         try {
             const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
@@ -387,6 +544,13 @@ router.post('/jobs/:id/stop', async (req, res) => {
             }, { merge: true });
         } catch (err) {
             console.warn('Failed to persist cancelled status to Firestore', err?.message || err);
+        }
+
+        if (!localJob && !queueJob) {
+            return res.json({
+                status: 'cleaned',
+                message: 'Job runner was not active. Stale run reference cleared.'
+            });
         }
 
         return res.json({ status: 'cancelled' });
@@ -414,13 +578,23 @@ router.post('/jobs/:id/pause', async (req, res) => {
         }
 
         let queueJob = null;
+        let persistedJob = null;
+        let persistedJobRef = null;
         if (!localJob) {
             const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
             if (ownership.error) {
-                if (ownership.error === 'Unauthorized.') return res.status(403).json({ error: 'Unauthorized to pause this job.' });
-                return res.status(404).json({ error: 'Job not found.' });
+                if (ownership.error === 'Unauthorized.') {
+                    return res.status(403).json({ error: 'Unauthorized to pause this job.' });
+                }
+                const persisted = await getFirestoreOwnedJob({ jobId, uid, clientId });
+                if (!persisted.exists) {
+                    return res.status(404).json({ error: 'Job not found.' });
+                }
+                persistedJob = persisted.job;
+                persistedJobRef = persisted.ref;
+            } else {
+                queueJob = ownership.queueJob;
             }
-            queueJob = ownership.queueJob;
         } else {
             queueJob = await getQueueJob(jobId);
         }
@@ -428,7 +602,13 @@ router.post('/jobs/:id/pause', async (req, res) => {
         if (queueJob?.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot pause.' });
         }
-        if (queueJob?.status === 'paused' || queueJob?.control?.paused || localJob?.paused) {
+        if (persistedJob?.status === 'cancelled') {
+            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot pause.' });
+        }
+        if (persistedJob?.status === 'completed') {
+            return res.json({ status: 'completed', message: 'Job already completed.' });
+        }
+        if (queueJob?.status === 'paused' || queueJob?.control?.paused || localJob?.paused || persistedJob?.paused) {
             return res.json({ status: 'paused', message: 'Job already paused.' });
         }
 
@@ -442,6 +622,14 @@ router.post('/jobs/:id/pause', async (req, res) => {
 
         if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
             markPaused(localJob, 'Paused by user');
+        }
+        if (!localJob && !queueJob && persistedJobRef) {
+            await persistedJobRef.set({
+                status: 'paused',
+                paused: true,
+                pausedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
         }
 
         // Update activeJob doc
@@ -482,13 +670,23 @@ router.post('/jobs/:id/resume', async (req, res) => {
         }
 
         let queueJob = null;
+        let persistedJob = null;
+        let persistedJobRef = null;
         if (!localJob) {
             const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
             if (ownership.error) {
-                if (ownership.error === 'Unauthorized.') return res.status(403).json({ error: 'Unauthorized to resume this job.' });
-                return res.status(404).json({ error: 'Job not found.' });
+                if (ownership.error === 'Unauthorized.') {
+                    return res.status(403).json({ error: 'Unauthorized to resume this job.' });
+                }
+                const persisted = await getFirestoreOwnedJob({ jobId, uid, clientId });
+                if (!persisted.exists) {
+                    return res.status(404).json({ error: 'Job not found.' });
+                }
+                persistedJob = persisted.job;
+                persistedJobRef = persisted.ref;
+            } else {
+                queueJob = ownership.queueJob;
             }
-            queueJob = ownership.queueJob;
         } else {
             queueJob = await getQueueJob(jobId);
         }
@@ -496,16 +694,26 @@ router.post('/jobs/:id/resume', async (req, res) => {
         if (queueJob?.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
         }
-        if (queueJob && queueJob.status !== 'paused' && !queueJob.control?.paused && !localJob?.paused) {
-            return res.json({ status: queueJob.status, message: 'Job is not paused.' });
+        if (persistedJob?.status === 'cancelled') {
+            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
         }
-        if (!queueJob && !localJob?.paused) {
-            return res.json({ status: localJob?.status || 'unknown', message: 'Job is not paused.' });
+        if (persistedJob?.status === 'completed') {
+            return res.json({ status: 'completed', message: 'Job already completed.' });
         }
 
-        writeJobControl(jobId, { paused: false });
+        const control = readJobControl(jobId);
+        const queuePaused = queueJob?.status === 'paused' || !!queueJob?.control?.paused;
+        const persistedPaused = persistedJob?.status === 'paused' || !!persistedJob?.paused;
+        const localPaused = !!localJob?.paused;
+        const isPaused = queuePaused || persistedPaused || localPaused || !!control?.paused;
+        if (!isPaused) {
+            const fallbackStatus = queueJob?.status || localJob?.status || persistedJob?.status || 'unknown';
+            return res.json({ status: fallbackStatus, message: 'Job is not paused.' });
+        }
+
+        writeJobControl(jobId, { paused: false, cancelled: false });
         if (queueJob) {
-            await updateQueueControl(jobId, { paused: false });
+            await updateQueueControl(jobId, { paused: false, cancelled: false });
         }
         if (queueJob?.status === 'paused') {
             await setQueueStatus(jobId, 'queued', { error: null });
@@ -515,9 +723,66 @@ router.post('/jobs/:id/resume', async (req, res) => {
             markResumed(localJob);
         }
 
-        const resumedStatus = queueJob?.status === 'running'
+        let resumedStatus = queueJob?.status === 'running'
             ? 'running'
             : (localJob ? 'running' : 'queued');
+
+        if (!localJob && !queueJob) {
+            if (USE_QUEUE_EXECUTION) {
+                const inferredFilteredPath = path.join(TMP_ROOT, jobId, 'domains-filtered.csv');
+                const payload = {
+                    id: jobId,
+                    fileName: persistedJob?.fileName || 'domains.csv',
+                    createdAt: persistedJob?.createdAt || new Date().toISOString(),
+                    dedupeStrategy: persistedJob?.dedupeStrategy || 'skip',
+                    sqlClientId: persistedJob?.sqlClientId || null,
+                    skipFounderFinder: !!persistedJob?.skipFounderFinder,
+                    skipEmailFinder: !!persistedJob?.skipEmailFinder,
+                    skipVerification: !!persistedJob?.skipVerification,
+                    skipDomainCheck: !!persistedJob?.skipDomainCheck,
+                    findFounder: persistedJob?.findFounder !== false,
+                    industry: persistedJob?.industry || null,
+                    nicheId: persistedJob?.nicheId || null,
+                    nicheLabel: persistedJob?.nicheLabel || null,
+                    personalizeFirstLine: !!persistedJob?.personalizeFirstLine,
+                    emailVerificationProvider: persistedJob?.emailVerificationProvider || 'trykitt',
+                    columnMapping: persistedJob?.columnMapping || { domain: 'domain', founder: '', email: '' },
+                    dedupeStats: persistedJob?.dedupeStats || null,
+                    cost: typeof persistedJob?.cost === 'number' ? persistedJob.cost : 0,
+                    stages: persistedJob?.stages || null,
+                    filteredPath: (persistedJob?.filteredPath && fs.existsSync(persistedJob.filteredPath))
+                        ? persistedJob.filteredPath
+                        : (fs.existsSync(inferredFilteredPath) ? inferredFilteredPath : null)
+                };
+
+                await enqueuePipelineJob({
+                    jobId,
+                    uid,
+                    clientId,
+                    payload
+                });
+                await updateQueueControl(jobId, { paused: false, cancelled: false });
+                await setQueueStatus(jobId, 'queued', { error: null });
+                resumedStatus = 'queued';
+            } else {
+                await startInlineResumeJob({
+                    jobId,
+                    uid,
+                    clientId,
+                    persistedJob
+                });
+                resumedStatus = 'running';
+            }
+        }
+
+        if (persistedJobRef) {
+            await persistedJobRef.set({
+                status: resumedStatus,
+                paused: false,
+                resumedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        }
 
         // Update activeJob doc
         try {
@@ -986,19 +1251,20 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
                             if (contactsResult.rows.length > 0) {
                                 // Bulk insert into contact_instantly_campaigns
                                 const values = contactsResult.rows.map((_, idx) => {
-                                    const offset = idx * 3;
-                                    return `($${offset + 1}, $${offset + 2}, $${offset + 3})`;
+                                    const offset = idx * 4;
+                                    return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`;
                                 }).join(', ');
                                 
                                 const params = contactsResult.rows.flatMap(contact => [
                                     contact.id,
                                     sqlCampaignId,
-                                    jobId
+                                    jobId,
+                                    'pipeline'
                                 ]);
                                 
                                 await pool.query(
                                     `INSERT INTO contact_instantly_campaigns 
-                                        (contact_id, campaign_id, job_id, upload_source, added_at)
+                                        (contact_id, campaign_id, job_id, upload_source)
                                      VALUES ${values}
                                      ON CONFLICT (contact_id, campaign_id) 
                                      DO UPDATE SET 
