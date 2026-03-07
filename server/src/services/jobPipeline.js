@@ -369,6 +369,8 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         nicheId: options.nicheId || null,
         nicheLabel: options.nicheLabel || null,
         personalizeFirstLine: options.personalizeFirstLine === true,
+        productPromptVersion: options.productPromptVersion || 'old',
+        productPromptProducts: Number.isFinite(options.productPromptProducts) ? options.productPromptProducts : 3,
         emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
         columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
         cost: 0,
@@ -802,6 +804,8 @@ async function processJob(job) {
                 nicheId: job.nicheId || null,
                 nicheLabel: job.nicheLabel || null,
                 personalizeFirstLine: job.personalizeFirstLine,
+                productPromptVersion: job.productPromptVersion || 'old',
+                productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
             })
         );
         computeJobCost(job);
@@ -1129,6 +1133,8 @@ function serializeJob(job) {
         nicheId: job.nicheId || null,
         nicheLabel: job.nicheLabel || null,
         personalizeFirstLine: !!job.personalizeFirstLine,
+        productPromptVersion: job.productPromptVersion || 'old',
+        productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
         skipDomainCheck: !!job.skipDomainCheck,
         cost: typeof job.cost === 'number' ? job.cost : 0
     };

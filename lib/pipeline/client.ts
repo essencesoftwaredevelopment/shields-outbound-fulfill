@@ -69,6 +69,8 @@ export interface CreatePipelineJobOptions {
     skipVerification?: boolean;
     skipDomainCheck?: boolean;
     personalizeFirstLine?: boolean;
+    productPromptVersion?: 'old' | 'new_gpt5mini';
+    productPromptProducts?: number;
     domainColumn?: string;
     founderColumn?: string;
     emailColumn?: string;
@@ -103,6 +105,8 @@ export async function createPipelineJob({
     skipVerification,
     skipDomainCheck,
     personalizeFirstLine,
+    productPromptVersion,
+    productPromptProducts,
     domainColumn,
     founderColumn,
     emailColumn,
@@ -148,6 +152,12 @@ export async function createPipelineJob({
     }
     if (typeof personalizeFirstLine === 'boolean') {
         formData.append("personalizeFirstLine", String(personalizeFirstLine));
+    }
+    if (productPromptVersion) {
+        formData.append("productPromptVersion", productPromptVersion);
+    }
+    if (typeof productPromptProducts === 'number' && Number.isFinite(productPromptProducts)) {
+        formData.append("productPromptProducts", String(productPromptProducts));
     }
     if (domainColumn) {
         formData.append("domainColumn", domainColumn);

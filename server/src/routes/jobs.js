@@ -28,10 +28,191 @@ import path from 'path';
 import { TMP_ROOT } from '../config/paths.js';
 import { ensureJobControl, readJobControl, writeJobControl } from '../services/jobControl.js';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
+import OpenAI from 'openai';
 
 const router = express.Router();
 const JOB_EXECUTION_MODE = String(process.env.JOB_EXECUTION_MODE || 'inline').toLowerCase();
 const USE_QUEUE_EXECUTION = JOB_EXECUTION_MODE === 'queue';
+const PERSONALIZATION_FIRST_LINE_PROMPT = ({ domain, productList, variantNumber }) => `You are analyzing multiple products from a Shopify store (domain: ${domain}).
+
+Your task:
+1. Review all products below.
+2. Choose the ONE product most likely to be:
+   - currently live and available
+   - a real consumer product, not a test item, gift card, SKU dump, placeholder, or broken title
+   - representative of the store
+3. Generate one personalized first line based only on that chosen product.
+
+First-line rules:
+- Exact structure: "I was taking a look at the {natural product name} and {brief, specific observation}!"
+- One sentence only
+- Sound like one real person writing to one real person
+- Keep it short, natural, and believable
+- Prefer about 12 to 20 words total
+- Use active voice
+- The line must not imply I bought, used, touched, smelled, wore, tasted, or tried the product
+- Base the observation only on things that could reasonably be noticed from the product title, description, or images
+- The sentence must be grammatically complete and natural, with no missing words
+
+Product name rules:
+- Shorten the product name so it sounds natural in a cold opener
+- Prefer the simplest natural version that still clearly identifies the product
+- Do not invent, merge, rename, or alter key words from the original product name
+- If shortening creates ambiguity or changes meaning, keep the clearer original words
+- Drop promo words such as "NEW", "EXCLUSIVE", "BESTSELLER", "LIMITED", "FREE", "SALE"
+- Drop bundle language, pack-size language, and extra descriptors unless essential
+- Drop brand prefixes or sub-brands unless they help the name sound more natural
+- Rewrite into normal sentence case when needed
+- Use normal sentence case in the final line, not title case
+- Prefer roughly 2 to 6 words for the product name inside the first line
+
+Observation rules:
+- The observation must read like a compliment, not a catalog description
+- The observation must be a complete natural-language phrase, not a fragment
+- The observation must include a natural verb such as "looks", "has", or "catches the light"
+- Use only one concrete visual observation
+- Prefer one specific visual anchor, such as:
+  - a color
+  - a print or pattern
+  - a finish
+  - a shape
+  - packaging design
+  - a visible material detail
+  - one obvious visual contrast or standout element
+- Prefer a specific detail over a broad adjective
+- Prefer observations phrased with "looks" or "catches the light" over "it has"
+- The compliment should sound casually human, not like a product review, merchandiser note, or catalog line
+- If several possible compliments are similar, choose the one that sounds most distinctive and least generic
+- Use "catches the light" only for surfaces where that would sound natural, such as metal, gloss, glass, polished finishes, or jewelry
+
+Avoid:
+- "We were taking a look"
+- sentence fragments like "a hand-polished wire frame"
+- copied product attributes pasted as compliments
+- all-caps product names or robotic title casing
+- altered names that do not clearly match the original title
+- repeating descriptive words from the title unless they become a natural visual observation
+- feature/spec descriptions such as pack size, number of pieces, included items, material composition, measurements, or construction details
+- neutral summaries like "it has X and Y"
+- analytic or merchandiser phrasing like "compact format", "tablet form", "neatly arranged", "individual sachets", "lineup", or "themed packaging"
+- phrases like "in the photos", "on the page", or "in the images"
+- repetitive default phrasing across outputs, especially "catches the eye" or "really stands out"
+- any wording that implies physical experience, such as "feels", "smells", "tastes", "fits", "wears", "holds", or "in your hand"
+- functional claims
+- overly polished wording like "richly saturated", "delightfully playful", "playfully wild", or "perfectly toasted"
+- marketing language, clichés, hype, or jargon
+- generic praise like "craftsmanship really stands out", "high quality", "game changer", "amazing value"
+- weak adjectives like "beautiful", "nice", "lovely", "inviting", "pretty", "amazing", "adorable", or "stunning" unless tied to one specific visual detail
+- made-up personal scenarios
+- mentioning friends, family, partners, roommates, gifts, workouts, hikes, weekends, or lifestyle assumptions
+- recency phrasing like "launched recently" or "earlier this summer" unless clearly essential to the title
+- multiple observations in one line
+
+If the product list is mostly junk, duplicate filler, test products, gift cards, SKUs, or unusable titles, return: "invalid"
+
+Products to choose from:
+${productList}
+
+Output format (JSON):
+{
+  "first_line": "..."
+}`;
+
+function stripHtmlForPrompt(html = '') {
+    return String(html || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function normalizeShopifyDomain(input = '') {
+    const raw = String(input || '').trim().toLowerCase();
+    if (!raw) return '';
+    const withoutProtocol = raw.replace(/^https?:\/\//, '');
+    return withoutProtocol.replace(/^www\./, '').split('/')[0].split('?')[0];
+}
+
+async function fetchShopifyProductList(domain, limit = 20) {
+    const normalizedDomain = normalizeShopifyDomain(domain);
+    if (!normalizedDomain) {
+        throw new Error('Invalid domain.');
+    }
+
+    const response = await fetch(`https://${normalizedDomain}/products.json?limit=${limit}`);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch products.json (HTTP ${response.status}).`);
+    }
+
+    const payload = await response.json();
+    const products = Array.isArray(payload?.products) ? payload.products : [];
+    if (!products.length) {
+        throw new Error('No Shopify products returned for this domain.');
+    }
+
+    const lines = products.map((product, index) => {
+        const title = String(product?.title || '').trim() || '[No title]';
+        const bodyText = stripHtmlForPrompt(product?.body_html || '').slice(0, 300);
+        const tags = String(product?.tags || '').trim();
+        const status = String(product?.status || '').trim() || 'unknown';
+        const publishedAt = String(product?.published_at || '').trim() || 'N/A';
+        const variantCount = Array.isArray(product?.variants) ? product.variants.length : 0;
+
+        return `${index + 1}. Title: ${title}
+Description: ${bodyText || 'N/A'}
+Tags: ${tags || 'N/A'}
+Status: ${status}
+Published At: ${publishedAt}
+Variants: ${variantCount}`;
+    });
+
+    return {
+        normalizedDomain,
+        productCount: products.length,
+        productList: lines.join('\n\n')
+    };
+}
+
+function parseFirstLinesFromModelOutput(raw = '') {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+
+    const fencedMatch = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const candidate = (fencedMatch ? fencedMatch[1] : text).trim();
+
+    try {
+        const parsed = JSON.parse(candidate);
+        if (Array.isArray(parsed)) {
+            const values = parsed
+                .filter((item) => typeof item === 'string')
+                .map((item) => item.trim())
+                .filter(Boolean);
+            return values.length ? values : null;
+        }
+        if (typeof parsed === 'string') {
+            const value = parsed.trim();
+            return value ? [value] : null;
+        }
+        if (parsed && Array.isArray(parsed.first_lines)) {
+            const values = parsed.first_lines
+                .filter((item) => typeof item === 'string')
+                .map((item) => item.trim())
+                .filter(Boolean);
+            return values.length ? values : null;
+        }
+        if (parsed && typeof parsed.first_line === 'string') {
+            const value = parsed.first_line.trim();
+            return value ? [value] : null;
+        }
+    } catch {
+        // Fall through to non-JSON handling.
+    }
+
+    if (/^"?invalid"?$/i.test(candidate)) {
+        return ['invalid'];
+    }
+
+    return null;
+}
 
 function buildQueuePayload(job) {
     return {
@@ -49,6 +230,8 @@ function buildQueuePayload(job) {
         nicheId: job.nicheId || null,
         nicheLabel: job.nicheLabel || null,
         personalizeFirstLine: !!job.personalizeFirstLine,
+        productPromptVersion: job.productPromptVersion || 'old',
+        productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
         emailVerificationProvider: job.emailVerificationProvider || 'trykitt',
         columnMapping: job.columnMapping || { domain: 'domain', founder: '', email: '' },
         dedupeStats: job.dedupeStats || null,
@@ -161,6 +344,8 @@ async function startInlineResumeJob({ jobId, uid, clientId, persistedJob }) {
         nicheId: persistedJob?.nicheId || null,
         nicheLabel: persistedJob?.nicheLabel || null,
         personalizeFirstLine: !!persistedJob?.personalizeFirstLine,
+        productPromptVersion: persistedJob?.productPromptVersion || 'old',
+        productPromptProducts: Number.isFinite(persistedJob?.productPromptProducts) ? persistedJob.productPromptProducts : 3,
         emailVerificationProvider: persistedJob?.emailVerificationProvider || 'trykitt',
         columnMapping: persistedJob?.columnMapping || { domain: 'domain', founder: '', email: '' },
         cost: typeof persistedJob?.cost === 'number' ? persistedJob.cost : 0,
@@ -214,6 +399,8 @@ const uploadFields = upload.fields([
     { name: 'skipDomainCheck', maxCount: 1 },
     { name: 'industry', maxCount: 1 },
     { name: 'personalizeFirstLine', maxCount: 1 },
+    { name: 'productPromptVersion', maxCount: 1 },
+    { name: 'productPromptProducts', maxCount: 1 },
     { name: 'domainColumn', maxCount: 1 },
     { name: 'founderColumn', maxCount: 1 },
     { name: 'emailColumn', maxCount: 1 }
@@ -307,6 +494,12 @@ router.post('/jobs', uploadFields, async (req, res) => {
         const nicheId = (req.body.nicheId || '').toString().trim();
         const nicheLabel = (req.body.nicheLabel || '').toString().trim();
         const personalizeFirstLine = String(req.body.personalizeFirstLine || '').toLowerCase() === 'true';
+        const productPromptVersionRaw = (req.body.productPromptVersion || '').toString().trim().toLowerCase();
+        const productPromptVersion = productPromptVersionRaw === 'new_gpt5mini' ? 'new_gpt5mini' : 'old';
+        const productPromptProductsParsed = parseInt(req.body.productPromptProducts || '3', 10);
+        const productPromptProducts = Number.isFinite(productPromptProductsParsed)
+            ? Math.max(1, Math.min(productPromptProductsParsed, 5))
+            : 3;
         let skipVerification = String(req.body.skipVerification || '').toLowerCase() === 'true';
         
         // Auto-skip verification when using self-hosted email finding (emails are already verified)
@@ -329,6 +522,8 @@ router.post('/jobs', uploadFields, async (req, res) => {
             nicheId,
             nicheLabel,
             personalizeFirstLine,
+            productPromptVersion,
+            productPromptProducts,
             emailVerificationProvider,
             sqlClientId,
             columnMapping: {
@@ -745,6 +940,8 @@ router.post('/jobs/:id/resume', async (req, res) => {
                     nicheId: persistedJob?.nicheId || null,
                     nicheLabel: persistedJob?.nicheLabel || null,
                     personalizeFirstLine: !!persistedJob?.personalizeFirstLine,
+                    productPromptVersion: persistedJob?.productPromptVersion || 'old',
+                    productPromptProducts: Number.isFinite(persistedJob?.productPromptProducts) ? persistedJob.productPromptProducts : 3,
                     emailVerificationProvider: persistedJob?.emailVerificationProvider || 'trykitt',
                     columnMapping: persistedJob?.columnMapping || { domain: 'domain', founder: '', email: '' },
                     dedupeStats: persistedJob?.dedupeStats || null,
@@ -1759,6 +1956,94 @@ const personalizerFields = upload.fields([
     { name: 'checkKlaviyo', maxCount: 1 },
     { name: 'removeB2B', maxCount: 1 }
 ]);
+
+// Test endpoint for iterating on personalization prompts.
+// Replace PERSONALIZATION_TEST_PROMPT above with your hardcoded prompt as needed.
+router.get('/jobs/personalizer/test-prompt', async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization || '';
+        const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+        const idToken = (req.query?.idToken || bearerToken || '').toString().trim();
+        let openaiKey = '';
+
+        if (idToken) {
+            const decodedToken = await admin.auth().verifyIdToken(idToken);
+            const uid = decodedToken.uid;
+
+            const userDoc = await firestore.collection('users').doc(uid).get();
+            if (userDoc.exists) {
+                openaiKey = (userDoc.data()?.openai_key || '').toString().trim();
+            }
+        }
+
+        if (!openaiKey) {
+            openaiKey = (process.env.OPENAI_API_KEY || '').toString().trim();
+        }
+
+        if (!openaiKey) {
+            return res.status(400).json({
+                error: 'Missing OpenAI key. Set OPENAI_API_KEY in server env, or pass a valid Firebase token for user vault lookup.'
+            });
+        }
+
+        const domain = (req.query?.domain || '').toString().trim();
+        const productListFromQuery = (req.query?.productList || '').toString().trim();
+        const productsLimitRaw = parseInt((req.query?.productsLimit || '20').toString(), 10);
+        const productsLimit = Number.isFinite(productsLimitRaw)
+            ? Math.max(1, Math.min(productsLimitRaw, 100))
+            : 20;
+        const model = (req.query?.model || 'gpt-5-mini').toString().trim();
+
+        if (!domain) {
+            return res.status(400).json({ error: 'Missing required query param: domain.' });
+        }
+
+        let productList = productListFromQuery;
+        let productsFetched = 0;
+        let normalizedDomain = normalizeShopifyDomain(domain);
+        if (!productList) {
+            const fetched = await fetchShopifyProductList(domain, productsLimit);
+            productList = fetched.productList;
+            productsFetched = fetched.productCount;
+            normalizedDomain = fetched.normalizedDomain;
+        }
+
+        const openai = new OpenAI({ apiKey: openaiKey });
+        const variationPromises = Array.from({ length: 5 }, (_, index) => {
+            const prompt = PERSONALIZATION_FIRST_LINE_PROMPT({
+                domain: normalizedDomain || domain,
+                productList,
+                variantNumber: index + 1
+            });
+
+            return openai.chat.completions.create({
+                model,
+                messages: [{ role: 'user', content: prompt }]
+            });
+        });
+
+        const variationCompletions = await Promise.all(variationPromises);
+        const firstLines = variationCompletions.map((completion) => {
+            const output = completion.choices?.[0]?.message?.content?.trim() || '';
+            const parsed = parseFirstLinesFromModelOutput(output);
+            return parsed?.[0] || null;
+        });
+
+        const validFirstLines = firstLines.filter((line) => typeof line === 'string' && line !== 'invalid');
+        if (validFirstLines.length === 0) {
+            return res.json({ first_lines: ['invalid'] });
+        }
+
+        if (validFirstLines.length < 5) {
+            return res.status(502).json({ error: 'Model returned fewer than 5 valid first lines.' });
+        }
+
+        return res.json({ first_lines: validFirstLines.slice(0, 5) });
+    } catch (error) {
+        console.error('Personalization test-prompt error:', error);
+        return res.status(500).json({ error: 'Failed to run personalization test prompt.' });
+    }
+});
 
 router.post('/jobs/personalizer', personalizerFields, async (req, res) => {
     try {

@@ -19,6 +19,8 @@ const B2B_KEYWORDS = [
     'minimum order', 'bulk order', 'trade account'
 ];
 
+const NEW_PROMPT_MODEL = 'gpt-5-mini';
+
 function normalizeHostname(urlOrDomain) {
     let hostname = urlOrDomain.trim().toLowerCase();
     // Fix malformed URLs
@@ -288,6 +290,341 @@ function isB2B(text) {
     return B2B_KEYWORDS.some(keyword => lower.includes(keyword));
 }
 
+function formatProductsForNewPrompt(products = []) {
+    return products.map((p, idx) => {
+        const title = String(p.title || '').trim() || '[No title]';
+        const description = String(stripHtml(p.body_html || '') || '').trim().slice(0, 320);
+
+        return `${idx + 1}. Title: ${title}
+Description: ${description || 'N/A'}`;
+    }).join('\n\n');
+}
+
+function buildNewPrompt({ domain, productList }) {
+    return `You are analyzing multiple products from a Shopify store (domain: ${domain}).
+
+Your task:
+1. Review all products below.
+2. Choose the ONE product most likely to be:
+   - currently live and available
+   - a real consumer product, not a test item, gift card, SKU dump, placeholder, or broken title
+   - representative of the store.
+3. Generate one personalized first line based only on that chosen product.
+
+First-line rules:
+- Exact structure: "I was taking a look at the {natural product name} and {brief, specific observation}!"
+- One sentence only
+- Sound like one real person writing to one real person
+- Keep it short, natural, and believable
+- Use active voice
+- The product name can be shortened naturally if needed
+- Rewrite product names into natural sentence case when needed (no ALL CAPS or shouty casing)
+- Remove promo words from the product name in the first line (for example: "EXCLUSIVE", "BESTSELLER", "NEW")
+- The observation must read like a compliment, not a catalog description
+- The observation must be a complete natural-language phrase, not a fragment
+- The observation must include a natural verb like "looks", "sounds", or "really catches the light"
+- The line must not imply I bought, used, touched, smelled, wore, tasted, or tried the product
+- Base the observation only on things that could reasonably be noticed from the product title, description, or images
+- Keep the compliment visual and aesthetic (how it looks), not functional or factual
+- Shorten the product name so it sounds natural in a cold opener
+- Prefer the simplest natural version that still clearly identifies the product
+- Do not invent, merge, rename, or alter key words from the original product name
+
+Avoid:
+- "We were taking a look"
+- copied product attributes pasted as compliments
+- all-caps product names or robotic title casing
+- feature/spec descriptions such as pack size, number of pieces, included item breakdown, gusset/material composition, measurements, or construction details
+- neutral product summaries like "it is a six-piece set..." or "it has X and Y"
+- marketing language, clichés, hype, or jargon
+
+If the product list is mostly junk, duplicate filler, test products, gift cards, SKUs, or unusable titles, return: "invalid"
+
+Products to choose from:
+${productList}
+
+Output format (JSON):
+{
+  "chosen_product_number": 1,
+  "product_title": "...",
+  "first_line": "..."
+}`;
+}
+
+function parseNewPromptResponse(raw = '') {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+
+    const fencedMatch = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const candidate = (fencedMatch ? fencedMatch[1] : text).trim();
+
+    if (/^"?invalid"?$/i.test(candidate)) {
+        return { invalid: true };
+    }
+
+    try {
+        const parsed = JSON.parse(candidate);
+        if (typeof parsed === 'string' && /^invalid$/i.test(parsed.trim())) {
+            return { invalid: true };
+        }
+        const firstLine = String(parsed?.first_line || '').trim();
+        const productTitle = String(parsed?.product_title || '').trim();
+        const chosenProductNumber = Number.parseInt(String(parsed?.chosen_product_number || 1), 10);
+        if (!firstLine) return null;
+        return {
+            invalid: false,
+            firstLine,
+            productTitle,
+            chosenProductNumber: Number.isFinite(chosenProductNumber) ? chosenProductNumber : 1
+        };
+    } catch {
+        const plain = candidate.replace(/^"|"$/g, '').trim();
+        if (!plain) return null;
+        return {
+            invalid: false,
+            firstLine: plain,
+            productTitle: '',
+            chosenProductNumber: 1
+        };
+    }
+}
+
+async function personalizeWithNewPromptFromShopify({
+    inputCsv,
+    outputCsv,
+    apiKeys,
+    log,
+    productPromptProducts = 3,
+    concurrency = 12,
+    model = NEW_PROMPT_MODEL,
+    removeB2B = true
+}) {
+    log?.(`Generating personalized first lines with New Prompt (${model})...`);
+
+    if (!apiKeys.openai) {
+        throw new Error('OpenAI API key required for personalization');
+    }
+
+    const openai = new OpenAI({ apiKey: apiKeys.openai });
+    const rows = [];
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(inputCsv)
+            .pipe(csvParse({ columns: true, trim: true }))
+            .on('data', (row) => {
+                if (row.shopify === 'Yes') rows.push(row);
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    if (!rows.length) {
+        fs.writeFileSync(outputCsv, 'domain,url,title,description,date,first_line\n');
+        return { personalized: 0, productsFetched: 0, failed: 0 };
+    }
+
+    const writeStream = fs.createWriteStream(outputCsv);
+    const stringifier = csvStringify({
+        header: true,
+        columns: ['domain', 'url', 'title', 'description', 'date', 'first_line']
+    });
+    stringifier.pipe(writeStream);
+
+    let processed = 0;
+    let productsFetched = 0;
+    let failed = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let fallbackUsed = 0;
+    let backoffMs = 0;
+
+    const fetchProductsForDomain = async (domain, retries = 2, attempts = 0) => {
+        const url = `https://${domain}/products.json?limit=${productPromptProducts}`;
+        try {
+            const data = await fetchUrl(url);
+            const products = Array.isArray(data?.products) ? data.products : [];
+            return products.slice(0, productPromptProducts);
+        } catch (err) {
+            if (attempts < retries) {
+                await new Promise((resolve) => setTimeout(resolve, 700 * (attempts + 1)));
+                return fetchProductsForDomain(domain, retries, attempts + 1);
+            }
+            throw err;
+        }
+    };
+
+    const createCompletionWithRetry = async ({
+        prompt,
+        requestedModel,
+        retryCount = 0,
+        allowFallback = true
+    }) => {
+        try {
+            if (backoffMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            }
+
+            const request = {
+                model: requestedModel,
+                messages: [{ role: 'user', content: prompt }]
+            };
+            if (requestedModel !== NEW_PROMPT_MODEL) {
+                request.max_tokens = 180;
+                request.temperature = 0.7;
+            }
+
+            const completion = await openai.chat.completions.create(request);
+
+            backoffMs = Math.max(0, backoffMs - 100);
+            return completion;
+        } catch (err) {
+            const message = String(err?.message || '');
+            const messageLower = message.toLowerCase();
+            const statusCode = Number(err?.status || 0);
+
+            if (statusCode === 429 && retryCount < 3) {
+                backoffMs = Math.min(5000, (backoffMs || 500) * 2);
+                log?.(`New prompt rate limited (${requestedModel}), backing off for ${backoffMs}ms`);
+                await new Promise((resolve) => setTimeout(resolve, backoffMs + Math.random() * 1000));
+                return createCompletionWithRetry({
+                    prompt,
+                    requestedModel,
+                    retryCount: retryCount + 1,
+                    allowFallback
+                });
+            }
+
+            const shouldFallback = allowFallback
+                && requestedModel === NEW_PROMPT_MODEL
+                && (messageLower.includes('model') || messageLower.includes('permission'));
+            if (shouldFallback) {
+                fallbackUsed += 1;
+                log?.(`New prompt model fallback: ${message}`);
+                return createCompletionWithRetry({
+                    prompt,
+                    requestedModel: 'gpt-4o-mini',
+                    retryCount,
+                    allowFallback: false
+                });
+            }
+
+            throw err;
+        }
+    };
+
+    const runRow = async (row) => {
+        const domain = normalizeHostname(row.domain || '');
+        if (!domain) return null;
+
+        let products;
+        try {
+            products = await fetchProductsForDomain(domain);
+        } catch (err) {
+            log?.(`New prompt fetch failed for ${domain}: ${err.message}`);
+            return {
+                domain,
+                url: `https://${domain}`,
+                title: '',
+                description: '',
+                date: '',
+                first_line: '[Generation failed]'
+            };
+        }
+
+        if (removeB2B) {
+            products = products.filter((p) => {
+                const combined = `${p.title || ''} ${stripHtml(p.body_html || '')} ${Array.isArray(p.tags) ? p.tags.join(', ') : (p.tags || '')}`;
+                return !isB2B(combined);
+            });
+        }
+
+        if (!products.length) {
+            return {
+                domain,
+                url: `https://${domain}`,
+                title: '',
+                description: '',
+                date: '',
+                first_line: 'invalid'
+            };
+        }
+        productsFetched += products.length;
+
+        const productList = formatProductsForNewPrompt(products);
+        const prompt = buildNewPrompt({ domain, productList });
+
+        const completion = await createCompletionWithRetry({
+            prompt,
+            requestedModel: model,
+            retryCount: 0,
+            allowFallback: true
+        });
+
+        totalInputTokens += completion.usage?.prompt_tokens || 0;
+        totalOutputTokens += completion.usage?.completion_tokens || 0;
+
+        const output = completion.choices?.[0]?.message?.content?.trim() || '';
+        const parsed = parseNewPromptResponse(output);
+        if (!parsed) {
+            log?.(`New prompt parse failed for ${domain}: ${output.slice(0, 180)}`);
+            return {
+                domain,
+                url: `https://${domain}`,
+                title: '',
+                description: '',
+                date: '',
+                first_line: '[Generation failed]'
+            };
+        }
+        if (parsed.invalid) {
+            return {
+                domain,
+                url: `https://${domain}`,
+                title: '',
+                description: '',
+                date: '',
+                first_line: 'invalid'
+            };
+        }
+
+        return {
+            domain,
+            url: `https://${domain}`,
+            title: parsed.productTitle || '',
+            description: '',
+            date: '',
+            first_line: parsed.firstLine
+        };
+    };
+
+    for (let i = 0; i < rows.length; i += concurrency) {
+        const batch = rows.slice(i, i + concurrency);
+        const results = await Promise.allSettled(batch.map((row) => runRow(row)));
+        for (const result of results) {
+            if (result.status === 'fulfilled' && result.value) {
+                processed += 1;
+                stringifier.write(result.value);
+            } else if (result.status === 'rejected') {
+                failed += 1;
+                log?.(`New prompt row failed: ${result.reason?.message || result.reason || 'Unknown error'}`);
+            }
+        }
+        log?.(`New prompt personalization progress: ${Math.min(i + concurrency, rows.length)}/${rows.length}`);
+    }
+
+    stringifier.end();
+    await new Promise((resolve) => writeStream.on('finish', resolve));
+
+    const estimatedCost = (totalInputTokens * 0.00025 / 1000) + (totalOutputTokens * 0.002 / 1000);
+    log?.(`New prompt personalization complete: ${processed} rows. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
+
+    return {
+        personalized: processed,
+        productsFetched,
+        failed,
+        estimatedCost
+    };
+}
+
 async function cleanProductData({ inputJson, outputCsv, log, maxBodyLength = 800, removeB2B = true }) {
     log?.(`Cleaning product data...${removeB2B ? '' : ' (B2B filter disabled)'}`);
 
@@ -543,7 +880,15 @@ Description: ${description}
     };
 }
 
-export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log, removeB2B = true }) {
+export async function runPersonalization({
+    inputCsv,
+    outputCsv,
+    apiKeys,
+    log,
+    removeB2B = true,
+    productPromptVersion = 'old',
+    productPromptProducts = 3
+}) {
     const jobDir = path.dirname(inputCsv);
     const shopifyDetectionCsv = path.join(jobDir, 'shopify-detection.csv');
     const productsJson = path.join(jobDir, 'products.json');
@@ -568,6 +913,35 @@ export async function runPersonalization({ inputCsv, outputCsv, apiKeys, log, re
             productsFetched: 0,
             personalized: 0,
             skipped: true
+        };
+    }
+
+    const useNewPrompt = String(productPromptVersion || '').toLowerCase() === 'new_gpt5mini';
+    if (useNewPrompt) {
+        const newPromptProducts = Number.isFinite(productPromptProducts)
+            ? Math.max(1, Math.min(productPromptProducts, 5))
+            : 3;
+
+        const newPromptStats = await personalizeWithNewPromptFromShopify({
+            inputCsv: shopifyDetectionCsv,
+            outputCsv,
+            apiKeys,
+            log,
+            productPromptProducts: newPromptProducts,
+            concurrency: 15,
+            model: NEW_PROMPT_MODEL,
+            removeB2B
+        });
+
+        return {
+            processed: newPromptStats.personalized,
+            total: shopifyStats.total,
+            ['Shopify Stores']: shopifyStats.shopifyStores,
+            ['Products Fetched']: newPromptStats.productsFetched,
+            ['Products Failed']: newPromptStats.failed,
+            ['Products Removed']: 0,
+            ['Personalized']: newPromptStats.personalized,
+            ['Estimated Cost']: newPromptStats.estimatedCost || 0
         };
     }
 

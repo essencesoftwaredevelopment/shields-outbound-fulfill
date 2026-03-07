@@ -378,6 +378,9 @@ export default function ClientPage() {
     // Step 3: Personalization options
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
     const [personalizeFirstLine, setPersonalizeFirstLine] = useState(false);
+    const [productPromptUseNew, setProductPromptUseNew] = useState(false);
+    const [productPromptUseOld, setProductPromptUseOld] = useState(true);
+    const [productPromptProducts, setProductPromptProducts] = useState(3);
     const [skipFounderFinder, setSkipFounderFinder] = useState(false);
     const [skipEmailFinder, setSkipEmailFinder] = useState(false);
     const [uploading, setUploading] = useState(false);
@@ -1823,6 +1826,14 @@ export default function ClientPage() {
         try {
             const idToken = await getIdToken(user);
             const activeNiche = niches.find(n => n.id === clientIndustry);
+            const selectedProductPromptVersion: 'old' | 'new_gpt5mini' | undefined =
+                clientIndustry === 'ecom' && personalizeFirstLine
+                    ? (productPromptUseNew ? 'new_gpt5mini' : 'old')
+                    : undefined;
+            const selectedProductPromptProducts =
+                clientIndustry === 'ecom' && personalizeFirstLine && productPromptUseNew
+                    ? productPromptProducts
+                    : undefined;
             const response = await createPipelineJob({
                 file: selectedFile,
                 idToken,
@@ -1839,6 +1850,8 @@ export default function ClientPage() {
                 skipVerification: !verifyEmail, // Invert: unchecked verifyEmail means skip verification
                 skipDomainCheck: !runDomainCheck,
                 personalizeFirstLine,
+                productPromptVersion: selectedProductPromptVersion,
+                productPromptProducts: selectedProductPromptProducts,
                 domainColumn,
                 founderColumn,
                 emailColumn,
@@ -5816,7 +5829,7 @@ export default function ClientPage() {
                                         {clientIndustry === 'ecom' && (
                                             <label style={{
                                                 display: 'flex',
-                                                alignItems: 'center',
+                                                alignItems: 'flex-start',
                                                 gap: '0.75rem',
                                                 cursor: 'pointer',
                                                 padding: '0.5rem'
@@ -5825,7 +5838,7 @@ export default function ClientPage() {
                                                     type="checkbox"
                                                     checked={personalizeFirstLine}
                                                     onChange={(e) => setPersonalizeFirstLine(e.target.checked)}
-                                                    style={{ width: '18px', height: '18px', cursor: 'pointer' }}
+                                                    style={{ width: '18px', height: '18px', cursor: 'pointer', marginTop: '0.15rem' }}
                                                 />
                                                 <div style={{ flex: 1 }}>
                                                     <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
@@ -5834,6 +5847,75 @@ export default function ClientPage() {
                                                     <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
                                                         Generate first line based on Shopify products
                                                     </div>
+                                                    {personalizeFirstLine && (
+                                                        <div style={{
+                                                            marginTop: '0.75rem',
+                                                            display: 'flex',
+                                                            flexDirection: 'column',
+                                                            gap: '0.625rem',
+                                                            padding: '0.75rem',
+                                                            borderRadius: '8px',
+                                                            background: 'rgba(255, 255, 255, 0.04)',
+                                                            border: '1px solid rgba(255, 255, 255, 0.12)'
+                                                        }}>
+                                                            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={productPromptUseNew}
+                                                                    onChange={(e) => {
+                                                                        const checked = e.target.checked;
+                                                                        setProductPromptUseNew(checked);
+                                                                        if (checked) {
+                                                                            setProductPromptUseOld(false);
+                                                                        } else if (!productPromptUseOld) {
+                                                                            setProductPromptUseOld(true);
+                                                                        }
+                                                                    }}
+                                                                    style={{ width: '16px', height: '16px', cursor: 'pointer' }}
+                                                                />
+                                                                <span style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                                    New Prompt (gpt-5-mini)
+                                                                </span>
+                                                            </label>
+
+                                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: '1.5rem' }}>
+                                                                <span style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.65)' }}>Products:</span>
+                                                                <select
+                                                                    value={productPromptProducts}
+                                                                    onChange={(e) => setProductPromptProducts(Number(e.target.value))}
+                                                                    disabled={!productPromptUseNew}
+                                                                    style={{
+                                                                        width: '80px',
+                                                                        opacity: productPromptUseNew ? 1 : 0.6
+                                                                    }}
+                                                                >
+                                                                    {[1, 2, 3, 4, 5].map((num) => (
+                                                                        <option key={num} value={num}>{num}</option>
+                                                                    ))}
+                                                                </select>
+                                                            </div>
+
+                                                            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={productPromptUseOld}
+                                                                    onChange={(e) => {
+                                                                        const checked = e.target.checked;
+                                                                        setProductPromptUseOld(checked);
+                                                                        if (checked) {
+                                                                            setProductPromptUseNew(false);
+                                                                        } else if (!productPromptUseNew) {
+                                                                            setProductPromptUseNew(true);
+                                                                        }
+                                                                    }}
+                                                                    style={{ width: '16px', height: '16px', cursor: 'pointer' }}
+                                                                />
+                                                                <span style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                                    Old Prompt
+                                                                </span>
+                                                            </label>
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </label>
                                         )}

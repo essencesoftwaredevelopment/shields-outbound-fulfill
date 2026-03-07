@@ -83,6 +83,8 @@ function buildRuntimeJob(queueJob, apiKeys) {
         nicheId: payload.nicheId || null,
         nicheLabel: payload.nicheLabel || null,
         personalizeFirstLine: !!payload.personalizeFirstLine,
+        productPromptVersion: payload.productPromptVersion || 'old',
+        productPromptProducts: Number.isFinite(payload.productPromptProducts) ? payload.productPromptProducts : 3,
         emailVerificationProvider: payload.emailVerificationProvider || 'trykitt',
         columnMapping: payload.columnMapping || { domain: 'domain', founder: '', email: '' },
         pricing: DEFAULT_PRICING,
