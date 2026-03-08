@@ -12,11 +12,71 @@
  */
 
 import express from 'express';
+import multer from 'multer';
+import { parse as csvParse } from 'csv-parse/sync';
 import { admin, firestore } from '../config/firebase.js';
 import { pool } from '../config/db.js';
 import { getOrCreateClient } from '../services/db/queries.js';
+import {
+    choosePreferredCampaign,
+    extractCampaignApiItems,
+    getCsvValueByAliases,
+    mapCsvEmailStatus,
+    normalizeCampaignName,
+    normalizeDomainForMatch,
+    normalizeEmailForMatch,
+    normalizeHeaderKey,
+    normalizePersonName,
+    shouldBackfillEmailStatus
+} from '../utils/instantlyImportMerge.js';
 
 const router = express.Router();
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024 }
+});
+
+const CAMPAIGN_NAME_ALIASES = ['campaign name', 'campaign', 'campaign_name'];
+const EMAIL_ALIASES = ['email', 'email address', 'lead email'];
+const DOMAIN_ALIASES = ['domain', 'website', 'company domain', 'company website', 'url'];
+const NAME_ALIASES = ['founder name', 'full name', 'name', 'founder_name', 'full_name'];
+const FIRST_NAME_ALIASES = ['first name', 'first_name'];
+const LAST_NAME_ALIASES = ['last name', 'last_name'];
+const EMAIL_STATUS_ALIASES = ['email_status', 'email status', 'verification status', 'lookup_status'];
+const MAX_BIND_PARAMS_PER_QUERY = 30000;
+
+function chunkArray(items, size) {
+    if (!Array.isArray(items) || items.length === 0) return [];
+    const chunks = [];
+    for (let i = 0; i < items.length; i += size) {
+        chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
+}
+
+function buildHeaderLookup(rows) {
+    const firstRow = rows[0] || {};
+    const headerLookup = new Map();
+    Object.keys(firstRow).forEach((header) => {
+        const normalized = normalizeHeaderKey(header);
+        if (!normalized || headerLookup.has(normalized)) return;
+        headerLookup.set(normalized, header);
+    });
+    return headerLookup;
+}
+
+function hasAnyHeaderAlias(headerLookup, aliases) {
+    return aliases.some((alias) => headerLookup.has(normalizeHeaderKey(alias)));
+}
+
+function extractContactNameFromRow(row, headerLookup) {
+    const directName = getCsvValueByAliases(row, NAME_ALIASES, headerLookup);
+    if (directName) return directName;
+
+    const firstName = getCsvValueByAliases(row, FIRST_NAME_ALIASES, headerLookup);
+    const lastName = getCsvValueByAliases(row, LAST_NAME_ALIASES, headerLookup);
+    return `${firstName} ${lastName}`.trim();
+}
 
 async function deleteAllDocs(ref) {
     const batchSize = 300;
@@ -291,6 +351,483 @@ router.get('/clients/:clientId/campaigns/list', async (req, res) => {
     } catch (error) {
         console.error('Error fetching campaigns list:', error);
         res.status(500).json({ error: 'Failed to fetch campaigns list.' });
+    }
+});
+
+// POST /api/clients/:clientId/instantly-import/merge - Merge Instantly CSV into SQL (no-delete)
+router.post('/clients/:clientId/instantly-import/merge', upload.single('file'), async (req, res) => {
+    try {
+        const { clientId } = req.params;
+        const idToken = String(req.body?.idToken || '').trim();
+        const notesRaw = String(req.body?.notes || '').trim();
+        const campaignNameOverridesRaw = String(req.body?.campaignNameOverrides || '').trim();
+        const file = req.file;
+
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientId) return res.status(400).json({ error: 'Missing client id.' });
+        if (!file?.buffer) return res.status(400).json({ error: 'Missing CSV file upload.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const uid = decoded.uid;
+
+        const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
+        const clientSnap = await clientRef.get();
+        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
+
+        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
+        if (!instantlyKey) {
+            return res.status(400).json({ error: 'Client has no Instantly API key configured.' });
+        }
+
+        let rows;
+        try {
+            rows = csvParse(file.buffer.toString('utf8'), {
+                columns: true,
+                skip_empty_lines: true,
+                trim: true,
+                bom: true,
+                relax_column_count: true,
+                relax_quotes: true,
+                skip_records_with_error: true
+            });
+        } catch (error) {
+            console.error('[instantly-import/merge] CSV parse failed:', error?.message || error);
+            return res.status(400).json({ error: 'Malformed CSV file.' });
+        }
+
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return res.status(400).json({ error: 'CSV file contains no data rows.' });
+        }
+
+        const headerLookup = buildHeaderLookup(rows);
+        if (!hasAnyHeaderAlias(headerLookup, CAMPAIGN_NAME_ALIASES)) {
+            return res.status(400).json({ error: 'Missing required "Campaign Name" column.' });
+        }
+
+        const sqlClientId = await getOrCreateClient(uid, clientId);
+        let campaignNameOverridesInput = {};
+        if (campaignNameOverridesRaw) {
+            try {
+                const parsed = JSON.parse(campaignNameOverridesRaw);
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    return res.status(400).json({ error: 'campaignNameOverrides must be a JSON object.' });
+                }
+                campaignNameOverridesInput = parsed;
+            } catch {
+                return res.status(400).json({ error: 'campaignNameOverrides must be valid JSON.' });
+            }
+        }
+
+        // Fetch campaigns from Instantly API (live) and resolve duplicate names deterministically
+        const instantlyResp = await fetch('https://api.instantly.ai/api/v2/campaigns', {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${instantlyKey}`,
+                'Accept': 'application/json'
+            }
+        });
+
+        if (!instantlyResp.ok) {
+            const message = await instantlyResp.text().catch(() => '');
+            console.error('[instantly-import/merge] Instantly campaigns fetch failed:', instantlyResp.status, message);
+            return res.status(502).json({ error: 'Failed to fetch campaigns from Instantly API.' });
+        }
+
+        const instantlyPayload = await instantlyResp.json();
+        const instantlyItems = extractCampaignApiItems(instantlyPayload);
+        const parsedCampaigns = instantlyItems
+            .map((item) => {
+                const instantlyCampaignId = String(item?.id || item?.campaignId || item?.uuid || item?._id || '').trim();
+                const name = String(item?.name || item?.title || item?.campaign_name || '').trim();
+                if (!instantlyCampaignId || !name) return null;
+                const createdRaw = item?.timestamp_created || item?.createdAt || item?.created_at || item?.created || item?.created_at_utc || null;
+                const createdAt = createdRaw ? new Date(createdRaw) : null;
+                const createdAtIso = createdAt && !Number.isNaN(createdAt.getTime()) ? createdAt.toISOString() : null;
+                return {
+                    instantlyCampaignId,
+                    name,
+                    status: item?.status ?? item?.state ?? null,
+                    startDate: createdAtIso ? new Date(createdAtIso) : null,
+                    raw: item
+                };
+            })
+            .filter(Boolean);
+
+        if (!parsedCampaigns.length) {
+            return res.status(502).json({ error: 'No campaigns were returned from Instantly API.' });
+        }
+
+        // Upsert all fetched campaigns to SQL cache
+        const campaignChunks = chunkArray(parsedCampaigns, 300);
+        for (const campaignChunk of campaignChunks) {
+            const params = [];
+            const values = [];
+            let paramIndex = 1;
+            for (const campaign of campaignChunk) {
+                params.push(uid, sqlClientId, campaign.instantlyCampaignId, campaign.name, campaign.startDate);
+                values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4})`);
+                paramIndex += 5;
+            }
+
+            await pool.query(
+                `INSERT INTO instantly_campaigns (agency_id, client_id, instantly_campaign_id, name, start_date)
+                 VALUES ${values.join(', ')}
+                 ON CONFLICT (agency_id, client_id, instantly_campaign_id)
+                 DO UPDATE SET
+                    name = EXCLUDED.name,
+                    start_date = COALESCE(EXCLUDED.start_date, instantly_campaigns.start_date),
+                    created_at = COALESCE(instantly_campaigns.created_at, now())`,
+                params
+            );
+        }
+
+        const campaignsByNormalizedName = new Map();
+        parsedCampaigns.forEach((campaign) => {
+            const normalizedName = normalizeCampaignName(campaign.name);
+            if (!normalizedName) return;
+            const existing = campaignsByNormalizedName.get(normalizedName) || [];
+            existing.push(campaign);
+            campaignsByNormalizedName.set(normalizedName, existing);
+        });
+
+        const resolvedCampaignByNormalizedName = new Map();
+        const duplicateNameResolutionByNormalizedName = new Map();
+        for (const [normalizedName, candidates] of campaignsByNormalizedName.entries()) {
+            const resolution = choosePreferredCampaign(candidates.map((candidate) => ({
+                id: candidate.instantlyCampaignId,
+                status: candidate.status,
+                createdAt: candidate.startDate
+            })));
+            if (!resolution.selected) continue;
+            const selectedCampaign = candidates.find((candidate) => candidate.instantlyCampaignId === String(resolution.selected.id));
+            if (!selectedCampaign) continue;
+            resolvedCampaignByNormalizedName.set(normalizedName, {
+                campaign: selectedCampaign,
+                resolutionReason: resolution.resolutionReason
+            });
+            if (candidates.length > 1) {
+                duplicateNameResolutionByNormalizedName.set(normalizedName, resolution.resolutionReason);
+            }
+        }
+
+        const resolvedInstantlyCampaignIds = Array.from(
+            new Set(Array.from(resolvedCampaignByNormalizedName.values()).map((entry) => entry.campaign.instantlyCampaignId))
+        );
+        const sqlCampaignIdByInstantlyId = new Map();
+        if (resolvedInstantlyCampaignIds.length > 0) {
+            const sqlCampaignResult = await pool.query(
+                `SELECT id, instantly_campaign_id
+                 FROM instantly_campaigns
+                 WHERE agency_id = $1
+                 AND client_id = $2
+                 AND instantly_campaign_id = ANY($3::text[])`,
+                [uid, sqlClientId, resolvedInstantlyCampaignIds]
+            );
+            sqlCampaignResult.rows.forEach((row) => {
+                sqlCampaignIdByInstantlyId.set(String(row.instantly_campaign_id), Number(row.id));
+            });
+        }
+
+        const manualOverridePairs = Object.entries(campaignNameOverridesInput || {})
+            .map(([campaignName, campaignId]) => ({
+                normalizedCampaignName: normalizeCampaignName(campaignName),
+                sqlCampaignId: Number(campaignId)
+            }))
+            .filter((item) => item.normalizedCampaignName && Number.isInteger(item.sqlCampaignId) && item.sqlCampaignId > 0);
+
+        const manualOverrideCampaignByNormalizedName = new Map();
+        if (manualOverridePairs.length > 0) {
+            const manualOverrideIds = Array.from(new Set(manualOverridePairs.map((item) => item.sqlCampaignId)));
+            const manualOverrideResult = await pool.query(
+                `SELECT id, instantly_campaign_id, name
+                 FROM instantly_campaigns
+                 WHERE agency_id = $1
+                 AND client_id = $2
+                 AND id = ANY($3::bigint[])`,
+                [uid, sqlClientId, manualOverrideIds]
+            );
+            const campaignById = new Map();
+            manualOverrideResult.rows.forEach((row) => {
+                campaignById.set(Number(row.id), {
+                    sqlCampaignId: Number(row.id),
+                    instantlyCampaignId: String(row.instantly_campaign_id || ''),
+                    name: String(row.name || '')
+                });
+            });
+
+            manualOverridePairs.forEach((item) => {
+                const campaign = campaignById.get(item.sqlCampaignId);
+                if (!campaign) return;
+                manualOverrideCampaignByNormalizedName.set(item.normalizedCampaignName, campaign);
+            });
+        }
+
+        const uniqueCsvEmails = new Set();
+        const uniqueCsvDomains = new Set();
+        const campaignNameByNormalizedNameFromCsv = new Map();
+
+        rows.forEach((row) => {
+            const campaignName = getCsvValueByAliases(row, CAMPAIGN_NAME_ALIASES, headerLookup);
+            const normalizedCampaign = normalizeCampaignName(campaignName);
+            if (normalizedCampaign && !campaignNameByNormalizedNameFromCsv.has(normalizedCampaign)) {
+                campaignNameByNormalizedNameFromCsv.set(normalizedCampaign, campaignName);
+            }
+
+            const email = normalizeEmailForMatch(getCsvValueByAliases(row, EMAIL_ALIASES, headerLookup));
+            if (email) uniqueCsvEmails.add(email);
+
+            const domain = normalizeDomainForMatch(getCsvValueByAliases(row, DOMAIN_ALIASES, headerLookup));
+            if (domain) uniqueCsvDomains.add(domain);
+        });
+
+        const contactByEmail = new Map();
+        if (uniqueCsvEmails.size > 0) {
+            const emailMatches = await pool.query(
+                `SELECT c.id, c.email, c.email_status, c.full_name, co.domain_normalized
+                 FROM contacts c
+                 JOIN companies co ON co.id = c.company_id
+                 WHERE c.client_id = $1 AND lower(c.email) = ANY($2::text[])`,
+                [sqlClientId, Array.from(uniqueCsvEmails)]
+            );
+            emailMatches.rows.forEach((row) => {
+                const key = normalizeEmailForMatch(row.email);
+                if (!key || contactByEmail.has(key)) return;
+                contactByEmail.set(key, {
+                    id: Number(row.id),
+                    email: row.email,
+                    emailStatus: row.email_status,
+                    fullName: row.full_name,
+                    domain: row.domain_normalized
+                });
+            });
+        }
+
+        const contactsByDomain = new Map();
+        if (uniqueCsvDomains.size > 0) {
+            const domainMatches = await pool.query(
+                `SELECT c.id, c.email, c.email_status, c.full_name, co.domain_normalized
+                 FROM contacts c
+                 JOIN companies co ON co.id = c.company_id
+                 WHERE c.client_id = $1 AND co.domain_normalized = ANY($2::text[])
+                 ORDER BY co.domain_normalized ASC, c.updated_at DESC`,
+                [sqlClientId, Array.from(uniqueCsvDomains)]
+            );
+
+            domainMatches.rows.forEach((row) => {
+                const domainKey = normalizeDomainForMatch(row.domain_normalized);
+                if (!domainKey) return;
+                const existing = contactsByDomain.get(domainKey) || [];
+                existing.push({
+                    id: Number(row.id),
+                    email: row.email,
+                    emailStatus: row.email_status,
+                    fullName: row.full_name,
+                    domain: row.domain_normalized
+                });
+                contactsByDomain.set(domainKey, existing);
+            });
+        }
+
+        const unresolvedCampaignNames = new Set();
+        const skippedRows = [];
+        const linkPairs = new Map();
+        const pendingEmailStatusUpdates = new Map();
+        let rowsMatched = 0;
+        let contactsNotFound = 0;
+
+        rows.forEach((row, index) => {
+            const rowNumber = index + 2;
+            const campaignName = getCsvValueByAliases(row, CAMPAIGN_NAME_ALIASES, headerLookup);
+            const normalizedCampaignName = normalizeCampaignName(campaignName);
+            if (!normalizedCampaignName) {
+                skippedRows.push({ row: rowNumber, reason: 'missing_campaign_name' });
+                return;
+            }
+
+            const resolvedCampaign = resolvedCampaignByNormalizedName.get(normalizedCampaignName);
+            const manualOverrideCampaign = manualOverrideCampaignByNormalizedName.get(normalizedCampaignName);
+            if (!resolvedCampaign && !manualOverrideCampaign) {
+                unresolvedCampaignNames.add(campaignName || normalizedCampaignName);
+                skippedRows.push({ row: rowNumber, reason: 'campaign_name_not_found_in_instantly', campaignName });
+                return;
+            }
+
+            const sqlCampaignId = manualOverrideCampaign
+                ? manualOverrideCampaign.sqlCampaignId
+                : sqlCampaignIdByInstantlyId.get(resolvedCampaign.campaign.instantlyCampaignId);
+            if (!sqlCampaignId) {
+                unresolvedCampaignNames.add(campaignName || normalizedCampaignName);
+                skippedRows.push({ row: rowNumber, reason: 'campaign_name_not_found_in_sql_cache', campaignName });
+                return;
+            }
+
+            const email = normalizeEmailForMatch(getCsvValueByAliases(row, EMAIL_ALIASES, headerLookup));
+            const domain = normalizeDomainForMatch(getCsvValueByAliases(row, DOMAIN_ALIASES, headerLookup));
+            const normalizedName = normalizePersonName(extractContactNameFromRow(row, headerLookup));
+            let matchedContact = email ? contactByEmail.get(email) : null;
+
+            if (!matchedContact && domain) {
+                const domainCandidates = contactsByDomain.get(domain) || [];
+                if (domainCandidates.length === 1) {
+                    matchedContact = domainCandidates[0];
+                } else if (domainCandidates.length > 1 && normalizedName) {
+                    const nameMatches = domainCandidates.filter((candidate) => normalizePersonName(candidate.fullName) === normalizedName);
+                    if (nameMatches.length === 1) {
+                        matchedContact = nameMatches[0];
+                    } else if (nameMatches.length > 1) {
+                        contactsNotFound += 1;
+                        skippedRows.push({
+                            row: rowNumber,
+                            reason: 'contact_ambiguous_domain_plus_name',
+                            domain
+                        });
+                        return;
+                    }
+                } else if (domainCandidates.length > 1) {
+                    contactsNotFound += 1;
+                    skippedRows.push({
+                        row: rowNumber,
+                        reason: 'contact_ambiguous_domain_requires_name',
+                        domain
+                    });
+                    return;
+                }
+            }
+
+            if (!matchedContact) {
+                contactsNotFound += 1;
+                skippedRows.push({
+                    row: rowNumber,
+                    reason: 'contact_not_found',
+                    email: email || null,
+                    domain: domain || null
+                });
+                return;
+            }
+
+            rowsMatched += 1;
+            const incomingEmailStatus = mapCsvEmailStatus(getCsvValueByAliases(row, EMAIL_STATUS_ALIASES, headerLookup));
+            if (shouldBackfillEmailStatus(matchedContact.emailStatus, incomingEmailStatus)) {
+                pendingEmailStatusUpdates.set(matchedContact.id, incomingEmailStatus);
+                matchedContact.emailStatus = incomingEmailStatus;
+            }
+
+            const pairKey = `${matchedContact.id}::${sqlCampaignId}`;
+            if (!linkPairs.has(pairKey)) {
+                linkPairs.set(pairKey, {
+                    contactId: matchedContact.id,
+                    campaignId: sqlCampaignId
+                });
+            } else {
+                skippedRows.push({
+                    row: rowNumber,
+                    reason: 'duplicate_contact_campaign_in_file',
+                    campaignName,
+                    email: email || null
+                });
+            }
+        });
+
+        // Conservative merge update: only fill email_status when existing status is empty/unknown
+        if (pendingEmailStatusUpdates.size > 0) {
+            const updates = Array.from(pendingEmailStatusUpdates.entries());
+            const maxUpdatesPerChunk = Math.max(1, Math.floor((MAX_BIND_PARAMS_PER_QUERY - 1) / 2));
+            const updateChunks = chunkArray(updates, maxUpdatesPerChunk);
+
+            for (const updateChunk of updateChunks) {
+                const ids = updateChunk.map(([id]) => id);
+                const params = [];
+                const cases = [];
+                updateChunk.forEach(([id, status], index) => {
+                    const idParam = index * 2 + 1;
+                    const statusParam = index * 2 + 2;
+                    params.push(id, status);
+                    cases.push(`WHEN $${idParam} THEN $${statusParam}`);
+                });
+                params.push(ids);
+
+                await pool.query(
+                    `UPDATE contacts
+                     SET email_status = CASE id ${cases.join(' ')} ELSE email_status END,
+                         updated_at = now()
+                     WHERE id = ANY($${params.length}::bigint[])`,
+                    params
+                );
+            }
+        }
+
+        let linksInserted = 0;
+        const linkRows = Array.from(linkPairs.values());
+        if (linkRows.length > 0) {
+            const importJobId = `manual_csv_import_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            const notes = notesRaw || null;
+            const maxLinksPerChunk = Math.max(1, Math.floor(MAX_BIND_PARAMS_PER_QUERY / 6));
+            const linkChunks = chunkArray(linkRows, maxLinksPerChunk);
+
+            for (const linkChunk of linkChunks) {
+                const params = [];
+                const values = [];
+                let paramIndex = 1;
+
+                linkChunk.forEach((row) => {
+                    params.push(row.contactId, row.campaignId, 'manual', uid, importJobId, notes);
+                    values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5})`);
+                    paramIndex += 6;
+                });
+
+                const insertResult = await pool.query(
+                    `INSERT INTO contact_instantly_campaigns
+                        (contact_id, campaign_id, upload_source, uploaded_by, job_id, notes)
+                     VALUES ${values.join(', ')}
+                     ON CONFLICT (contact_id, campaign_id) DO NOTHING
+                     RETURNING contact_id, campaign_id`,
+                    params
+                );
+                linksInserted += insertResult.rowCount || 0;
+            }
+        }
+
+        const resolvedCampaigns = Array.from(campaignNameByNormalizedNameFromCsv.entries())
+            .map(([normalizedName, originalName]) => {
+                const manualOverrideCampaign = manualOverrideCampaignByNormalizedName.get(normalizedName);
+                if (manualOverrideCampaign) {
+                    return {
+                        campaignName: originalName,
+                        instantlyCampaignId: manualOverrideCampaign.instantlyCampaignId,
+                        sqlCampaignId: manualOverrideCampaign.sqlCampaignId,
+                        resolutionReason: 'manual_override'
+                    };
+                }
+                const resolvedCampaign = resolvedCampaignByNormalizedName.get(normalizedName);
+                if (!resolvedCampaign) return null;
+                const sqlCampaignId = sqlCampaignIdByInstantlyId.get(resolvedCampaign.campaign.instantlyCampaignId);
+                if (!sqlCampaignId) return null;
+                return {
+                    campaignName: originalName,
+                    instantlyCampaignId: resolvedCampaign.campaign.instantlyCampaignId,
+                    sqlCampaignId,
+                    resolutionReason: duplicateNameResolutionByNormalizedName.get(normalizedName) || 'single_match'
+                };
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.campaignName.localeCompare(b.campaignName));
+
+        res.json({
+            summary: {
+                rowsTotal: rows.length,
+                rowsMatched,
+                linksInserted,
+                linksAlreadyPresent: Math.max(linkRows.length - linksInserted, 0),
+                contactsNotFound,
+                campaignNamesUnresolved: unresolvedCampaignNames.size
+            },
+            unresolvedCampaignNames: Array.from(unresolvedCampaignNames).sort((a, b) => a.localeCompare(b)),
+            skippedRows,
+            resolvedCampaigns
+        });
+    } catch (error) {
+        console.error('Error merging Instantly CSV import:', error);
+        res.status(500).json({ error: 'Failed to process Instantly CSV merge import.' });
     }
 });
 

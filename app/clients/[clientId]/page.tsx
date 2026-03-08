@@ -108,6 +108,31 @@ type Segment = {
     updatedAt?: string;
 };
 
+type InstantlyCsvMergeResult = {
+    summary: {
+        rowsTotal: number;
+        rowsMatched: number;
+        linksInserted: number;
+        linksAlreadyPresent: number;
+        contactsNotFound: number;
+        campaignNamesUnresolved: number;
+    };
+    unresolvedCampaignNames: string[];
+    skippedRows: Array<{
+        row: number;
+        reason: string;
+        campaignName?: string;
+        email?: string | null;
+        domain?: string | null;
+    }>;
+    resolvedCampaigns: Array<{
+        campaignName: string;
+        instantlyCampaignId: string;
+        sqlCampaignId: number;
+        resolutionReason: string;
+    }>;
+};
+
 type JobStatus = PipelineJob["status"];
 type StageStatus = PipelineStageStatus;
 
@@ -425,6 +450,14 @@ export default function ClientPage() {
     const [manualUploadLoading, setManualUploadLoading] = useState(false);
     const [qualifiedContactsCount, setQualifiedContactsCount] = useState<{qualified: number, total: number} | null>(null);
     const [jobUploadStatus, setJobUploadStatus] = useState<Record<string, any[]>>({});
+    const [showInstantlyCsvImportModal, setShowInstantlyCsvImportModal] = useState(false);
+    const [instantlyCsvImportFile, setInstantlyCsvImportFile] = useState<File | null>(null);
+    const [instantlyCsvImportNotes, setInstantlyCsvImportNotes] = useState('');
+    const [instantlyCsvImportLoading, setInstantlyCsvImportLoading] = useState(false);
+    const [instantlyCsvImportResult, setInstantlyCsvImportResult] = useState<InstantlyCsvMergeResult | null>(null);
+    const [instantlyCsvOverrideCampaigns, setInstantlyCsvOverrideCampaigns] = useState<Campaign[]>([]);
+    const [instantlyCsvCampaignOverrides, setInstantlyCsvCampaignOverrides] = useState<Record<string, string>>({});
+    const [instantlyCsvCampaignsLoading, setInstantlyCsvCampaignsLoading] = useState(false);
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
@@ -2683,6 +2716,41 @@ export default function ClientPage() {
     };
 
     // Manual upload handlers
+    const fetchSqlCampaignList = async () => {
+        const token = await user?.getIdToken();
+        const campaignsResponse = await fetch(
+            `${getPipelineBaseUrl()}/api/clients/${clientId}/campaigns/list?agencyId=${user?.uid}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+
+        if (!campaignsResponse.ok) {
+            throw new Error(`Failed to fetch campaigns: ${campaignsResponse.status}`);
+        }
+
+        const campaignsData = await campaignsResponse.json();
+        return (campaignsData.campaigns || []) as Campaign[];
+    };
+
+    const handleOpenInstantlyCsvImportModal = async () => {
+        setShowInstantlyCsvImportModal(true);
+        setInstantlyCsvImportFile(null);
+        setInstantlyCsvImportNotes('');
+        setInstantlyCsvImportResult(null);
+        setInstantlyCsvCampaignOverrides({});
+        setInstantlyCsvCampaignsLoading(true);
+
+        try {
+            const campaigns = await fetchSqlCampaignList();
+            setInstantlyCsvOverrideCampaigns(campaigns);
+        } catch (error) {
+            console.error('Error loading campaigns for Instantly CSV import:', error);
+            setToastMessage('Failed to load campaigns for manual override');
+            setToastVisible(true);
+        } finally {
+            setInstantlyCsvCampaignsLoading(false);
+        }
+    };
+
     const fetchQualifiedCount = async (jobId: string) => {
         try {
             const token = await user?.getIdToken();
@@ -2704,18 +2772,8 @@ export default function ClientPage() {
         setManualUploadLoading(true);
         
         try {
-            const token = await user?.getIdToken();
-            const campaignsResponse = await fetch(
-                `${getPipelineBaseUrl()}/api/clients/${clientId}/campaigns/list?agencyId=${user?.uid}`,
-                { headers: { Authorization: `Bearer ${token}` } }
-            );
-            
-            if (!campaignsResponse.ok) {
-                throw new Error(`Failed to fetch campaigns: ${campaignsResponse.status}`);
-            }
-            
-            const campaignsData = await campaignsResponse.json();
-            setManualUploadCampaigns(campaignsData.campaigns || []);
+            const campaigns = await fetchSqlCampaignList();
+            setManualUploadCampaigns(campaigns);
             
             const countData = await fetchQualifiedCount(job.id);
             setQualifiedContactsCount(countData);
@@ -2824,6 +2882,60 @@ export default function ClientPage() {
             console.error('Error reverting manual upload:', error);
             setToastMessage('❌ Failed to revert manual upload');
             setToastVisible(true);
+        }
+    };
+
+    const handleSubmitInstantlyCsvMergeImport = async () => {
+        if (!user || !clientId) return;
+        if (!instantlyCsvImportFile) {
+            setToastMessage('Please choose a CSV file to import');
+            setToastVisible(true);
+            return;
+        }
+
+        try {
+            setInstantlyCsvImportLoading(true);
+            const idToken = await getIdToken(user);
+            const formData = new FormData();
+            formData.append('idToken', idToken);
+            formData.append('file', instantlyCsvImportFile);
+            if (instantlyCsvImportNotes.trim()) {
+                formData.append('notes', instantlyCsvImportNotes.trim());
+            }
+            const selectedOverrides = Object.entries(instantlyCsvCampaignOverrides).reduce((acc, [campaignName, sqlCampaignId]) => {
+                const name = campaignName.trim();
+                const id = sqlCampaignId.trim();
+                if (!name || !id) return acc;
+                acc[name] = id;
+                return acc;
+            }, {} as Record<string, string>);
+            if (Object.keys(selectedOverrides).length > 0) {
+                formData.append('campaignNameOverrides', JSON.stringify(selectedOverrides));
+            }
+
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly-import/merge`,
+                {
+                    method: 'POST',
+                    body: formData
+                }
+            );
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || `Import failed (${response.status})`);
+            }
+
+            setInstantlyCsvImportResult(data as InstantlyCsvMergeResult);
+            setToastMessage(`Imported CSV: ${data?.summary?.linksInserted ?? 0} campaign links added`);
+            setToastVisible(true);
+            fetchLeads(true);
+        } catch (error) {
+            console.error('Error importing Instantly CSV merge:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to import Instantly CSV');
+            setToastVisible(true);
+        } finally {
+            setInstantlyCsvImportLoading(false);
         }
     };
 
@@ -5314,6 +5426,20 @@ export default function ClientPage() {
                                     Paste this into Instantly events/webhook settings for this client.
                                 </span>
                             </label>
+                            <div className="settings-field">
+                                <span className="settings-field__label">Instantly CSV Merge Import</span>
+                                <span className="settings-field__hint" style={{ marginBottom: '0.5rem' }}>
+                                    Upload an Instantly export CSV. The importer only merges and links; it never clears existing lead fields.
+                                </span>
+                                <button
+                                    type="button"
+                                    className="secondary-button"
+                                    onClick={handleOpenInstantlyCsvImportModal}
+                                    disabled={instantlyCsvImportLoading}
+                                >
+                                    📥 Import Instantly CSV
+                                </button>
+                            </div>
                             <div className="modal__actions" style={{ justifyContent: 'flex-start' }}>
                                 <button
                                     type="button"
@@ -6265,6 +6391,177 @@ export default function ClientPage() {
                                 onClick={() => handleDownloadResults(downloadScope)}
                             >
                                 Download
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Instantly CSV Merge Import Modal */}
+            {showInstantlyCsvImportModal && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => {
+                        if (instantlyCsvImportLoading) return;
+                        setShowInstantlyCsvImportModal(false);
+                    }}
+                >
+                    <div
+                        className="modal"
+                        onClick={(event) => event.stopPropagation()}
+                        style={{ maxWidth: '760px', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }}
+                    >
+                        <div className="modal__header">
+                            <div>
+                                <h2 className="modal__title">Import Instantly CSV (Merge-Only)</h2>
+                                <p className="modal__description">
+                                    Campaign IDs are resolved from Instantly API by campaign name. Existing lead fields are never deleted.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', overflowY: 'auto' }}>
+                            <label className="settings-field">
+                                <span className="settings-field__label">CSV File *</span>
+                                <input
+                                    type="file"
+                                    accept=".csv,text/csv"
+                                    onChange={(e) => {
+                                        setInstantlyCsvImportFile(e.target.files?.[0] || null);
+                                        setInstantlyCsvImportResult(null);
+                                        setInstantlyCsvCampaignOverrides({});
+                                    }}
+                                    disabled={instantlyCsvImportLoading}
+                                />
+                                <span className="settings-field__hint">
+                                    Required column: Campaign Name. Matching prefers Email, then Domain + Name fallback.
+                                </span>
+                            </label>
+
+                            <label className="settings-field">
+                                <span className="settings-field__label">Notes (Optional)</span>
+                                <textarea
+                                    value={instantlyCsvImportNotes}
+                                    onChange={(e) => setInstantlyCsvImportNotes(e.target.value)}
+                                    placeholder="Optional note stored with campaign link records..."
+                                    rows={3}
+                                    disabled={instantlyCsvImportLoading}
+                                    style={{ resize: 'vertical', fontFamily: 'inherit', fontSize: 'inherit' }}
+                                />
+                            </label>
+                            {instantlyCsvCampaignsLoading && (
+                                <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.65)' }}>
+                                    Loading campaign options for manual mapping...
+                                </div>
+                            )}
+
+                            {instantlyCsvImportResult && (
+                                <div style={{
+                                    padding: '1rem',
+                                    borderRadius: '10px',
+                                    border: '1px solid rgba(255,255,255,0.1)',
+                                    background: 'rgba(255,255,255,0.03)',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '0.85rem'
+                                }}>
+                                    <div style={{ fontWeight: 600, color: '#fff' }}>Last Import Result</div>
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.5rem', fontSize: '0.9rem' }}>
+                                        <div>Rows: <strong>{instantlyCsvImportResult.summary.rowsTotal}</strong></div>
+                                        <div>Matched: <strong>{instantlyCsvImportResult.summary.rowsMatched}</strong></div>
+                                        <div>Inserted: <strong>{instantlyCsvImportResult.summary.linksInserted}</strong></div>
+                                        <div>Already linked: <strong>{instantlyCsvImportResult.summary.linksAlreadyPresent}</strong></div>
+                                        <div>Contacts not found: <strong>{instantlyCsvImportResult.summary.contactsNotFound}</strong></div>
+                                        <div>Unresolved campaigns: <strong>{instantlyCsvImportResult.summary.campaignNamesUnresolved}</strong></div>
+                                    </div>
+
+                                    {instantlyCsvImportResult.unresolvedCampaignNames.length > 0 && (
+                                        <div>
+                                            <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '0.25rem' }}>
+                                                Unresolved campaign names
+                                            </div>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                                                {instantlyCsvImportResult.unresolvedCampaignNames.slice(0, 10).map((campaignName) => (
+                                                    <div key={campaignName} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: '0.5rem', alignItems: 'center' }}>
+                                                        <span style={{ fontSize: '0.85rem', color: '#fca5a5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {campaignName}
+                                                        </span>
+                                                        <select
+                                                            value={instantlyCsvCampaignOverrides[campaignName] || ''}
+                                                            onChange={(e) => {
+                                                                const value = e.target.value;
+                                                                setInstantlyCsvCampaignOverrides((prev) => ({
+                                                                    ...prev,
+                                                                    [campaignName]: value
+                                                                }));
+                                                            }}
+                                                            disabled={instantlyCsvImportLoading || instantlyCsvCampaignsLoading}
+                                                            style={{
+                                                                width: '100%',
+                                                                padding: '0.4rem 0.5rem',
+                                                                borderRadius: '6px',
+                                                                background: 'rgba(0,0,0,0.2)',
+                                                                color: '#fff',
+                                                                border: '1px solid rgba(255,255,255,0.2)'
+                                                            }}
+                                                        >
+                                                            <option value="">Map manually...</option>
+                                                            {instantlyCsvOverrideCampaigns.map((campaign) => (
+                                                                <option key={campaign.id} value={campaign.id}>
+                                                                    {campaign.name}
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                    </div>
+                                                ))}
+                                                {!instantlyCsvCampaignsLoading && instantlyCsvOverrideCampaigns.length === 0 && (
+                                                    <div style={{ fontSize: '0.8rem', color: '#fca5a5' }}>
+                                                        No campaigns available in SQL cache. Sync campaigns first.
+                                                    </div>
+                                                )}
+                                                {instantlyCsvImportResult.unresolvedCampaignNames.length > 10 && (
+                                                    <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)' }}>
+                                                        +{instantlyCsvImportResult.unresolvedCampaignNames.length - 10} more unresolved names
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {instantlyCsvImportResult.skippedRows.length > 0 && (
+                                        <div>
+                                            <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '0.25rem' }}>
+                                                Skipped rows (first 12)
+                                            </div>
+                                            <div style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.85)', lineHeight: 1.45 }}>
+                                                {instantlyCsvImportResult.skippedRows.slice(0, 12).map((item) => (
+                                                    <div key={`${item.row}-${item.reason}`}>Row {item.row}: {item.reason}</div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setShowInstantlyCsvImportModal(false)}
+                                disabled={instantlyCsvImportLoading}
+                            >
+                                Close
+                            </button>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                onClick={handleSubmitInstantlyCsvMergeImport}
+                                disabled={instantlyCsvImportLoading || !instantlyCsvImportFile}
+                            >
+                                {instantlyCsvImportLoading ? 'Importing...' : (instantlyCsvImportResult ? 'Re-run Import' : 'Import CSV')}
                             </button>
                         </div>
                     </div>

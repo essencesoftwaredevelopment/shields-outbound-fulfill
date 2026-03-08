@@ -6,7 +6,8 @@
     "scripts": {
         "dev": "node src/index.js",
         "worker": "node src/worker/queueWorker.js",
-        "db:ping": "node scripts/db-ping.js"
+        "db:ping": "node scripts/db-ping.js",
+        "test": "node --test \"src/utils/__tests__/*.test.js\""
     },
     "dependencies": {
         "axios": "^1.7.7",
