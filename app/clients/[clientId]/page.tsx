@@ -4218,7 +4218,7 @@ export default function ClientPage() {
                                                 const idToken = await getIdToken(user);
                                                 const params = new URLSearchParams();
                                                 params.append('clientId', clientId);
-                                                params.append('limit', '500');
+                                                params.append('limit', '5000');
                                                 
                                                 // Apply filters to API request
                                                 if (campaignFilterId) {
@@ -4286,8 +4286,8 @@ export default function ClientPage() {
                                                     hasMore = more && mapped.length > 0;
                                                     
                                                     // Safety limit
-                                                    if (collected.length >= 50000) {
-                                                        console.warn('Reached max export limit of 50,000 leads');
+                                                    if (collected.length >= 1000000) {
+                                                        console.warn('Reached max export limit of 1,000,000 leads');
                                                         break;
                                                     }
                                                 }
