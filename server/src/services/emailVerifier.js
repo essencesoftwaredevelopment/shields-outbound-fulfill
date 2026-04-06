@@ -7,8 +7,10 @@ import http from 'http';
 
 dotenv.config();
 
-const CONCURRENCY = 5; // Reduced from 15 to prevent overwhelming the server
-const MAX_RETRIES = 5;
+const CONCURRENCY = 15;
+const MAX_RETRIES = 3;
+const RATE_LIMIT_MAX_RETRIES = 5;
+const RATE_LIMIT_BACKOFF_MS = 3000;
 const INITIAL_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT = 30000; // 30 second timeout
 const REQUEST_TIMEOUT_MS = 20000; // 20s hard timeout per verification request
@@ -30,7 +32,7 @@ const PROVIDERS = {
 const SELF_HOSTED_URL = 'http://193.181.209.186:8080/v0/check_email';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-const shouldRetry = status => status === 402 || status === 429 || status >= 500;
+const shouldRetry = status => status === 429 || status >= 500;
 
 function normalize(value) {
     return (value || '').trim();
@@ -77,9 +79,12 @@ async function readEmailCandidates(filePath) {
  */
 async function verifyEmailWithTryKitt(email, apiKey) {
     let attempt = 0;
+    let rateLimitHits = 0;
     let backoff = INITIAL_BACKOFF_MS;
 
-    while (attempt < MAX_RETRIES) {
+    const maxAttempts = MAX_RETRIES + RATE_LIMIT_MAX_RETRIES;
+
+    while (attempt < maxAttempts) {
         attempt += 1;
 
         try {
@@ -95,34 +100,36 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                 })
             });
 
-            // Debug logging
-            // console.log(`[EMAIL VERIFIER DEBUG] Request to TryKitt for email: ${email}`);
-            // console.log(`[EMAIL VERIFIER DEBUG] Response Status: ${res.status} ${res.statusText}`);
-            // console.log(`[EMAIL VERIFIER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
-
             const text = await res.text();
-            // console.log(`[EMAIL VERIFIER DEBUG] Response Body:`, text);
             
             let parsed;
 
             try {
                 parsed = JSON.parse(text);
             } catch {
-                console.log(`[EMAIL VERIFIER DEBUG] Failed to parse JSON response`);
                 parsed = null;
             }
 
-            // Check for credit exhaustion (402)
+            // Handle 402 (rate limit) with dedicated backoff
             if (res.status === 402) {
-                const error = new Error('TryKitt account out of credits');
-                error.code = 'CREDIT_EXHAUSTED';
-                error.stage = 'verification';
-                throw error;
+                rateLimitHits += 1;
+                if (rateLimitHits >= RATE_LIMIT_MAX_RETRIES) {
+                    console.warn(`[EMAIL_VERIFIER] 402 rate-limited ${rateLimitHits} times for ${email}, giving up on this row`);
+                    return {
+                        email,
+                        status: 'ERROR',
+                        validity: 'error: rate_limited'
+                    };
+                }
+                const rlBackoff = RATE_LIMIT_BACKOFF_MS * rateLimitHits;
+                console.warn(`[EMAIL_VERIFIER] 402 rate-limited for ${email}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
+                await wait(rlBackoff);
+                continue;
             }
 
             const validity = parsed?.validity ?? null;
 
-            if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
+            if (!res.ok && shouldRetry(res.status) && attempt < maxAttempts) {
                 await wait(backoff);
                 backoff *= 2;
                 continue;
@@ -135,11 +142,6 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                 raw: parsed
             };
         } catch (error) {
-            // Re-throw credit exhaustion errors immediately
-            if (error.code === 'CREDIT_EXHAUSTED') {
-                throw error;
-            }
-            
             if (error.message === 'timeout') {
                 return {
                     email,
@@ -147,7 +149,7 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                     validity: 'timeout'
                 };
             }
-            if (attempt >= MAX_RETRIES) {
+            if (attempt >= maxAttempts) {
                 return {
                     email,
                     status: 'ERROR',
@@ -282,7 +284,7 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkPaused = null } = {}) {
+export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkPaused = null, onBatch = null } = {}) {
     const API_KEY = apiKeys.kitt;
 
     // Validate based on provider
@@ -306,6 +308,20 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
     const controller = new AbortController();
+
+    // In-flight batch for incremental upserts
+    const pendingBatch = [];
+    let flushPromise = Promise.resolve();
+    const BATCH_SIZE = 50;
+
+    const flushBatch = async (force = false) => {
+        if (!onBatch) return;
+        if (!force && pendingBatch.length < BATCH_SIZE) return;
+        const batch = pendingBatch.splice(0, pendingBatch.length);
+        if (batch.length === 0) return;
+        flushPromise = flushPromise.then(() => onBatch(batch));
+        await flushPromise;
+    };
 
     log(`Verify: ${candidates.length} rows loaded | ${toVerify.length} eligible emails.`);
 
@@ -346,16 +362,25 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
                     stats.unknown += 1;
                 }
             } catch (error) {
-                // Check for credit exhaustion - abort entire job
-                if (error.code === 'CREDIT_EXHAUSTED') {
-                    console.log(`[EMAIL_VERIFIER] Credit exhausted, aborting job`);
-                    controller.abort();
-                    throw error; // Re-throw to stop execution
-                }
-                throw new Error(`Email verification failed for ${item.row.email}: ${error?.message || error}`);
+                console.error(`[EMAIL_VERIFIER] Verification failed for ${item.row.email}: ${error?.message || error}`);
+                rows[item.index].email_status = `error: ${error?.message || 'unknown'}`;
+                stats.unknown += 1;
             }
 
             completed += 1;
+
+            // Queue incremental upsert batch
+            if (onBatch) {
+                const row = rows[item.index];
+                pendingBatch.push({
+                    domain: row.domain,
+                    founder_name: row.founder_name,
+                    email: row.email,
+                    email_status: row.email_status
+                });
+                await flushBatch(false);
+            }
+
             const percent = toVerify.length ? ((completed / toVerify.length) * 100).toFixed(1) : '0.0';
             const progressPayload = {
                 progress: {
@@ -383,32 +408,12 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
 
     try {
         await Promise.all(tasks);
-    } catch (error) {
-        // If credit exhausted, write partial results and re-throw
-        if (error.code === 'CREDIT_EXHAUSTED') {
-            console.log(`[EMAIL_VERIFIER] Writing partial results before pausing...`);
-            
-            // Write what we have so far
-            const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
-            writer.write('domain,founder_name,email,email_status\n');
-            rows.forEach(row => {
-                writer.write(
-                    [
-                        toCsvValue(row.domain),
-                        toCsvValue(row.founder_name),
-                        toCsvValue(row.email),
-                        toCsvValue(row.email_status)
-                    ].join(',') + '\n'
-                );
-            });
-            writer.end();
-            await new Promise(res => writer.on('finish', res));
-            
-            throw error; // Re-throw to propagate to runStage
-        }
-        throw error; // Re-throw other errors
     } finally {
         clearInterval(pauseCheckInterval);
+        // Flush any remaining batch
+        if (onBatch) {
+            await flushBatch(true);
+        }
     }
 
     const writer = fs.createWriteStream(outputCsv, { flags: 'w' });

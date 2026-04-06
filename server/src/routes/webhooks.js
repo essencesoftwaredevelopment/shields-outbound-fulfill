@@ -1,6 +1,7 @@
 import express from 'express';
 import { firestore } from '../config/firebase.js';
 import { searchLead, sendToClay } from '../services/leadWebhook.js';
+import { processInstantlyWebhookEvent } from '../services/instantlyState.js';
 import { upsertLead } from '../services/leads.js';
 
 const router = express.Router();
@@ -15,7 +16,7 @@ function pickClayWebhook(userData = {}, clientData = {}) {
         || '';
 }
 
-router.post('/webhook/events/:userId/:clientId', async (req, res) => {
+async function handleLeadWebhookEvent(req, res) {
     const { userId, clientId } = req.params;
 
     // Dev visibility: log incoming payload and headers for debugging
@@ -142,9 +143,12 @@ router.post('/webhook/events/:userId/:clientId', async (req, res) => {
         console.error(`[lead-webhook][${userId}/${clientId}] unexpected error`, error);
         return res.status(500).json({ error: 'Unhandled server error.' });
     }
-});
+}
 
-router.post('/webhook/clay-result/:userId/:clientId', (req, res) => {
+router.post('/webhook/events/:userId/:clientId', handleLeadWebhookEvent);
+router.post('/events/:userId/:clientId', handleLeadWebhookEvent);
+
+function handleClayResult(req, res) {
     const { userId, clientId } = req.params;
     const body = req.body || {};
     const data = body.data || body;
@@ -177,6 +181,32 @@ router.post('/webhook/clay-result/:userId/:clientId', (req, res) => {
     }
 
     return res.json(payload);
-});
+}
+
+router.post('/webhook/clay-result/:userId/:clientId', handleClayResult);
+router.post('/clay-result/:userId/:clientId', handleClayResult);
+
+async function handleInstantlyWebhookEvent(req, res) {
+    const { userId, clientId } = req.params;
+    const secret = (req.headers['x-shields-webhook-secret'] || '').toString().trim();
+
+    try {
+        const result = await processInstantlyWebhookEvent({
+            agencyId: userId,
+            clientSlug: clientId,
+            secret,
+            event: req.body || {},
+            logger: (message) => console.log(`[instantly-webhook][${userId}/${clientId}] ${message}`)
+        });
+        return res.status(202).json({ ok: true, ...result });
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        console.error(`[instantly-webhook][${userId}/${clientId}] failed:`, error?.message || error);
+        return res.status(statusCode).json({ error: error?.message || 'Failed to process Instantly webhook event.' });
+    }
+}
+
+router.post('/webhook/instantly/events/:userId/:clientId', handleInstantlyWebhookEvent);
+router.post('/instantly/events/:userId/:clientId', handleInstantlyWebhookEvent);
 
 export default router;

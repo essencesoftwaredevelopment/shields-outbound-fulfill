@@ -84,6 +84,24 @@ type Lead = {
     }>;
 };
 
+type InstantlySyncRun = {
+    id: number;
+    status: string;
+    progressMessage?: string | null;
+    totalCampaigns: number;
+    campaignsCompleted: number;
+    currentCampaignId?: string | null;
+    currentCampaignName?: string | null;
+    totalLeadsSeen: number;
+    matchedLeads: number;
+    unmatchedLeads: number;
+    error?: string | null;
+    startedAt?: string | null;
+    completedAt?: string | null;
+    updatedAt?: string | null;
+    triggerSource?: string;
+};
+
 type Campaign = {
     id: string;
     name: string;
@@ -458,10 +476,17 @@ export default function ClientPage() {
     const [instantlyCsvOverrideCampaigns, setInstantlyCsvOverrideCampaigns] = useState<Campaign[]>([]);
     const [instantlyCsvCampaignOverrides, setInstantlyCsvCampaignOverrides] = useState<Record<string, string>>({});
     const [instantlyCsvCampaignsLoading, setInstantlyCsvCampaignsLoading] = useState(false);
+    const [registeringInstantlyWebhook, setRegisteringInstantlyWebhook] = useState(false);
+    const [syncingInstantlyState, setSyncingInstantlyState] = useState(false);
+    const [clientInstantlyWebhookStatus, setClientInstantlyWebhookStatus] = useState<number | null>(null);
+    const [clientInstantlyWebhookUpdatedAt, setClientInstantlyWebhookUpdatedAt] = useState<string | null>(null);
+    const [instantlySyncRun, setInstantlySyncRun] = useState<InstantlySyncRun | null>(null);
+    const instantlySyncPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const previousInstantlySyncStatusRef = useRef<string | null>(null);
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
-        return `https://api.shieldsoutboundserver.org/webhook/events/${user.uid}/${clientId}`;
+        return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${user.uid}/${clientId}`;
     }, [user, clientId]);
     const [copiedWebhook, setCopiedWebhook] = useState(false);
 
@@ -688,6 +713,13 @@ export default function ClientPage() {
         return `${count.toLocaleString()}/${total.toLocaleString()} uploaded`;
     }, [uploadMetrics]);
 
+    const stopInstantlySyncPolling = useCallback(() => {
+        if (instantlySyncPollRef.current) {
+            clearInterval(instantlySyncPollRef.current);
+            instantlySyncPollRef.current = null;
+        }
+    }, []);
+
     const niches = useMemo<Niche[]>(
         () => [
             {
@@ -805,6 +837,8 @@ export default function ClientPage() {
                 setClientIndustry((data.industry as Niche["id"]) || "ecom");
                 setClientInstantlyKey((data.instantly_key as string) || "");
                 setClientTotalLeads((data.totalLeads as number) || 0);
+                setClientInstantlyWebhookStatus(typeof data.instantlyWebhookStatus === 'number' ? data.instantlyWebhookStatus : null);
+                setClientInstantlyWebhookUpdatedAt(data.instantlyWebhookUpdatedAt?.toDate ? data.instantlyWebhookUpdatedAt.toDate().toLocaleString() : null);
             }
         }, () => {
             if (!cancelled) {
@@ -812,6 +846,8 @@ export default function ClientPage() {
                 setClientIndustry("ecom");
                 setClientInstantlyKey("");
                 setClientTotalLeads(0);
+                setClientInstantlyWebhookStatus(null);
+                setClientInstantlyWebhookUpdatedAt(null);
             }
         });
 
@@ -860,11 +896,12 @@ export default function ClientPage() {
 
         return () => {
             cancelled = true;
+            stopInstantlySyncPolling();
             try { unsubClient(); } catch { }
             try { unsubCampaigns(); } catch { }
             try { unsubSegments(); } catch { }
         };
-    }, [user, clientId]);
+    }, [user, clientId, stopInstantlySyncPolling]);
 
     useEffect(() => {
         if (!user || !clientId) return;
@@ -1159,10 +1196,96 @@ export default function ClientPage() {
         }
     }, [user, clientId, leadSearch, jobIdFilter, leadsCursor, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
 
+    const fetchInstantlySyncRun = useCallback(async (runId: number) => {
+        if (!user || !clientId || !runId) return null;
+        const idToken = await getIdToken(user);
+        const response = await fetchWithRetry(
+            `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/${runId}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${idToken}`
+                }
+            }
+        );
+
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error || `Failed to fetch Instantly sync run (${response.status})`);
+        }
+
+        const data = await response.json();
+        const run = (data.run || null) as InstantlySyncRun | null;
+        setInstantlySyncRun(run);
+        return run;
+    }, [user, clientId]);
+
+    const fetchLatestInstantlySyncRun = useCallback(async () => {
+        if (!user || !clientId) return null;
+        const idToken = await getIdToken(user);
+        const response = await fetchWithRetry(
+            `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/latest`,
+            {
+                headers: {
+                    Authorization: `Bearer ${idToken}`
+                }
+            }
+        );
+
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error || `Failed to fetch latest Instantly sync run (${response.status})`);
+        }
+
+        const data = await response.json();
+        const run = (data.run || null) as InstantlySyncRun | null;
+        setInstantlySyncRun(run);
+        return run;
+    }, [user, clientId]);
+
+    useEffect(() => {
+        if (!user || !clientId) return;
+        fetchLatestInstantlySyncRun().catch((error) => {
+            console.error('Failed to fetch latest Instantly sync run:', error);
+        });
+    }, [user, clientId, fetchLatestInstantlySyncRun]);
+
+    useEffect(() => {
+        const runId = instantlySyncRun?.id;
+        const status = instantlySyncRun?.status;
+        if (!runId || (status !== 'queued' && status !== 'running')) {
+            stopInstantlySyncPolling();
+            return;
+        }
+
+        stopInstantlySyncPolling();
+        instantlySyncPollRef.current = setInterval(() => {
+            fetchInstantlySyncRun(runId).catch((error) => {
+                console.error('Failed to poll Instantly sync run:', error);
+            });
+        }, 2000);
+
+        return () => {
+            stopInstantlySyncPolling();
+        };
+    }, [instantlySyncRun?.id, instantlySyncRun?.status, fetchInstantlySyncRun, stopInstantlySyncPolling]);
+
     const loadMoreLeads = useCallback(() => {
         if (leadsLoading || !leadsHasMore) return;
         fetchLeads(false);
     }, [fetchLeads, leadsHasMore, leadsLoading]);
+
+    useEffect(() => {
+        const currentStatus = instantlySyncRun?.status || null;
+        const previousStatus = previousInstantlySyncStatusRef.current;
+        previousInstantlySyncStatusRef.current = currentStatus;
+
+        if (currentStatus === 'completed' && previousStatus && previousStatus !== 'completed') {
+            setLeads([]);
+            setLeadsCursor(0);
+            setLeadsHasMore(true);
+            fetchLeads(true);
+        }
+    }, [instantlySyncRun?.status, fetchLeads]);
 
     // All filters are now applied server-side
     const filteredLeads = useMemo(() => {
@@ -2235,16 +2358,21 @@ export default function ClientPage() {
         }
     };
 
+    const persistClientInfo = useCallback(async () => {
+        if (!user || !clientId) return;
+        const ref = doc(firestore, "users", user.uid, "clients", clientId);
+        await setDoc(ref, {
+            name: clientName?.trim() || clientId,
+            industry: clientIndustry,
+            instantly_key: clientInstantlyKey?.trim() || ""
+        }, { merge: true });
+    }, [user, clientId, clientName, clientIndustry, clientInstantlyKey]);
+
     const handleSaveClientInfo = async () => {
         if (!user || !clientId) return;
         setIsSavingClient(true);
         try {
-            const ref = doc(firestore, "users", user.uid, "clients", clientId);
-            await setDoc(ref, {
-                name: clientName?.trim() || clientId,
-                industry: clientIndustry,
-                instantly_key: clientInstantlyKey?.trim() || ""
-            }, { merge: true });
+            await persistClientInfo();
             setToastMessage('Client info saved');
             setToastVisible(true);
         } catch (error) {
@@ -2252,6 +2380,77 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setIsSavingClient(false);
+        }
+    };
+
+    const handleRegisterInstantlyWebhook = async () => {
+        if (!user || !clientId) return;
+        if (!clientInstantlyKey.trim()) {
+            setToastMessage('Save an Instantly API key first.');
+            setToastVisible(true);
+            return;
+        }
+
+        setRegisteringInstantlyWebhook(true);
+        try {
+            await persistClientInfo();
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/webhook`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ idToken })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to register Instantly webhook (${response.status})`);
+            }
+
+            setToastMessage(data.targetUrl ? 'Instantly webhook registered.' : 'Instantly webhook updated.');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to register Instantly webhook');
+            setToastVisible(true);
+        } finally {
+            setRegisteringInstantlyWebhook(false);
+        }
+    };
+
+    const handleSyncInstantlyState = async () => {
+        if (!user || !clientId) return;
+        if (!clientInstantlyKey.trim()) {
+            setToastMessage('Save an Instantly API key first.');
+            setToastVisible(true);
+            return;
+        }
+
+        setSyncingInstantlyState(true);
+        try {
+            await persistClientInfo();
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ idToken })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to sync Instantly state (${response.status})`);
+            }
+
+            setInstantlySyncRun((data.run || null) as InstantlySyncRun | null);
+            setToastMessage(data.alreadyRunning ? 'Instantly sync is already running.' : 'Instantly sync started.');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to sync Instantly state');
+            setToastVisible(true);
+        } finally {
+            setSyncingInstantlyState(false);
         }
     };
 
@@ -3074,82 +3273,6 @@ export default function ClientPage() {
                                 </div>
                             </div>
 
-                            {/* Active Campaigns List */}
-                            {campaigns.filter(c => c.status === 1).length > 0 && (
-                                <div style={{ marginTop: '2rem' }}>
-                                    <p className="eyebrow eyebrow--muted">Active Campaigns</p>
-                                    <h2 className="pipeline-panel__title" style={{ fontSize: '1.25rem', marginTop: '0.5rem' }}>Campaigns</h2>
-                                    <div style={{
-                                        marginTop: '1rem',
-                                        display: 'grid',
-                                        gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
-                                        gap: '1rem'
-                                    }}>
-                                        {campaigns.filter(c => c.status === 1).map((campaign) => (
-                                            <div
-                                                key={campaign.id}
-                                                style={{
-                                                    border: '1px solid rgba(255, 255, 255, 0.15)',
-                                                    borderRadius: '16px',
-                                                    padding: '1.25rem',
-                                                    background: 'rgba(255, 255, 255, 0.05)',
-                                                    transition: 'transform 0.2s ease, border-color 0.2s ease',
-                                                    cursor: 'pointer'
-                                                }}
-                                                onMouseEnter={(e) => {
-                                                    e.currentTarget.style.transform = 'translateY(-2px)';
-                                                    e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.3)';
-                                                }}
-                                                onMouseLeave={(e) => {
-                                                    e.currentTarget.style.transform = 'translateY(0)';
-                                                    e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.15)';
-                                                }}
-                                            >
-                                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
-                                                    <p style={{
-                                                        margin: 0,
-                                                        fontSize: '1.1rem',
-                                                        fontWeight: 600,
-                                                        color: '#ffffff'
-                                                    }}>{campaign.name}</p>
-                                                    <span style={{
-                                                        display: 'inline-flex',
-                                                        alignItems: 'center',
-                                                        padding: '0.25rem 0.65rem',
-                                                        borderRadius: '999px',
-                                                        fontSize: '0.7rem',
-                                                        fontWeight: 600,
-                                                        textTransform: 'uppercase',
-                                                        letterSpacing: '0.05em',
-                                                        background: 'rgba(34, 197, 94, 0.15)',
-                                                        color: '#22c55e',
-                                                        border: '1px solid rgba(34, 197, 94, 0.3)'
-                                                    }}>Active</span>
-                                                </div>
-                                                <p style={{
-                                                    margin: '0.5rem 0 0',
-                                                    fontSize: '0.85rem',
-                                                    color: 'rgba(255, 255, 255, 0.6)'
-                                                }}>
-                                                    Leads: {campaign.totalLeads?.toLocaleString() || 0}
-                                                </p>
-                                                {campaign.createdAt && (
-                                                    <p style={{
-                                                        margin: '0.5rem 0 0',
-                                                        fontSize: '0.8rem',
-                                                        color: 'rgba(255, 255, 255, 0.4)'
-                                                    }}>
-                                                        Created: {campaign.createdAt}
-                                                    </p>
-                                                )}
-                                                {/* Upload to Instantly Modal rendered once outside the list */}
-
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-
                             {/* Pipeline Panel */}
                             {pipelineVisible && jobState && (
                                 <div style={{ 
@@ -3658,184 +3781,6 @@ export default function ClientPage() {
                                                                             background: statusColor,
                                                                             transition: 'width 0.3s ease'
                                                                         }}/>
-                                                                    </div>
-                                                                </div>
-                                                            )}
-
-                                                            {/* Pipeline Stages - Show when selected */}
-                                                            {isSelected && (
-                                                                <div style={{
-                                                                    marginTop: '1.5rem',
-                                                                    paddingTop: '1.5rem',
-                                                                    borderTop: '1px solid rgba(255, 255, 255, 0.1)'
-                                                                }}>
-                                                                    <p style={{
-                                                                        margin: '0 0 1rem 0',
-                                                                        fontSize: '0.7rem',
-                                                                        textTransform: 'uppercase',
-                                                                        letterSpacing: '0.05em',
-                                                                        color: 'rgba(255, 255, 255, 0.5)',
-                                                                        fontWeight: 600
-                                                                    }}>Live Pipeline</p>
-                                                                    
-                                                                    {/* Pipeline flow summary */}
-                                                                    {(() => {
-                                                                        const foundersFound = deriveStageTotals(job.stages.founders).throughputNum ?? 0;
-                                                                        const dedupedTotal = deriveDedupedDomainBaseline(job);
-                                                                        const foundersProcessedRaw = deriveStageTotals(job.stages.founders).total ?? 0;
-                                                                        const foundersProcessed = foundersProcessedRaw > 0 ? foundersProcessedRaw : (dedupedTotal ?? 0);
-                                                                        const emailsFound = (job.stages.emailDiscovery?.summary as any)?.Found ?? (job.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(job.stages.emailDiscovery).throughputNum ?? 0;
-                                                                        const safe = (job.stages.verification?.summary as any)?.Valid ?? (job.stages.verification?.summary as any)?.valid ?? 0;
-                                                                        const personalized = (job.stages.personalization?.summary as any)?.Personalized ?? (job.stages.personalization?.summary as any)?.personalized ?? (job.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
-                                                                        
-                                                                        return (
-                                                                            <div style={{ 
-                                                                                display: 'flex', 
-                                                                                alignItems: 'center', 
-                                                                                gap: '0.75rem',
-                                                                                padding: '0.75rem 1rem',
-                                                                                background: 'rgba(255, 255, 255, 0.03)',
-                                                                                borderRadius: '8px',
-                                                                                border: '1px solid rgba(255, 255, 255, 0.08)',
-                                                                                marginBottom: '1rem',
-                                                                                fontSize: '0.8rem',
-                                                                                fontVariantNumeric: 'tabular-nums',
-                                                                                flexWrap: 'wrap'
-                                                                            }}>
-                                                                                <span style={{ opacity: 0.5, fontSize: '0.7rem' }}>Flow:</span>
-                                                                                <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
-                                                                                <span style={{ opacity: 0.4 }}>→</span>
-                                                                                <span style={{ fontWeight: '600' }}>{foundersFound.toLocaleString()}</span>
-                                                                                <span style={{ opacity: 0.4 }}>→</span>
-                                                                                <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
-                                                                                <span style={{ opacity: 0.4 }}>→</span>
-                                                                                <span style={{ fontWeight: '600', color: '#22c55e' }}>{safe.toLocaleString()}</span>
-                                                                                <span style={{ opacity: 0.4 }}>→</span>
-                                                                                <span style={{ fontWeight: '600', color: '#3b82f6' }}>{personalized.toLocaleString()}</span>
-                                                                            </div>
-                                                                        );
-                                                                    })()}
-                                                                    
-                                                                    <div className="stage-grid" style={{ gap: '0.75rem' }}>
-                                                                        {[...STAGE_ORDER].map((stageKey) => {
-                                                                            const stage = job.stages[stageKey];
-                                                                            const meta = STAGE_METADATA[stageKey];
-                                                                            const { throughputNum, total } = deriveStageTotals(stage);
-                                                                            const summary = stage?.summary as Record<string, unknown> | null;
-                                                                            const stats = stage?.progress?.stats as Record<string, unknown> | undefined;
-                                                                            
-                                                                            // Simplified metrics based on stage type
-                                                                            let heroNumber = null;
-                                                                            let heroLabel = "";
-                                                                            let subtext = "";
-                                                                            let costFooter = "";
-                                                                            
-                                                                            if (stageKey === "domainPrep") {
-                                                                                const domainCheckSkipped = summary?.domainCheckSkipped === true;
-                                                                                const checked = (summary?.checked as number) ?? (summary?.normalized as number) ?? total ?? 0;
-                                                                                const live = (summary?.live as number) ?? 0;
-                                                                                const dead = (summary?.dead as number) ?? 0;
-                                                                                const unknown = (summary?.unknown as number) ?? 0;
-                                                                                const processable = (summary?.processable as number) ?? throughputNum ?? live;
-                                                                                heroNumber = processable;
-                                                                                heroLabel = "Processable";
-                                                                                subtext = domainCheckSkipped
-                                                                                    ? `${processable.toLocaleString()} processable • domain check skipped`
-                                                                                    : checked > 0
-                                                                                    ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
-                                                                                    : "Awaiting...";
-                                                                            } else if (stageKey === "founders") {
-                                                                                const dedupedTotal = deriveDedupedDomainBaseline(job);
-                                                                                const processedRaw = total ?? 0;
-                                                                                const processed = processedRaw > 0 ? processedRaw : (dedupedTotal ?? 0);
-                                                                                const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
-                                                                                const cost = summary?.cost || stats?.cost;
-                                                                                heroNumber = found;
-                                                                                heroLabel = "Found";
-                                                                                subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
-                                                                                if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
-                                                                            } else if (stageKey === "emailDiscovery") {
-                                                                                const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
-                                                                                const dedupedTotal = (job?.dedupeStats?.new ?? job?.dedupeStats?.total ?? null);
-                                                                                const attemptedRaw = typeof stage?.progress?.processed === "number"
-                                                                                    ? stage.progress.processed
-                                                                                    : total ?? 0;
-                                                                                const attempted = dedupedTotal ?? attemptedRaw;
-                                                                                heroNumber = found;
-                                                                                heroLabel = "Emails Found";
-                                                                                subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
-                                                                            } else if (stageKey === "verification") {
-                                                                                const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
-                                                                                const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
-                                                                                const verified = total ?? 0;
-                                                                                heroNumber = safe;
-                                                                                heroLabel = "Safe";
-                                                                                const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
-                                                                                subtext = verified > 0 ? `${verified.toLocaleString()} verified${riskyText}` : "Awaiting...";
-                                                                            } else if (stageKey === "personalization") {
-                                                                                const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
-                                                                                const candidates = total ?? 0;
-                                                                                const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
-                                                                                heroNumber = personalized;
-                                                                                heroLabel = "Ready";
-                                                                                subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
-                                                                                if (failed > 0) subtext += ` • ${failed} failed`;
-                                                                            }
-                                                                            
-                                                                            return (
-                                                                                <article
-                                                                                    key={stageKey}
-                                                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""}`}
-                                                                                    style={{ padding: '0.875rem' }}
-                                                                                >
-                                                                                    <div className="stage-card__head">
-                                                                                        <div>
-                                                                                            <p className="stage-card__label" style={{ fontSize: '0.8rem' }}>{meta.title}</p>
-                                                                                        </div>
-                                                                                        <span className="stage-card__status" style={{ fontSize: '0.65rem' }}>{formatStageStatus(stage?.status)}</span>
-                                                                                    </div>
-                                                                                    
-                                                                                    {stage?.error === 'Add Credits to TryKitt' ? (
-                                                                                        <div style={{
-                                                                                            marginTop: '0.5rem',
-                                                                                            padding: '0.75rem',
-                                                                                            background: 'rgba(239, 68, 68, 0.15)',
-                                                                                            border: '1px solid rgba(239, 68, 68, 0.5)',
-                                                                                            borderRadius: '8px',
-                                                                                            color: '#ef4444',
-                                                                                            fontWeight: 600,
-                                                                                            fontSize: '0.75rem',
-                                                                                            textAlign: 'center'
-                                                                                        }}>
-                                                                                            ⚠️ Add Credits to TryKitt
-                                                                                        </div>
-                                                                                    ) : stage?.error ? (
-                                                                                        <p className="stage-card__error" style={{ fontSize: '0.75rem' }}>{stage.error}</p>
-                                                                                    ) : heroNumber !== null ? (
-                                                                                        <>
-                                                                                            <div style={{ marginTop: '0.5rem' }}>
-                                                                                                <div style={{ fontSize: '1.75rem', fontWeight: '700', lineHeight: '1' }}>
-                                                                                                    {heroNumber.toLocaleString()}
-                                                                                                    <span style={{ fontSize: '0.8rem', fontWeight: '500', marginLeft: '0.4rem', opacity: 0.7 }}>{heroLabel}</span>
-                                                                                                </div>
-                                                                                                <div style={{ fontSize: '0.75rem', marginTop: '0.4rem', opacity: 0.65 }}>
-                                                                                                    {subtext}
-                                                                                                </div>
-                                                                                            </div>
-                                                                                            {costFooter && (
-                                                                                                <div style={{ fontSize: '0.65rem', marginTop: '0.5rem', opacity: 0.5 }}>
-                                                                                                    {costFooter}
-                                                                                                </div>
-                                                                                            )}
-                                                                                        </>
-                                                                                    ) : (
-                                                                                        <p className="stage-card__progress" style={{ marginTop: '0.5rem', opacity: 0.6, fontSize: '0.75rem' }}>
-                                                                                            {describeStageProgress(stage)}
-                                                                                        </p>
-                                                                                    )}
-                                                                                </article>
-                                                                            );
-                                                                        })}
                                                                     </div>
                                                                 </div>
                                                             )}
@@ -5423,8 +5368,66 @@ export default function ClientPage() {
                                     </button>
                                 </div>
                                 <span className="settings-field__hint">
-                                    Paste this into Instantly events/webhook settings for this client.
+                                    This is the live Instantly event endpoint for this client.
                                 </span>
+                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.5rem', fontSize: '0.875rem', color: 'rgba(255,255,255,0.72)' }}>
+                                    <span>Webhook status: {clientInstantlyWebhookStatus === null ? 'Not registered' : String(clientInstantlyWebhookStatus)}</span>
+                                    {clientInstantlyWebhookUpdatedAt && <span>Registered: {clientInstantlyWebhookUpdatedAt}</span>}
+                                </div>
+                                {instantlySyncRun && (
+                                    <div style={{
+                                        marginTop: '0.75rem',
+                                        padding: '0.9rem',
+                                        borderRadius: '10px',
+                                        background: 'rgba(255,255,255,0.04)',
+                                        border: '1px solid rgba(255,255,255,0.08)'
+                                    }}>
+                                        <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', fontSize: '0.875rem', color: 'rgba(255,255,255,0.78)' }}>
+                                            <span>Status: <strong style={{ color: '#fff' }}>{instantlySyncRun.status}</strong></span>
+                                            {instantlySyncRun.updatedAt && <span>Updated: {new Date(instantlySyncRun.updatedAt).toLocaleString()}</span>}
+                                            {instantlySyncRun.completedAt && <span>Completed: {new Date(instantlySyncRun.completedAt).toLocaleString()}</span>}
+                                        </div>
+                                        {instantlySyncRun.progressMessage && (
+                                            <div style={{ marginTop: '0.5rem', color: '#fff', fontSize: '0.95rem' }}>
+                                                {instantlySyncRun.progressMessage}
+                                            </div>
+                                        )}
+                                        <div style={{ display: 'flex', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.6rem', fontSize: '0.85rem', color: 'rgba(255,255,255,0.72)' }}>
+                                            <span>Campaigns: {instantlySyncRun.campaignsCompleted}/{instantlySyncRun.totalCampaigns}</span>
+                                            <span>Seen: {instantlySyncRun.totalLeadsSeen}</span>
+                                            <span>Matched: {instantlySyncRun.matchedLeads}</span>
+                                            <span>Unmatched: {instantlySyncRun.unmatchedLeads}</span>
+                                        </div>
+                                        {instantlySyncRun.currentCampaignName && (
+                                            <div style={{ marginTop: '0.45rem', fontSize: '0.85rem', color: '#bfdbfe' }}>
+                                                Current campaign: {instantlySyncRun.currentCampaignName}
+                                            </div>
+                                        )}
+                                        {instantlySyncRun.error && (
+                                            <div style={{ marginTop: '0.5rem', color: '#fca5a5', fontSize: '0.875rem' }}>
+                                                Error: {instantlySyncRun.error}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                                <div className="modal__actions" style={{ justifyContent: 'flex-start', marginTop: '0.75rem' }}>
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={handleRegisterInstantlyWebhook}
+                                        disabled={registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                    >
+                                        {registeringInstantlyWebhook ? 'Registering...' : 'Register Webhook'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={handleSyncInstantlyState}
+                                        disabled={syncingInstantlyState || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                    >
+                                        {syncingInstantlyState ? 'Syncing...' : 'Sync Instantly State'}
+                                    </button>
+                                </div>
                             </label>
                             <div className="settings-field">
                                 <span className="settings-field__label">Instantly CSV Merge Import</span>

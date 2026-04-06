@@ -772,6 +772,15 @@ async function processJob(job) {
                     checkPaused: () => {
                         syncJobControl(job);
                         return job.paused || job.cancelled;
+                    },
+                    onBatch: async (rows) => {
+                        await upsertLeadRowsBatch({
+                            agencyId: job.uid,
+                            clientId: job.sqlClientId,
+                            rows,
+                            type: 'verification',
+                            jobId: job.id
+                        });
                     }
                 })
             );
@@ -806,6 +815,15 @@ async function processJob(job) {
                 personalizeFirstLine: job.personalizeFirstLine,
                 productPromptVersion: job.productPromptVersion || 'old',
                 productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
+                onBatch: async (rows) => {
+                    await upsertLeadRowsBatch({
+                        agencyId: job.uid,
+                        clientId: job.sqlClientId,
+                        rows,
+                        type: 'personalization',
+                        jobId: job.id
+                    });
+                }
             })
         );
         computeJobCost(job);

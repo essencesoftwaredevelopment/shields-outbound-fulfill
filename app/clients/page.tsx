@@ -81,7 +81,7 @@ export default function ClientsPage() {
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !selectedClientId) return "";
-        return `https://api.shieldsoutboundserver.org/webhook/events/${user.uid}/${selectedClientId}`;
+        return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${user.uid}/${selectedClientId}`;
     }, [user, selectedClientId]);
 
     useEffect(() => {

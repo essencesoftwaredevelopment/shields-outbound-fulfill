@@ -397,7 +397,8 @@ async function personalizeWithNewPromptFromShopify({
     productPromptProducts = 3,
     concurrency = 12,
     model = NEW_PROMPT_MODEL,
-    removeB2B = true
+    removeB2B = true,
+    onBatch = null
 }) {
     log?.(`Generating personalized first lines with New Prompt (${model})...`);
 
@@ -436,6 +437,20 @@ async function personalizeWithNewPromptFromShopify({
     let totalOutputTokens = 0;
     let fallbackUsed = 0;
     let backoffMs = 0;
+
+    // In-flight batch for incremental upserts
+    const pendingBatch = [];
+    let flushPromise = Promise.resolve();
+    const BATCH_SIZE = 50;
+
+    const flushBatch = async (force = false) => {
+        if (!onBatch) return;
+        if (!force && pendingBatch.length < BATCH_SIZE) return;
+        const batch = pendingBatch.splice(0, pendingBatch.length);
+        if (batch.length === 0) return;
+        flushPromise = flushPromise.then(() => onBatch(batch));
+        await flushPromise;
+    };
 
     const fetchProductsForDomain = async (domain, retries = 2, attempts = 0) => {
         const url = `https://${domain}/products.json?limit=${productPromptProducts}`;
@@ -603,16 +618,29 @@ async function personalizeWithNewPromptFromShopify({
             if (result.status === 'fulfilled' && result.value) {
                 processed += 1;
                 stringifier.write(result.value);
+                // Queue incremental upsert
+                if (onBatch && result.value.first_line && result.value.first_line !== '[Generation failed]' && result.value.first_line !== 'invalid') {
+                    pendingBatch.push({
+                        domain: result.value.domain,
+                        personalization_first_line: result.value.first_line
+                    });
+                }
             } else if (result.status === 'rejected') {
                 failed += 1;
                 log?.(`New prompt row failed: ${result.reason?.message || result.reason || 'Unknown error'}`);
             }
         }
+        await flushBatch(false);
         log?.(`New prompt personalization progress: ${Math.min(i + concurrency, rows.length)}/${rows.length}`);
     }
 
     stringifier.end();
     await new Promise((resolve) => writeStream.on('finish', resolve));
+
+    // Flush remaining batch
+    if (onBatch) {
+        await flushBatch(true);
+    }
 
     const estimatedCost = (totalInputTokens * 0.00025 / 1000) + (totalOutputTokens * 0.002 / 1000);
     log?.(`New prompt personalization complete: ${processed} rows. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
@@ -715,7 +743,7 @@ function getHumanTimeframe(dateStr) {
     }
 }
 
-async function personalizeWithLLM({ inputCsv, outputCsv, apiKeys, log, concurrency = 15, model = 'gpt-5-nano' }) {
+async function personalizeWithLLM({ inputCsv, outputCsv, apiKeys, log, concurrency = 15, model = 'gpt-5-nano', onBatch = null }) {
     log?.('Generating personalized first lines with OpenAI...');
 
     if (!apiKeys.openai) {
@@ -738,6 +766,20 @@ async function personalizeWithLLM({ inputCsv, outputCsv, apiKeys, log, concurren
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let backoffMs = 0;
+
+    // In-flight batch for incremental upserts
+    const pendingBatch = [];
+    let flushPromise = Promise.resolve();
+    const BATCH_SIZE = 50;
+
+    const flushBatch = async (force = false) => {
+        if (!onBatch) return;
+        if (!force && pendingBatch.length < BATCH_SIZE) return;
+        const batch = pendingBatch.splice(0, pendingBatch.length);
+        if (batch.length === 0) return;
+        flushPromise = flushPromise.then(() => onBatch(batch));
+        await flushPromise;
+    };
 
     const generateFirstLine = async (title, description, timeframe, retryCount = 0) => {
         try {
@@ -855,8 +897,16 @@ Description: ${description}
         batchResults.forEach(result => {
             if (result.status === 'fulfilled' && result.value) {
                 stringifier.write(result.value);
+                // Queue incremental upsert
+                if (onBatch && result.value.first_line && result.value.first_line !== '[Generation failed]' && result.value.first_line !== 'invalid') {
+                    pendingBatch.push({
+                        domain: result.value.domain,
+                        personalization_first_line: result.value.first_line
+                    });
+                }
             }
         });
+        await flushBatch(false);
     };
 
     // Process all rows in batches
@@ -867,6 +917,11 @@ Description: ${description}
 
     stringifier.end();
     await new Promise(resolve => writeStream.on('finish', resolve));
+
+    // Flush remaining batch
+    if (onBatch) {
+        await flushBatch(true);
+    }
 
     const estimatedCost = (totalInputTokens * 0.00015 / 1000) + (totalOutputTokens * 0.0006 / 1000);
     log?.(`Personalization complete: ${processed} first lines generated`);
@@ -888,7 +943,8 @@ export async function runPersonalization({
     concurrency,
     removeB2B = true,
     productPromptVersion = 'old',
-    productPromptProducts = 3
+    productPromptProducts = 3,
+    onBatch = null
 }) {
     const jobDir = path.dirname(inputCsv);
     const shopifyDetectionCsv = path.join(jobDir, 'shopify-detection.csv');
@@ -934,7 +990,8 @@ export async function runPersonalization({
             productPromptProducts: newPromptProducts,
             concurrency: personalizationConcurrency,
             model: NEW_PROMPT_MODEL,
-            removeB2B
+            removeB2B,
+            onBatch
         });
 
         return {
@@ -1001,7 +1058,8 @@ export async function runPersonalization({
         apiKeys,
         log,
         concurrency: personalizationConcurrency,
-        model: 'gpt-4o-mini'
+        model: 'gpt-4o-mini',
+        onBatch
     });
 
     return {

@@ -34,6 +34,40 @@ function safeEncodeURIComponent(value = '') {
     }
 }
 
+function normalizeOptionalText(value) {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    const normalized = String(value).trim();
+    return normalized || null;
+}
+
+function normalizeOptionalNumber(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeOptionalBoolean(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (typeof value === 'boolean') return value;
+    if (value === 'true' || value === '1' || value === 1) return true;
+    if (value === 'false' || value === '0' || value === 0) return false;
+    return undefined;
+}
+
+function normalizeOptionalTimestamp(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return undefined;
+    return parsed.toISOString();
+}
+
+function normalizeOptionalObject(value) {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return value;
+}
+
 function buildClientMatchers(...values) {
     const textVariants = new Set();
     const slugVariants = new Set();
@@ -247,7 +281,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 JOIN contact_instantly_campaigns cic ON cic.contact_id = c.id
                 JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
             `;
-            whereClause += ` AND ic.instantly_campaign_id = $${paramIndex}`;
+            whereClause += ` AND ic.instantly_campaign_id = $${paramIndex} AND cic.active = TRUE`;
             params.push(instantlyCampaignId);
             paramIndex++;
         }
@@ -281,20 +315,38 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 c.created_at,
                 c.updated_at,
                 co.domain_normalized,
+                ci.annual_revenue_text,
+                ci.annual_revenue_min,
+                ci.annual_revenue_max,
+                ci.uses_klaviyo,
+                ci.klaviyo_percent,
+                ci.discovery_call_held,
+                ci.last_discovery_call_at,
+                ci.source AS insight_source,
+                ci.notes AS insight_notes,
+                ci.attributes AS insight_attributes,
                 (
                     SELECT json_agg(
                         json_build_object(
                             'campaignId', ic.instantly_campaign_id,
                             'campaignName', ic.name,
-                            'addedAt', cic.added_at
+                            'addedAt', cic.added_at,
+                            'active', cic.active,
+                            'lastReplyAt', cic.timestamp_last_reply,
+                            'lastReplyCategory', cic.last_reply_category,
+                            'leadStatus', cic.lead_status_label,
+                            'interestStatus', cic.interest_status_label,
+                            'lastSyncedAt', cic.last_synced_at
                         )
                     )
                     FROM contact_instantly_campaigns cic
                     JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
                     WHERE cic.contact_id = c.id
+                    AND cic.active = TRUE
                 ) as campaigns_data
             FROM contacts c
             JOIN companies co ON c.company_id = co.id
+            LEFT JOIN contact_insights ci ON ci.contact_id = c.id
             ${joinClause}
             WHERE ${whereClause}
             ORDER BY c.created_at DESC
@@ -319,7 +371,19 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             jobId: row.job_id,
             createdAt: row.created_at,
             updatedAt: row.updated_at,
-            campaignsData: row.campaigns_data || []
+            campaignsData: row.campaigns_data || [],
+            insights: {
+                annualRevenueText: row.annual_revenue_text,
+                annualRevenueMin: row.annual_revenue_min,
+                annualRevenueMax: row.annual_revenue_max,
+                usesKlaviyo: row.uses_klaviyo,
+                klaviyoPercent: row.klaviyo_percent,
+                discoveryCallHeld: row.discovery_call_held,
+                lastDiscoveryCallAt: row.last_discovery_call_at,
+                source: row.insight_source,
+                notes: row.insight_notes,
+                attributes: row.insight_attributes || {}
+            }
         }));
 
         res.json({
@@ -743,6 +807,157 @@ router.get('/instantly-campaigns', verifyFirebaseToken, async (req, res) => {
     } catch (error) {
         console.error('Error fetching instantly campaigns:', error);
         res.status(500).json({ error: 'Failed to fetch campaigns' });
+    }
+});
+
+router.get('/leads/:contactId/events', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        const limit = Math.min(Number.parseInt(req.query.limit, 10) || 50, 200);
+
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+
+        const result = await pool.query(
+            `SELECT
+                cie.id,
+                cie.event_type,
+                cie.reply_category,
+                cie.instantly_campaign_id,
+                ic.name AS campaign_name,
+                cie.instantly_lead_id,
+                cie.lead_email,
+                cie.email_account,
+                cie.unibox_url,
+                cie.step,
+                cie.variant,
+                cie.message_text,
+                cie.event_timestamp,
+                cie.source,
+                cie.payload,
+                cie.created_at
+             FROM contact_instantly_events cie
+             JOIN contacts c ON c.id = cie.contact_id
+             LEFT JOIN instantly_campaigns ic ON ic.id = cie.campaign_id
+             WHERE cie.contact_id = $1
+             AND c.agency_id = $2
+             ORDER BY cie.event_timestamp DESC, cie.id DESC
+             LIMIT $3`,
+            [contactId, agencyId, limit]
+        );
+
+        res.json({ events: result.rows });
+    } catch (error) {
+        console.error('Error fetching lead events:', error);
+        res.status(500).json({ error: 'Failed to fetch lead events' });
+    }
+});
+
+router.post('/leads/:contactId/insights', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+
+        const annualRevenueText = normalizeOptionalText(req.body?.annualRevenueText);
+        const annualRevenueMin = normalizeOptionalNumber(req.body?.annualRevenueMin);
+        const annualRevenueMax = normalizeOptionalNumber(req.body?.annualRevenueMax);
+        const usesKlaviyo = normalizeOptionalBoolean(req.body?.usesKlaviyo);
+        const klaviyoPercent = normalizeOptionalNumber(req.body?.klaviyoPercent);
+        const discoveryCallHeld = normalizeOptionalBoolean(req.body?.discoveryCallHeld);
+        const lastDiscoveryCallAt = normalizeOptionalTimestamp(req.body?.lastDiscoveryCallAt);
+        const source = normalizeOptionalText(req.body?.source);
+        const notes = normalizeOptionalText(req.body?.notes);
+        const attributes = normalizeOptionalObject(req.body?.attributes);
+        const sourcePayload = normalizeOptionalObject(req.body?.sourcePayload);
+
+        const result = await pool.query(
+            `INSERT INTO contact_insights (
+                contact_id,
+                agency_id,
+                client_id,
+                annual_revenue_text,
+                annual_revenue_min,
+                annual_revenue_max,
+                uses_klaviyo,
+                klaviyo_percent,
+                discovery_call_held,
+                last_discovery_call_at,
+                source,
+                notes,
+                attributes,
+                source_payload
+            )
+            SELECT
+                c.id,
+                c.agency_id,
+                co.client_id,
+                COALESCE($3, NULL),
+                COALESCE($4, NULL),
+                COALESCE($5, NULL),
+                COALESCE($6, NULL),
+                COALESCE($7, NULL),
+                COALESCE($8, NULL),
+                COALESCE($9, NULL),
+                COALESCE($10, NULL),
+                COALESCE($11, NULL),
+                COALESCE($12::jsonb, '{}'::jsonb),
+                COALESCE($13::jsonb, '{}'::jsonb)
+            FROM contacts c
+            JOIN companies co ON co.id = c.company_id
+            WHERE c.id = $1
+            AND c.agency_id = $2
+            ON CONFLICT (contact_id)
+            DO UPDATE SET
+                annual_revenue_text = COALESCE(EXCLUDED.annual_revenue_text, contact_insights.annual_revenue_text),
+                annual_revenue_min = COALESCE(EXCLUDED.annual_revenue_min, contact_insights.annual_revenue_min),
+                annual_revenue_max = COALESCE(EXCLUDED.annual_revenue_max, contact_insights.annual_revenue_max),
+                uses_klaviyo = COALESCE(EXCLUDED.uses_klaviyo, contact_insights.uses_klaviyo),
+                klaviyo_percent = COALESCE(EXCLUDED.klaviyo_percent, contact_insights.klaviyo_percent),
+                discovery_call_held = COALESCE(EXCLUDED.discovery_call_held, contact_insights.discovery_call_held),
+                last_discovery_call_at = COALESCE(EXCLUDED.last_discovery_call_at, contact_insights.last_discovery_call_at),
+                source = COALESCE(EXCLUDED.source, contact_insights.source),
+                notes = COALESCE(EXCLUDED.notes, contact_insights.notes),
+                attributes = CASE
+                    WHEN EXCLUDED.attributes = '{}'::jsonb THEN contact_insights.attributes
+                    ELSE EXCLUDED.attributes
+                END,
+                source_payload = CASE
+                    WHEN EXCLUDED.source_payload = '{}'::jsonb THEN contact_insights.source_payload
+                    ELSE EXCLUDED.source_payload
+                END,
+                updated_at = NOW()
+            RETURNING *`,
+            [
+                contactId,
+                agencyId,
+                annualRevenueText,
+                annualRevenueMin,
+                annualRevenueMax,
+                usesKlaviyo,
+                klaviyoPercent,
+                discoveryCallHeld,
+                lastDiscoveryCallAt,
+                source,
+                notes,
+                attributes ? JSON.stringify(attributes) : null,
+                sourcePayload ? JSON.stringify(sourcePayload) : null
+            ]
+        );
+
+        if (!result.rowCount) {
+            return res.status(404).json({ error: 'Lead not found for this agency.' });
+        }
+
+        res.json({ insight: result.rows[0] });
+    } catch (error) {
+        console.error('Error upserting lead insights:', error);
+        res.status(500).json({ error: 'Failed to save lead insights' });
     }
 });
 

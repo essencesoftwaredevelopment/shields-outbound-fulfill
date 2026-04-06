@@ -6,6 +6,8 @@
     "scripts": {
         "dev": "node src/index.js",
         "worker": "node src/worker/queueWorker.js",
+        "instantly:worker": "node src/worker/instantlySyncWorker.js",
+        "instantly:sync": "node src/scripts/run-instantly-sync-once.js",
         "personalizer:local": "node src/scripts/run-personalizer-local.js",
         "db:ping": "node scripts/db-ping.js",
         "db:migration:capture-baseline": "bash scripts/migration/capture-cloudsql-baseline.sh",

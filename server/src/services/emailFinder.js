@@ -7,9 +7,11 @@ import http from 'http';
 
 dotenv.config();
 
-const CONCURRENCY = 5;
-const MAX_RETRIES = 1;
+const CONCURRENCY = 15;
+const MAX_RETRIES = 3;
+const RATE_LIMIT_MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
+const RATE_LIMIT_BACKOFF_MS = 3000;
 const REQUEST_TIMEOUT = 30000; // 30 second timeout
 
 // Create HTTP agent with keep-alive to prevent ECONNRESET
@@ -29,7 +31,7 @@ const PROVIDERS = {
 const SELF_HOSTED_VERIFY_URL = 'http://193.181.209.186:8080/v0/check_email';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-const shouldRetry = status => status === 402 || status === 429 || status >= 500;
+const shouldRetry = status => status === 429 || status >= 500;
 
 function normalize(value) {
     return (value || '').trim();
@@ -132,6 +134,7 @@ function extractEmail(payload) {
 
 async function lookupEmail(fullName, domain, apiKey) {
     let attempt = 0;
+    let rateLimitHits = 0;
     let backoff = INITIAL_BACKOFF_MS;
     const body = {
         fullName,
@@ -141,7 +144,9 @@ async function lookupEmail(fullName, domain, apiKey) {
         strictNameMatches: false
     };
 
-    while (attempt < MAX_RETRIES) {
+    const maxAttempts = MAX_RETRIES + RATE_LIMIT_MAX_RETRIES; // total ceiling
+
+    while (attempt < maxAttempts) {
         attempt += 1;
         try {
             const res = await fetch('https://api.trykitt.ai/job/find_email', {
@@ -153,31 +158,32 @@ async function lookupEmail(fullName, domain, apiKey) {
                 body: JSON.stringify(body)
             });
 
-            // Debug logging
-            // console.log(`[EMAIL FINDER DEBUG] Request to TryKitt for domain: ${domain}`);
-            // console.log(`[EMAIL FINDER DEBUG] Response Status: ${res.status} ${res.statusText}`);
-            // console.log(`[EMAIL FINDER DEBUG] Response Headers:`, Object.fromEntries(res.headers.entries()));
-
             const text = await res.text();
-            // console.log(`[EMAIL FINDER DEBUG] Response Body:`, text);
             
             let parsed = null;
             try {
                 parsed = text ? JSON.parse(text) : null;
             } catch {
-                // console.log(`[EMAIL FINDER DEBUG] Failed to parse JSON response`);
                 parsed = null;
             }
 
-            // Check for credit exhaustion (402)
+            // Handle 402 (rate limit) with dedicated backoff
             if (res.status === 402) {
-                const error = new Error('TryKitt account out of credits');
-                error.code = 'CREDIT_EXHAUSTED';
-                error.stage = 'emailDiscovery';
-                throw error;
+                rateLimitHits += 1;
+                if (rateLimitHits >= RATE_LIMIT_MAX_RETRIES) {
+                    console.warn(`[EMAIL_FINDER] 402 rate-limited ${rateLimitHits} times for ${domain}, giving up on this row`);
+                    return {
+                        email: null,
+                        status: 'error: rate_limited'
+                    };
+                }
+                const rlBackoff = RATE_LIMIT_BACKOFF_MS * rateLimitHits;
+                console.warn(`[EMAIL_FINDER] 402 rate-limited for ${domain}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
+                await wait(rlBackoff);
+                continue;
             }
 
-            if (!res.ok && shouldRetry(res.status) && attempt < MAX_RETRIES) {
+            if (!res.ok && shouldRetry(res.status) && attempt < maxAttempts) {
                 await wait(backoff);
                 backoff *= 2;
                 continue;
@@ -200,12 +206,7 @@ async function lookupEmail(fullName, domain, apiKey) {
                 raw: parsed
             };
         } catch (error) {
-            // Re-throw credit exhaustion errors immediately
-            if (error.code === 'CREDIT_EXHAUSTED') {
-                throw error;
-            }
-            
-            if (attempt >= MAX_RETRIES) {
+            if (attempt >= maxAttempts) {
                 return {
                     email: null,
                     status: `error: ${error.message}`
@@ -450,13 +451,8 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
                     status = 'not_found';
                 }
             } catch (error) {
-                // Check for credit exhaustion - abort entire job
-                if (error.code === 'CREDIT_EXHAUSTED') {
-                    console.log(`[EMAIL_FINDER] Credit exhausted, aborting job`);
-                    controller.abort();
-                    throw error; // Re-throw to stop execution
-                }
-                throw new Error(`Email lookup failed for ${domain}: ${error?.message || error}`);
+                console.error(`[EMAIL_FINDER] Lookup failed for ${domain}: ${error?.message || error}`);
+                status = `error: ${error?.message || 'unknown'}`;
             }
 
             if (email) {

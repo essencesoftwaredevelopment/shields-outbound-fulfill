@@ -18,6 +18,13 @@ import { admin, firestore } from '../config/firebase.js';
 import { pool } from '../config/db.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import {
+    beginInstantlySyncRun,
+    buildInstantlyWebhookTargetUrl,
+    getInstantlySyncRun,
+    getLatestInstantlySyncRun,
+    registerInstantlyWebhook
+} from '../services/instantlyState.js';
+import {
     choosePreferredCampaign,
     extractCampaignApiItems,
     getCsvValueByAliases,
@@ -92,6 +99,20 @@ async function deleteAllDocs(ref) {
         lastDoc = snap.docs[snap.docs.length - 1];
         if (snap.size < batchSize) break;
     }
+}
+
+async function verifyAgencyIdFromRequest(req) {
+    const authHeader = String(req.headers.authorization || '').trim();
+    const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+    const idToken = bearerMatch?.[1] || String(req.query?.idToken || req.body?.idToken || '').trim();
+    if (!idToken) {
+        const error = new Error('Missing ID token.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    return decoded.uid;
 }
 
 // Create client via server (uses Admin SDK; bypasses client-side rules)
@@ -251,46 +272,40 @@ router.post('/clients/:id/campaigns', async (req, res) => {
         // Sync campaigns to SQL (instantly_campaigns table)
         try {
             if (campaigns.length > 0) {
-                // First, get the SQL client_id
-                const clientResult = await pool.query(
-                    'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-                    [uid, clientId]
-                );
-                
-                if (clientResult.rows.length > 0) {
-                    const sqlClientId = clientResult.rows[0].id;
-                    
-                    // Build bulk upsert query
-                    const values = [];
-                    const params = [];
-                    let paramIndex = 1;
-                    
-                    campaigns.forEach((c) => {
-                        const instantlyId = (c.id || c.campaignId || c.uuid || c._id || '').toString();
-                        const name = c.name || c.title || c.campaign_name || '';
-                        const created = c.timestamp_created || c.createdAt || c.created_at || c.created || c.created_at_utc || null;
-                        const startDate = created ? new Date(created) : null;
-                        
-                        params.push(uid, sqlClientId, instantlyId, name, startDate);
-                        values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4})`);
-                        paramIndex += 5;
-                    });
-                    
-                    const query = `
-                        INSERT INTO instantly_campaigns (agency_id, client_id, instantly_campaign_id, name, start_date)
-                        VALUES ${values.join(', ')}
-                        ON CONFLICT (agency_id, client_id, instantly_campaign_id)
-                        DO UPDATE SET 
-                            name = EXCLUDED.name,
-                            start_date = COALESCE(EXCLUDED.start_date, instantly_campaigns.start_date),
-                            created_at = COALESCE(instantly_campaigns.created_at, now())
-                    `;
-                    
-                    await pool.query(query, params);
-                    console.log('[campaigns] synced to SQL', { count: campaigns.length, sqlClientId });
-                } else {
-                    console.warn('[campaigns] SQL client not found, skipping SQL sync', { uid, clientId });
-                }
+                const sqlClientId = await getOrCreateClient(uid, clientId);
+
+                // Build bulk upsert query
+                const values = [];
+                const params = [];
+                let paramIndex = 1;
+
+                campaigns.forEach((c) => {
+                    const instantlyId = (c.id || c.campaignId || c.uuid || c._id || '').toString();
+                    const name = c.name || c.title || c.campaign_name || '';
+                    const created = c.timestamp_created || c.createdAt || c.created_at || c.created || c.created_at_utc || null;
+                    const startDate = created ? new Date(created) : null;
+
+                    params.push(uid, sqlClientId, instantlyId, name, startDate, typeof c.status !== 'undefined' ? Number(c.status) : (c.state ?? null), JSON.stringify(c));
+                    values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}::jsonb, NOW())`);
+                    paramIndex += 7;
+                });
+
+                const query = `
+                    INSERT INTO instantly_campaigns (
+                        agency_id, client_id, instantly_campaign_id, name, start_date, status, raw_campaign_payload, last_synced_at
+                    )
+                    VALUES ${values.join(', ')}
+                    ON CONFLICT (agency_id, client_id, instantly_campaign_id)
+                    DO UPDATE SET 
+                        name = EXCLUDED.name,
+                        start_date = COALESCE(EXCLUDED.start_date, instantly_campaigns.start_date),
+                        status = COALESCE(EXCLUDED.status, instantly_campaigns.status),
+                        raw_campaign_payload = EXCLUDED.raw_campaign_payload,
+                        last_synced_at = EXCLUDED.last_synced_at
+                `;
+
+                await pool.query(query, params);
+                console.log('[campaigns] synced to SQL', { count: campaigns.length, sqlClientId });
             }
         } catch (sqlErr) {
             console.error('[campaigns] failed to sync to SQL', sqlErr?.message || sqlErr);
@@ -317,6 +332,123 @@ router.post('/clients/:id/campaigns', async (req, res) => {
     } catch (error) {
         console.error('Client campaigns sync error:', error);
         res.status(500).json({ error: 'Failed to sync campaigns.' });
+    }
+});
+
+router.post('/clients/:id/instantly/webhook', async (req, res) => {
+    try {
+        const { idToken, rotateSecret = false } = req.body || {};
+        const clientSlug = req.params.id;
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const agencyId = decoded.uid;
+
+        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
+        const clientSnap = await clientRef.get();
+        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
+
+        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
+        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+
+        const targetUrl = buildInstantlyWebhookTargetUrl(req, agencyId, clientSlug);
+        if (!targetUrl) return res.status(400).json({ error: 'Could not determine webhook target URL.' });
+
+        await getOrCreateClient(agencyId, clientSlug);
+        const result = await registerInstantlyWebhook({
+            agencyId,
+            clientSlug,
+            instantlyKey,
+            targetUrl,
+            rotateSecret: !!rotateSecret
+        });
+
+        await clientRef.set({
+            instantlyWebhookId: result.webhook?.id || null,
+            instantlyWebhookUrl: result.webhook?.target_hook_url || targetUrl,
+            instantlyWebhookStatus: typeof result.webhook?.status === 'number' ? result.webhook.status : null,
+            instantlyWebhookUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        res.json({
+            clientId: result.clientId,
+            webhookId: result.webhook?.id || null,
+            targetUrl: result.webhook?.target_hook_url || targetUrl,
+            status: result.webhook?.status ?? null,
+            secret: result.secret
+        });
+    } catch (error) {
+        console.error('Error registering Instantly webhook:', error);
+        res.status(500).json({ error: 'Failed to register Instantly webhook.' });
+    }
+});
+
+router.post('/clients/:id/instantly/sync', async (req, res) => {
+    try {
+        const { idToken } = req.body || {};
+        const clientSlug = req.params.id;
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const agencyId = decoded.uid;
+
+        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
+        const clientSnap = await clientRef.get();
+        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
+
+        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
+        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+
+        const result = await beginInstantlySyncRun({
+            agencyId,
+            clientSlug,
+            instantlyKey,
+            triggerSource: 'manual',
+            logger: (message) => console.log(`[instantly-sync][${agencyId}/${clientSlug}] ${message}`)
+        });
+
+        res.status(result.alreadyRunning ? 200 : 202).json({
+            run: result.run,
+            alreadyRunning: result.alreadyRunning
+        });
+    } catch (error) {
+        console.error('Error syncing Instantly state:', error);
+        res.status(500).json({ error: 'Failed to sync Instantly state.' });
+    }
+});
+
+router.get('/clients/:id/instantly/sync-runs/latest', async (req, res) => {
+    try {
+        const clientSlug = req.params.id;
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+
+        const agencyId = await verifyAgencyIdFromRequest(req);
+        const run = await getLatestInstantlySyncRun({ agencyId, clientSlug });
+        res.json({ run });
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        console.error('Error fetching latest Instantly sync run:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to fetch latest Instantly sync run.' });
+    }
+});
+
+router.get('/clients/:id/instantly/sync-runs/:runId', async (req, res) => {
+    try {
+        const clientSlug = req.params.id;
+        const runId = Number.parseInt(req.params.runId, 10);
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+        if (!Number.isInteger(runId) || runId <= 0) return res.status(400).json({ error: 'Invalid sync run id.' });
+
+        const agencyId = await verifyAgencyIdFromRequest(req);
+        const run = await getInstantlySyncRun({ agencyId, clientSlug, runId });
+        if (!run) return res.status(404).json({ error: 'Sync run not found.' });
+        res.json({ run });
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        console.error('Error fetching Instantly sync run:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to fetch Instantly sync run.' });
     }
 });
 
@@ -464,18 +596,21 @@ router.post('/clients/:clientId/instantly-import/merge', upload.single('file'), 
             const values = [];
             let paramIndex = 1;
             for (const campaign of campaignChunk) {
-                params.push(uid, sqlClientId, campaign.instantlyCampaignId, campaign.name, campaign.startDate);
-                values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4})`);
-                paramIndex += 5;
+                params.push(uid, sqlClientId, campaign.instantlyCampaignId, campaign.name, campaign.startDate, campaign.status ?? null, JSON.stringify(campaign.raw || {}));
+                values.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}::jsonb)`);
+                paramIndex += 7;
             }
 
             await pool.query(
-                `INSERT INTO instantly_campaigns (agency_id, client_id, instantly_campaign_id, name, start_date)
+                `INSERT INTO instantly_campaigns (agency_id, client_id, instantly_campaign_id, name, start_date, status, raw_campaign_payload)
                  VALUES ${values.join(', ')}
                  ON CONFLICT (agency_id, client_id, instantly_campaign_id)
                  DO UPDATE SET
                     name = EXCLUDED.name,
                     start_date = COALESCE(EXCLUDED.start_date, instantly_campaigns.start_date),
+                    status = COALESCE(EXCLUDED.status, instantly_campaigns.status),
+                    raw_campaign_payload = EXCLUDED.raw_campaign_payload,
+                    last_synced_at = now(),
                     created_at = COALESCE(instantly_campaigns.created_at, now())`,
                 params
             );
