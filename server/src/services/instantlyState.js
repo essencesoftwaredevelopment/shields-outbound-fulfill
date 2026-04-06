@@ -1885,13 +1885,18 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
             }
         }
 
-        await client.query('COMMIT');
+        const workspaceId = asNullableText(event?.workspace) || clientState.instantly_workspace_id;
+        const syncedAt = new Date().toISOString();
+        await client.query(
+            `UPDATE clients
+             SET instantly_workspace_id = COALESCE($2, instantly_workspace_id),
+                 instantly_last_synced_at = $3,
+                 instantly_last_sync_error = NULL
+             WHERE id = $1`,
+            [clientState.id, workspaceId, syncedAt]
+        );
 
-        await updateClientState(clientState.id, {
-            instantly_workspace_id: asNullableText(event?.workspace) || clientState.instantly_workspace_id,
-            instantly_last_synced_at: new Date().toISOString(),
-            instantly_last_sync_error: null
-        });
+        await client.query('COMMIT');
 
         logger(`Stored Instantly webhook event ${event?.event_type || 'unknown'} for ${agencyId}/${clientSlug}`);
         return {

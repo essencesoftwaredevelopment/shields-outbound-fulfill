@@ -309,7 +309,6 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         }
 
         const searchActive = typeof search === 'string' && search.trim() !== '';
-        const campaignFilterActive = Boolean(sqlInstantlyCampaignId);
         const filterParams = [...params];
 
         // Fetch contacts with pagination and campaign data
@@ -353,6 +352,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                             'interestStatus', cic.interest_status_label,
                             'lastSyncedAt', cic.last_synced_at
                         )
+                        ORDER BY COALESCE(cic.last_synced_at, cic.added_at) DESC NULLS LAST, cic.added_at DESC NULLS LAST
                     )
                     FROM contact_instantly_campaigns cic
                     JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
@@ -369,7 +369,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         params.push(parsedLimit, parsedOffset);
 
         const result = await pool.query(contactsQuery, params);
-        const total = (searchActive || campaignFilterActive)
+        const total = searchActive
             ? result.rows.length
             : await (async () => {
                 const countQuery = `
@@ -419,7 +419,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             total,
             limit: parsedLimit,
             offset: parsedOffset,
-            hasMore: (searchActive || campaignFilterActive) ? result.rows.length === parsedLimit : parsedOffset + parsedLimit < total
+            hasMore: searchActive ? result.rows.length === parsedLimit : parsedOffset + parsedLimit < total
         });
     } catch (error) {
         console.error('Error fetching leads:', error);

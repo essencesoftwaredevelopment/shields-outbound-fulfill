@@ -189,7 +189,7 @@ router.post('/clay-result/:userId/:clientId', handleClayResult);
 // ---------------------------------------------------------------------------
 // Instantly webhook – concurrency-limited, async processing
 // ---------------------------------------------------------------------------
-const INSTANTLY_WEBHOOK_CONCURRENCY = Math.max(Number(process.env.INSTANTLY_WEBHOOK_CONCURRENCY || 3) || 3, 1);
+const INSTANTLY_WEBHOOK_CONCURRENCY = Math.max(Number(process.env.INSTANTLY_WEBHOOK_CONCURRENCY || 2) || 2, 1);
 let instantlyWebhookRunning = 0;
 const instantlyWebhookQueue = [];
 

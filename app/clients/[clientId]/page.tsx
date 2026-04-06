@@ -1126,6 +1126,11 @@ export default function ClientPage() {
     }, [campaigns]);
 
     const getCampaignNamesForLead = useCallback((lead: Lead) => {
+        if (lead.campaignsData && lead.campaignsData.length > 0) {
+            return lead.campaignsData
+                .map((campaign) => campaign.campaignName)
+                .filter((name): name is string => Boolean(name));
+        }
         if (!lead.campaigns || lead.campaigns.length === 0) return [];
         return lead.campaigns.map((id) => campaignIdToName.get(id) || id);
     }, [campaignIdToName]);
@@ -4149,20 +4154,10 @@ export default function ClientPage() {
                                 flexWrap: 'wrap'
                             }}>
                                 {campaignFilterId || leadSearch.trim() || jobIdFilter.trim() ? (
-                                    <>
-                                        <div className="metric-chip">
-                                            <span className="metric-chip__label">Filtered Total</span>
-                                            <span className="metric-chip__value">{displayedStats.total.toLocaleString()}</span>
-                                        </div>
-                                        <div className="metric-chip">
-                                            <span className="metric-chip__label">Verified</span>
-                                            <span className="metric-chip__value" style={{ color: '#16a34a' }}>{displayedStats.verified.toLocaleString()}</span>
-                                        </div>
-                                        <div className="metric-chip">
-                                            <span className="metric-chip__label">Unverified</span>
-                                            <span className="metric-chip__value" style={{ color: '#a1a1aa' }}>{displayedStats.unverified.toLocaleString()}</span>
-                                        </div>
-                                    </>
+                                    <div className="metric-chip">
+                                        <span className="metric-chip__label">Filtered Total</span>
+                                        <span className="metric-chip__value">{displayedStats.total.toLocaleString()}</span>
+                                    </div>
                                 ) : (
                                     <div className="metric-chip">
                                         <span className="metric-chip__label">Total Leads</span>
@@ -4603,17 +4598,20 @@ export default function ClientPage() {
                                                                 {(() => {
                                                                     const names = getCampaignNamesForLead(lead);
                                                                     if (!names.length) return '—';
-                                                                    const visibleNames = names.slice(0, 2);
-                                                                    const hiddenCount = names.length - visibleNames.length;
+                                                                    const hiddenCount = names.length - 1;
                                                                     return (
                                                                         <div className="lead-pastel-chip-list">
-                                                                            {visibleNames.map((name, chipIndex) => (
-                                                                                <span key={`${name}-${chipIndex}`} className="lead-pastel-chip lead-pastel-chip--campaign">
-                                                                                    {name}
-                                                                                </span>
-                                                                            ))}
+                                                                            <span
+                                                                                className="lead-pastel-chip lead-pastel-chip--campaign"
+                                                                                style={{ paddingInline: '0.75rem' }}
+                                                                            >
+                                                                                {names[0]}
+                                                                            </span>
                                                                             {hiddenCount > 0 && (
-                                                                                <span className="lead-pastel-chip lead-pastel-chip--campaign-more">
+                                                                                <span
+                                                                                    className="lead-pastel-chip lead-pastel-chip--campaign-more"
+                                                                                    style={{ paddingInline: '0.75rem' }}
+                                                                                >
                                                                                     +{hiddenCount}
                                                                                 </span>
                                                                             )}
@@ -7105,6 +7103,7 @@ export default function ClientPage() {
                                     {selectedLead.campaignsData.map((campaign, idx) => {
                                         const interest = (campaign.interestStatus || '').toLowerCase();
                                         const isPositive = interest === 'interested' || interest === 'meeting_booked' || interest === 'meeting booked';
+                                        const isCompleted = (campaign.leadStatus || '').toLowerCase() === 'completed';
                                         const isNeutral = !interest || interest === '—';
                                         const icon = isPositive ? '✅' : isNeutral ? '📨' : '⚠️';
                                         const statusText = campaign.interestStatus
@@ -7137,7 +7136,7 @@ export default function ClientPage() {
                                                 <span style={{
                                                     fontSize: '0.8rem',
                                                     fontWeight: 600,
-                                                    color: isPositive ? '#4ade80' : 'rgba(255, 255, 255, 0.5)',
+                                                    color: (isPositive || isCompleted) ? '#4ade80' : 'rgba(255, 255, 255, 0.5)',
                                                     flexShrink: 0,
                                                     textTransform: 'capitalize'
                                                 }}>
@@ -7148,50 +7147,6 @@ export default function ClientPage() {
                                     })}
                                 </div>
                             )}
-
-                            {/* Personalization First Line */}
-                            {selectedLead.firstLine && (
-                                <div style={{
-                                    padding: '0.75rem',
-                                    backgroundColor: 'rgba(34, 197, 94, 0.08)',
-                                    borderRadius: '8px',
-                                    borderLeft: '3px solid rgba(34, 197, 94, 0.4)',
-                                    fontStyle: 'italic',
-                                    color: 'rgba(255, 255, 255, 0.9)',
-                                    fontSize: '0.95rem',
-                                    marginBottom: '1.25rem',
-                                    lineHeight: 1.5
-                                }}>
-                                    &ldquo;{selectedLead.firstLine}&rdquo;
-                                </div>
-                            )}
-
-                            {/* CTA buttons */}
-                            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
-                                {selectedLead.personalizationUrl && (
-                                    <a
-                                        href={selectedLead.personalizationUrl}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        style={{
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            gap: '0.4rem',
-                                            padding: '0.45rem 0.85rem',
-                                            borderRadius: '6px',
-                                            background: 'rgba(255, 255, 255, 0.06)',
-                                            border: '1px solid rgba(255, 255, 255, 0.12)',
-                                            color: 'rgba(255, 255, 255, 0.7)',
-                                            fontSize: '0.88rem',
-                                            fontWeight: 500,
-                                            textDecoration: 'none',
-                                            cursor: 'pointer'
-                                        }}
-                                    >
-                                        🛍 Product
-                                    </a>
-                                )}
-                            </div>
 
                             {/* Events Timeline */}
                             <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.75rem', marginBottom: '0.75rem' }}>
