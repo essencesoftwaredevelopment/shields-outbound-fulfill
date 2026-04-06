@@ -1,7 +1,7 @@
 import express from 'express';
 import { firestore } from '../config/firebase.js';
 import { searchLead, sendToClay } from '../services/leadWebhook.js';
-import { processInstantlyWebhookEvent } from '../services/instantlyState.js';
+import { processInstantlyWebhookEvent, validateInstantlyWebhookSecret } from '../services/instantlyState.js';
 import { upsertLead } from '../services/leads.js';
 
 const router = express.Router();
@@ -186,24 +186,56 @@ function handleClayResult(req, res) {
 router.post('/webhook/clay-result/:userId/:clientId', handleClayResult);
 router.post('/clay-result/:userId/:clientId', handleClayResult);
 
+// ---------------------------------------------------------------------------
+// Instantly webhook – concurrency-limited, async processing
+// ---------------------------------------------------------------------------
+const INSTANTLY_WEBHOOK_CONCURRENCY = Math.max(Number(process.env.INSTANTLY_WEBHOOK_CONCURRENCY || 3) || 3, 1);
+let instantlyWebhookRunning = 0;
+const instantlyWebhookQueue = [];
+
+function drainInstantlyWebhookQueue() {
+    while (instantlyWebhookRunning < INSTANTLY_WEBHOOK_CONCURRENCY && instantlyWebhookQueue.length > 0) {
+        const task = instantlyWebhookQueue.shift();
+        instantlyWebhookRunning++;
+        task().finally(() => {
+            instantlyWebhookRunning--;
+            drainInstantlyWebhookQueue();
+        });
+    }
+}
+
 async function handleInstantlyWebhookEvent(req, res) {
     const { userId, clientId } = req.params;
     const secret = (req.headers['x-shields-webhook-secret'] || '').toString().trim();
 
+    // Fast-path validation using cached client state – reject bad requests immediately
     try {
-        const result = await processInstantlyWebhookEvent({
+        const validation = await validateInstantlyWebhookSecret(userId, clientId, secret);
+        if (!validation.valid) {
+            return res.status(validation.statusCode).json({ error: validation.message });
+        }
+    } catch (error) {
+        console.error(`[instantly-webhook][${userId}/${clientId}] validation error:`, error?.message || error);
+        return res.status(500).json({ error: 'Webhook validation failed.' });
+    }
+
+    // Respond immediately – processing happens async
+    res.status(202).json({ ok: true, queued: true });
+
+    // Enqueue the actual DB work
+    const event = req.body || {};
+    instantlyWebhookQueue.push(() =>
+        processInstantlyWebhookEvent({
             agencyId: userId,
             clientSlug: clientId,
             secret,
-            event: req.body || {},
+            event,
             logger: (message) => console.log(`[instantly-webhook][${userId}/${clientId}] ${message}`)
-        });
-        return res.status(202).json({ ok: true, ...result });
-    } catch (error) {
-        const statusCode = Number(error?.statusCode || 500);
-        console.error(`[instantly-webhook][${userId}/${clientId}] failed:`, error?.message || error);
-        return res.status(statusCode).json({ error: error?.message || 'Failed to process Instantly webhook event.' });
-    }
+        }).catch((error) => {
+            console.error(`[instantly-webhook][${userId}/${clientId}] failed:`, error?.message || error);
+        })
+    );
+    drainInstantlyWebhookQueue();
 }
 
 router.post('/webhook/instantly/events/:userId/:clientId', handleInstantlyWebhookEvent);

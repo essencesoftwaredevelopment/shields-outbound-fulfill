@@ -14,6 +14,9 @@ const INSTANTLY_MIN_REQUEST_INTERVAL_MS = Math.max(Math.ceil(1000 / INSTANTLY_RA
 const instantlyNextRequestAtByKey = new Map();
 const instantlyAbortControllersByRunId = new Map();
 
+const clientStateCache = new Map();
+const CLIENT_STATE_CACHE_TTL_MS = 60_000;
+
 const LEAD_STATUS_LABELS = new Map([
     [1, 'active'],
     [2, 'paused'],
@@ -662,6 +665,12 @@ async function publishInstantlySyncProgress(runId, patch = {}) {
 }
 
 async function resolveClientState(agencyId, clientSlug) {
+    const cacheKey = `${agencyId}::${clientSlug}`;
+    const cached = clientStateCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < CLIENT_STATE_CACHE_TTL_MS) {
+        return cached.value;
+    }
+
     const clientId = await getOrCreateClient(agencyId, clientSlug);
     const result = await pool.query(
         `SELECT id, name, instantly_workspace_id, instantly_webhook_id, instantly_webhook_secret,
@@ -671,7 +680,17 @@ async function resolveClientState(agencyId, clientSlug) {
          WHERE id = $1 AND agency_id = $2`,
         [clientId, agencyId]
     );
-    return result.rows[0] || null;
+    const value = result.rows[0] || null;
+    clientStateCache.set(cacheKey, { value, ts: Date.now() });
+    return value;
+}
+
+export async function validateInstantlyWebhookSecret(agencyId, clientSlug, secret) {
+    const clientState = await resolveClientState(agencyId, clientSlug);
+    if (!clientState) return { valid: false, statusCode: 404, message: 'Client not found.' };
+    const expectedSecret = asNullableText(clientState.instantly_webhook_secret);
+    if (!expectedSecret || expectedSecret !== secret) return { valid: false, statusCode: 401, message: 'Invalid Instantly webhook secret.' };
+    return { valid: true };
 }
 
 async function createInstantlySyncRun({ agencyId, clientId, triggerSource = 'manual' }) {
