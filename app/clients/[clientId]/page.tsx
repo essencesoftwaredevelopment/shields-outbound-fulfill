@@ -81,6 +81,12 @@ type Lead = {
         campaignId: string;
         campaignName: string;
         addedAt: string;
+        active?: boolean;
+        lastReplyAt?: string | null;
+        lastReplyCategory?: string | null;
+        leadStatus?: string | null;
+        interestStatus?: string | null;
+        lastSyncedAt?: string | null;
     }>;
 };
 
@@ -799,6 +805,15 @@ export default function ClientPage() {
         // If email_status is empty, the email finder hasn't run yet
         if (!emailStatus || emailStatus.trim() === '') return 'Not Run';
         return emailStatus;
+    };
+
+    const formatInstantlyStateLabel = (value?: string | null) => {
+        if (!value || !value.trim()) return '—';
+        return value
+            .split('_')
+            .filter(Boolean)
+            .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+            .join(' ');
     };
 
     type LeadStatusChipVariant =
@@ -6933,6 +6948,12 @@ export default function ClientPage() {
                                             >
                                                 <div style={{ fontWeight: 600, color: '#bfdbfe', marginBottom: '0.25rem' }}>
                                                     {campaign.campaignName}
+                                                </div>
+                                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.72)', marginBottom: '0.35rem' }}>
+                                                    <span>Lead status: {formatInstantlyStateLabel(campaign.leadStatus)}</span>
+                                                    {campaign.interestStatus && (
+                                                        <span>Interest: {formatInstantlyStateLabel(campaign.interestStatus)}</span>
+                                                    )}
                                                 </div>
                                                 <div style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.5)' }}>
                                                     Added: {new Date(campaign.addedAt).toLocaleString()}
