@@ -232,6 +232,13 @@ class InstantlyRequestError extends Error {
     }
 }
 
+class InstantlySyncCancelledError extends Error {
+    constructor(message = 'Instantly sync cancelled.') {
+        super(message);
+        this.name = 'InstantlySyncCancelledError';
+    }
+}
+
 async function waitForInstantlyRateLimitSlot(apiKey) {
     const now = Date.now();
     const nextAvailableAt = Math.max(instantlyNextRequestAtByKey.get(apiKey) || 0, now);
@@ -272,6 +279,13 @@ function normalizeSyncRunRow(row) {
         startedAt: row.started_at,
         completedAt: row.completed_at,
         updatedAt: row.updated_at
+    };
+}
+
+function mergeMetadataPatch(existingMetadata, patchMetadata) {
+    return {
+        ...(existingMetadata && typeof existingMetadata === 'object' ? existingMetadata : {}),
+        ...(patchMetadata && typeof patchMetadata === 'object' ? patchMetadata : {})
     };
 }
 
@@ -576,6 +590,17 @@ async function updateInstantlySyncRun(runId, patch = {}) {
     return normalizeSyncRunRow(result.rows[0] || null);
 }
 
+async function getInstantlySyncRunRowById(runId) {
+    const result = await pool.query(
+        `SELECT *
+         FROM instantly_sync_runs
+         WHERE id = $1
+         LIMIT 1`,
+        [runId]
+    );
+    return result.rows[0] || null;
+}
+
 export async function getInstantlySyncRun({ agencyId, clientSlug, runId }) {
     const clientId = await getOrCreateClient(agencyId, clientSlug);
     const result = await pool.query(
@@ -602,6 +627,58 @@ export async function getLatestInstantlySyncRun({ agencyId, clientSlug }) {
         [agencyId, clientId]
     );
     return normalizeSyncRunRow(result.rows[0] || null);
+}
+
+export async function requestStopInstantlySyncRun({ agencyId, clientSlug, runId }) {
+    const clientId = await getOrCreateClient(agencyId, clientSlug);
+    const current = await pool.query(
+        `SELECT *
+         FROM instantly_sync_runs
+         WHERE id = $1
+         AND agency_id = $2
+         AND client_id = $3
+         LIMIT 1`,
+        [runId, agencyId, clientId]
+    );
+    const row = current.rows[0];
+    if (!row) {
+        const error = new Error('Sync run not found.');
+        error.statusCode = 404;
+        throw error;
+    }
+
+    const normalized = normalizeSyncRunRow(row);
+    if (!['queued', 'running', 'cancelling'].includes(normalized.status)) {
+        return normalized;
+    }
+
+    const metadata = mergeMetadataPatch(row.metadata, {
+        stopRequestedAt: new Date().toISOString()
+    });
+
+    return updateInstantlySyncRun(runId, {
+        status: 'cancelling',
+        progress_message: 'Stop requested',
+        metadata
+    });
+}
+
+async function shouldStopInstantlySyncRun(syncRunId) {
+    if (!syncRunId) return false;
+    const row = await getInstantlySyncRunRowById(syncRunId);
+    if (!row) return false;
+
+    const status = String(row.status || '').toLowerCase();
+    const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+    return status === 'cancelling' || Boolean(metadata.stopRequestedAt);
+}
+
+async function assertSyncRunNotCancelled(syncRunId) {
+    if (!syncRunId) return;
+    const stopRequested = await shouldStopInstantlySyncRun(syncRunId);
+    if (stopRequested) {
+        throw new InstantlySyncCancelledError();
+    }
 }
 
 export async function beginInstantlySyncRun({ agencyId, clientSlug, instantlyKey, triggerSource = 'manual', logger = () => {} }) {
@@ -1131,6 +1208,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
         let campaignsSynced = 0;
 
         for (const campaign of campaigns) {
+            await assertSyncRunNotCancelled(syncRunId);
             const instantlyCampaignId = asNullableText(campaign?.id || campaign?.campaignId || campaign?.uuid || campaign?._id);
             const campaignName = asNullableText(campaign?.name || campaign?.title || campaign?.campaign_name);
             if (!instantlyCampaignId || !campaignName) continue;
@@ -1168,7 +1246,11 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             );
 
             const matchedSnapshots = [];
-            for (const lead of leads) {
+            for (let leadIndex = 0; leadIndex < leads.length; leadIndex += 1) {
+                if (leadIndex % 50 === 0) {
+                    await assertSyncRunNotCancelled(syncRunId);
+                }
+                const lead = leads[leadIndex];
                 const email = normalizeEmail(lead?.email);
                 let contactId = email ? contactMap.get(email) : null;
                 if (!contactId && email) {
@@ -1296,6 +1378,31 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             syncedAt: syncStartedAt
         };
     } catch (error) {
+        if (error instanceof InstantlySyncCancelledError) {
+            if (syncRunId) {
+                const currentRow = await getInstantlySyncRunRowById(syncRunId);
+                const metadata = mergeMetadataPatch(currentRow?.metadata, {
+                    cancelledAt: new Date().toISOString()
+                });
+                await updateInstantlySyncRun(syncRunId, {
+                    status: 'cancelled',
+                    progress_message: 'Sync cancelled',
+                    completed_at: new Date().toISOString(),
+                    current_campaign_id: null,
+                    current_campaign_name: null,
+                    metadata
+                });
+            }
+            return {
+                clientId: sqlClientId,
+                campaignsSynced: null,
+                totalLeadsSeen: null,
+                matchedLeads: null,
+                unmatchedLeads: null,
+                syncedAt: syncStartedAt,
+                cancelled: true
+            };
+        }
         await updateClientState(sqlClientId, {
             instantly_last_sync_error: String(error?.message || error)
         });

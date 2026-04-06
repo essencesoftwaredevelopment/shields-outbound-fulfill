@@ -22,6 +22,7 @@ import {
     buildInstantlyWebhookTargetUrl,
     getInstantlySyncRun,
     getLatestInstantlySyncRun,
+    requestStopInstantlySyncRun,
     registerInstantlyWebhook
 } from '../services/instantlyState.js';
 import {
@@ -458,6 +459,24 @@ router.get('/clients/:id/instantly/sync-runs/:runId', async (req, res) => {
         const statusCode = Number(error?.statusCode || 500);
         console.error('Error fetching Instantly sync run:', error);
         res.status(statusCode).json({ error: error?.message || 'Failed to fetch Instantly sync run.' });
+    }
+});
+
+router.post('/clients/:id/instantly/sync-runs/:runId/stop', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientSlug = req.params.id;
+        const runId = Number.parseInt(req.params.runId, 10);
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+        if (!Number.isInteger(runId) || runId <= 0) return res.status(400).json({ error: 'Invalid sync run id.' });
+
+        const agencyId = await verifyAgencyIdFromRequest(req);
+        const run = await requestStopInstantlySyncRun({ agencyId, clientSlug, runId });
+        res.json({ run });
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        console.error('Error stopping Instantly sync run:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to stop Instantly sync run.' });
     }
 });
 

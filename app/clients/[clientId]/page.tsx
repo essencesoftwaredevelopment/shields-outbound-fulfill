@@ -108,6 +108,8 @@ type InstantlySyncRun = {
     triggerSource?: string;
 };
 
+const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
+
 type Campaign = {
     id: string;
     name: string;
@@ -484,6 +486,7 @@ export default function ClientPage() {
     const [instantlyCsvCampaignsLoading, setInstantlyCsvCampaignsLoading] = useState(false);
     const [registeringInstantlyWebhook, setRegisteringInstantlyWebhook] = useState(false);
     const [syncingInstantlyState, setSyncingInstantlyState] = useState(false);
+    const [stoppingInstantlySync, setStoppingInstantlySync] = useState(false);
     const [clientInstantlyWebhookStatus, setClientInstantlyWebhookStatus] = useState<number | null>(null);
     const [clientInstantlyWebhookUpdatedAt, setClientInstantlyWebhookUpdatedAt] = useState<string | null>(null);
     const [instantlySyncRun, setInstantlySyncRun] = useState<InstantlySyncRun | null>(null);
@@ -1269,7 +1272,7 @@ export default function ClientPage() {
     useEffect(() => {
         const runId = instantlySyncRun?.id;
         const status = instantlySyncRun?.status;
-        if (!runId || (status !== 'queued' && status !== 'running')) {
+        if (!runId || !ACTIVE_INSTANTLY_SYNC_STATUSES.has(status || '')) {
             stopInstantlySyncPolling();
             return;
         }
@@ -2469,6 +2472,38 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setSyncingInstantlyState(false);
+        }
+    };
+
+    const handleStopInstantlySync = async () => {
+        if (!user || !clientId || !instantlySyncRun?.id) return;
+
+        setStoppingInstantlySync(true);
+        try {
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/${instantlySyncRun.id}/stop`,
+                {
+                    method: 'POST',
+                    cache: 'no-store',
+                    headers: {
+                        Authorization: `Bearer ${idToken}`
+                    }
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to stop Instantly sync (${response.status})`);
+            }
+
+            setInstantlySyncRun((data.run || null) as InstantlySyncRun | null);
+            setToastMessage('Instantly sync stop requested.');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to stop Instantly sync');
+            setToastVisible(true);
+        } finally {
+            setStoppingInstantlySync(false);
         }
     };
 
@@ -5441,10 +5476,20 @@ export default function ClientPage() {
                                         type="button"
                                         className="secondary-button"
                                         onClick={handleSyncInstantlyState}
-                                        disabled={syncingInstantlyState || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                        disabled={syncingInstantlyState || stoppingInstantlySync || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
                                     >
                                         {syncingInstantlyState ? 'Syncing...' : 'Sync Instantly State'}
                                     </button>
+                                    {instantlySyncRun && ACTIVE_INSTANTLY_SYNC_STATUSES.has(instantlySyncRun.status) && (
+                                        <button
+                                            type="button"
+                                            className="secondary-button"
+                                            onClick={handleStopInstantlySync}
+                                            disabled={stoppingInstantlySync || syncingInstantlyState || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                        >
+                                            {stoppingInstantlySync ? 'Stopping...' : 'Stop Sync'}
+                                        </button>
+                                    )}
                                 </div>
                             </label>
                             <div className="settings-field">
