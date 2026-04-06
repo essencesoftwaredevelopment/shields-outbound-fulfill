@@ -11,6 +11,7 @@ const INSTANTLY_MAX_RETRIES = Math.max(parseInt(process.env.INSTANTLY_MAX_RETRIE
 const INSTANTLY_RETRY_BASE_DELAY_MS = Math.max(parseInt(process.env.INSTANTLY_RETRY_BASE_DELAY_MS || '1000', 10) || 1000, 100);
 const INSTANTLY_MIN_REQUEST_INTERVAL_MS = Math.max(Math.ceil(1000 / INSTANTLY_RATE_LIMIT_PER_SECOND), 1);
 const instantlyNextRequestAtByKey = new Map();
+const instantlyAbortControllersByRunId = new Map();
 
 const LEAD_STATUS_LABELS = new Map([
     [1, 'active'],
@@ -156,6 +157,38 @@ function buildInstantlyRoleType(lead) {
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function registerInstantlyAbortController(syncRunId, controller) {
+    if (!syncRunId) return;
+    const key = String(syncRunId);
+    const controllers = instantlyAbortControllersByRunId.get(key) || new Set();
+    controllers.add(controller);
+    instantlyAbortControllersByRunId.set(key, controllers);
+}
+
+function unregisterInstantlyAbortController(syncRunId, controller) {
+    if (!syncRunId) return;
+    const key = String(syncRunId);
+    const controllers = instantlyAbortControllersByRunId.get(key);
+    if (!controllers) return;
+    controllers.delete(controller);
+    if (controllers.size === 0) {
+        instantlyAbortControllersByRunId.delete(key);
+    }
+}
+
+function abortInstantlyRequestsForRun(syncRunId) {
+    if (!syncRunId) return;
+    const controllers = instantlyAbortControllersByRunId.get(String(syncRunId));
+    if (!controllers) return;
+    for (const controller of controllers) {
+        try {
+            controller.abort();
+        } catch {
+            // ignore controller abort failures
+        }
+    }
 }
 
 function extractItems(payload) {
@@ -392,11 +425,26 @@ function buildEventPatch(event, eventTimestamp) {
     return patch;
 }
 
-async function instantlyRequest({ apiKey, path, method = 'GET', body }) {
+async function sleepWithCancellation(ms, syncRunId = null) {
+    if (!syncRunId) {
+        await sleep(ms);
+        return;
+    }
+
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        await assertSyncRunNotCancelled(syncRunId);
+        await sleep(Math.min(250, Math.max(deadline - Date.now(), 0)));
+    }
+}
+
+async function instantlyRequest({ apiKey, path, method = 'GET', body, syncRunId = null }) {
     for (let attempt = 0; attempt <= INSTANTLY_MAX_RETRIES; attempt += 1) {
+        await assertSyncRunNotCancelled(syncRunId);
         await waitForInstantlyRateLimitSlot(apiKey);
 
         const controller = new AbortController();
+        registerInstantlyAbortController(syncRunId, controller);
         const timeoutId = setTimeout(() => controller.abort(), INSTANTLY_REQUEST_TIMEOUT_MS);
 
         try {
@@ -430,7 +478,7 @@ async function instantlyRequest({ apiKey, path, method = 'GET', body }) {
                     throw error;
                 }
 
-                await sleep(computeRetryDelayMs(error, attempt));
+                await sleepWithCancellation(computeRetryDelayMs(error, attempt), syncRunId);
                 continue;
             }
 
@@ -438,6 +486,9 @@ async function instantlyRequest({ apiKey, path, method = 'GET', body }) {
             return response.json();
         } catch (error) {
             const timedOut = error?.name === 'AbortError';
+            if (timedOut && syncRunId && await shouldStopInstantlySyncRun(syncRunId)) {
+                throw new InstantlySyncCancelledError();
+            }
             const retryable = timedOut || error instanceof TypeError || error?.retryable === true;
             const wrappedError = error instanceof InstantlyRequestError
                 ? error
@@ -455,20 +506,22 @@ async function instantlyRequest({ apiKey, path, method = 'GET', body }) {
                 throw wrappedError;
             }
 
-            await sleep(computeRetryDelayMs(wrappedError, attempt));
+            await sleepWithCancellation(computeRetryDelayMs(wrappedError, attempt), syncRunId);
         } finally {
             clearTimeout(timeoutId);
+            unregisterInstantlyAbortController(syncRunId, controller);
         }
     }
 
     throw new InstantlyRequestError(`Instantly API ${method} ${path} failed after ${INSTANTLY_MAX_RETRIES + 1} attempts`);
 }
 
-async function fetchInstantlyCampaigns(apiKey) {
+async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {}) {
     const payload = await instantlyRequest({
         apiKey,
         path: '/api/v2/campaigns',
-        method: 'GET'
+        method: 'GET',
+        syncRunId
     });
     return extractItems(payload);
 }
@@ -495,7 +548,8 @@ async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = nul
                     apiKey,
                     path: '/api/v2/leads/list',
                     method: 'POST',
-                    body
+                    body,
+                    syncRunId
                 });
                 break;
             } catch (error) {
@@ -658,11 +712,13 @@ export async function requestStopInstantlySyncRun({ agencyId, clientSlug, runId 
         stopRequestedAt: new Date().toISOString()
     });
 
-    return updateInstantlySyncRun(runId, {
+    const updatedRun = await updateInstantlySyncRun(runId, {
         status: 'cancelling',
         progress_message: 'Stop requested',
         metadata
     });
+    abortInstantlyRequestsForRun(runId);
+    return updatedRun;
 }
 
 async function shouldStopInstantlySyncRun(syncRunId) {
@@ -1193,7 +1249,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             });
         }
 
-        const campaigns = await fetchInstantlyCampaigns(instantlyKey);
+        const campaigns = await fetchInstantlyCampaigns(instantlyKey, { syncRunId });
         logger(`Fetched ${campaigns.length} Instantly campaigns for ${agencyId}/${clientSlug}`);
         if (syncRunId) {
             await updateInstantlySyncRun(syncRunId, {
