@@ -1217,6 +1217,7 @@ export default function ClientPage() {
         const response = await fetchWithRetry(
             `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/${runId}`,
             {
+                cache: 'no-store',
                 headers: {
                     Authorization: `Bearer ${idToken}`
                 }
@@ -1240,6 +1241,7 @@ export default function ClientPage() {
         const response = await fetchWithRetry(
             `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/latest`,
             {
+                cache: 'no-store',
                 headers: {
                     Authorization: `Bearer ${idToken}`
                 }
@@ -2449,6 +2451,7 @@ export default function ClientPage() {
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync`,
                 {
                     method: 'POST',
+                    cache: 'no-store',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ idToken })
                 }

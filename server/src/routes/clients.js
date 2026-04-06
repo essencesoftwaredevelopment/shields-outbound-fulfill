@@ -52,6 +52,12 @@ const LAST_NAME_ALIASES = ['last name', 'last_name'];
 const EMAIL_STATUS_ALIASES = ['email_status', 'email status', 'verification status', 'lookup_status'];
 const MAX_BIND_PARAMS_PER_QUERY = 30000;
 
+function setNoStoreHeaders(res) {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+}
+
 function chunkArray(items, size) {
     if (!Array.isArray(items) || items.length === 0) return [];
     const chunks = [];
@@ -386,6 +392,7 @@ router.post('/clients/:id/instantly/webhook', async (req, res) => {
 
 router.post('/clients/:id/instantly/sync', async (req, res) => {
     try {
+        setNoStoreHeaders(res);
         const { idToken } = req.body || {};
         const clientSlug = req.params.id;
         if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
@@ -421,6 +428,7 @@ router.post('/clients/:id/instantly/sync', async (req, res) => {
 
 router.get('/clients/:id/instantly/sync-runs/latest', async (req, res) => {
     try {
+        setNoStoreHeaders(res);
         const clientSlug = req.params.id;
         if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
 
@@ -436,6 +444,7 @@ router.get('/clients/:id/instantly/sync-runs/latest', async (req, res) => {
 
 router.get('/clients/:id/instantly/sync-runs/:runId', async (req, res) => {
     try {
+        setNoStoreHeaders(res);
         const clientSlug = req.params.id;
         const runId = Number.parseInt(req.params.runId, 10);
         if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
