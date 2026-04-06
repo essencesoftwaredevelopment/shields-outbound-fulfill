@@ -216,13 +216,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramIndex++;
         }
 
-        // General search filter
+        // General search filter (exact match on domain, email, or founder name)
         if (search) {
-            const searchTerm = `%${search.toLowerCase()}%`;
+            const searchTerm = search.toLowerCase().trim();
             whereClause += ` AND (
-                LOWER(co.domain_normalized) LIKE $${paramIndex}
-                OR LOWER(c.email) LIKE $${paramIndex}
-                OR LOWER(c.full_name) LIKE $${paramIndex}
+                LOWER(co.domain_normalized) = $${paramIndex}
+                OR LOWER(c.email) = $${paramIndex}
+                OR LOWER(c.full_name) = $${paramIndex}
             )`;
             params.push(searchTerm);
             paramIndex++;
@@ -361,7 +361,9 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             domain: row.domain_normalized,
             email: row.email,
             founderName: row.full_name,
-            roleType: row.role_type,
+            roleType: typeof row.role_type === 'string' && row.role_type.startsWith('instantly:')
+                ? 'instantly_lead'
+                : row.role_type,
             status: row.email_status,
             verified: row.email_status === 'valid',
             confidence: row.confidence,

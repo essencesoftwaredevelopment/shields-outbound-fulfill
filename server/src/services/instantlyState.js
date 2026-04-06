@@ -61,6 +61,99 @@ function asJsonObject(value) {
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
+function normalizeDomain(value) {
+    const raw = asNullableText(value);
+    if (!raw) return null;
+
+    let normalized = raw.toLowerCase();
+    normalized = normalized.replace(/^[a-z]+:\/\//, '');
+    normalized = normalized.replace(/^www\./, '');
+    normalized = normalized.split('/')[0];
+    normalized = normalized.split('?')[0];
+    normalized = normalized.split('#')[0];
+    normalized = normalized.replace(/:\d+$/, '');
+    return normalized || null;
+}
+
+function extractEmailDomain(email) {
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !normalizedEmail.includes('@')) return null;
+    return normalizeDomain(normalizedEmail.split('@')[1]);
+}
+
+function extractLeadFirstName(lead) {
+    return asNullableText(
+        lead?.first_name
+        || lead?.firstName
+        || lead?.fname
+    );
+}
+
+function extractLeadLastName(lead) {
+    return asNullableText(
+        lead?.last_name
+        || lead?.lastName
+        || lead?.lname
+    );
+}
+
+function extractLeadFullName(lead) {
+    const direct = asNullableText(
+        lead?.full_name
+        || lead?.fullName
+        || lead?.name
+        || lead?.lead_name
+    );
+    if (direct) return direct;
+
+    const firstName = extractLeadFirstName(lead);
+    const lastName = extractLeadLastName(lead);
+    const combined = [firstName, lastName].filter(Boolean).join(' ').trim();
+    if (combined) return combined;
+
+    return null;
+}
+
+function extractLeadDomain(lead) {
+    const candidates = [
+        lead?.company_domain,
+        lead?.companyDomain,
+        lead?.website,
+        lead?.website_url,
+        lead?.company_website,
+        lead?.companyWebsite,
+        lead?.domain,
+        lead?.company_url,
+        lead?.company?.domain,
+        lead?.company?.website
+    ];
+
+    for (const candidate of candidates) {
+        const normalized = normalizeDomain(candidate);
+        if (normalized) return normalized;
+    }
+
+    return extractEmailDomain(lead?.email);
+}
+
+function buildSyntheticInstantlyDomain(lead) {
+    const key = asNullableText(lead?.id)
+        || normalizeEmail(lead?.email)
+        || extractLeadFullName(lead)
+        || crypto.randomUUID();
+    const suffix = crypto.createHash('sha1').update(key).digest('hex').slice(0, 16);
+    return `instantly-${suffix}.invalid`;
+}
+
+function buildInstantlyRoleType(lead) {
+    const key = asNullableText(lead?.id)
+        || normalizeEmail(lead?.email)
+        || extractLeadFullName(lead)
+        || crypto.randomUUID();
+    const suffix = crypto.createHash('sha1').update(key).digest('hex').slice(0, 16);
+    return `instantly:${suffix}`;
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -630,6 +723,174 @@ async function loadContactMapForEmails(db, clientId, emails) {
     return new Map(result.rows.map((row) => [row.email, Number(row.id)]));
 }
 
+async function ensureInstantlyCompany(db, { agencyId, clientId, domainNormalized }) {
+    const result = await db.query(
+        `INSERT INTO companies (agency_id, client_id, domain_normalized)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (client_id, domain_normalized)
+         DO UPDATE SET updated_at = NOW()
+         RETURNING id`,
+        [agencyId, clientId, domainNormalized]
+    );
+    return Number(result.rows[0]?.id || 0) || null;
+}
+
+async function upsertInstantlyContactInsights(db, {
+    agencyId,
+    clientId,
+    contactId,
+    source,
+    campaign,
+    lead
+}) {
+    if (!contactId) return;
+
+    const attributes = {
+        instantlyLeadId: asNullableText(lead?.id),
+        instantlyCampaignId: asNullableText(campaign?.instantlyCampaignId),
+        instantlyCampaignName: asNullableText(campaign?.campaignName),
+        firstName: extractLeadFirstName(lead),
+        lastName: extractLeadLastName(lead),
+        fullName: extractLeadFullName(lead),
+        email: normalizeEmail(lead?.email),
+        domain: extractLeadDomain(lead),
+        companyName: asNullableText(lead?.company_name || lead?.companyName || lead?.company),
+        source
+    };
+
+    const sourcePayload = {
+        campaign: {
+            instantlyCampaignId: asNullableText(campaign?.instantlyCampaignId),
+            campaignName: asNullableText(campaign?.campaignName)
+        },
+        lead: lead && typeof lead === 'object' ? lead : {}
+    };
+
+    await db.query(
+        `INSERT INTO contact_insights (
+            contact_id,
+            agency_id,
+            client_id,
+            source,
+            attributes,
+            source_payload
+        )
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+        ON CONFLICT (contact_id)
+        DO UPDATE SET
+            client_id = COALESCE(EXCLUDED.client_id, contact_insights.client_id),
+            source = COALESCE(EXCLUDED.source, contact_insights.source),
+            attributes = COALESCE(contact_insights.attributes, '{}'::jsonb) || EXCLUDED.attributes,
+            source_payload = CASE
+                WHEN EXCLUDED.source_payload = '{}'::jsonb THEN contact_insights.source_payload
+                ELSE EXCLUDED.source_payload
+            END,
+            updated_at = NOW()`,
+        [
+            contactId,
+            agencyId,
+            clientId,
+            source,
+            JSON.stringify(attributes),
+            JSON.stringify(sourcePayload)
+        ]
+    );
+}
+
+async function ensureInstantlyContact(db, {
+    agencyId,
+    clientId,
+    campaign,
+    lead,
+    source
+}) {
+    const normalizedEmail = normalizeEmail(lead?.email);
+    if (!normalizedEmail) return null;
+
+    const existingResult = await db.query(
+        `SELECT id
+         FROM contacts
+         WHERE client_id = $1
+         AND LOWER(email) = $2
+         LIMIT 1`,
+        [clientId, normalizedEmail]
+    );
+
+    let contactId = Number(existingResult.rows[0]?.id || 0) || null;
+
+    if (!contactId) {
+        const domainNormalized = extractLeadDomain(lead) || buildSyntheticInstantlyDomain(lead);
+        const companyId = await ensureInstantlyCompany(db, {
+            agencyId,
+            clientId,
+            domainNormalized
+        });
+
+        const fullName = extractLeadFullName(lead);
+        const roleType = buildInstantlyRoleType(lead);
+
+        try {
+            const insertResult = await db.query(
+                `INSERT INTO contacts (
+                    agency_id,
+                    client_id,
+                    company_id,
+                    role_type,
+                    full_name,
+                    email,
+                    email_status,
+                    confidence
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id`,
+                [
+                    agencyId,
+                    clientId,
+                    companyId,
+                    roleType,
+                    fullName,
+                    normalizedEmail,
+                    null,
+                    null
+                ]
+            );
+            contactId = Number(insertResult.rows[0]?.id || 0) || null;
+        } catch (error) {
+            if (error?.code !== '23505') throw error;
+            const retryResult = await db.query(
+                `SELECT id
+                 FROM contacts
+                 WHERE client_id = $1
+                 AND LOWER(email) = $2
+                 LIMIT 1`,
+                [clientId, normalizedEmail]
+            );
+            contactId = Number(retryResult.rows[0]?.id || 0) || null;
+        }
+    } else {
+        await db.query(
+            `UPDATE contacts
+             SET full_name = COALESCE(full_name, $2),
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [contactId, extractLeadFullName(lead)]
+        );
+    }
+
+    if (contactId) {
+        await upsertInstantlyContactInsights(db, {
+            agencyId,
+            clientId,
+            contactId,
+            source,
+            campaign,
+            lead
+        });
+    }
+
+    return contactId;
+}
+
 async function upsertCampaignSnapshots(db, rows) {
     if (!rows.length) return;
     await db.query(
@@ -909,7 +1170,22 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             const matchedSnapshots = [];
             for (const lead of leads) {
                 const email = normalizeEmail(lead?.email);
-                const contactId = email ? contactMap.get(email) : null;
+                let contactId = email ? contactMap.get(email) : null;
+                if (!contactId && email) {
+                    contactId = await ensureInstantlyContact(pool, {
+                        agencyId,
+                        clientId: sqlClientId,
+                        campaign: {
+                            instantlyCampaignId,
+                            campaignName
+                        },
+                        lead,
+                        source: 'instantly_sync'
+                    });
+                    if (contactId) {
+                        contactMap.set(email, contactId);
+                    }
+                }
                 if (!contactId) {
                     unmatchedLeads += 1;
                     continue;
@@ -1086,6 +1362,25 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
                 [clientState.id, normalizedEmail]
             );
             contactId = Number(contactResult.rows[0]?.id || 0) || null;
+        }
+
+        if (!contactId && normalizedEmail) {
+            contactId = await ensureInstantlyContact(pool, {
+                agencyId,
+                clientId: clientState.id,
+                campaign: {
+                    instantlyCampaignId,
+                    campaignName
+                },
+                lead: {
+                    id: event?.lead_id || event?.instantly_lead_id,
+                    email: normalizedEmail,
+                    first_name: event?.first_name,
+                    last_name: event?.last_name,
+                    full_name: event?.lead_name || event?.full_name || event?.name
+                },
+                source: 'instantly_webhook'
+            });
         }
 
         const fingerprint = buildEventFingerprint(event);

@@ -6889,7 +6889,13 @@ export default function ClientPage() {
                             <label className="settings-field">
                                 <span className="settings-field__label">Role</span>
                                 <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)' }}>
-                                    {selectedLead.roleType === 'founder' ? 'Founder' : selectedLead.roleType === 'dm' ? 'Decision Maker' : selectedLead.roleType || '—'}
+                                    {selectedLead.roleType === 'founder'
+                                        ? 'Founder'
+                                        : selectedLead.roleType === 'dm'
+                                            ? 'Decision Maker'
+                                            : selectedLead.roleType === 'instantly_lead'
+                                                ? 'Instantly Lead'
+                                                : selectedLead.roleType || '—'}
                                 </div>
                             </label>
 
