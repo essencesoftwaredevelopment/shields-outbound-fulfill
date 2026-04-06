@@ -9,6 +9,7 @@ const INSTANTLY_REQUEST_TIMEOUT_MS = Math.max(parseInt(process.env.INSTANTLY_REQ
 const INSTANTLY_RATE_LIMIT_PER_SECOND = Math.max(parseInt(process.env.INSTANTLY_RATE_LIMIT_PER_SECOND || '20', 10) || 20, 1);
 const INSTANTLY_MAX_RETRIES = Math.max(parseInt(process.env.INSTANTLY_MAX_RETRIES || '4', 10) || 4, 0);
 const INSTANTLY_RETRY_BASE_DELAY_MS = Math.max(parseInt(process.env.INSTANTLY_RETRY_BASE_DELAY_MS || '1000', 10) || 1000, 100);
+const INSTANTLY_SYNC_PROGRESS_BATCH_SIZE = Math.max(parseInt(process.env.INSTANTLY_SYNC_PROGRESS_BATCH_SIZE || '25', 10) || 25, 1);
 const INSTANTLY_MIN_REQUEST_INTERVAL_MS = Math.max(Math.ceil(1000 / INSTANTLY_RATE_LIMIT_PER_SECOND), 1);
 const instantlyNextRequestAtByKey = new Map();
 const instantlyAbortControllersByRunId = new Map();
@@ -293,6 +294,7 @@ function computeRetryDelayMs(error, attempt) {
 
 function normalizeSyncRunRow(row) {
     if (!row) return null;
+    const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
     return {
         id: Number(row.id),
         agencyId: row.agency_id,
@@ -308,7 +310,23 @@ function normalizeSyncRunRow(row) {
         matchedLeads: Number(row.matched_leads || 0),
         unmatchedLeads: Number(row.unmatched_leads || 0),
         error: row.error,
-        metadata: row.metadata || {},
+        metadata,
+        phase: asNullableText(metadata.phase),
+        currentCampaignFetchedLeads: Number.isFinite(Number(metadata.currentCampaignFetchedLeads))
+            ? Number(metadata.currentCampaignFetchedLeads)
+            : null,
+        currentCampaignLeadTotal: Number.isFinite(Number(metadata.currentCampaignLeadTotal))
+            ? Number(metadata.currentCampaignLeadTotal)
+            : null,
+        currentCampaignProcessedLeads: Number.isFinite(Number(metadata.currentCampaignProcessedLeads))
+            ? Number(metadata.currentCampaignProcessedLeads)
+            : null,
+        currentCampaignMatchedLeads: Number.isFinite(Number(metadata.currentCampaignMatchedLeads))
+            ? Number(metadata.currentCampaignMatchedLeads)
+            : null,
+        currentCampaignUnmatchedLeads: Number.isFinite(Number(metadata.currentCampaignUnmatchedLeads))
+            ? Number(metadata.currentCampaignUnmatchedLeads)
+            : null,
         startedAt: row.started_at,
         completedAt: row.completed_at,
         updatedAt: row.updated_at
@@ -544,7 +562,7 @@ async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {}) {
     return extractItems(payload);
 }
 
-async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = null, logger = () => {} } = {}) {
+async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = null, logger = () => {}, onProgress = null } = {}) {
     const rows = [];
     let startingAfter = null;
 
@@ -584,11 +602,63 @@ async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = nul
 
         const next = nextStartingAfter(page);
         logger(`Fetched ${items.length} leads for campaign ${instantlyCampaignId}${next ? ` (next=${next})` : ''}`);
+        if (typeof onProgress === 'function') {
+            await onProgress({
+                fetchedLeads: rows.length,
+                lastPageSize: items.length,
+                hasMore: Boolean(next)
+            });
+        }
         if (!next) break;
         startingAfter = next;
     }
 
     return rows;
+}
+
+async function publishInstantlySyncProgress(runId, patch = {}) {
+    if (!runId) return null;
+
+    const {
+        phase,
+        currentCampaignFetchedLeads,
+        currentCampaignLeadTotal,
+        currentCampaignProcessedLeads,
+        currentCampaignMatchedLeads,
+        currentCampaignUnmatchedLeads,
+        metadata: patchMetadata,
+        ...rest
+    } = patch;
+
+    const needsMetadataMerge = [
+        phase,
+        currentCampaignFetchedLeads,
+        currentCampaignLeadTotal,
+        currentCampaignProcessedLeads,
+        currentCampaignMatchedLeads,
+        currentCampaignUnmatchedLeads,
+        patchMetadata
+    ].some((value) => value !== undefined);
+
+    if (!needsMetadataMerge) {
+        return updateInstantlySyncRun(runId, rest);
+    }
+
+    const currentRow = await getInstantlySyncRunRowById(runId);
+    const metadata = mergeMetadataPatch(currentRow?.metadata, {
+        ...(phase !== undefined ? { phase } : {}),
+        ...(currentCampaignFetchedLeads !== undefined ? { currentCampaignFetchedLeads } : {}),
+        ...(currentCampaignLeadTotal !== undefined ? { currentCampaignLeadTotal } : {}),
+        ...(currentCampaignProcessedLeads !== undefined ? { currentCampaignProcessedLeads } : {}),
+        ...(currentCampaignMatchedLeads !== undefined ? { currentCampaignMatchedLeads } : {}),
+        ...(currentCampaignUnmatchedLeads !== undefined ? { currentCampaignUnmatchedLeads } : {}),
+        ...(patchMetadata && typeof patchMetadata === 'object' ? patchMetadata : {})
+    });
+
+    return updateInstantlySyncRun(runId, {
+        ...rest,
+        metadata
+    });
 }
 
 async function resolveClientState(agencyId, clientSlug) {
@@ -1251,7 +1321,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
 
     try {
         if (syncRunId) {
-            await updateInstantlySyncRun(syncRunId, {
+            await publishInstantlySyncProgress(syncRunId, {
                 status: 'running',
                 progress_message: 'Fetching campaigns from Instantly',
                 started_at: syncStartedAt,
@@ -1263,18 +1333,25 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
                 matched_leads: 0,
                 unmatched_leads: 0,
                 current_campaign_id: null,
-                current_campaign_name: null
+                current_campaign_name: null,
+                phase: 'fetching_campaigns',
+                currentCampaignFetchedLeads: 0,
+                currentCampaignLeadTotal: null,
+                currentCampaignProcessedLeads: 0,
+                currentCampaignMatchedLeads: 0,
+                currentCampaignUnmatchedLeads: 0
             });
         }
 
         const campaigns = await fetchInstantlyCampaigns(instantlyKey, { syncRunId });
         logger(`Fetched ${campaigns.length} Instantly campaigns for ${agencyId}/${clientSlug}`);
         if (syncRunId) {
-            await updateInstantlySyncRun(syncRunId, {
+            await publishInstantlySyncProgress(syncRunId, {
                 progress_message: campaigns.length
                     ? `Fetched ${campaigns.length} campaign(s) from Instantly`
                     : 'No Instantly campaigns found',
-                total_campaigns: campaigns.length
+                total_campaigns: campaigns.length,
+                phase: 'processing_campaigns'
             });
         }
 
@@ -1290,14 +1367,20 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             if (!instantlyCampaignId || !campaignName) continue;
 
             if (syncRunId) {
-                await updateInstantlySyncRun(syncRunId, {
-                    progress_message: `Syncing campaign ${campaignName}`,
+                await publishInstantlySyncProgress(syncRunId, {
+                    progress_message: `Fetching leads for ${campaignName}`,
                     current_campaign_id: instantlyCampaignId,
                     current_campaign_name: campaignName,
                     total_leads_seen: totalLeadsSeen,
                     matched_leads: matchedLeads,
                     unmatched_leads: unmatchedLeads,
-                    campaigns_completed: campaignsSynced
+                    campaigns_completed: campaignsSynced,
+                    phase: 'fetching_campaign_leads',
+                    currentCampaignFetchedLeads: 0,
+                    currentCampaignLeadTotal: null,
+                    currentCampaignProcessedLeads: 0,
+                    currentCampaignMatchedLeads: 0,
+                    currentCampaignUnmatchedLeads: 0
                 });
             }
 
@@ -1314,9 +1397,46 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
 
             const leads = await fetchCampaignLeads(instantlyKey, instantlyCampaignId, {
                 syncRunId,
-                logger
+                logger: (message) => logger(message),
+                onProgress: syncRunId
+                    ? async ({ fetchedLeads }) => {
+                        await publishInstantlySyncProgress(syncRunId, {
+                            progress_message: `Fetched ${fetchedLeads} lead${fetchedLeads === 1 ? '' : 's'} from ${campaignName}`,
+                            current_campaign_id: instantlyCampaignId,
+                            current_campaign_name: campaignName,
+                            total_leads_seen: totalLeadsSeen,
+                            matched_leads: matchedLeads,
+                            unmatched_leads: unmatchedLeads,
+                            campaigns_completed: campaignsSynced,
+                            phase: 'fetching_campaign_leads',
+                            currentCampaignFetchedLeads: fetchedLeads,
+                            currentCampaignLeadTotal: null,
+                            currentCampaignProcessedLeads: 0,
+                            currentCampaignMatchedLeads: 0,
+                            currentCampaignUnmatchedLeads: 0
+                        });
+                    }
+                    : null
             });
             totalLeadsSeen += leads.length;
+
+            if (syncRunId) {
+                await publishInstantlySyncProgress(syncRunId, {
+                    progress_message: `Processing 0/${leads.length} leads in ${campaignName}`,
+                    current_campaign_id: instantlyCampaignId,
+                    current_campaign_name: campaignName,
+                    total_leads_seen: totalLeadsSeen,
+                    matched_leads: matchedLeads,
+                    unmatched_leads: unmatchedLeads,
+                    campaigns_completed: campaignsSynced,
+                    phase: 'processing_campaign_leads',
+                    currentCampaignFetchedLeads: leads.length,
+                    currentCampaignLeadTotal: leads.length,
+                    currentCampaignProcessedLeads: 0,
+                    currentCampaignMatchedLeads: 0,
+                    currentCampaignUnmatchedLeads: 0
+                });
+            }
 
             const contactMap = await loadContactMapForEmails(
                 pool,
@@ -1325,6 +1445,8 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             );
 
             const matchedSnapshots = [];
+            let matchedLeadsInCampaign = 0;
+            let unmatchedLeadsInCampaign = 0;
             for (let leadIndex = 0; leadIndex < leads.length; leadIndex += 1) {
                 if (leadIndex % 50 === 0) {
                     await assertSyncRunNotCancelled(syncRunId);
@@ -1349,10 +1471,33 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
                 }
                 if (!contactId) {
                     unmatchedLeads += 1;
+                    unmatchedLeadsInCampaign += 1;
+                    if (
+                        syncRunId
+                        && (
+                            ((leadIndex + 1) % INSTANTLY_SYNC_PROGRESS_BATCH_SIZE === 0)
+                            || leadIndex === leads.length - 1
+                        )
+                    ) {
+                        await publishInstantlySyncProgress(syncRunId, {
+                            progress_message: `${leadIndex + 1}/${leads.length} leads processed in ${campaignName}`,
+                            total_leads_seen: totalLeadsSeen,
+                            matched_leads: matchedLeads,
+                            unmatched_leads: unmatchedLeads,
+                            campaigns_completed: campaignsSynced,
+                            phase: 'processing_campaign_leads',
+                            currentCampaignFetchedLeads: leads.length,
+                            currentCampaignLeadTotal: leads.length,
+                            currentCampaignProcessedLeads: leadIndex + 1,
+                            currentCampaignMatchedLeads: matchedLeadsInCampaign,
+                            currentCampaignUnmatchedLeads: unmatchedLeadsInCampaign
+                        });
+                    }
                     continue;
                 }
 
                 matchedLeads += 1;
+                matchedLeadsInCampaign += 1;
                 const snapshot = deriveSnapshotFromLead(lead, syncStartedAt);
                 matchedSnapshots.push({
                     contact_id: contactId,
@@ -1387,6 +1532,28 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
                     last_unsubscribe_at: snapshot.lastUnsubscribeAt,
                     last_synced_at: snapshot.lastSyncedAt
                 });
+
+                if (
+                    syncRunId
+                    && (
+                        ((leadIndex + 1) % INSTANTLY_SYNC_PROGRESS_BATCH_SIZE === 0)
+                        || leadIndex === leads.length - 1
+                    )
+                ) {
+                    await publishInstantlySyncProgress(syncRunId, {
+                        progress_message: `${leadIndex + 1}/${leads.length} leads processed in ${campaignName}`,
+                        total_leads_seen: totalLeadsSeen,
+                        matched_leads: matchedLeads,
+                        unmatched_leads: unmatchedLeads,
+                        campaigns_completed: campaignsSynced,
+                        phase: 'processing_campaign_leads',
+                        currentCampaignFetchedLeads: leads.length,
+                        currentCampaignLeadTotal: leads.length,
+                        currentCampaignProcessedLeads: leadIndex + 1,
+                        currentCampaignMatchedLeads: matchedLeadsInCampaign,
+                        currentCampaignUnmatchedLeads: unmatchedLeadsInCampaign
+                    });
+                }
             }
 
             const client = await pool.connect();
@@ -1417,14 +1584,20 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             campaignsSynced += 1;
 
             if (syncRunId) {
-                await updateInstantlySyncRun(syncRunId, {
-                    progress_message: `Completed ${campaignName}`,
+                await publishInstantlySyncProgress(syncRunId, {
+                    progress_message: `Completed ${campaignName} (${leads.length} leads processed)`,
                     current_campaign_id: instantlyCampaignId,
                     current_campaign_name: campaignName,
                     total_leads_seen: totalLeadsSeen,
                     matched_leads: matchedLeads,
                     unmatched_leads: unmatchedLeads,
-                    campaigns_completed: campaignsSynced
+                    campaigns_completed: campaignsSynced,
+                    phase: 'campaign_completed',
+                    currentCampaignFetchedLeads: leads.length,
+                    currentCampaignLeadTotal: leads.length,
+                    currentCampaignProcessedLeads: leads.length,
+                    currentCampaignMatchedLeads: matchedLeadsInCampaign,
+                    currentCampaignUnmatchedLeads: unmatchedLeadsInCampaign
                 });
             }
         }
@@ -1435,7 +1608,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
         });
 
         if (syncRunId) {
-            await updateInstantlySyncRun(syncRunId, {
+            await publishInstantlySyncProgress(syncRunId, {
                 status: 'completed',
                 progress_message: 'Sync completed',
                 current_campaign_id: null,
@@ -1444,7 +1617,8 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
                 matched_leads: matchedLeads,
                 unmatched_leads: unmatchedLeads,
                 campaigns_completed: campaignsSynced,
-                completed_at: new Date().toISOString()
+                completed_at: new Date().toISOString(),
+                phase: 'completed'
             });
         }
 
@@ -1461,7 +1635,8 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             if (syncRunId) {
                 const currentRow = await getInstantlySyncRunRowById(syncRunId);
                 const metadata = mergeMetadataPatch(currentRow?.metadata, {
-                    cancelledAt: new Date().toISOString()
+                    cancelledAt: new Date().toISOString(),
+                    phase: 'cancelled'
                 });
                 await updateInstantlySyncRun(syncRunId, {
                     status: 'cancelled',
@@ -1486,11 +1661,12 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             instantly_last_sync_error: String(error?.message || error)
         });
         if (syncRunId) {
-            await updateInstantlySyncRun(syncRunId, {
+            await publishInstantlySyncProgress(syncRunId, {
                 status: 'failed',
                 progress_message: 'Sync failed',
                 error: String(error?.message || error),
-                completed_at: new Date().toISOString()
+                completed_at: new Date().toISOString(),
+                phase: 'failed'
             });
         }
         throw error;
@@ -1551,7 +1727,7 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
         }
 
         if (!contactId && normalizedEmail) {
-            contactId = await ensureInstantlyContact(pool, {
+            contactId = await ensureInstantlyContact(client, {
                 agencyId,
                 clientId: clientState.id,
                 campaign: {

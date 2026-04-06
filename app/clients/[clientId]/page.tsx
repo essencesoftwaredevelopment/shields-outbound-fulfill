@@ -101,6 +101,12 @@ type InstantlySyncRun = {
     totalLeadsSeen: number;
     matchedLeads: number;
     unmatchedLeads: number;
+    phase?: string | null;
+    currentCampaignFetchedLeads?: number | null;
+    currentCampaignLeadTotal?: number | null;
+    currentCampaignProcessedLeads?: number | null;
+    currentCampaignMatchedLeads?: number | null;
+    currentCampaignUnmatchedLeads?: number | null;
     error?: string | null;
     startedAt?: string | null;
     completedAt?: string | null;
@@ -213,6 +219,30 @@ const humanizeKey = (value: string) =>
     value
         .replace(/[_-]/g, " ")
         .replace(/\b(\w)/g, (match) => match.toUpperCase());
+
+const formatInstantlySyncPhase = (phase?: string | null) => {
+    if (!phase) return null;
+    switch (phase) {
+        case "fetching_campaigns":
+            return "Fetching campaign list";
+        case "processing_campaigns":
+            return "Preparing campaign sync";
+        case "fetching_campaign_leads":
+            return "Fetching campaign leads";
+        case "processing_campaign_leads":
+            return "Processing campaign leads";
+        case "campaign_completed":
+            return "Campaign completed";
+        case "completed":
+            return "Completed";
+        case "cancelled":
+            return "Cancelled";
+        case "failed":
+            return "Failed";
+        default:
+            return humanizeKey(phase);
+    }
+};
 
 const describeStageProgress = (stage?: PipelineStageState) => {
     if (!stage) {
@@ -5452,9 +5482,43 @@ export default function ClientPage() {
                                             {instantlySyncRun.updatedAt && <span>Updated: {new Date(instantlySyncRun.updatedAt).toLocaleString()}</span>}
                                             {instantlySyncRun.completedAt && <span>Completed: {new Date(instantlySyncRun.completedAt).toLocaleString()}</span>}
                                         </div>
+                                        {formatInstantlySyncPhase(instantlySyncRun.phase) && (
+                                            <div style={{ marginTop: '0.45rem', fontSize: '0.84rem', color: 'rgba(191,219,254,0.95)' }}>
+                                                Phase: {formatInstantlySyncPhase(instantlySyncRun.phase)}
+                                            </div>
+                                        )}
                                         {instantlySyncRun.progressMessage && (
                                             <div style={{ marginTop: '0.5rem', color: '#fff', fontSize: '0.95rem' }}>
                                                 {instantlySyncRun.progressMessage}
+                                            </div>
+                                        )}
+                                        {instantlySyncRun.currentCampaignName && (
+                                            <div style={{
+                                                marginTop: '0.65rem',
+                                                padding: '0.75rem',
+                                                borderRadius: '8px',
+                                                background: 'rgba(15,23,42,0.45)',
+                                                border: '1px solid rgba(148,163,184,0.18)'
+                                            }}>
+                                                <div style={{ fontSize: '0.85rem', color: '#bfdbfe' }}>
+                                                    Current campaign: {instantlySyncRun.currentCampaignName}
+                                                </div>
+                                                {typeof instantlySyncRun.currentCampaignProcessedLeads === 'number' && typeof instantlySyncRun.currentCampaignLeadTotal === 'number' && (
+                                                    <div style={{ marginTop: '0.4rem', color: '#fff', fontSize: '0.95rem' }}>
+                                                        {instantlySyncRun.currentCampaignProcessedLeads}/{instantlySyncRun.currentCampaignLeadTotal} leads processed in {instantlySyncRun.currentCampaignName}
+                                                    </div>
+                                                )}
+                                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.45rem', fontSize: '0.82rem', color: 'rgba(255,255,255,0.72)' }}>
+                                                    {typeof instantlySyncRun.currentCampaignFetchedLeads === 'number' && (
+                                                        <span>Fetched: {instantlySyncRun.currentCampaignFetchedLeads}</span>
+                                                    )}
+                                                    {typeof instantlySyncRun.currentCampaignMatchedLeads === 'number' && (
+                                                        <span>Matched: {instantlySyncRun.currentCampaignMatchedLeads}</span>
+                                                    )}
+                                                    {typeof instantlySyncRun.currentCampaignUnmatchedLeads === 'number' && (
+                                                        <span>Unmatched: {instantlySyncRun.currentCampaignUnmatchedLeads}</span>
+                                                    )}
+                                                </div>
                                             </div>
                                         )}
                                         <div style={{ display: 'flex', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.6rem', fontSize: '0.85rem', color: 'rgba(255,255,255,0.72)' }}>
@@ -5463,11 +5527,6 @@ export default function ClientPage() {
                                             <span>Matched: {instantlySyncRun.matchedLeads}</span>
                                             <span>Unmatched: {instantlySyncRun.unmatchedLeads}</span>
                                         </div>
-                                        {instantlySyncRun.currentCampaignName && (
-                                            <div style={{ marginTop: '0.45rem', fontSize: '0.85rem', color: '#bfdbfe' }}>
-                                                Current campaign: {instantlySyncRun.currentCampaignName}
-                                            </div>
-                                        )}
                                         {instantlySyncRun.error && (
                                             <div style={{ marginTop: '0.5rem', color: '#fca5a5', fontSize: '0.875rem' }}>
                                                 Error: {instantlySyncRun.error}
