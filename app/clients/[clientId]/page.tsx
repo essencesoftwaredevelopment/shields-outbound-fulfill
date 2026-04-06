@@ -642,17 +642,29 @@ export default function ClientPage() {
     const [allLeadsCached, setAllLeadsCached] = useState(false); // Track if we've fetched all leads for filtering
     const [stats, setStats] = useState<{ total: number; verified: number; unverified: number }>(() => ({ total: 0, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
+    const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
     const [leadSearch, setLeadSearch] = useState<string>("");
+    const [debouncedLeadSearch, setDebouncedLeadSearch] = useState<string>("");
     const [jobIdFilter, setJobIdFilter] = useState<string>("");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
     const [founderFilter, setFounderFilter] = useState<string>("");
     const [emailFilter, setEmailFilter] = useState<string>("");
     const [emailStatusFilter, setEmailStatusFilter] = useState<string>("");
     const [exportingCsv, setExportingCsv] = useState(false);
+
+    useEffect(() => {
+        const timeoutId = window.setTimeout(() => {
+            setDebouncedLeadSearch(leadSearch);
+        }, 350);
+
+        return () => {
+            window.clearTimeout(timeoutId);
+        };
+    }, [leadSearch]);
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -930,7 +942,7 @@ export default function ClientPage() {
         setLeadsHasMore(true);
         fetchLeads(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, leadSearch, jobIdFilter, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
+    }, [user, clientId, debouncedLeadSearch, jobIdFilter, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -1134,8 +1146,8 @@ export default function ClientPage() {
             }
 
             // Send search term to backend for SQL filtering
-            if (leadSearch.trim()) {
-                params.append('search', leadSearch.trim());
+            if (debouncedLeadSearch.trim()) {
+                params.append('search', debouncedLeadSearch.trim());
             }
 
             if (!reset && leadsCursor) {
@@ -1212,7 +1224,7 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, leadSearch, jobIdFilter, leadsCursor, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
+    }, [user, clientId, debouncedLeadSearch, jobIdFilter, leadsCursor, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
 
     const fetchInstantlySyncRun = useCallback(async (runId: number) => {
         if (!user || !clientId || !runId) return null;
@@ -3256,7 +3268,7 @@ export default function ClientPage() {
                             className={`tab-nav__button ${activeTab === "campaigns" ? "tab-nav__button--active" : ""}`}
                             onClick={() => setActiveTab("campaigns")}
                         >
-                            Campaigns
+                            Pipeline
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "leads" ? "tab-nav__button--active" : ""}`}
@@ -6822,7 +6834,7 @@ export default function ClientPage() {
                         className="modal-overlay"
                         role="dialog"
                         aria-modal="true"
-                        onClick={() => setSelectedLead(null)}
+                        onClick={() => { setSelectedLead(null); setShowLeadAdvanced(false); }}
                         style={{ zIndex: 10000 }}
                     />
                     <div
@@ -6857,17 +6869,12 @@ export default function ClientPage() {
               }
             `}</style>
 
-                        <div className="modal__header">
-                            <div>
-                                <p className="eyebrow eyebrow--muted">Lead Details</p>
-                                <div style={{ 
-                                    display: 'flex', 
-                                    alignItems: 'center', 
-                                    gap: '0.75rem',
-                                    flexWrap: 'wrap'
-                                }}>
+                        {/* Header: Name + Domain + Status badge */}
+                        <div className="modal__header" style={{ paddingBottom: '0.75rem' }}>
+                            <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
                                     {selectedLead.domain && (
-                                        <img 
+                                        <img
                                             src={`https://www.google.com/s2/favicons?domain=${selectedLead.domain}&sz=64`}
                                             alt={`${selectedLead.domain} favicon`}
                                             style={{
@@ -6878,233 +6885,321 @@ export default function ClientPage() {
                                                 padding: '4px',
                                                 flexShrink: 0
                                             }}
-                                            onError={(e) => {
-                                                // Hide image on error
-                                                e.currentTarget.style.display = 'none';
-                                            }}
+                                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
                                         />
                                     )}
-                                    <h2 style={{ 
-                                        margin: 0, 
-                                        wordBreak: 'break-word',
-                                        fontSize: '1.5rem',
-                                        fontWeight: 600,
-                                        color: '#ffffff',
-                                        flex: '1 1 auto'
-                                    }}>
-                                        {selectedLead.domain}
-                                    </h2>
+                                    <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+                                        <h2 style={{
+                                            margin: 0,
+                                            fontSize: '1.25rem',
+                                            fontWeight: 600,
+                                            color: '#ffffff',
+                                            whiteSpace: 'nowrap',
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis'
+                                        }}>
+                                            {selectedLead.founderName || selectedLead.domain || '—'}
+                                        </h2>
+                                        {selectedLead.founderName && selectedLead.domain && (
+                                            <span style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.5)' }}>
+                                                {selectedLead.domain}
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                                {/* Status badge row */}
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                    {(() => {
+                                        const chip = getLeadStatusChipMeta(selectedLead.status);
+                                        const colorMap: Record<string, { bg: string; border: string; text: string }> = {
+                                            'valid': { bg: 'rgba(34, 197, 94, 0.15)', border: 'rgba(34, 197, 94, 0.4)', text: '#4ade80' },
+                                            'valid-risky': { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)', text: '#facc15' },
+                                            'invalid': { bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.4)', text: '#f87171' },
+                                            'not-found': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.5)' },
+                                            'not-run': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.4)' },
+                                            'skipped': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.5)' },
+                                            'default': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.6)' },
+                                        };
+                                        const colors = colorMap[chip.variant] || colorMap['default'];
+                                        return (
+                                            <span style={{
+                                                display: 'inline-flex',
+                                                alignItems: 'center',
+                                                padding: '0.25rem 0.6rem',
+                                                borderRadius: '999px',
+                                                background: colors.bg,
+                                                border: `1px solid ${colors.border}`,
+                                                color: colors.text,
+                                                fontSize: '0.8rem',
+                                                fontWeight: 600,
+                                                letterSpacing: '0.02em',
+                                                textTransform: 'uppercase'
+                                            }}>
+                                                {chip.label}
+                                            </span>
+                                        );
+                                    })()}
+                                    {selectedLead.roleType && (
+                                        <span style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            padding: '0.25rem 0.6rem',
+                                            borderRadius: '999px',
+                                            background: 'rgba(139, 92, 246, 0.12)',
+                                            border: '1px solid rgba(139, 92, 246, 0.3)',
+                                            color: '#c4b5fd',
+                                            fontSize: '0.8rem',
+                                            fontWeight: 500
+                                        }}>
+                                            {selectedLead.roleType === 'founder' ? 'Founder'
+                                                : selectedLead.roleType === 'dm' ? 'Decision Maker'
+                                                    : selectedLead.roleType === 'instantly_lead' ? 'Instantly Lead'
+                                                        : selectedLead.roleType}
+                                        </span>
+                                    )}
                                 </div>
                             </div>
-                            <button
-                                onClick={() => setSelectedLead(null)}
-                                style={{
-                                    background: 'transparent',
-                                    border: 'none',
-                                    cursor: 'pointer',
-                                    color: 'rgba(255, 255, 255, 0.6)',
-                                    fontSize: '1.5rem',
-                                    padding: '0.25rem',
-                                    lineHeight: 1
-                                }}
-                            >
-                                ✕
-                            </button>
                         </div>
 
-                        {selectedLead?.campaigns && selectedLead.campaigns.length > 0 && (
-                            <div style={{ margin: '0 0 1rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                                {getCampaignNamesForLead(selectedLead).map((name) => (
-                                    <span key={name} style={{
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        padding: '0.35rem 0.65rem',
-                                        borderRadius: '999px',
-                                        background: 'rgba(59, 130, 246, 0.15)',
-                                        color: '#bfdbfe',
-                                        fontSize: '0.8rem',
-                                        border: '1px solid rgba(59, 130, 246, 0.35)'
-                                    }}>
-                                        {name}
+                        <div className="modal__body" style={{ paddingTop: 0 }}>
+
+                            {/* Lead Info — compressed metadata block */}
+                            <div style={{ marginBottom: '1.25rem' }}>
+                                <p style={{
+                                    margin: '0 0 0.6rem',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.06em',
+                                    color: 'rgba(255, 255, 255, 0.4)'
+                                }}>Lead Info</p>
+                                <div style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'auto 1fr',
+                                    gap: '0.35rem 0.75rem',
+                                    fontSize: '0.9rem',
+                                    lineHeight: 1.6
+                                }}>
+                                    {selectedLead.founderName && (
+                                        <>
+                                            <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Founder</span>
+                                            <span style={{ color: 'rgba(255, 255, 255, 0.9)' }}>{selectedLead.founderName}</span>
+                                        </>
+                                    )}
+                                    <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Email</span>
+                                    <span style={{ color: 'rgba(255, 255, 255, 0.9)', wordBreak: 'break-all' }}>
+                                        {displayEmail(selectedLead.email, selectedLead.status)}
+                                        {selectedLead.verified && (
+                                            <span style={{ marginLeft: '0.35rem', color: '#4ade80', fontSize: '0.85rem' }}>✓</span>
+                                        )}
                                     </span>
-                                ))}
+                                    {selectedLead.createdAt && (
+                                        <>
+                                            <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Created</span>
+                                            <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>
+                                                {new Date(selectedLead.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                                            </span>
+                                        </>
+                                    )}
+                                    {selectedLead.campaigns && selectedLead.campaigns.length > 0 && (
+                                        <>
+                                            <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Source</span>
+                                            <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>
+                                                {getCampaignNamesForLead(selectedLead)[0] || 'Pipeline'}
+                                            </span>
+                                        </>
+                                    )}
+                                </div>
                             </div>
-                        )}
 
-                        <div className="modal__body">
-                            <label className="settings-field">
-                                <span className="settings-field__label">Founder</span>
-                                <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)' }}>
-                                    {selectedLead.founderName || '—'}
-                                </div>
-                            </label>
-
-                            <label className="settings-field">
-                                <span className="settings-field__label">Email</span>
-                                <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)', wordBreak: 'break-all' }}>
-                                    {displayEmail(selectedLead.email, selectedLead.status)}
-                                </div>
-                            </label>
-
-                            <label className="settings-field">
-                                <span className="settings-field__label">Email Status</span>
-                                <div style={{
-                                    padding: '0.625rem 0',
-                                    color: selectedLead.verified ? '#16a34a' : 'rgba(255, 255, 255, 0.7)'
-                                }}>
-                                    {displayEmailStatus(selectedLead.status)}
-                                </div>
-                            </label>
-
-                            <label className="settings-field">
-                                <span className="settings-field__label">Role</span>
-                                <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)' }}>
-                                    {selectedLead.roleType === 'founder'
-                                        ? 'Founder'
-                                        : selectedLead.roleType === 'dm'
-                                            ? 'Decision Maker'
-                                            : selectedLead.roleType === 'instantly_lead'
-                                                ? 'Instantly Lead'
-                                                : selectedLead.roleType || '—'}
-                                </div>
-                            </label>
-
-                            {selectedLead.createdAt && (
-                                <label className="settings-field">
-                                    <span className="settings-field__label">Created At</span>
-                                    <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.6)', fontSize: '0.875rem' }}>
-                                        {new Date(selectedLead.createdAt).toLocaleString()}
-                                    </div>
-                                </label>
-                            )}
-
-                            {selectedLead.lastVerifiedAt && (
-                                <label className="settings-field">
-                                    <span className="settings-field__label">Last Verified At</span>
-                                    <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.6)', fontSize: '0.875rem' }}>
-                                        {new Date(selectedLead.lastVerifiedAt).toLocaleString()}
-                                    </div>
-                                </label>
-                            )}
-
+                            {/* Campaign Outcomes — signal, not logs */}
                             {selectedLead.campaignsData && selectedLead.campaignsData.length > 0 && (
-                                <label className="settings-field">
-                                    <span className="settings-field__label">Instantly Campaigns</span>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.5rem' }}>
-                                        {selectedLead.campaignsData.map((campaign, idx) => (
-                                            <div
-                                                key={idx}
-                                                style={{
-                                                    padding: '0.75rem',
-                                                    background: 'rgba(59, 130, 246, 0.1)',
-                                                    borderRadius: '8px',
-                                                    border: '1px solid rgba(59, 130, 246, 0.25)'
-                                                }}
-                                            >
-                                                <div style={{ fontWeight: 600, color: '#bfdbfe', marginBottom: '0.25rem' }}>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginBottom: '1.25rem' }}>
+                                    {selectedLead.campaignsData.map((campaign, idx) => {
+                                        const interest = (campaign.interestStatus || '').toLowerCase();
+                                        const isPositive = interest === 'interested' || interest === 'meeting_booked' || interest === 'meeting booked';
+                                        const isNeutral = !interest || interest === '—';
+                                        const icon = isPositive ? '✅' : isNeutral ? '📨' : '⚠️';
+                                        const statusText = campaign.interestStatus
+                                            ? formatInstantlyStateLabel(campaign.interestStatus)
+                                            : formatInstantlyStateLabel(campaign.leadStatus) || 'Sent';
+                                        return (
+                                            <div key={idx} style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: '0.5rem',
+                                                padding: '0.5rem 0.65rem',
+                                                background: isPositive
+                                                    ? 'rgba(34, 197, 94, 0.08)'
+                                                    : 'rgba(255, 255, 255, 0.04)',
+                                                borderRadius: '8px',
+                                                border: `1px solid ${isPositive ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)'}`,
+                                            }}>
+                                                <span style={{ fontSize: '1rem', flexShrink: 0 }}>{icon}</span>
+                                                <span style={{
+                                                    fontSize: '0.88rem',
+                                                    color: 'rgba(255, 255, 255, 0.8)',
+                                                    flex: '1 1 auto',
+                                                    minWidth: 0,
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap'
+                                                }}>
                                                     {campaign.campaignName}
-                                                </div>
-                                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.72)', marginBottom: '0.35rem' }}>
-                                                    <span>Lead status: {formatInstantlyStateLabel(campaign.leadStatus)}</span>
-                                                    {campaign.interestStatus && (
-                                                        <span>Interest: {formatInstantlyStateLabel(campaign.interestStatus)}</span>
-                                                    )}
-                                                </div>
-                                                <div style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.5)' }}>
-                                                    Added: {new Date(campaign.addedAt).toLocaleString()}
-                                                </div>
+                                                </span>
+                                                <span style={{
+                                                    fontSize: '0.8rem',
+                                                    fontWeight: 600,
+                                                    color: isPositive ? '#4ade80' : 'rgba(255, 255, 255, 0.5)',
+                                                    flexShrink: 0,
+                                                    textTransform: 'capitalize'
+                                                }}>
+                                                    {statusText}
+                                                </span>
                                             </div>
-                                        ))}
-                                    </div>
-                                </label>
+                                        );
+                                    })}
+                                </div>
                             )}
 
+                            {/* Personalization First Line */}
                             {selectedLead.firstLine && (
-                                <label className="settings-field">
-                                    <span className="settings-field__label">Personalization First Line</span>
+                                <div style={{
+                                    padding: '0.75rem',
+                                    backgroundColor: 'rgba(34, 197, 94, 0.08)',
+                                    borderRadius: '8px',
+                                    borderLeft: '3px solid rgba(34, 197, 94, 0.4)',
+                                    fontStyle: 'italic',
+                                    color: 'rgba(255, 255, 255, 0.9)',
+                                    fontSize: '0.95rem',
+                                    marginBottom: '1.25rem',
+                                    lineHeight: 1.5
+                                }}>
+                                    &ldquo;{selectedLead.firstLine}&rdquo;
+                                </div>
+                            )}
+
+                            {/* CTA buttons */}
+                            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
+                                {selectedLead.domain && (
+                                    <a
+                                        href={`https://${selectedLead.domain}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '0.4rem',
+                                            padding: '0.45rem 0.85rem',
+                                            borderRadius: '6px',
+                                            background: 'rgba(255, 255, 255, 0.06)',
+                                            border: '1px solid rgba(255, 255, 255, 0.12)',
+                                            color: 'rgba(255, 255, 255, 0.7)',
+                                            fontSize: '0.88rem',
+                                            fontWeight: 500,
+                                            textDecoration: 'none',
+                                            cursor: 'pointer'
+                                        }}
+                                    >
+                                        ↗ Visit Site
+                                    </a>
+                                )}
+                                {selectedLead.personalizationUrl && (
+                                    <a
+                                        href={selectedLead.personalizationUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '0.4rem',
+                                            padding: '0.45rem 0.85rem',
+                                            borderRadius: '6px',
+                                            background: 'rgba(255, 255, 255, 0.06)',
+                                            border: '1px solid rgba(255, 255, 255, 0.12)',
+                                            color: 'rgba(255, 255, 255, 0.7)',
+                                            fontSize: '0.88rem',
+                                            fontWeight: 500,
+                                            textDecoration: 'none',
+                                            cursor: 'pointer'
+                                        }}
+                                    >
+                                        🛍 Product
+                                    </a>
+                                )}
+                            </div>
+
+                            {/* Personalization product details */}
+                            {selectedLead.personalizationTitle && (
+                                <div style={{ marginBottom: '1.25rem' }}>
+                                    <p style={{
+                                        margin: '0 0 0.4rem',
+                                        fontSize: '0.75rem',
+                                        fontWeight: 600,
+                                        textTransform: 'uppercase',
+                                        letterSpacing: '0.06em',
+                                        color: 'rgba(255, 255, 255, 0.4)'
+                                    }}>Product</p>
+                                    <span style={{ fontSize: '0.9rem', color: 'rgba(255, 255, 255, 0.8)' }}>
+                                        {selectedLead.personalizationTitle}
+                                    </span>
+                                </div>
+                            )}
+
+                            {/* Advanced / IDs — collapsed by default */}
+                            <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.75rem' }}>
+                                <button
+                                    onClick={() => setShowLeadAdvanced(!showLeadAdvanced)}
+                                    style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        cursor: 'pointer',
+                                        color: 'rgba(255, 255, 255, 0.35)',
+                                        fontSize: '0.8rem',
+                                        padding: 0,
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '0.3rem'
+                                    }}
+                                >
+                                    <span style={{
+                                        display: 'inline-block',
+                                        transition: 'transform 0.15s',
+                                        transform: showLeadAdvanced ? 'rotate(90deg)' : 'rotate(0deg)',
+                                        fontSize: '0.75rem'
+                                    }}>▶</span>
+                                    Advanced
+                                </button>
+                                {showLeadAdvanced && (
                                     <div style={{
-                                        padding: '0.75rem',
-                                        backgroundColor: 'rgba(34, 197, 94, 0.1)',
-                                        borderRadius: '6px',
-                                        borderLeft: '3px solid rgba(34, 197, 94, 0.5)',
-                                        fontStyle: 'italic',
-                                        color: 'rgba(255, 255, 255, 0.9)',
-                                        marginTop: '0.5rem'
+                                        display: 'grid',
+                                        gridTemplateColumns: 'auto 1fr',
+                                        gap: '0.25rem 0.75rem',
+                                        fontSize: '0.85rem',
+                                        lineHeight: 1.5,
+                                        marginTop: '0.5rem',
+                                        color: 'rgba(255, 255, 255, 0.4)'
                                     }}>
-                                        "{selectedLead.firstLine}"
+                                        <span>Domain ID</span>
+                                        <span style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{selectedLead.id}</span>
+                                        <span>Job ID</span>
+                                        <span style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{selectedLead.jobId || '—'}</span>
+                                        {selectedLead.lastVerifiedAt && (
+                                            <>
+                                                <span>Verified</span>
+                                                <span>{new Date(selectedLead.lastVerifiedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                                            </>
+                                        )}
+                                        {selectedLead.updatedAt && (
+                                            <>
+                                                <span>Updated</span>
+                                                <span>{new Date(selectedLead.updatedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                                            </>
+                                        )}
                                     </div>
-                                </label>
-                            )}
+                                )}
+                            </div>
 
-                            {(selectedLead.personalizationTitle || selectedLead.personalizationUrl) && (
-                                <>
-                                    <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.1)', margin: '1.5rem 0' }} />
-
-                                    {selectedLead.personalizationTitle && (
-                                        <label className="settings-field">
-                                            <span className="settings-field__label">Product Title</span>
-                                            <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.9)' }}>
-                                                {selectedLead.personalizationTitle}
-                                            </div>
-                                        </label>
-                                    )}
-
-                                    {selectedLead.personalizationUrl && (
-                                        <label className="settings-field">
-                                            <span className="settings-field__label">Product URL</span>
-                                            <a
-                                                href={selectedLead.personalizationUrl}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                style={{
-                                                    display: 'block',
-                                                    padding: '0.625rem 0',
-                                                    color: '#3b82f6',
-                                                    textDecoration: 'none',
-                                                    wordBreak: 'break-all'
-                                                }}
-                                            >
-                                                {selectedLead.personalizationUrl}
-                                            </a>
-                                        </label>
-                                    )}
-                                </>
-                            )}
-
-                            <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.1)', margin: '1.5rem 0' }} />
-
-                            <label className="settings-field">
-                                <span className="settings-field__label">Domain ID</span>
-                                <div style={{
-                                    padding: '0.625rem 0',
-                                    color: 'rgba(255, 255, 255, 0.6)',
-                                    fontFamily: 'monospace',
-                                    fontSize: '0.875rem'
-                                }}>
-                                    {selectedLead.id}
-                                </div>
-                            </label>
-
-                            <label className="settings-field">
-                                <span className="settings-field__label">Job ID</span>
-                                <div style={{
-                                    padding: '0.625rem 0',
-                                    color: 'rgba(255, 255, 255, 0.6)',
-                                    fontFamily: 'monospace',
-                                    fontSize: '0.875rem'
-                                }}>
-                                    {selectedLead.jobId || '—'}
-                                </div>
-                            </label>
-
-                            {selectedLead.updatedAt && (
-                                <label className="settings-field">
-                                    <span className="settings-field__label">Last Updated</span>
-                                    <div style={{ padding: '0.625rem 0', color: 'rgba(255, 255, 255, 0.6)', fontSize: '0.875rem' }}>
-                                        {selectedLead.updatedAt}
-                                    </div>
-                                </label>
-                            )}
                         </div>
                     </div>
                 </>

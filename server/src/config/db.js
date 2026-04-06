@@ -23,7 +23,7 @@ export const pool = new Pool({
     user: env.PGUSER,
     password: env.PGPASSWORD,
     ssl: sslConfig,
-    max: 20,
+    max: env.PGPOOL_MAX,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 30_000, // Increased from 10s to 30s
     keepAlive: true,

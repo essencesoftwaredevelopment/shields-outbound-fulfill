@@ -286,16 +286,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramIndex++;
         }
 
-        // Get total count with filters applied
-        const countQuery = `
-            SELECT COUNT(*) as count
-            FROM contacts c
-            JOIN companies co ON c.company_id = co.id
-            ${joinClause}
-            WHERE ${whereClause}
-        `;
-        const countResult = await pool.query(countQuery, params);
-        const total = parseInt(countResult.rows[0]?.count || 0, 10);
+        const searchActive = typeof search === 'string' && search.trim() !== '';
+        const filterParams = [...params];
 
         // Fetch contacts with pagination and campaign data
         const contactsQuery = `
@@ -355,6 +347,19 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         params.push(parsedLimit, parsedOffset);
 
         const result = await pool.query(contactsQuery, params);
+        const total = searchActive
+            ? result.rows.length
+            : await (async () => {
+                const countQuery = `
+                    SELECT COUNT(*) as count
+                    FROM contacts c
+                    JOIN companies co ON c.company_id = co.id
+                    ${joinClause}
+                    WHERE ${whereClause}
+                `;
+                const countResult = await pool.query(countQuery, filterParams);
+                return parseInt(countResult.rows[0]?.count || 0, 10);
+            })();
 
         const leads = result.rows.map((row) => ({
             id: row.id,
@@ -393,7 +398,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             total,
             limit: parsedLimit,
             offset: parsedOffset,
-            hasMore: parsedOffset + parsedLimit < total
+            hasMore: searchActive ? result.rows.length === parsedLimit : parsedOffset + parsedLimit < total
         });
     } catch (error) {
         console.error('Error fetching leads:', error);

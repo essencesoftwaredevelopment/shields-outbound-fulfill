@@ -46,6 +46,7 @@ export const env = {
     PGPASSWORD: process.env.PGPASSWORD || databasePasswordFromUrl,
     PGSSLMODE: process.env.PGSSLMODE || databaseSslModeFromUrl || 'disable',
     PGSSLROOTCERT: process.env.PGSSLROOTCERT || '',
+    PGPOOL_MAX: Math.max(Number(process.env.PGPOOL_MAX || 5) || 5, 1),
     DB_WRITE_FREEZE: String(process.env.DB_WRITE_FREEZE || 'false').toLowerCase() === 'true',
     STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || '',
     STRIPE_PRICE_ID: process.env.STRIPE_PRICE_ID || '',

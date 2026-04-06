@@ -8,6 +8,7 @@ const baseEnv = {
   PGPASSWORD: process.env.PGPASSWORD || '',
   PGSSLMODE: process.env.PGSSLMODE || 'require',
   PGSSLROOTCERT: process.env.PGSSLROOTCERT || '',
+  PGPOOL_MAX: process.env.PGPOOL_MAX || 5,
   DB_WRITE_FREEZE: process.env.DB_WRITE_FREEZE || 'false',
   JOB_EXECUTION_MODE: process.env.JOB_EXECUTION_MODE || 'queue',
   INSTANTLY_SYNC_INTERVAL_MS: process.env.INSTANTLY_SYNC_INTERVAL_MS || 900000,

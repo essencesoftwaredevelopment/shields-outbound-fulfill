@@ -24,6 +24,9 @@
 
 import { pool } from '../../config/db.js';
 
+const clientIdCache = new Map();
+const clientIdLookupInFlight = new Map();
+
 function safeDecodeURIComponent(value = '') {
     try {
         return decodeURIComponent(value);
@@ -93,53 +96,78 @@ export async function getOrCreateClient(agencyId, clientName) {
     }
 
     const normalizedClientName = String(clientName).trim();
-    const variants = buildClientLookupVariants(normalizedClientName);
-
-    // Try to find existing client
-    const findQuery = `
-        WITH client_candidates AS (
-            SELECT
-                id,
-                LOWER(name) AS lower_name,
-                REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.') AS decoded_name,
-                REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g') AS slug_name,
-                REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '', 'g') AS compact_name,
-                REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '-', 'g') AS decoded_slug_name,
-                REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '', 'g') AS decoded_compact_name
-            FROM clients
-            WHERE agency_id = $1
-        )
-        SELECT id
-        FROM client_candidates
-        WHERE
-            lower_name = ANY($2::text[])
-            OR decoded_name = ANY($2::text[])
-            OR slug_name = ANY($3::text[])
-            OR decoded_slug_name = ANY($3::text[])
-            OR compact_name = ANY($4::text[])
-            OR decoded_compact_name = ANY($4::text[])
-        ORDER BY id ASC
-        LIMIT 1
-    `;
-    const findResult = await pool.query(findQuery, [
-        agencyId,
-        variants.textVariants,
-        variants.slugVariants,
-        variants.compactVariants
-    ]);
-    
-    if (findResult.rows.length > 0) {
-        return findResult.rows[0].id;
+    const cacheKey = `${agencyId}::${normalizedClientName.toLowerCase()}`;
+    const cachedClientId = clientIdCache.get(cacheKey);
+    if (cachedClientId) {
+        return cachedClientId;
     }
 
-    // Create new client if not found
-    const insertQuery = `
-        INSERT INTO clients (agency_id, name)
-        VALUES ($1, $2)
-        RETURNING id
-    `;
-    const insertResult = await pool.query(insertQuery, [agencyId, normalizedClientName]);
-    return insertResult.rows[0].id;
+    const inFlightLookup = clientIdLookupInFlight.get(cacheKey);
+    if (inFlightLookup) {
+        return inFlightLookup;
+    }
+
+    const lookupPromise = (async () => {
+        const variants = buildClientLookupVariants(normalizedClientName);
+
+        // Try to find existing client
+        const findQuery = `
+            WITH client_candidates AS (
+                SELECT
+                    id,
+                    LOWER(name) AS lower_name,
+                    REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.') AS decoded_name,
+                    REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g') AS slug_name,
+                    REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '', 'g') AS compact_name,
+                    REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '-', 'g') AS decoded_slug_name,
+                    REGEXP_REPLACE(REPLACE(REPLACE(LOWER(name), '%40', '@'), '%2e', '.'), '[^a-z0-9]+', '', 'g') AS decoded_compact_name
+                FROM clients
+                WHERE agency_id = $1
+            )
+            SELECT id
+            FROM client_candidates
+            WHERE
+                lower_name = ANY($2::text[])
+                OR decoded_name = ANY($2::text[])
+                OR slug_name = ANY($3::text[])
+                OR decoded_slug_name = ANY($3::text[])
+                OR compact_name = ANY($4::text[])
+                OR decoded_compact_name = ANY($4::text[])
+            ORDER BY id ASC
+            LIMIT 1
+        `;
+        const findResult = await pool.query(findQuery, [
+            agencyId,
+            variants.textVariants,
+            variants.slugVariants,
+            variants.compactVariants
+        ]);
+        
+        if (findResult.rows.length > 0) {
+            const clientId = findResult.rows[0].id;
+            clientIdCache.set(cacheKey, clientId);
+            return clientId;
+        }
+
+        // Create new client if not found
+        const insertQuery = `
+            INSERT INTO clients (agency_id, name)
+            VALUES ($1, $2)
+            RETURNING id
+        `;
+        const insertResult = await pool.query(insertQuery, [agencyId, normalizedClientName]);
+        const clientId = insertResult.rows[0].id;
+        clientIdCache.set(cacheKey, clientId);
+        return clientId;
+    })();
+
+    clientIdLookupInFlight.set(cacheKey, lookupPromise);
+
+    try {
+        return await lookupPromise;
+    } finally {
+        clientIdLookupInFlight.delete(cacheKey);
+    }
 }
 
 /**
