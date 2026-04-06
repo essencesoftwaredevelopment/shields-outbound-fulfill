@@ -274,19 +274,42 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramIndex++;
         }
 
-        // Campaign filter (requires join with contact_instantly_campaigns and instantly_campaigns)
-        let joinClause = '';
+        let sqlInstantlyCampaignId = null;
         if (instantlyCampaignId) {
-            joinClause = `
-                JOIN contact_instantly_campaigns cic ON cic.contact_id = c.id
-                JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
-            `;
-            whereClause += ` AND ic.instantly_campaign_id = $${paramIndex} AND cic.active = TRUE`;
-            params.push(instantlyCampaignId);
+            const campaignResult = await pool.query(
+                `SELECT id
+                 FROM instantly_campaigns
+                 WHERE agency_id = $1
+                 AND client_id = $2
+                 AND instantly_campaign_id = $3
+                 LIMIT 1`,
+                [agencyId, clientId, instantlyCampaignId]
+            );
+
+            sqlInstantlyCampaignId = campaignResult.rows[0]?.id || null;
+            if (!sqlInstantlyCampaignId) {
+                return res.json({
+                    leads: [],
+                    total: 0,
+                    limit: parsedLimit,
+                    offset: parsedOffset,
+                    hasMore: false
+                });
+            }
+
+            whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM contact_instantly_campaigns cic_filter
+                WHERE cic_filter.contact_id = c.id
+                AND cic_filter.campaign_id = $${paramIndex}
+                AND cic_filter.active = TRUE
+            )`;
+            params.push(sqlInstantlyCampaignId);
             paramIndex++;
         }
 
         const searchActive = typeof search === 'string' && search.trim() !== '';
+        const campaignFilterActive = Boolean(sqlInstantlyCampaignId);
         const filterParams = [...params];
 
         // Fetch contacts with pagination and campaign data
@@ -339,7 +362,6 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             FROM contacts c
             JOIN companies co ON c.company_id = co.id
             LEFT JOIN contact_insights ci ON ci.contact_id = c.id
-            ${joinClause}
             WHERE ${whereClause}
             ORDER BY c.created_at DESC
             LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
@@ -347,14 +369,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         params.push(parsedLimit, parsedOffset);
 
         const result = await pool.query(contactsQuery, params);
-        const total = searchActive
+        const total = (searchActive || campaignFilterActive)
             ? result.rows.length
             : await (async () => {
                 const countQuery = `
                     SELECT COUNT(*) as count
                     FROM contacts c
                     JOIN companies co ON c.company_id = co.id
-                    ${joinClause}
                     WHERE ${whereClause}
                 `;
                 const countResult = await pool.query(countQuery, filterParams);
@@ -398,7 +419,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             total,
             limit: parsedLimit,
             offset: parsedOffset,
-            hasMore: searchActive ? result.rows.length === parsedLimit : parsedOffset + parsedLimit < total
+            hasMore: (searchActive || campaignFilterActive) ? result.rows.length === parsedLimit : parsedOffset + parsedLimit < total
         });
     } catch (error) {
         console.error('Error fetching leads:', error);

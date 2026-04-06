@@ -673,6 +673,8 @@ export default function ClientPage() {
     const [stats, setStats] = useState<{ total: number; verified: number; unverified: number }>(() => ({ total: 0, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
+    const [leadEvents, setLeadEvents] = useState<Array<{ id: number; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_category?: string }>>([]);
+    const [leadEventsLoading, setLeadEventsLoading] = useState(false);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
@@ -685,6 +687,32 @@ export default function ClientPage() {
     const [emailFilter, setEmailFilter] = useState<string>("");
     const [emailStatusFilter, setEmailStatusFilter] = useState<string>("");
     const [exportingCsv, setExportingCsv] = useState(false);
+
+    useEffect(() => {
+        if (!selectedLead || !user) {
+            setLeadEvents([]);
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            setLeadEventsLoading(true);
+            try {
+                const idToken = await getIdToken(user);
+                const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/${selectedLead.id}/events?limit=50`, {
+                    headers: { Authorization: `Bearer ${idToken}` }
+                });
+                if (!res.ok) throw new Error(`Failed to fetch events: ${res.statusText}`);
+                const data = await res.json();
+                if (!cancelled) setLeadEvents(data.events || []);
+            } catch (err) {
+                console.error('Failed to fetch lead events:', err);
+                if (!cancelled) setLeadEvents([]);
+            } finally {
+                if (!cancelled) setLeadEventsLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [selectedLead?.id, user]);
 
     useEffect(() => {
         const timeoutId = window.setTimeout(() => {
@@ -7140,29 +7168,6 @@ export default function ClientPage() {
 
                             {/* CTA buttons */}
                             <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
-                                {selectedLead.domain && (
-                                    <a
-                                        href={`https://${selectedLead.domain}`}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        style={{
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            gap: '0.4rem',
-                                            padding: '0.45rem 0.85rem',
-                                            borderRadius: '6px',
-                                            background: 'rgba(255, 255, 255, 0.06)',
-                                            border: '1px solid rgba(255, 255, 255, 0.12)',
-                                            color: 'rgba(255, 255, 255, 0.7)',
-                                            fontSize: '0.88rem',
-                                            fontWeight: 500,
-                                            textDecoration: 'none',
-                                            cursor: 'pointer'
-                                        }}
-                                    >
-                                        ↗ Visit Site
-                                    </a>
-                                )}
                                 {selectedLead.personalizationUrl && (
                                     <a
                                         href={selectedLead.personalizationUrl}
@@ -7188,22 +7193,91 @@ export default function ClientPage() {
                                 )}
                             </div>
 
-                            {/* Personalization product details */}
-                            {selectedLead.personalizationTitle && (
-                                <div style={{ marginBottom: '1.25rem' }}>
-                                    <p style={{
-                                        margin: '0 0 0.4rem',
-                                        fontSize: '0.75rem',
-                                        fontWeight: 600,
-                                        textTransform: 'uppercase',
-                                        letterSpacing: '0.06em',
-                                        color: 'rgba(255, 255, 255, 0.4)'
-                                    }}>Product</p>
-                                    <span style={{ fontSize: '0.9rem', color: 'rgba(255, 255, 255, 0.8)' }}>
-                                        {selectedLead.personalizationTitle}
-                                    </span>
-                                </div>
-                            )}
+                            {/* Events Timeline */}
+                            <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.75rem', marginBottom: '0.75rem' }}>
+                                <p style={{
+                                    margin: '0 0 0.6rem',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.06em',
+                                    color: 'rgba(255, 255, 255, 0.4)'
+                                }}>Activity</p>
+                                {leadEventsLoading ? (
+                                    <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>Loading…</p>
+                                ) : leadEvents.length === 0 ? (
+                                    <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>No events yet</p>
+                                ) : (
+                                    <div style={{ position: 'relative', paddingLeft: '1rem' }}>
+                                        {/* Vertical line */}
+                                        <div style={{
+                                            position: 'absolute',
+                                            left: '3px',
+                                            top: '6px',
+                                            bottom: '6px',
+                                            width: '1px',
+                                            background: 'rgba(255, 255, 255, 0.1)'
+                                        }} />
+                                        {leadEvents.map((evt) => {
+                                            const typeLabel = (evt.event_type || 'unknown').replace(/_/g, ' ');
+                                            const dotColor = evt.event_type === 'email_sent' ? '#3b82f6'
+                                                : evt.event_type === 'email_opened' ? '#a855f7'
+                                                : evt.event_type === 'email_replied' ? '#22c55e'
+                                                : evt.event_type === 'email_bounced' ? '#ef4444'
+                                                : evt.event_type === 'lead_unsubscribed' ? '#f59e0b'
+                                                : 'rgba(255, 255, 255, 0.3)';
+                                            return (
+                                                <div key={evt.id} style={{
+                                                    position: 'relative',
+                                                    paddingBottom: '0.65rem',
+                                                    paddingLeft: '0.6rem'
+                                                }}>
+                                                    {/* Dot */}
+                                                    <div style={{
+                                                        position: 'absolute',
+                                                        left: '-1rem',
+                                                        top: '5px',
+                                                        width: '7px',
+                                                        height: '7px',
+                                                        borderRadius: '50%',
+                                                        background: dotColor
+                                                    }} />
+                                                    <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem', flexWrap: 'wrap' }}>
+                                                        <span style={{
+                                                            fontSize: '0.82rem',
+                                                            fontWeight: 500,
+                                                            color: 'rgba(255, 255, 255, 0.8)',
+                                                            textTransform: 'capitalize'
+                                                        }}>{typeLabel}</span>
+                                                        <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.3)' }}>
+                                                            {new Date(evt.event_timestamp).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+                                                            {' '}
+                                                            {new Date(evt.event_timestamp).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
+                                                        </span>
+                                                    </div>
+                                                    {evt.campaign_name && (
+                                                        <p style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.35)' }}>
+                                                            {evt.campaign_name}
+                                                        </p>
+                                                    )}
+                                                    {evt.reply_category && (
+                                                        <span style={{
+                                                            display: 'inline-block',
+                                                            marginTop: '0.2rem',
+                                                            padding: '0.1rem 0.4rem',
+                                                            borderRadius: '4px',
+                                                            fontSize: '0.72rem',
+                                                            fontWeight: 500,
+                                                            background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(255, 255, 255, 0.06)',
+                                                            color: evt.reply_category === 'Interested' ? '#4ade80' : 'rgba(255, 255, 255, 0.5)'
+                                                        }}>{evt.reply_category}</span>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
 
                             {/* Advanced / IDs — collapsed by default */}
                             <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.75rem' }}>
