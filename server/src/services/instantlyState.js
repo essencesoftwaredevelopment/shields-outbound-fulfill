@@ -473,11 +473,12 @@ async function fetchInstantlyCampaigns(apiKey) {
     return extractItems(payload);
 }
 
-async function fetchCampaignLeads(apiKey, instantlyCampaignId, logger = () => {}) {
+async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = null, logger = () => {} } = {}) {
     const rows = [];
     let startingAfter = null;
 
     while (true) {
+        await assertSyncRunNotCancelled(syncRunId);
         let page = null;
         let lastError = null;
         const requestBodies = [
@@ -488,6 +489,7 @@ async function fetchCampaignLeads(apiKey, instantlyCampaignId, logger = () => {}
         ));
 
         for (const body of requestBodies) {
+            await assertSyncRunNotCancelled(syncRunId);
             try {
                 page = await instantlyRequest({
                     apiKey,
@@ -1236,7 +1238,10 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
                 lastSyncedAt: syncStartedAt
             });
 
-            const leads = await fetchCampaignLeads(instantlyKey, instantlyCampaignId, logger);
+            const leads = await fetchCampaignLeads(instantlyKey, instantlyCampaignId, {
+                syncRunId,
+                logger
+            });
             totalLeadsSeen += leads.length;
 
             const contactMap = await loadContactMapForEmails(

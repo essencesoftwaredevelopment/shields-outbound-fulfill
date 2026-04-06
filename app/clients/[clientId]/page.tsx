@@ -5485,9 +5485,16 @@ export default function ClientPage() {
                                             type="button"
                                             className="secondary-button"
                                             onClick={handleStopInstantlySync}
-                                            disabled={stoppingInstantlySync || syncingInstantlyState || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                            disabled={
+                                                stoppingInstantlySync
+                                                || syncingInstantlyState
+                                                || instantlySyncRun.status === 'cancelling'
+                                                || registeringInstantlyWebhook
+                                                || isSavingClient
+                                                || isDeletingClient
+                                            }
                                         >
-                                            {stoppingInstantlySync ? 'Stopping...' : 'Stop Sync'}
+                                            {stoppingInstantlySync || instantlySyncRun.status === 'cancelling' ? 'Stopping...' : 'Stop Sync'}
                                         </button>
                                     )}
                                 </div>
