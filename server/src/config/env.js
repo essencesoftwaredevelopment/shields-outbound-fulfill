@@ -19,15 +19,34 @@ for (const envPath of ENV_PATHS) {
     }
 }
 
+const databaseUrl = process.env.DATABASE_URL || '';
+let parsedDatabaseUrl = null;
+
+if (databaseUrl) {
+    try {
+        parsedDatabaseUrl = new URL(databaseUrl);
+    } catch (error) {
+        console.warn(`[env] Invalid DATABASE_URL: ${error.message}`);
+    }
+}
+
+const databaseNameFromUrl = parsedDatabaseUrl?.pathname?.replace(/^\//, '') || '';
+const databasePortFromUrl = parsedDatabaseUrl?.port ? Number(parsedDatabaseUrl.port) : 5432;
+const databaseUserFromUrl = parsedDatabaseUrl?.username ? decodeURIComponent(parsedDatabaseUrl.username) : '';
+const databasePasswordFromUrl = parsedDatabaseUrl?.password ? decodeURIComponent(parsedDatabaseUrl.password) : '';
+const databaseSslModeFromUrl = parsedDatabaseUrl?.searchParams.get('sslmode') || '';
+
 export const env = {
     PORT: process.env.PORT || 4000,
-    PGHOST: process.env.PGHOST || '',
-    PGPORT: Number(process.env.PGPORT || 5432),
-    PGDATABASE: process.env.PGDATABASE || '',
-    PGUSER: process.env.PGUSER || '',
-    PGPASSWORD: process.env.PGPASSWORD || '',
-    PGSSLMODE: process.env.PGSSLMODE || 'disable',
+    DATABASE_URL: databaseUrl,
+    PGHOST: process.env.PGHOST || parsedDatabaseUrl?.hostname || '',
+    PGPORT: Number(process.env.PGPORT || databasePortFromUrl),
+    PGDATABASE: process.env.PGDATABASE || databaseNameFromUrl,
+    PGUSER: process.env.PGUSER || databaseUserFromUrl,
+    PGPASSWORD: process.env.PGPASSWORD || databasePasswordFromUrl,
+    PGSSLMODE: process.env.PGSSLMODE || databaseSslModeFromUrl || 'disable',
     PGSSLROOTCERT: process.env.PGSSLROOTCERT || '',
+    DB_WRITE_FREEZE: String(process.env.DB_WRITE_FREEZE || 'false').toLowerCase() === 'true',
     STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || '',
     STRIPE_PRICE_ID: process.env.STRIPE_PRICE_ID || '',
     STRIPE_SUCCESS_URL: process.env.STRIPE_SUCCESS_URL || 'http://localhost:3000/account?checkout=success',

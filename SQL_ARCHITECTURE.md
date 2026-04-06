@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document explains how the SQL interactions work in the Shields Outbound lead generation pipeline. The system uses **PostgreSQL (Cloud SQL)** as the primary data store with a multi-tenant architecture scoped by agency and client identifiers.
+This document explains how the SQL interactions work in the Shields Outbound lead generation pipeline. The system uses **PostgreSQL** as the primary data store with a multi-tenant architecture scoped by agency and client identifiers.
 
 ---
 
@@ -31,7 +31,7 @@ The system implements a **tenant-per-row** architecture where:
 
 **Canonical Identity Rule:**
 ```
-Firebase Auth UID = agency_id in Cloud SQL
+Firebase Auth UID = agency_id in PostgreSQL
 ```
 No mapping table or reconciliation is required. The Firebase UID is used directly as the agency identifier in all SQL tables.
 
@@ -40,7 +40,7 @@ No mapping table or reconciliation is required. The Firebase UID is used directl
 1. **Agency-First Authorization**: All data access is gated by `agency_id`
 2. **Client-Level Scoping**: Within an agency, data is further scoped by `client_id`
 3. **Zero Unscoped Queries**: Every query must include WHERE clauses for both identifiers
-4. **Single Source of Truth**: Cloud SQL is authoritative; Firestore is used only for job state and UI sync
+4. **Single Source of Truth**: PostgreSQL is authoritative; Firestore is used only for job state and UI sync
 
 ---
 
@@ -754,12 +754,12 @@ if (!hasAccess) {
 
 ### Initial Schema
 
-**File**: `migrations/0001_cloud_sql_init.sql`
+**File**: `server/migrations/0001_cloudsql_baseline.sql`
 
 **Execution**: Run once during initial deployment:
 
 ```bash
-psql $DATABASE_URL < migrations/0001_cloud_sql_init.sql
+psql "$TARGET_DATABASE_URL" < server/migrations/0001_cloudsql_baseline.sql
 ```
 
 ### Future Migrations

@@ -365,6 +365,13 @@ NEXT_PUBLIC_FIREBASE_PROJECT_ID=your_project_id
 
 # Backend (server/.env)
 PORT=4000
+PGHOST=aws-1-eu-central-1.pooler.supabase.com
+PGPORT=5432
+PGDATABASE=postgres
+PGUSER=postgres.xfamwraegljpmvsdimrp
+PGPASSWORD=<supabase-password>
+PGSSLMODE=require
+DB_WRITE_FREEZE=false
 FIREBASE_PROJECT_ID=your_project_id
 FIREBASE_CLIENT_EMAIL=your_service_account_email
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
@@ -375,6 +382,9 @@ FOUNDER_AI_MIN_RPM=120
 FOUNDER_AI_MAX_RPM=900
 FOUNDER_AI_RECOVERY_SUCCESS_THRESHOLD=25
 FOUNDER_RESET_RPM_ON_RESUME=true
+
+# Optional single-string form if your deploy target prefers it
+DATABASE_URL=postgresql://postgres.xfamwraegljpmvsdimrp:<supabase-password>@aws-1-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
 ```
 
 ### Installation
@@ -437,6 +447,8 @@ pm2 startup
 ```
 
 See [server/PM2_COMMANDS.md](server/PM2_COMMANDS.md) for detailed PM2 management commands.
+
+Migration and cutover runbook: [server/SUPABASE_MIGRATION_RUNBOOK.md](server/SUPABASE_MIGRATION_RUNBOOK.md)
 
 ### Frontend Deployment (Vercel/Netlify)
 

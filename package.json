@@ -6,7 +6,7 @@
     "dev": "next dev",
     "dev:app": "next dev",
     "dev:server": "npm --prefix server run dev",
-    "dev:all": "bash -c \"cloud-sql-proxy shields-outbound-fulfill:europe-southwest1:shields-outbound-sql --port 5432 --address 127.0.0.1 --max-connections 0 --max-sigterm-delay 30s & npm run dev:server & npm run dev:app; wait\"",
+    "dev:all": "bash -c \"npm run dev:server & npm run dev:app; wait\"",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

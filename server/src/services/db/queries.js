@@ -1,9 +1,9 @@
 /**
- * Database query helpers for multi-tenant Cloud SQL operations.
+ * Database query helpers for multi-tenant PostgreSQL operations.
  *
  * CANONICAL AGENCY IDENTIFIER RULE:
  * The Firestore users/{uid} document ID is the canonical agency identifier.
- * This same Firebase Auth uid is used directly as agency_id in all Cloud SQL tables.
+ * This same Firebase Auth uid is used directly as agency_id in all PostgreSQL tables.
  * No reconciliation or mapping is required.
  *
  * MVP SCOPE: Single implicit client per agency

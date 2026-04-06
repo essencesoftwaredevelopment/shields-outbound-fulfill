@@ -885,6 +885,7 @@ export async function runPersonalization({
     outputCsv,
     apiKeys,
     log,
+    concurrency,
     removeB2B = true,
     productPromptVersion = 'old',
     productPromptProducts = 3
@@ -917,6 +918,9 @@ export async function runPersonalization({
     }
 
     const useNewPrompt = String(productPromptVersion || '').toLowerCase() === 'new_gpt5mini';
+    const personalizationConcurrency = Number.isFinite(concurrency)
+        ? Math.max(1, concurrency)
+        : 15;
     if (useNewPrompt) {
         const newPromptProducts = Number.isFinite(productPromptProducts)
             ? Math.max(1, Math.min(productPromptProducts, 5))
@@ -928,7 +932,7 @@ export async function runPersonalization({
             apiKeys,
             log,
             productPromptProducts: newPromptProducts,
-            concurrency: 15,
+            concurrency: personalizationConcurrency,
             model: NEW_PROMPT_MODEL,
             removeB2B
         });
@@ -996,7 +1000,7 @@ export async function runPersonalization({
         outputCsv,
         apiKeys,
         log,
-        concurrency: 15,
+        concurrency: personalizationConcurrency,
         model: 'gpt-4o-mini'
     });
 

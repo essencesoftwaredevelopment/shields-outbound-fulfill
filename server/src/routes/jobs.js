@@ -3,15 +3,15 @@
  *
  * CANONICAL AGENCY IDENTIFIER RULE:
  * The Firestore users/{uid} document ID is the canonical agency identifier.
- * This same Firebase Auth uid is used directly as agency_id in all Cloud SQL tables.
+ * This same Firebase Auth uid is used directly as agency_id in all PostgreSQL tables.
  * No reconciliation or mapping is required.
  *
  * This route manages:
  * 1. Firestore orchestration (job state, status, client metadata)
  * 2. CSV file uploads and processing
- * 3. Integration with Cloud SQL via the leads service (see services/leads.js)
+ * 3. Integration with PostgreSQL via the leads service (see services/leads.js)
  *
- * All Cloud SQL operations are scoped by agency_id derived from the verified Firebase token.
+ * All PostgreSQL operations are scoped by agency_id derived from the verified Firebase token.
  */
 
 import express from 'express';

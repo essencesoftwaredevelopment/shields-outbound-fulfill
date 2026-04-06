@@ -146,7 +146,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             return res.status(500).json({ error: 'Failed to resolve client ID' });
         }
 
-        const parsedLimit = Math.min(parseInt(limit, 10) || 200, 500);
+        const parsedLimit = Math.min(parseInt(limit, 10) || 200, 5000);
         const parsedOffset = parseInt(offset, 10) || 0;
 
         // Build WHERE clause with filters

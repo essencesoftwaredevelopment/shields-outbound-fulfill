@@ -258,6 +258,28 @@ Temporary files live under:
 
 - server/tmp/jobs/<jobId>/
 
+## Running Personalization Locally From Domains Only
+
+If you want the Shopify personalizer without the live server job flow, Firebase, Firestore, DB, founders, or emails, use:
+
+```bash
+cd server
+OPENAI_API_KEY=... npm run personalizer:local -- --input /absolute/path/domains.csv
+```
+
+Notes:
+
+- The input only needs a domain column.
+- Default expected header is `domain`.
+- If your CSV uses another header, pass `--domain-column website` (or whatever your column is named).
+- Optional flags:
+  - `--products-to-pull 5`
+  - `--check-klaviyo`
+  - `--remove-b2b`
+- Output defaults to `server/tmp/jobs/local-personalizer-<timestamp>/personalized.csv`.
+
+This runner calls `server/src/services/personalizerPipeline.js` directly and rewrites your input into the one-column `domain` shape that pipeline expects.
+
 Key files:
 
 - domains.csv: original input

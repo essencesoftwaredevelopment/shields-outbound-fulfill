@@ -1,6 +1,15 @@
 # PM2 process management commands for production
 
-# Start all processes from ecosystem config (ensures DB env vars are applied)
+# Required env vars (export these before starting PM2)
+export PGHOST="aws-1-eu-central-1.pooler.supabase.com"
+export PGPORT="5432"
+export PGDATABASE="postgres"
+export PGUSER="postgres.xfamwraegljpmvsdimrp"
+export PGPASSWORD="<supabase-password>"
+export PGSSLMODE="require"
+export DB_WRITE_FREEZE="false"
+
+# Start all processes from ecosystem config (loads env vars from current shell)
 pm2 start ecosystem.config.cjs
 
 # Start only API or only worker from ecosystem config
@@ -15,6 +24,16 @@ pm2 logs shields-outbound-worker
 pm2 list
 
 # Restart with env refresh
+pm2 restart shields-outbound-server --update-env
+pm2 restart shields-outbound-worker --update-env
+
+# Enable write freeze for migration cutover (returns 503 on write methods)
+export DB_WRITE_FREEZE="true"
+pm2 restart shields-outbound-server --update-env
+pm2 restart shields-outbound-worker --update-env
+
+# Disable write freeze after cutover validation
+export DB_WRITE_FREEZE="false"
 pm2 restart shields-outbound-server --update-env
 pm2 restart shields-outbound-worker --update-env
 

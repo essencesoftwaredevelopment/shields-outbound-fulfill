@@ -3,10 +3,10 @@
  *
  * CANONICAL AGENCY IDENTIFIER RULE:
  * The Firestore users/{uid} document ID is the canonical agency identifier.
- * This same Firebase Auth uid is used directly as agency_id in all Cloud SQL tables.
+ * This same Firebase Auth uid is used directly as agency_id in all PostgreSQL tables.
  * No reconciliation or mapping is required.
  *
- * All endpoints that access Cloud SQL are protected by verifyFirebaseToken middleware,
+ * All endpoints that access PostgreSQL are protected by verifyFirebaseToken middleware,
  * which derives agency_id from the verified Firebase ID token.
  * See server/AGENCY_IDENTITY.md for complete architecture documentation.
  */
@@ -27,6 +27,7 @@ const PORT = env.PORT || 4000;
 const JOB_EXECUTION_MODE = String(process.env.JOB_EXECUTION_MODE || 'inline').toLowerCase();
 const queueExecutionEnabled = JOB_EXECUTION_MODE === 'queue';
 let embeddedWorker = null;
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 // Middleware
 app.use(cors());
@@ -50,6 +51,19 @@ app.use((req, res, next) => {
     });
     
     next();
+});
+
+// Optional write freeze for controlled DB cutovers.
+app.use((req, res, next) => {
+    if (!env.DB_WRITE_FREEZE) {
+        return next();
+    }
+    if (!WRITE_METHODS.has(req.method)) {
+        return next();
+    }
+    return res.status(503).json({
+        error: 'Write operations are temporarily disabled for database maintenance.'
+    });
 });
 
 // Error handling middleware
@@ -84,8 +98,11 @@ app.get('/health', (req, res) => {
 // Start server
 const server = app.listen(PORT, async () => {
     embeddedWorker = startEmbeddedQueueWorker({
-        enabled: process.env.DISABLE_EMBEDDED_QUEUE_WORKER !== 'true' && queueExecutionEnabled
+        enabled: process.env.DISABLE_EMBEDDED_QUEUE_WORKER !== 'true' && queueExecutionEnabled && !env.DB_WRITE_FREEZE
     });
+    if (env.DB_WRITE_FREEZE) {
+        console.warn('⚠️  DB_WRITE_FREEZE=true: write endpoints are currently blocked');
+    }
     try {
         const ok = await testConnection();
         console.log(`Server running on port ${PORT} (db:${ok ? 'ok' : 'error'})`);

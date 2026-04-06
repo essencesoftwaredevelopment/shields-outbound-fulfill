@@ -1,29 +1,25 @@
+const baseEnv = {
+  NODE_ENV: process.env.NODE_ENV || 'production',
+  PORT: process.env.PORT || 4000,
+  PGHOST: process.env.PGHOST || '',
+  PGPORT: process.env.PGPORT || 5432,
+  PGDATABASE: process.env.PGDATABASE || '',
+  PGUSER: process.env.PGUSER || '',
+  PGPASSWORD: process.env.PGPASSWORD || '',
+  PGSSLMODE: process.env.PGSSLMODE || 'require',
+  PGSSLROOTCERT: process.env.PGSSLROOTCERT || '',
+  DB_WRITE_FREEZE: process.env.DB_WRITE_FREEZE || 'false',
+  JOB_EXECUTION_MODE: process.env.JOB_EXECUTION_MODE || 'queue'
+};
+
 module.exports = {
   apps: [
-    {
-      name: 'cloud-sql-proxy',
-      script: '/usr/local/bin/cloud-sql-proxy',
-      args: 'shields-outbound-fulfill:europe-southwest1:shields-outbound-sql --port 5432 --address 127.0.0.1',
-      env: {
-        GOOGLE_APPLICATION_CREDENTIALS: '/root/.secrets/gcp-key.json'
-      },
-      autorestart: true,
-      max_restarts: 5,
-      restart_delay: 3000
-    },
     {
       name: 'shields-outbound-server',
       script: 'src/index.js',
       cwd: '/root/shields-outbound/server',
       env: {
-        NODE_ENV: 'production',
-        PORT: 4000,
-        PGHOST: '127.0.0.1',
-        PGPORT: 5432,
-        PGDATABASE: 'shields_outbound',
-        PGUSER: 'postgres',
-        PGPASSWORD: 'Rinn2015!',
-        PGSSLMODE: 'disable'
+        ...baseEnv
       },
       autorestart: true
     },
@@ -34,13 +30,7 @@ module.exports = {
       instances: 2,
       exec_mode: 'fork',
       env: {
-        NODE_ENV: 'production',
-        PGHOST: '127.0.0.1',
-        PGPORT: 5432,
-        PGDATABASE: 'shields_outbound',
-        PGUSER: 'postgres',
-        PGPASSWORD: 'Rinn2015!',
-        PGSSLMODE: 'disable'
+        ...baseEnv
       },
       autorestart: true
     }

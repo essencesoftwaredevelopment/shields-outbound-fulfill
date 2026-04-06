@@ -14,7 +14,7 @@
  * - Domain deduplication for new job runs
  *
  * All operations are scoped by agency_id (and client_id if present).
- * NO Firestore usage. Cloud SQL is the single source of truth.
+ * NO Firestore usage. PostgreSQL is the single source of truth.
  */
 
 import fs from 'fs';

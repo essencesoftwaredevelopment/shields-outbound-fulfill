@@ -6,7 +6,13 @@
     "scripts": {
         "dev": "node src/index.js",
         "worker": "node src/worker/queueWorker.js",
+        "personalizer:local": "node src/scripts/run-personalizer-local.js",
         "db:ping": "node scripts/db-ping.js",
+        "db:migration:capture-baseline": "bash scripts/migration/capture-cloudsql-baseline.sh",
+        "db:migration:export-data": "bash scripts/migration/export-cloudsql-data.sh",
+        "db:migration:import-target": "bash scripts/migration/import-into-supabase.sh",
+        "db:migration:compare-parity": "bash scripts/migration/compare-parity.sh",
+        "db:migration:validate-target": "bash scripts/migration/validate-target.sh",
         "test": "node --test \"src/utils/__tests__/*.test.js\""
     },
     "dependencies": {

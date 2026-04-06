@@ -12,9 +12,14 @@ const WORKER_ID = `${os.hostname()}-${process.pid}`;
 const POLL_INTERVAL_MS = Math.max(parseInt(process.env.JOB_QUEUE_POLL_MS || '1500', 10), 250);
 
 let shutdownRequested = false;
+let writeFreezeLogged = false;
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isWriteFreezeEnabled() {
+    return String(process.env.DB_WRITE_FREEZE || 'false').toLowerCase() === 'true';
 }
 
 function runChild(jobId) {
@@ -67,6 +72,16 @@ async function workerLoop() {
     console.log(`[worker:${WORKER_ID}] Queue worker started (poll ${POLL_INTERVAL_MS}ms)`);
     while (!shutdownRequested) {
         try {
+            if (isWriteFreezeEnabled()) {
+                if (!writeFreezeLogged) {
+                    console.warn(`[worker:${WORKER_ID}] DB_WRITE_FREEZE=true: skipping queue claims`);
+                    writeFreezeLogged = true;
+                }
+                await sleep(POLL_INTERVAL_MS);
+                continue;
+            }
+            writeFreezeLogged = false;
+
             const claimed = await claimNextQueuedJob(WORKER_ID);
             if (!claimed) {
                 await sleep(POLL_INTERVAL_MS);

@@ -3,7 +3,7 @@
  * 
  * Helps find uid, clientId, and sqlClientId for a job by querying:
  * - Firestore for job metadata
- * - Cloud SQL for client information
+ * - PostgreSQL for client information
  * 
  * Usage: node src/scripts/lookup-job-info.js <jobId>
  */
