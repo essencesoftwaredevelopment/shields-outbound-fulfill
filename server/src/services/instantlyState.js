@@ -272,13 +272,13 @@ class InstantlySyncCancelledError extends Error {
     }
 }
 
-async function waitForInstantlyRateLimitSlot(apiKey) {
+async function waitForInstantlyRateLimitSlot(apiKey, syncRunId = null) {
     const now = Date.now();
     const nextAvailableAt = Math.max(instantlyNextRequestAtByKey.get(apiKey) || 0, now);
     instantlyNextRequestAtByKey.set(apiKey, nextAvailableAt + INSTANTLY_MIN_REQUEST_INTERVAL_MS);
     const waitMs = nextAvailableAt - now;
     if (waitMs > 0) {
-        await sleep(waitMs);
+        await sleepWithCancellation(waitMs, syncRunId);
     }
 }
 
@@ -441,11 +441,26 @@ async function sleepWithCancellation(ms, syncRunId = null) {
 async function instantlyRequest({ apiKey, path, method = 'GET', body, syncRunId = null }) {
     for (let attempt = 0; attempt <= INSTANTLY_MAX_RETRIES; attempt += 1) {
         await assertSyncRunNotCancelled(syncRunId);
-        await waitForInstantlyRateLimitSlot(apiKey);
+        await waitForInstantlyRateLimitSlot(apiKey, syncRunId);
 
         const controller = new AbortController();
         registerInstantlyAbortController(syncRunId, controller);
         const timeoutId = setTimeout(() => controller.abort(), INSTANTLY_REQUEST_TIMEOUT_MS);
+        let cancellationWatchId = null;
+
+        if (syncRunId) {
+            cancellationWatchId = setInterval(() => {
+                shouldStopInstantlySyncRun(syncRunId)
+                    .then((stopRequested) => {
+                        if (stopRequested) {
+                            controller.abort();
+                        }
+                    })
+                    .catch(() => {
+                        // ignore cancellation polling errors during request teardown
+                    });
+            }, 250);
+        }
 
         try {
             const response = await fetch(`${INSTANTLY_API_BASE_URL}${path}`, {
@@ -509,6 +524,9 @@ async function instantlyRequest({ apiKey, path, method = 'GET', body, syncRunId 
             await sleepWithCancellation(computeRetryDelayMs(wrappedError, attempt), syncRunId);
         } finally {
             clearTimeout(timeoutId);
+            if (cancellationWatchId) {
+                clearInterval(cancellationWatchId);
+            }
             unregisterInstantlyAbortController(syncRunId, controller);
         }
     }
