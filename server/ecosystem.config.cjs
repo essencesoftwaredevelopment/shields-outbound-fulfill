@@ -34,7 +34,7 @@ module.exports = {
       name: 'shields-outbound-worker',
       script: 'src/worker/queueWorker.js',
       cwd: '/root/shields-outbound/server',
-      instances: 2,
+      instances: 1,
       exec_mode: 'fork',
       env: {
         ...baseEnv
