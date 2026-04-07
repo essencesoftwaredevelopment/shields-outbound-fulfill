@@ -18,6 +18,13 @@ import { pool } from '../lib/db.js';
 
 const router = express.Router();
 
+function setNoStoreHeaders(res) {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.set('Surrogate-Control', 'no-store');
+}
+
 function safeDecodeURIComponent(value = '') {
     try {
         return decodeURIComponent(value);
@@ -125,6 +132,343 @@ function clientMatchersOverlap(left, right) {
         || setsIntersect(left.sets.compact, right.sets.compact);
 }
 
+const LEAD_FILTER_FIELDS = [
+    {
+        key: 'full_name',
+        label: 'Founder Name',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'eq', label: 'Equals' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        key: 'email',
+        label: 'Email',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'eq', label: 'Equals' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        key: 'email_status',
+        label: 'Email Status',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'is_empty', label: 'Is Empty' }
+        ],
+        options: [
+            { value: 'valid', label: 'Valid' },
+            { value: 'risky', label: 'Valid-Risky' },
+            { value: 'invalid', label: 'Invalid' },
+            { value: 'unknown', label: 'Unknown' }
+        ]
+    },
+    {
+        key: 'domain',
+        label: 'Domain',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'eq', label: 'Equals' }
+        ]
+    },
+    {
+        key: 'job_id',
+        label: 'Job ID',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'eq', label: 'Equals' },
+            { key: 'is_empty', label: 'Is Empty' }
+        ]
+    },
+    {
+        key: 'created_at',
+        label: 'Created At',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' }
+        ]
+    },
+    {
+        key: 'last_contacted_at',
+        label: 'Last Contacted',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'older_than_days', label: 'Older Than Days' },
+            { key: 'is_empty', label: 'Is Empty' }
+        ]
+    },
+    {
+        key: 'added_to_campaign_at',
+        label: 'Added To Campaign',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'is_empty', label: 'Is Empty' }
+        ]
+    },
+    {
+        key: 'instantly_status',
+        label: 'Instantly Status',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' }
+        ],
+        options: [
+            { value: 'active', label: 'Active' },
+            { value: 'paused', label: 'Paused' },
+            { value: 'completed', label: 'Completed' },
+            { value: 'bounced', label: 'Bounced' },
+            { value: 'unsubscribed', label: 'Unsubscribed' },
+            { value: 'skipped', label: 'Skipped' },
+            { value: 'interested', label: 'Interested' },
+            { value: 'meeting_booked', label: 'Meeting Booked' },
+            { value: 'meeting_completed', label: 'Meeting Completed' },
+            { value: 'won', label: 'Won' },
+            { value: 'out_of_office', label: 'Out Of Office' },
+            { value: 'not_interested', label: 'Not Interested' },
+            { value: 'wrong_person', label: 'Wrong Person' },
+            { value: 'lost', label: 'Lost' },
+            { value: 'no_show', label: 'No Show' }
+        ]
+    },
+    {
+        key: 'campaign_count_all_time',
+        label: 'Campaign Count',
+        type: 'number',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' }
+        ]
+    }
+];
+
+const LEAD_FILTER_FIELD_MAP = new Map(LEAD_FILTER_FIELDS.map((field) => [field.key, field]));
+
+function getLeadFilterFieldsPayload() {
+    return LEAD_FILTER_FIELDS.map((field) => ({
+        key: field.key,
+        label: field.label,
+        type: field.type,
+        operators: field.operators,
+        options: field.options || []
+    }));
+}
+
+function parseLeadFiltersQuery(rawFilters) {
+    if (typeof rawFilters !== 'string' || !rawFilters.trim()) return [];
+
+    let parsed;
+    try {
+        parsed = JSON.parse(rawFilters);
+    } catch {
+        const error = new Error('Invalid filters JSON.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    if (!Array.isArray(parsed)) {
+        const error = new Error('filters must be an array.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    return parsed.slice(0, 25);
+}
+
+function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
+    if (operatorKey === 'is_empty' || operatorKey === 'not_empty') return null;
+
+    if (fieldKey === 'campaign_count_all_time' || operatorKey === 'older_than_days') {
+        const parsed = Number(rawValue);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    if (fieldKey === 'created_at' || fieldKey === 'last_contacted_at' || fieldKey === 'added_to_campaign_at') {
+        const normalized = normalizeOptionalTimestamp(rawValue);
+        return normalized || null;
+    }
+
+    const normalizedText = normalizeOptionalText(rawValue);
+    if (!normalizedText) return null;
+
+    if (fieldKey === 'email_status') {
+        const lowered = normalizedText.toLowerCase();
+        return lowered === 'valid-risky' ? 'risky' : lowered;
+    }
+
+    if (fieldKey === 'instantly_status') {
+        return normalizedText.toLowerCase();
+    }
+
+    return normalizedText;
+}
+
+function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
+    const clauses = [];
+    const bindParam = (value) => {
+        paramsState.params.push(value);
+        const ref = `$${paramsState.paramIndex}`;
+        paramsState.paramIndex += 1;
+        return ref;
+    };
+
+    for (const rawFilter of rawFilters) {
+        if (!rawFilter || typeof rawFilter !== 'object' || Array.isArray(rawFilter)) continue;
+
+        const fieldKey = normalizeOptionalText(rawFilter.field)?.toLowerCase() || '';
+        const operatorKey = normalizeOptionalText(rawFilter.op)?.toLowerCase() || '';
+        if (!fieldKey || !operatorKey) continue;
+
+        const fieldDef = LEAD_FILTER_FIELD_MAP.get(fieldKey);
+        if (!fieldDef) continue;
+        if (!fieldDef.operators.some((operator) => operator.key === operatorKey)) continue;
+
+        const normalizedValue = normalizeLeadFilterValue(fieldKey, operatorKey, rawFilter.value);
+        if (operatorKey !== 'is_empty' && operatorKey !== 'not_empty' && normalizedValue === null) continue;
+
+        if (fieldKey === 'full_name') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`LOWER(COALESCE(c.full_name, '')) LIKE ${ref}`);
+            } else if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.full_name, '')) = ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.full_name IS NULL OR BTRIM(c.full_name) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '')`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'email') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`LOWER(COALESCE(c.email, '')) LIKE ${ref}`);
+            } else if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.email, '')) = ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.email IS NULL OR BTRIM(c.email) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.email IS NOT NULL AND BTRIM(c.email) <> '')`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'email_status') {
+            if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.email_status, '')) = ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.email_status IS NULL OR BTRIM(c.email_status) = '')`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'domain') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`LOWER(COALESCE(co.domain_normalized, '')) LIKE ${ref}`);
+            } else if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(co.domain_normalized, '')) = ${ref}`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'job_id') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`LOWER(COALESCE(c.job_id, '')) LIKE ${ref}`);
+            } else if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`COALESCE(c.job_id, '') = ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.job_id IS NULL OR BTRIM(c.job_id) = '')`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'created_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`c.created_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`c.created_at < (${ref}::date + INTERVAL '1 day')`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'last_contacted_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`c.last_contacted_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`c.last_contacted_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'older_than_days') {
+                const ref = bindParam(Number(normalizedValue));
+                clauses.push(`(c.last_contacted_at IS NULL OR c.last_contacted_at < NOW() - (${ref}::text || ' days')::interval)`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`c.last_contacted_at IS NULL`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'added_to_campaign_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`cs.last_campaign_added_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`cs.last_campaign_added_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`cs.last_campaign_added_at IS NULL`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'instantly_status' && operatorKey === 'eq') {
+            const ref = bindParam(String(normalizedValue));
+            clauses.push(`(
+                ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
+                OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
+            )`);
+            continue;
+        }
+
+        if (fieldKey === 'campaign_count_all_time') {
+            const ref = bindParam(Number(normalizedValue));
+            const target = 'COALESCE(cs.campaign_count_all_time, 0)';
+            if (operatorKey === 'eq') clauses.push(`${target} = ${ref}`);
+            if (operatorKey === 'gt') clauses.push(`${target} > ${ref}`);
+            if (operatorKey === 'gte') clauses.push(`${target} >= ${ref}`);
+            if (operatorKey === 'lt') clauses.push(`${target} < ${ref}`);
+            if (operatorKey === 'lte') clauses.push(`${target} <= ${ref}`);
+        }
+    }
+
+    return clauses;
+}
+
 /**
  * GET /leads
  *
@@ -139,6 +483,8 @@ function clientMatchersOverlap(left, right) {
  *   - fullName: Specific full name search (contains, for segments)
  *   - founderFilter: Filter founder existence (exists, not_found)
  *   - emailFilter: Filter email existence (exists, not_found)
+ *   - instantlyStatus: Filter by active Instantly campaign status/interest status label
+ *   - filters: JSON array of dynamic filter clauses
  *   - jobId: Filter by exact job_id
  *   - createdAfter: Filter leads created after date (ISO 8601 format)
  *   - createdBefore: Filter leads created before date (ISO 8601 format)
@@ -149,6 +495,7 @@ function clientMatchersOverlap(left, right) {
  */
 router.get('/leads', verifyFirebaseToken, async (req, res) => {
     try {
+        setNoStoreHeaders(res);
         const agencyId = req.agencyId;
         const {
             clientId: clientSlug,
@@ -159,10 +506,15 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             fullName,
             founderFilter,
             emailFilter,
+            instantlyStatus,
+            filters: rawFilters,
             jobId,
             createdAfter,
             createdBefore,
             instantlyCampaignId,
+            includeLatestEvent,
+            includeTotal,
+            countOnly,
             limit = 200,
             offset = 0
         } = req.query;
@@ -182,11 +534,35 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
 
         const parsedLimit = Math.min(parseInt(limit, 10) || 200, 5000);
         const parsedOffset = parseInt(offset, 10) || 0;
+        const shouldIncludeLatestEvent = includeLatestEvent === 'true' || includeLatestEvent === '1';
+        const shouldIncludeTotal = includeTotal === 'true' || includeTotal === '1';
+        const isCountOnly = countOnly === 'true' || countOnly === '1';
+
+        const dynamicFilters = parseLeadFiltersQuery(rawFilters);
+        const hasAnyLeadFilters = Boolean(
+            emailStatus
+            || emailStatusMulti
+            || roleType
+            || (typeof search === 'string' && search.trim())
+            || (typeof fullName === 'string' && fullName.trim())
+            || founderFilter
+            || emailFilter
+            || instantlyStatus
+            || (typeof jobId === 'string' && jobId.trim())
+            || createdAfter
+            || createdBefore
+            || instantlyCampaignId
+            || dynamicFilters.length > 0
+        );
 
         // Build WHERE clause with filters
-        let whereClause = 'c.agency_id = $1 AND co.client_id = $2';
-        const params = [agencyId, clientId];
-        let paramIndex = 3;
+        let whereClause = 'c.agency_id = $1 AND c.client_id = $2';
+        const paramsState = {
+            params: [agencyId, clientId],
+            paramIndex: 3
+        };
+        const params = paramsState.params;
+        let paramIndex = paramsState.paramIndex;
 
         // Single email status filter
         if (emailStatus) {
@@ -197,6 +573,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 params.push(emailStatus);
                 paramIndex++;
             }
+            paramsState.paramIndex = paramIndex;
         }
 
         // Multi-select email status filter (for segments)
@@ -207,6 +584,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 whereClause += ` AND c.email_status IN (${placeholders})`;
                 params.push(...statuses);
                 paramIndex += statuses.length;
+                paramsState.paramIndex = paramIndex;
             }
         }
 
@@ -214,6 +592,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             whereClause += ` AND c.role_type = $${paramIndex}`;
             params.push(roleType);
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
         // General search filter (exact match on domain, email, or founder name)
@@ -226,6 +605,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             )`;
             params.push(searchTerm);
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
         // Specific full name search (for segments)
@@ -234,6 +614,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             whereClause += ` AND LOWER(c.full_name) LIKE $${paramIndex}`;
             params.push(nameTerm);
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
         // Filter by founder existence
@@ -255,10 +636,28 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             whereClause += ` AND (c.email_status IS NULL OR c.email_status = '') AND (c.email IS NULL OR c.email = '')`;
         }
 
+        if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
+            const normalizedInstantlyStatus = instantlyStatus.trim().toLowerCase();
+            whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM contact_instantly_campaigns cic_status
+                WHERE cic_status.contact_id = c.id
+                AND cic_status.active = TRUE
+                AND (
+                    LOWER(COALESCE(cic_status.interest_status_label, '')) = $${paramIndex}
+                    OR LOWER(COALESCE(cic_status.lead_status_label, '')) = $${paramIndex}
+                )
+            )`;
+            params.push(normalizedInstantlyStatus);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
         if (typeof jobId === 'string' && jobId.trim()) {
             whereClause += ` AND c.job_id = $${paramIndex}`;
             params.push(jobId.trim());
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
         // Date filters
@@ -266,12 +665,14 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             whereClause += ` AND c.created_at >= $${paramIndex}::timestamp`;
             params.push(createdAfter);
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
         if (createdBefore) {
             whereClause += ` AND c.created_at <= $${paramIndex}::timestamp`;
             params.push(createdBefore);
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
         let sqlInstantlyCampaignId = null;
@@ -306,29 +707,178 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             )`;
             params.push(sqlInstantlyCampaignId);
             paramIndex++;
+            paramsState.paramIndex = paramIndex;
         }
 
-        const searchActive = typeof search === 'string' && search.trim() !== '';
+        const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
+        if (dynamicClauses.length > 0) {
+            whereClause += ` AND ${dynamicClauses.map((clause) => `(${clause})`).join(' AND ')}`;
+        }
+        paramIndex = paramsState.paramIndex;
+
         const filterParams = [...params];
+        const baseWithClause = `
+            WITH scoped_companies AS (
+                SELECT
+                    id,
+                    domain_normalized
+                FROM companies
+                WHERE agency_id = $1
+                AND client_id = $2
+            ),
+            scoped_campaigns AS (
+                SELECT
+                    id,
+                    instantly_campaign_id,
+                    name
+                FROM instantly_campaigns
+                WHERE agency_id = $1
+                AND client_id = $2
+            ),
+            campaign_stats AS (
+                SELECT
+                    cic.contact_id,
+                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
+                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    MAX(cic.added_at) AS last_campaign_added_at,
+                    MAX(cic.timestamp_last_reply) AS last_reply_at,
+                    BOOL_OR(cic.email_reply_count > 0) AS has_replied,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT LOWER(cic.lead_status_label)) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.lead_status_label IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_lead_status_labels,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT LOWER(cic.interest_status_label)) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.interest_status_label IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_interest_status_labels
+                FROM contact_instantly_campaigns cic
+                JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
+                GROUP BY cic.contact_id
+            )
+        `;
+        const countQuery = `
+            ${baseWithClause}
+            SELECT COUNT(*) as count
+            FROM contacts c
+            JOIN scoped_companies co ON c.company_id = co.id
+            LEFT JOIN campaign_stats cs ON cs.contact_id = c.id
+            WHERE ${whereClause}
+        `;
+
+        if (isCountOnly && !hasAnyLeadFilters) {
+            const simpleCountResult = await pool.query(
+                `SELECT COUNT(*) as count
+                 FROM contacts c
+                 WHERE c.agency_id = $1
+                 AND c.client_id = $2`,
+                [agencyId, clientId]
+            );
+            const total = parseInt(simpleCountResult.rows[0]?.count || 0, 10);
+            return res.json({
+                leads: [],
+                total,
+                limit: parsedLimit,
+                offset: parsedOffset,
+                hasMore: false
+            });
+        }
+
+        if (isCountOnly) {
+            const countResult = await pool.query(countQuery, filterParams);
+            const total = parseInt(countResult.rows[0]?.count || 0, 10);
+            return res.json({
+                leads: [],
+                total,
+                limit: parsedLimit,
+                offset: parsedOffset,
+                hasMore: false
+            });
+        }
+
+        const pagedWithClause = `
+            ${baseWithClause},
+            paged_contacts AS (
+                SELECT
+                    c.id,
+                    c.agency_id,
+                    c.company_id,
+                    c.role_type,
+                    c.full_name,
+                    c.email,
+                    c.email_status,
+                    c.last_verified_at,
+                    c.last_contacted_at,
+                    c.confidence,
+                    c.personalization_first_line,
+                    c.job_id,
+                    c.created_at,
+                    c.updated_at,
+                    co.domain_normalized,
+                    cs.campaign_count_all_time,
+                    cs.campaign_count_active,
+                    cs.last_campaign_added_at
+                FROM contacts c
+                JOIN scoped_companies co ON c.company_id = co.id
+                LEFT JOIN campaign_stats cs ON cs.contact_id = c.id
+                WHERE ${whereClause}
+                ORDER BY cs.last_campaign_added_at DESC NULLS LAST, c.created_at DESC
+                LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+            )
+        `;
+
+        const latestEventSelect = shouldIncludeLatestEvent
+            ? `
+                le.event_type AS latest_event_type,
+                le.reply_category AS latest_event_reply_category,
+                le.message_text AS latest_event_message_text,
+                le.reply_text_snippet AS latest_event_reply_text_snippet,
+                le.event_timestamp AS latest_event_timestamp,
+                le.email_account AS latest_event_email_account,
+            `
+            : '';
+
+        const latestEventJoin = shouldIncludeLatestEvent
+            ? `
+            LEFT JOIN LATERAL (
+                SELECT
+                    cie.event_type,
+                    cie.reply_category,
+                    cie.message_text,
+                    cie.reply_text_snippet,
+                    cie.event_timestamp,
+                    cie.email_account
+                FROM contact_instantly_events cie
+                WHERE cie.contact_id = pc.id
+                ORDER BY cie.event_timestamp DESC NULLS LAST, cie.created_at DESC NULLS LAST, cie.id DESC
+                LIMIT 1
+            ) le ON TRUE`
+            : '';
 
         // Fetch contacts with pagination and campaign data
         const contactsQuery = `
+            ${pagedWithClause}
             SELECT
-                c.id,
-                c.agency_id,
-                c.company_id,
-                c.role_type,
-                c.full_name,
-                c.email,
-                c.email_status,
-                c.last_verified_at,
-                c.last_contacted_at,
-                c.confidence,
-                c.personalization_first_line,
-                c.job_id,
-                c.created_at,
-                c.updated_at,
-                co.domain_normalized,
+                pc.id,
+                pc.agency_id,
+                pc.company_id,
+                pc.role_type,
+                pc.full_name,
+                pc.email,
+                pc.email_status,
+                pc.last_verified_at,
+                pc.last_contacted_at,
+                pc.confidence,
+                pc.personalization_first_line,
+                pc.job_id,
+                pc.created_at,
+                pc.updated_at,
+                pc.domain_normalized,
                 ci.annual_revenue_text,
                 ci.annual_revenue_min,
                 ci.annual_revenue_max,
@@ -339,50 +889,50 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 ci.source AS insight_source,
                 ci.notes AS insight_notes,
                 ci.attributes AS insight_attributes,
+                pc.campaign_count_all_time,
+                pc.campaign_count_active,
+                pc.last_campaign_added_at,
+                ${latestEventSelect}
                 (
                     SELECT json_agg(
                         json_build_object(
-                            'campaignId', ic.instantly_campaign_id,
-                            'campaignName', ic.name,
+                            'campaignId', sc.instantly_campaign_id,
+                            'campaignName', sc.name,
                             'addedAt', cic.added_at,
                             'active', cic.active,
                             'lastReplyAt', cic.timestamp_last_reply,
                             'lastReplyCategory', cic.last_reply_category,
                             'leadStatus', cic.lead_status_label,
                             'interestStatus', cic.interest_status_label,
-                            'lastSyncedAt', cic.last_synced_at
+                            'lastSyncedAt', cic.last_synced_at,
+                            'lastBounceAt', cic.last_bounce_at,
+                            'timestampLastInterestChange', cic.timestamp_last_interest_change
                         )
                         ORDER BY COALESCE(cic.last_synced_at, cic.added_at) DESC NULLS LAST, cic.added_at DESC NULLS LAST
                     )
                     FROM contact_instantly_campaigns cic
-                    JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
-                    WHERE cic.contact_id = c.id
+                    JOIN scoped_campaigns sc ON sc.id = cic.campaign_id
+                    WHERE cic.contact_id = pc.id
                     AND cic.active = TRUE
                 ) as campaigns_data
-            FROM contacts c
-            JOIN companies co ON c.company_id = co.id
-            LEFT JOIN contact_insights ci ON ci.contact_id = c.id
-            WHERE ${whereClause}
-            ORDER BY c.created_at DESC
-            LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+            FROM paged_contacts pc
+            LEFT JOIN contact_insights ci ON ci.contact_id = pc.id
+            ${latestEventJoin}
+            ORDER BY pc.last_campaign_added_at DESC NULLS LAST, pc.created_at DESC
         `;
-        params.push(parsedLimit, parsedOffset);
+        params.push(parsedLimit + 1, parsedOffset);
 
         const result = await pool.query(contactsQuery, params);
-        const total = searchActive
-            ? result.rows.length
-            : await (async () => {
-                const countQuery = `
-                    SELECT COUNT(*) as count
-                    FROM contacts c
-                    JOIN companies co ON c.company_id = co.id
-                    WHERE ${whereClause}
-                `;
-                const countResult = await pool.query(countQuery, filterParams);
-                return parseInt(countResult.rows[0]?.count || 0, 10);
-            })();
+        const hasMore = result.rows.length > parsedLimit;
+        const pagedRows = hasMore ? result.rows.slice(0, parsedLimit) : result.rows;
+        let total = null;
 
-        const leads = result.rows.map((row) => ({
+        if (shouldIncludeTotal) {
+            const countResult = await pool.query(countQuery, filterParams);
+            total = parseInt(countResult.rows[0]?.count || 0, 10);
+        }
+
+        const leads = pagedRows.map((row) => ({
             id: row.id,
             domain: row.domain_normalized,
             email: row.email,
@@ -399,7 +949,21 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             jobId: row.job_id,
             createdAt: row.created_at,
             updatedAt: row.updated_at,
+            lastContactedAt: row.last_contacted_at,
+            campaignCountAllTime: row.campaign_count_all_time,
+            campaignCountActive: row.campaign_count_active,
+            lastCampaignAddedAt: row.last_campaign_added_at,
             campaignsData: row.campaigns_data || [],
+            latestEvent: row.latest_event_type
+                ? {
+                    eventType: row.latest_event_type,
+                    replyCategory: row.latest_event_reply_category,
+                    messageText: row.latest_event_message_text,
+                    replyTextSnippet: row.latest_event_reply_text_snippet,
+                    eventTimestamp: row.latest_event_timestamp,
+                    emailAccount: row.latest_event_email_account
+                }
+                : null,
             insights: {
                 annualRevenueText: row.annual_revenue_text,
                 annualRevenueMin: row.annual_revenue_min,
@@ -419,12 +983,18 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             total,
             limit: parsedLimit,
             offset: parsedOffset,
-            hasMore: searchActive ? result.rows.length === parsedLimit : parsedOffset + parsedLimit < total
+            hasMore
         });
     } catch (error) {
         console.error('Error fetching leads:', error);
-        res.status(500).json({ error: 'Failed to fetch leads' });
+        res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to fetch leads' });
     }
+});
+
+router.get('/leads/filter-fields', verifyFirebaseToken, async (_req, res) => {
+    res.json({
+        fields: getLeadFilterFieldsPayload()
+    });
 });
 
 /**
@@ -849,30 +1419,89 @@ router.get('/leads/:contactId/events', verifyFirebaseToken, async (req, res) => 
         }
 
         const result = await pool.query(
-            `SELECT
-                cie.id,
-                cie.event_type,
-                cie.reply_category,
-                cie.instantly_campaign_id,
-                ic.name AS campaign_name,
-                cie.instantly_lead_id,
-                cie.lead_email,
-                cie.email_account,
-                cie.unibox_url,
-                cie.step,
-                cie.variant,
-                cie.message_text,
-                cie.event_timestamp,
-                cie.source,
-                cie.payload,
-                cie.created_at
-             FROM contact_instantly_events cie
-             JOIN contacts c ON c.id = cie.contact_id
-             LEFT JOIN instantly_campaigns ic ON ic.id = cie.campaign_id
-             WHERE cie.contact_id = $1
-             AND c.agency_id = $2
-             ORDER BY cie.event_timestamp DESC, cie.id DESC
-             LIMIT $3`,
+            `WITH timeline_events AS (
+                SELECT
+                    cie.id::text AS id,
+                    cie.event_type,
+                    cie.reply_category,
+                    cie.instantly_campaign_id,
+                    ic.name AS campaign_name,
+                    cie.instantly_lead_id,
+                    cie.lead_email,
+                    cie.email_account,
+                    cie.unibox_url,
+                    cie.step,
+                    cie.variant,
+                    cie.message_text,
+                    cie.reply_text_snippet,
+                    cie.event_timestamp,
+                    cie.source,
+                    cie.payload,
+                    cie.created_at
+                FROM contact_instantly_events cie
+                JOIN contacts c ON c.id = cie.contact_id
+                LEFT JOIN instantly_campaigns ic ON ic.id = cie.campaign_id
+                WHERE cie.contact_id = $1
+                AND c.agency_id = $2
+
+                UNION ALL
+
+                SELECT
+                    CONCAT('campaign-link:', cic.contact_id, ':', cic.campaign_id) AS id,
+                    'added_to_campaign' AS event_type,
+                    NULL::text AS reply_category,
+                    ic.instantly_campaign_id,
+                    ic.name AS campaign_name,
+                    cic.instantly_lead_id,
+                    c.email AS lead_email,
+                    NULL::text AS email_account,
+                    NULL::text AS unibox_url,
+                    NULL::integer AS step,
+                    NULL::integer AS variant,
+                    COALESCE(
+                        NULLIF(BTRIM(cic.notes), ''),
+                        CONCAT('Added to campaign via ', REPLACE(cic.upload_source, '_', ' '))
+                    ) AS message_text,
+                    NULL::text AS reply_text_snippet,
+                    cic.added_at AS event_timestamp,
+                    'campaign_link' AS source,
+                    jsonb_build_object(
+                        'upload_source', cic.upload_source,
+                        'uploaded_by', cic.uploaded_by,
+                        'job_id', cic.job_id,
+                        'notes', cic.notes,
+                        'active', cic.active,
+                        'removed_at', cic.removed_at
+                    ) AS payload,
+                    cic.added_at AS created_at
+                FROM contact_instantly_campaigns cic
+                JOIN contacts c ON c.id = cic.contact_id
+                LEFT JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+                WHERE cic.contact_id = $1
+                AND c.agency_id = $2
+                AND cic.added_at IS NOT NULL
+            )
+            SELECT
+                id,
+                event_type,
+                reply_category,
+                instantly_campaign_id,
+                campaign_name,
+                instantly_lead_id,
+                lead_email,
+                email_account,
+                unibox_url,
+                step,
+                variant,
+                message_text,
+                reply_text_snippet,
+                event_timestamp,
+                source,
+                payload,
+                created_at
+            FROM timeline_events
+            ORDER BY event_timestamp DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+            LIMIT $3`,
             [contactId, agencyId, limit]
         );
 

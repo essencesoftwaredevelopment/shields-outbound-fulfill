@@ -141,6 +141,28 @@ function extractLeadDomain(lead) {
     return extractEmailDomain(lead?.email);
 }
 
+function extractLeadCustomProperties(lead) {
+    const payload = asJsonObject(lead?.payload);
+    const custom = {};
+    const reservedKeys = new Set([
+        'email',
+        'domain',
+        'firstName',
+        'lastName',
+        'first_name',
+        'last_name'
+    ]);
+
+    for (const [key, value] of Object.entries(payload)) {
+        if (!key || reservedKeys.has(key) || value === null || value === undefined) continue;
+        const keyText = String(key).trim();
+        if (!keyText) continue;
+        custom[keyText] = value;
+    }
+
+    return custom;
+}
+
 function buildSyntheticInstantlyDomain(lead) {
     const key = asNullableText(lead?.id)
         || normalizeEmail(lead?.email)
@@ -348,6 +370,13 @@ function deriveSnapshotFromLead(lead, syncedAt) {
     const interestStatus = asNullableInt(lead?.lt_interest_status);
     return {
         instantlyLeadId: asNullableText(lead?.id),
+        addedAt: asNullableTimestamp(
+            lead?.timestamp_created
+            || lead?.createdAt
+            || lead?.created_at
+            || lead?.created
+            || lead?.created_at_utc
+        ),
         active: true,
         lastSeenAt: syncedAt,
         leadStatus,
@@ -987,6 +1016,8 @@ async function upsertInstantlyContactInsights(db, {
 }) {
     if (!contactId) return;
 
+    const customLeadProperties = extractLeadCustomProperties(lead);
+
     const attributes = {
         instantlyLeadId: asNullableText(lead?.id),
         instantlyCampaignId: asNullableText(campaign?.instantlyCampaignId),
@@ -997,7 +1028,8 @@ async function upsertInstantlyContactInsights(db, {
         email: normalizeEmail(lead?.email),
         domain: extractLeadDomain(lead),
         companyName: asNullableText(lead?.company_name || lead?.companyName || lead?.company),
-        source
+        source,
+        ...customLeadProperties
     };
 
     const sourcePayload = {
@@ -1143,6 +1175,7 @@ async function upsertCampaignSnapshots(db, rows) {
                 campaign_id BIGINT,
                 upload_source TEXT,
                 instantly_lead_id TEXT,
+                added_at TIMESTAMPTZ,
                 active BOOLEAN,
                 last_seen_at TIMESTAMPTZ,
                 lead_status INTEGER,
@@ -1173,7 +1206,7 @@ async function upsertCampaignSnapshots(db, rows) {
             )
         )
         INSERT INTO contact_instantly_campaigns (
-            contact_id, campaign_id, upload_source, instantly_lead_id, active, last_seen_at, removed_at,
+            contact_id, campaign_id, upload_source, instantly_lead_id, added_at, active, last_seen_at, removed_at,
             lead_status, lead_status_label, interest_status, interest_status_label, verification_status,
             email_open_count, email_reply_count, email_click_count,
             timestamp_last_contact, timestamp_last_open, timestamp_last_reply, timestamp_last_interest_change, timestamp_last_click,
@@ -1182,7 +1215,7 @@ async function upsertCampaignSnapshots(db, rows) {
             last_reply_category, last_event_type, last_bounce_at, last_unsubscribe_at, last_synced_at
         )
         SELECT
-            contact_id, campaign_id, upload_source, instantly_lead_id, active, last_seen_at, NULL,
+            contact_id, campaign_id, upload_source, instantly_lead_id, added_at, active, last_seen_at, NULL,
             lead_status, lead_status_label, interest_status, interest_status_label, verification_status,
             email_open_count, email_reply_count, email_click_count,
             timestamp_last_contact, timestamp_last_open, timestamp_last_reply, timestamp_last_interest_change, timestamp_last_click,
@@ -1193,6 +1226,7 @@ async function upsertCampaignSnapshots(db, rows) {
         ON CONFLICT (contact_id, campaign_id)
         DO UPDATE SET
             instantly_lead_id = COALESCE(EXCLUDED.instantly_lead_id, contact_instantly_campaigns.instantly_lead_id),
+            added_at = COALESCE(EXCLUDED.added_at, contact_instantly_campaigns.added_at),
             active = TRUE,
             last_seen_at = EXCLUDED.last_seen_at,
             removed_at = NULL,
@@ -1523,6 +1557,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
                     campaign_id: sqlCampaignId,
                     upload_source: 'instantly_sync',
                     instantly_lead_id: snapshot.instantlyLeadId,
+                    added_at: snapshot.addedAt,
                     active: snapshot.active,
                     last_seen_at: snapshot.lastSeenAt,
                     lead_status: snapshot.leadStatus,
@@ -1770,12 +1805,12 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
             `INSERT INTO contact_instantly_events (
                 agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
                 event_type, reply_category, lead_email, email_account, unibox_url, step, variant,
-                message_text, event_timestamp, fingerprint, source, payload
+                message_text, reply_text_snippet, event_timestamp, fingerprint, source, payload
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12, $13,
-                $14, $15, $16, $17, $18::jsonb
+                $14, $15, $16, $17, $18, $19::jsonb
             )
             ON CONFLICT (source, fingerprint) DO NOTHING
             RETURNING id`,
@@ -1794,6 +1829,7 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
                 asNullableInt(event?.step),
                 asNullableInt(event?.variant),
                 asNullableText(event?.message_text || event?.reply_text || event?.text),
+                asNullableText(event?.reply_text_snippet),
                 eventTimestamp,
                 fingerprint,
                 'webhook',

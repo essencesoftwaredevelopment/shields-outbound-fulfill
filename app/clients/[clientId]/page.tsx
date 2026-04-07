@@ -75,7 +75,11 @@ type Lead = {
     updatedAt?: string;
     createdAt?: string;
     lastVerifiedAt?: string;
+    lastContactedAt?: string;
     jobId?: string;
+    campaignCountAllTime?: number | null;
+    campaignCountActive?: number | null;
+    lastCampaignAddedAt?: string | null;
     campaigns?: string[];
     campaignsData?: Array<{
         campaignId: string;
@@ -87,7 +91,61 @@ type Lead = {
         leadStatus?: string | null;
         interestStatus?: string | null;
         lastSyncedAt?: string | null;
+        lastBounceAt?: string | null;
+        timestampLastInterestChange?: string | null;
     }>;
+    latestEvent?: {
+        eventType?: string | null;
+        replyCategory?: string | null;
+        messageText?: string | null;
+        replyTextSnippet?: string | null;
+        eventTimestamp?: string | null;
+        emailAccount?: string | null;
+    } | null;
+    insights?: {
+        annualRevenueText?: string | null;
+        annualRevenueMin?: number | null;
+        annualRevenueMax?: number | null;
+        usesKlaviyo?: boolean | null;
+        klaviyoPercent?: number | null;
+        discoveryCallHeld?: boolean | null;
+        lastDiscoveryCallAt?: string | null;
+        source?: string | null;
+        notes?: string | null;
+        attributes?: Record<string, unknown>;
+    };
+};
+
+type LeadFilterOperator = {
+    key: string;
+    label: string;
+};
+
+type LeadFilterOption = {
+    value: string;
+    label: string;
+};
+
+type LeadFilterField = {
+    key: string;
+    label: string;
+    type: "text" | "number" | "date" | "enum";
+    operators: LeadFilterOperator[];
+    options: LeadFilterOption[];
+};
+
+type LeadFilterClause = {
+    id: string;
+    field: string;
+    op: string;
+    value: string;
+};
+
+type LeadExportFieldDef = {
+    key: string;
+    label: string;
+    group: "Lead" | "Insights" | "Campaigns" | "Events";
+    defaultSelected?: boolean;
 };
 
 type InstantlySyncRun = {
@@ -115,6 +173,150 @@ type InstantlySyncRun = {
 };
 
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
+
+const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
+    { key: 'founder_name', label: 'Founder Name', group: 'Lead', defaultSelected: true },
+    { key: 'email', label: 'Email', group: 'Lead', defaultSelected: true },
+    { key: 'status', label: 'Status', group: 'Lead', defaultSelected: true },
+    { key: 'domain', label: 'Domain', group: 'Lead', defaultSelected: true },
+    { key: 'first_line', label: 'First Line', group: 'Lead', defaultSelected: true },
+    { key: 'created_at', label: 'Created At', group: 'Lead' },
+    { key: 'updated_at', label: 'Updated At', group: 'Lead', defaultSelected: true },
+    { key: 'last_verified_at', label: 'Last Verified At', group: 'Lead' },
+    { key: 'last_contacted_at', label: 'Last Contacted At', group: 'Lead' },
+    { key: 'role_type', label: 'Role Type', group: 'Lead' },
+    { key: 'job_id', label: 'Job ID', group: 'Lead' },
+    { key: 'annual_revenue_text', label: 'Annual Revenue Text', group: 'Insights' },
+    { key: 'annual_revenue_min', label: 'Annual Revenue Min', group: 'Insights' },
+    { key: 'annual_revenue_max', label: 'Annual Revenue Max', group: 'Insights' },
+    { key: 'uses_klaviyo', label: 'Uses Klaviyo', group: 'Insights' },
+    { key: 'klaviyo_percent', label: 'Klaviyo Percent', group: 'Insights' },
+    { key: 'discovery_call_held', label: 'Discovery Call Held', group: 'Insights' },
+    { key: 'last_discovery_call_at', label: 'Last Discovery Call At', group: 'Insights' },
+    { key: 'insight_source', label: 'Insight Source', group: 'Insights' },
+    { key: 'insight_notes', label: 'Insight Notes', group: 'Insights' },
+    { key: 'campaign_names', label: 'Campaign Names', group: 'Campaigns', defaultSelected: true },
+    { key: 'campaign_count_all_time', label: 'Campaign Count All Time', group: 'Campaigns' },
+    { key: 'campaign_count_active', label: 'Active Campaign Count', group: 'Campaigns' },
+    { key: 'added_to_campaign_at', label: 'Added To Campaign', group: 'Campaigns' },
+    { key: 'latest_campaign_name', label: 'Latest Campaign Name', group: 'Campaigns' },
+    { key: 'latest_campaign_lead_status', label: 'Latest Campaign Lead Status', group: 'Campaigns' },
+    { key: 'latest_campaign_interest_status', label: 'Latest Campaign Interest Status', group: 'Campaigns' },
+    { key: 'latest_campaign_last_reply_at', label: 'Latest Campaign Last Reply At', group: 'Campaigns' },
+    { key: 'latest_campaign_last_bounce_at', label: 'Latest Campaign Last Bounce At', group: 'Campaigns' },
+    { key: 'latest_event_type', label: 'Latest Event Type', group: 'Events' },
+    { key: 'latest_event_at', label: 'Latest Event At', group: 'Events' },
+    { key: 'latest_event_reply_category', label: 'Latest Event Reply Category', group: 'Events' },
+    { key: 'latest_event_message_text', label: 'Latest Event Message Text', group: 'Events' },
+    { key: 'latest_event_reply_text_snippet', label: 'Latest Event Reply Text Snippet', group: 'Events' },
+    { key: 'latest_event_email_account', label: 'Latest Event Email Account', group: 'Events' }
+];
+
+const DEFAULT_LEAD_EXPORT_FIELD_KEYS = LEAD_EXPORT_FIELDS
+    .filter((field) => field.defaultSelected)
+    .map((field) => field.key);
+
+function createLeadFilterId() {
+    return `lead-filter-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getLeadCampaignNames(lead: Lead): string[] {
+    if (Array.isArray(lead.campaignsData) && lead.campaignsData.length > 0) {
+        return lead.campaignsData
+            .map((campaign) => campaign.campaignName)
+            .filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+    }
+    if (Array.isArray(lead.campaigns) && lead.campaigns.length > 0) {
+        return lead.campaigns.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+    }
+    return [];
+}
+
+function csvEscape(value: unknown): string {
+    const normalized = value == null ? "" : String(value);
+    return `"${normalized.replace(/"/g, '""')}"`;
+}
+
+function getLeadExportValue(lead: Lead, key: string): unknown {
+    const latestCampaign = Array.isArray(lead.campaignsData) && lead.campaignsData.length > 0
+        ? lead.campaignsData[0]
+        : null;
+
+    switch (key) {
+    case 'founder_name':
+        return lead.founderName || '';
+    case 'email':
+        return lead.email || '';
+    case 'status':
+        return lead.status || '';
+    case 'domain':
+        return lead.domain || '';
+    case 'first_line':
+        return lead.firstLine || '';
+    case 'created_at':
+        return lead.createdAt || '';
+    case 'updated_at':
+        return lead.updatedAt || '';
+    case 'last_verified_at':
+        return lead.lastVerifiedAt || '';
+    case 'last_contacted_at':
+        return lead.lastContactedAt || '';
+    case 'role_type':
+        return lead.roleType || '';
+    case 'job_id':
+        return lead.jobId || '';
+    case 'annual_revenue_text':
+        return lead.insights?.annualRevenueText || '';
+    case 'annual_revenue_min':
+        return lead.insights?.annualRevenueMin ?? '';
+    case 'annual_revenue_max':
+        return lead.insights?.annualRevenueMax ?? '';
+    case 'uses_klaviyo':
+        return lead.insights?.usesKlaviyo == null ? '' : (lead.insights.usesKlaviyo ? 'Yes' : 'No');
+    case 'klaviyo_percent':
+        return lead.insights?.klaviyoPercent ?? '';
+    case 'discovery_call_held':
+        return lead.insights?.discoveryCallHeld == null ? '' : (lead.insights.discoveryCallHeld ? 'Yes' : 'No');
+    case 'last_discovery_call_at':
+        return lead.insights?.lastDiscoveryCallAt || '';
+    case 'insight_source':
+        return lead.insights?.source || '';
+    case 'insight_notes':
+        return lead.insights?.notes || '';
+    case 'campaign_names':
+        return getLeadCampaignNames(lead).join('; ');
+    case 'campaign_count_all_time':
+        return lead.campaignCountAllTime ?? '';
+    case 'campaign_count_active':
+        return lead.campaignCountActive ?? '';
+    case 'added_to_campaign_at':
+        return lead.lastCampaignAddedAt || '';
+    case 'latest_campaign_name':
+        return latestCampaign?.campaignName || '';
+    case 'latest_campaign_lead_status':
+        return latestCampaign?.leadStatus || '';
+    case 'latest_campaign_interest_status':
+        return latestCampaign?.interestStatus || '';
+    case 'latest_campaign_last_reply_at':
+        return latestCampaign?.lastReplyAt || '';
+    case 'latest_campaign_last_bounce_at':
+        return latestCampaign?.lastBounceAt || '';
+    case 'latest_event_type':
+        return lead.latestEvent?.eventType || '';
+    case 'latest_event_at':
+        return lead.latestEvent?.eventTimestamp || '';
+    case 'latest_event_reply_category':
+        return lead.latestEvent?.replyCategory || '';
+    case 'latest_event_message_text':
+        return lead.latestEvent?.messageText || '';
+    case 'latest_event_reply_text_snippet':
+        return lead.latestEvent?.replyTextSnippet || '';
+    case 'latest_event_email_account':
+        return lead.latestEvent?.emailAccount || '';
+    default:
+        return '';
+    }
+}
 
 type Campaign = {
     id: string;
@@ -670,10 +872,11 @@ export default function ClientPage() {
     // Leads state
     const [leads, setLeads] = useState<Lead[]>([]);
     const [allLeadsCached, setAllLeadsCached] = useState(false); // Track if we've fetched all leads for filtering
-    const [stats, setStats] = useState<{ total: number; verified: number; unverified: number }>(() => ({ total: 0, verified: 0, unverified: 0 }));
+    const [stats, setStats] = useState<{ total: number | null; verified: number; unverified: number }>(() => ({ total: null, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
+    const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
-    const [leadEvents, setLeadEvents] = useState<Array<{ id: number; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_category?: string }>>([]);
+    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
@@ -681,12 +884,19 @@ export default function ClientPage() {
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
     const [leadSearch, setLeadSearch] = useState<string>("");
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState<string>("");
-    const [jobIdFilter, setJobIdFilter] = useState<string>("");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
-    const [founderFilter, setFounderFilter] = useState<string>("");
-    const [emailFilter, setEmailFilter] = useState<string>("");
-    const [emailStatusFilter, setEmailStatusFilter] = useState<string>("");
+    const [leadFilterFields, setLeadFilterFields] = useState<LeadFilterField[]>([]);
+    const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
+    const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>([]);
+    const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string }>>([]);
     const [exportingCsv, setExportingCsv] = useState(false);
+    const [leadExportModalOpen, setLeadExportModalOpen] = useState(false);
+    const [selectedLeadExportFields, setSelectedLeadExportFields] = useState<string[]>(DEFAULT_LEAD_EXPORT_FIELD_KEYS);
+
+    useEffect(() => {
+        setLeadModalTab('detail');
+        setShowLeadAdvanced(false);
+    }, [selectedLead?.id]);
 
     useEffect(() => {
         if (!selectedLead || !user) {
@@ -723,6 +933,41 @@ export default function ClientPage() {
             window.clearTimeout(timeoutId);
         };
     }, [leadSearch]);
+
+    useEffect(() => {
+        if (!user) return;
+        let cancelled = false;
+
+        (async () => {
+            setLeadFilterFieldsLoading(true);
+            try {
+                const idToken = await getIdToken(user);
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/filter-fields`, {
+                    headers: { Authorization: `Bearer ${idToken}` }
+                });
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch filter fields: ${response.statusText}`);
+                }
+                const data = await response.json();
+                if (!cancelled) {
+                    setLeadFilterFields(Array.isArray(data.fields) ? data.fields : []);
+                }
+            } catch (error) {
+                console.error('Failed to fetch lead filter fields:', error);
+                if (!cancelled) {
+                    setLeadFilterFields([]);
+                }
+            } finally {
+                if (!cancelled) {
+                    setLeadFilterFieldsLoading(false);
+                }
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [user]);
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -889,6 +1134,198 @@ export default function ClientPage() {
             .join(' ');
     };
 
+    const leadFilterFieldMap = useMemo(() => {
+        return new Map(leadFilterFields.map((field) => [field.key, field]));
+    }, [leadFilterFields]);
+
+    const doesLeadFilterRequireValue = useCallback((fieldKey: string, operatorKey: string) => {
+        const field = leadFilterFieldMap.get(fieldKey);
+        if (!field) return false;
+        if (!field.operators.some((operator) => operator.key === operatorKey)) return false;
+        return operatorKey !== 'is_empty' && operatorKey !== 'not_empty';
+    }, [leadFilterFieldMap]);
+
+    const getLeadFilterInputMode = useCallback((fieldKey: string, operatorKey: string) => {
+        const field = leadFilterFieldMap.get(fieldKey);
+        if (!field) return null;
+        if (!doesLeadFilterRequireValue(fieldKey, operatorKey)) return null;
+        if (operatorKey === 'older_than_days') return 'number';
+        return field.type;
+    }, [doesLeadFilterRequireValue, leadFilterFieldMap]);
+
+    const normalizedLeadFilters = useMemo(() => {
+        return leadFilters
+            .filter((filter) => {
+                const field = leadFilterFieldMap.get(filter.field);
+                if (!field) return false;
+                if (!field.operators.some((operator) => operator.key === filter.op)) return false;
+                if (!doesLeadFilterRequireValue(filter.field, filter.op)) return true;
+                return String(filter.value || '').trim() !== '';
+            })
+            .map((filter) => ({
+                field: filter.field,
+                op: filter.op,
+                value: filter.value
+            }));
+    }, [doesLeadFilterRequireValue, leadFilterFieldMap, leadFilters]);
+
+    const leadFiltersDirty = useMemo(() => (
+        JSON.stringify(normalizedLeadFilters) !== JSON.stringify(appliedLeadFilters)
+    ), [appliedLeadFilters, normalizedLeadFilters]);
+
+    const addLeadFilter = useCallback(() => {
+        setLeadFilters((prev) => {
+            const firstField = leadFilterFields[0];
+            if (!firstField) return prev;
+            return [
+                ...prev,
+                {
+                    id: createLeadFilterId(),
+                    field: firstField.key,
+                    op: firstField.operators[0]?.key || '',
+                    value: ''
+                }
+            ];
+        });
+    }, [leadFilterFields]);
+
+    const updateLeadFilter = useCallback((filterId: string, updates: Partial<LeadFilterClause>) => {
+        setLeadFilters((prev) => prev.map((item) => (
+            item.id === filterId ? { ...item, ...updates } : item
+        )));
+    }, []);
+
+    const removeLeadFilter = useCallback((filterId: string) => {
+        setLeadFilters((prev) => prev.filter((item) => item.id !== filterId));
+    }, []);
+
+    const applyLeadFilters = useCallback(() => {
+        setAppliedLeadFilters(normalizedLeadFilters);
+    }, [normalizedLeadFilters]);
+
+    const leadFilterContent = useMemo(() => {
+        if (leadFilterFieldsLoading) {
+            return (
+                <p style={{ margin: 0, fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.45)' }}>
+                    Loading filter fields...
+                </p>
+            );
+        }
+
+        return leadFilters.map((filter) => {
+            const field = leadFilterFieldMap.get(filter.field) || leadFilterFields[0];
+            const operators = field?.operators || [];
+            const selectedOperator = operators.find((operator) => operator.key === filter.op) || operators[0];
+            const valueMode = getLeadFilterInputMode(filter.field, selectedOperator?.key || '');
+
+            return (
+                <div
+                    key={filter.id}
+                    style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(220px, 1.4fr) auto',
+                        gap: '0.75rem',
+                        alignItems: 'end'
+                    }}
+                >
+                    <label className="settings-field">
+                        <span className="settings-field__label">Field</span>
+                        <select
+                            value={filter.field}
+                            onChange={(e) => {
+                                const nextField = leadFilterFieldMap.get(e.target.value) || leadFilterFields[0];
+                                updateLeadFilter(filter.id, {
+                                    field: nextField?.key || '',
+                                    op: nextField?.operators[0]?.key || '',
+                                    value: ''
+                                });
+                            }}
+                        >
+                            {leadFilterFields.map((item) => (
+                                <option key={item.key} value={item.key}>{item.label}</option>
+                            ))}
+                        </select>
+                    </label>
+
+                    <label className="settings-field">
+                        <span className="settings-field__label">Operator</span>
+                        <select
+                            value={filter.op}
+                            onChange={(e) => {
+                                const nextOp = e.target.value;
+                                updateLeadFilter(filter.id, {
+                                    op: nextOp,
+                                    value: doesLeadFilterRequireValue(filter.field, nextOp) ? filter.value : ''
+                                });
+                            }}
+                        >
+                            {operators.map((operator) => (
+                                <option key={operator.key} value={operator.key}>{operator.label}</option>
+                            ))}
+                        </select>
+                    </label>
+
+                    <label className="settings-field">
+                        <span className="settings-field__label">Value</span>
+                        {!valueMode ? (
+                            <div style={{
+                                minHeight: '42px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                padding: '0 0.9rem',
+                                borderRadius: '10px',
+                                border: '1px solid rgba(255,255,255,0.08)',
+                                background: 'rgba(255,255,255,0.03)',
+                                color: 'rgba(255,255,255,0.45)',
+                                fontSize: '0.9rem'
+                            }}>
+                                No value needed
+                            </div>
+                        ) : valueMode === 'enum' ? (
+                            <select
+                                value={filter.value}
+                                onChange={(e) => updateLeadFilter(filter.id, { value: e.target.value })}
+                            >
+                                <option value="">Select value</option>
+                                {(field?.options || []).map((option) => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                            </select>
+                        ) : (
+                            <input
+                                type={valueMode === 'number' ? 'number' : valueMode === 'date' ? 'date' : 'text'}
+                                value={filter.value}
+                                onChange={(e) => updateLeadFilter(filter.id, { value: e.target.value })}
+                                placeholder={valueMode === 'number'
+                                    ? 'Enter number'
+                                    : valueMode === 'date'
+                                        ? ''
+                                        : 'Enter value'}
+                            />
+                        )}
+                    </label>
+
+                    <button
+                        type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={() => removeLeadFilter(filter.id)}
+                    >
+                        Remove
+                    </button>
+                </div>
+            );
+        });
+    }, [
+        doesLeadFilterRequireValue,
+        getLeadFilterInputMode,
+        leadFilterFieldMap,
+        leadFilterFields,
+        leadFilterFieldsLoading,
+        leadFilters,
+        removeLeadFilter,
+        updateLeadFilter
+    ]);
+
     type LeadStatusChipVariant =
         | "valid"
         | "valid-risky"
@@ -994,13 +1431,14 @@ export default function ClientPage() {
     useEffect(() => {
         if (!user || !clientId) return;
         
-        // Reset and refetch when lead filters change
+        // Reset and refetch when applied lead filters change
         setLeads([]);
         setLeadsCursor(0);
         setLeadsHasMore(true);
         fetchLeads(true);
+        fetchLeadTotal();
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, debouncedLeadSearch, jobIdFilter, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
+    }, [user, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -1176,46 +1614,122 @@ export default function ClientPage() {
         };
     }, [normalizeStages]);
 
+    const buildLeadQueryParams = useCallback(({ limit, offset, includeTotal, countOnly, includeLatestEvent }: { limit: number; offset?: number; includeTotal?: boolean; countOnly?: boolean; includeLatestEvent?: boolean }) => {
+        const params = new URLSearchParams();
+        params.append('clientId', clientId);
+        params.append('limit', String(limit));
+
+        if (campaignFilterId) {
+            params.append('instantlyCampaignId', campaignFilterId);
+        }
+
+        if (debouncedLeadSearch.trim()) {
+            params.append('search', debouncedLeadSearch.trim());
+        }
+
+        if (appliedLeadFilters.length > 0) {
+            params.append('filters', JSON.stringify(appliedLeadFilters));
+        }
+
+        if (typeof offset === 'number' && Number.isFinite(offset) && offset > 0) {
+            params.append('offset', String(offset));
+        }
+
+        if (includeTotal) {
+            params.append('includeTotal', 'true');
+        }
+
+        if (countOnly) {
+            params.append('countOnly', 'true');
+        }
+
+        if (includeLatestEvent) {
+            params.append('includeLatestEvent', 'true');
+        }
+
+        return params;
+    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch]);
+
+    const mapApiLeadRow = useCallback((row: any): Lead => ({
+        id: row.id,
+        domain: row.domain || "",
+        email: row.email || "",
+        status: row.status || "",
+        verified: row.verified,
+        firstLine: row.firstLine || "",
+        founderName: row.founderName || "",
+        roleType: row.roleType || "",
+        personalizationUrl: row.personalizationUrl || "",
+        personalizationTitle: row.personalizationTitle || "",
+        updatedAt: row.updatedAt || "",
+        createdAt: row.createdAt || "",
+        lastVerifiedAt: row.lastVerifiedAt || "",
+        lastContactedAt: row.lastContactedAt || "",
+        jobId: row.jobId || "",
+        campaignCountAllTime: typeof row.campaignCountAllTime === "number" ? row.campaignCountAllTime : null,
+        campaignCountActive: typeof row.campaignCountActive === "number" ? row.campaignCountActive : null,
+        lastCampaignAddedAt: row.lastCampaignAddedAt || "",
+        campaigns: row.campaigns || [],
+        campaignsData: row.campaignsData || [],
+        insights: row.insights || undefined,
+        latestEvent: row.latestEvent || null
+    }), []);
+
+    const fetchLeadTotal = useCallback(async () => {
+        if (!user || !clientId) return;
+        try {
+            const idToken = await getIdToken(user);
+            const params = buildLeadQueryParams({
+                limit: 1,
+                includeTotal: true,
+                countOnly: true
+            });
+
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                headers: {
+                    'Authorization': `Bearer ${idToken}`
+                }
+            });
+            if (!response.ok) {
+                throw new Error(`Failed to fetch lead total: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            const total = Number.isFinite(Number(data?.total)) ? Number(data.total) : null;
+            setStats((prev) => ({
+                total,
+                verified: prev.verified,
+                unverified: total === null ? 0 : Math.max(0, total - prev.verified),
+            }));
+        } catch (error) {
+            console.error('Failed to fetch lead total:', error);
+            setStats((prev) => ({
+                total: null,
+                verified: prev.verified,
+                unverified: 0,
+            }));
+        }
+    }, [buildLeadQueryParams, clientId, user]);
+
     const fetchLeads = useCallback(async (reset = false) => {
         if (!user || !clientId) return;
+        if (reset) {
+            setStats((prev) => ({
+                total: null,
+                verified: prev.verified,
+                unverified: 0,
+            }));
+        }
         setLeadsLoading(true);
         try {
             // Get Firebase ID token for authentication
             const idToken = await getIdToken(user);
             
             // Build query parameters
-            const params = new URLSearchParams();
-            params.append('clientId', clientId);
-            params.append('limit', '100'); // Reasonable page size
-
-            if (emailStatusFilter) {
-                params.append('emailStatus', emailStatusFilter);
-            }
-
-            if (founderFilter) {
-                params.append('founderFilter', founderFilter);
-            }
-
-            if (emailFilter) {
-                params.append('emailFilter', emailFilter);
-            }
-
-            if (campaignFilterId) {
-                params.append('instantlyCampaignId', campaignFilterId);
-            }
-
-            if (jobIdFilter.trim()) {
-                params.append('jobId', jobIdFilter.trim());
-            }
-
-            // Send search term to backend for SQL filtering
-            if (debouncedLeadSearch.trim()) {
-                params.append('search', debouncedLeadSearch.trim());
-            }
-
-            if (!reset && leadsCursor) {
-                params.append('offset', String(leadsCursor));
-            }
+            const params = buildLeadQueryParams({
+                limit: 100,
+                offset: !reset && leadsCursor ? leadsCursor : undefined
+            });
 
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
                 headers: {
@@ -1227,27 +1741,9 @@ export default function ClientPage() {
             }
 
             const data = await response.json();
-            const { leads: apiLeads, total, hasMore } = data;
+            const { leads: apiLeads, hasMore } = data;
 
-            // Map API response to Lead type
-            const mapped: Lead[] = apiLeads.map((row: any) => ({
-                id: row.id,
-                domain: row.domain || "",
-                email: row.email || "",
-                status: row.status || "",
-                verified: row.verified,
-                firstLine: row.firstLine || "",
-                founderName: row.founderName || "",
-                roleType: row.roleType || "",
-                personalizationUrl: row.personalizationUrl || "",
-                personalizationTitle: row.personalizationTitle || "",
-                updatedAt: row.updatedAt || "",
-                createdAt: row.createdAt || "",
-                lastVerifiedAt: row.lastVerifiedAt || "",
-                jobId: row.jobId || "",
-                campaigns: row.campaigns || [],
-                campaignsData: row.campaignsData || []
-            }));
+            const mapped: Lead[] = apiLeads.map(mapApiLeadRow);
 
             // Deduplicate leads by ID to prevent React key conflicts
             setLeads(reset ? mapped : (prev) => {
@@ -1258,11 +1754,11 @@ export default function ClientPage() {
             
             // Use server-provided total count
             const verifiedCount = apiLeads.filter((r: any) => r.verified).length;
-            setStats({
-                total: total,
+            setStats((prev) => ({
+                total: prev.total,
                 verified: verifiedCount,
-                unverified: Math.max(0, total - verifiedCount),
-            });
+                unverified: prev.total === null ? 0 : Math.max(0, prev.total - verifiedCount),
+            }));
 
             // Set cursor for pagination (use count of loaded items as offset)
             setLeadsCursor(reset ? mapped.length : (leadsCursor || 0) + mapped.length);
@@ -1287,7 +1783,7 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, debouncedLeadSearch, jobIdFilter, leadsCursor, emailStatusFilter, founderFilter, emailFilter, campaignFilterId]);
+    }, [user, clientId, leadsCursor, buildLeadQueryParams, mapApiLeadRow]);
 
     const fetchInstantlySyncRun = useCallback(async (runId: number) => {
         if (!user || !clientId || !runId) return null;
@@ -1379,8 +1875,9 @@ export default function ClientPage() {
             setLeadsCursor(0);
             setLeadsHasMore(true);
             fetchLeads(true);
+            fetchLeadTotal();
         }
-    }, [instantlySyncRun?.status, fetchLeads]);
+    }, [instantlySyncRun?.status, fetchLeadTotal, fetchLeads]);
 
     // All filters are now applied server-side
     const filteredLeads = useMemo(() => {
@@ -1391,6 +1888,9 @@ export default function ClientPage() {
         // Stats come from server with filters applied
         return stats;
     }, [stats]);
+
+    const displayedLeadTotal = displayedStats.total;
+    const displayedLeadTotalLabel = displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString();
 
     useEffect(() => {
         return () => {
@@ -2817,7 +3317,9 @@ export default function ClientPage() {
                 personalizationTitle: row.personalizationTitle || "",
                 updatedAt: row.updatedAt || "",
                 jobId: row.jobId || "",
-                campaigns: row.campaigns || []
+                campaigns: row.campaigns || [],
+                campaignsData: row.campaignsData || [],
+                insights: row.insights || undefined
             }));
 
             setSegmentLeads(mapped);
@@ -3257,6 +3759,7 @@ export default function ClientPage() {
             setToastMessage(`Imported CSV: ${data?.summary?.linksInserted ?? 0} campaign links added`);
             setToastVisible(true);
             fetchLeads(true);
+            fetchLeadTotal();
         } catch (error) {
             console.error('Error importing Instantly CSV merge:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to import Instantly CSV');
@@ -3286,7 +3789,497 @@ export default function ClientPage() {
         }
     };
 
+    const leadExportFieldGroups = useMemo(() => (
+        LEAD_EXPORT_FIELDS.reduce<Record<string, LeadExportFieldDef[]>>((acc, field) => {
+            if (!acc[field.group]) acc[field.group] = [];
+            acc[field.group].push(field);
+            return acc;
+        }, {})
+    ), []);
+
+    const toggleLeadExportField = useCallback((fieldKey: string) => {
+        setSelectedLeadExportFields((prev) => (
+            prev.includes(fieldKey)
+                ? prev.filter((key) => key !== fieldKey)
+                : [...prev, fieldKey]
+        ));
+    }, []);
+
+    const handleExportLeadsCsv = useCallback(async () => {
+        if (selectedLeadExportFields.length === 0) {
+            setToastMessage('Select at least one field to export.');
+            setToastVisible(true);
+            return;
+        }
+        if (!user || !clientId) {
+            setToastMessage('You must be signed in to export leads.');
+            setToastVisible(true);
+            return;
+        }
+
+        setLeadExportModalOpen(false);
+        setExportingCsv(true);
+        try {
+            const idToken = await getIdToken(user);
+            const includeLatestEvent = selectedLeadExportFields.some((fieldKey) => (
+                LEAD_EXPORT_FIELDS.find((field) => field.key === fieldKey)?.group === 'Events'
+            ));
+            const params = buildLeadQueryParams({ limit: 5000, includeLatestEvent });
+
+            const collected: Lead[] = [];
+            let offset = 0;
+            let hasMore = true;
+
+            while (hasMore) {
+                params.set('offset', String(offset));
+
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                    headers: {
+                        'Authorization': `Bearer ${idToken}`
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch leads: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                const { leads: apiLeads, hasMore: more } = data;
+                const mapped: Lead[] = apiLeads.map(mapApiLeadRow);
+
+                collected.push(...mapped);
+                offset += mapped.length;
+                hasMore = more && mapped.length > 0;
+
+                if (collected.length >= 1000000) {
+                    console.warn('Reached max export limit of 1,000,000 leads');
+                    break;
+                }
+            }
+
+            const orderedFields = LEAD_EXPORT_FIELDS.filter((field) => selectedLeadExportFields.includes(field.key));
+            const csvRows = [
+                orderedFields.map((field) => csvEscape(field.label)).join(',')
+            ];
+
+            collected.forEach((lead) => {
+                csvRows.push(orderedFields.map((field) => csvEscape(getLeadExportValue(lead, field.key))).join(','));
+            });
+
+            const csvContent = csvRows.join('\n');
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', `${clientName}_leads_${new Date().toISOString().split('T')[0]}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (error) {
+            console.error('CSV export failed:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to export CSV');
+            setToastVisible(true);
+        } finally {
+            setExportingCsv(false);
+        }
+    }, [buildLeadQueryParams, clientName, mapApiLeadRow, selectedLeadExportFields, user]);
+
     const uploadDisabled = !selectedFile || uploading;
+
+    const leadTabContent = (
+        <div>
+            <div style={{
+                display: 'flex',
+                gap: '1rem',
+                marginTop: '2rem',
+                flexWrap: 'wrap'
+            }}>
+                {campaignFilterId || leadSearch.trim() || appliedLeadFilters.length > 0 ? (
+                    <div className="metric-chip">
+                        <span className="metric-chip__label">Filtered Total</span>
+                        <span className="metric-chip__value">{displayedLeadTotalLabel}</span>
+                    </div>
+                ) : (
+                    <div className="metric-chip">
+                        <span className="metric-chip__label">Total Leads</span>
+                        <span className="metric-chip__value">{displayedLeadTotalLabel}</span>
+                    </div>
+                )}
+            </div>
+
+            <div style={{
+                marginTop: '1rem',
+                display: 'flex',
+                gap: '0.75rem',
+                flexWrap: 'wrap',
+                alignItems: 'flex-end'
+            }}>
+                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '220px' }}>
+                    <span className="settings-field__label">Filter by Campaign</span>
+                    <select
+                        value={campaignFilterId}
+                        onChange={(e) => setCampaignFilterId(e.target.value)}
+                        disabled={instantlyCampaignsLoading}
+                    >
+                        <option value="">All campaigns</option>
+                        {instantlyCampaigns.map((c) => (
+                            <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                    </select>
+                </label>
+                <label className="settings-field" style={{ flex: '2 1 260px', minWidth: '260px' }}>
+                    <span className="settings-field__label">Search leads</span>
+                    <input
+                        type="text"
+                        value={leadSearch}
+                        onChange={(e) => setLeadSearch(e.target.value)}
+                        placeholder="Search by domain, email, or founder name"
+                    />
+                </label>
+                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'flex-end', marginLeft: 'auto' }}>
+                    <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() => setLeadExportModalOpen(true)}
+                        style={{ flex: '0 0 auto' }}
+                        disabled={leadsLoading || exportingCsv}
+                    >
+                        {exportingCsv ? (
+                            <>
+                                <svg className="spinner" style={{ width: '14px', height: '14px', marginRight: '0.5rem' }} viewBox="0 0 24 24" fill="none">
+                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                </svg>
+                                Exporting...
+                            </>
+                        ) : (
+                            `📥 Export CSV (${allLeadsCached ? filteredLeads.length : (displayedLeadTotal === null ? '...' : displayedLeadTotal)})`
+                        )}
+                    </button>
+                    {(appliedLeadFilters.length > 0 || leadFilters.length > 0 || leadSearch.trim() || campaignFilterId) && (
+                        <button
+                            type="button"
+                            className="secondary-button secondary-button--active"
+                            onClick={() => {
+                                setLeadFilters([]);
+                                setAppliedLeadFilters([]);
+                                setLeadSearch("");
+                                setCampaignFilterId("");
+                            }}
+                            style={{ flex: '0 0 auto' }}
+                            disabled={leadsLoading}
+                        >
+                            Clear Filters
+                        </button>
+                    )}
+                </div>
+            </div>
+
+            <div style={{
+                marginTop: '0.75rem',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.75rem'
+            }}>
+                <div style={{
+                    padding: '1rem',
+                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                    borderRadius: '10px',
+                    background: 'rgba(255, 255, 255, 0.03)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.75rem'
+                }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <div>
+                            <div style={{ fontSize: '0.78rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'rgba(255, 255, 255, 0.45)' }}>
+                                Filters
+                            </div>
+                            <div style={{ fontSize: '0.88rem', color: 'rgba(255, 255, 255, 0.65)', marginTop: '0.2rem' }}>
+                                Build lead filters locally, then run the query when you are ready.
+                            </div>
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                            {leadFiltersDirty && (
+                                <span style={{ fontSize: '0.82rem', color: '#fbbf24', fontWeight: 600 }}>
+                                    Unapplied changes
+                                </span>
+                            )}
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={addLeadFilter}
+                                disabled={leadFilterFieldsLoading || leadFilterFields.length === 0}
+                            >
+                                + Add Filter
+                            </button>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                onClick={applyLeadFilters}
+                                disabled={leadsLoading || !leadFiltersDirty}
+                            >
+                                Run Query
+                            </button>
+                        </div>
+                    </div>
+
+                    {leadFilterContent}
+                </div>
+
+                <div style={{
+                    display: 'flex',
+                    gap: '0.75rem',
+                    flexWrap: 'wrap',
+                    alignItems: 'center'
+                }}>
+                    {leadsLoading && (
+                        <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.5rem',
+                            padding: '0.5rem 0.75rem',
+                            fontSize: '0.875rem',
+                            color: 'rgba(255, 255, 255, 0.7)'
+                        }}>
+                            <svg className="spinner" style={{ width: '16px', height: '16px' }} viewBox="0 0 24 24" fill="none">
+                                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                            </svg>
+                            {allLeadsCached ? 'Filtering...' : 'Loading leads...'}
+                        </div>
+                    )}
+                </div>
+
+                <div style={{ marginTop: '1.5rem', position: 'relative' }}>
+                    {leadsLoading && filteredLeads.length === 0 ? (
+                        <div className="pipeline-panel__empty">
+                            <div style={{
+                                display: 'flex',
+                                flexDirection: 'column',
+                                alignItems: 'center',
+                                gap: '1rem'
+                            }}>
+                                <svg className="spinner" style={{ width: '32px', height: '32px' }} viewBox="0 0 24 24" fill="none">
+                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                </svg>
+                                <p>Loading leads...</p>
+                            </div>
+                        </div>
+                    ) : filteredLeads.length === 0 ? (
+                        <div className="pipeline-panel__empty">
+                            <p>No leads yet.</p>
+                            <p className="pipeline-panel__subtitle">Upload leads to start seeing them here.</p>
+                        </div>
+                    ) : (
+                        <div style={{
+                            overflowX: 'auto',
+                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                            borderRadius: '8px',
+                            backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                            maxHeight: '520px',
+                            overflowY: 'auto',
+                            position: 'relative'
+                        }}>
+                            {leadsLoading && filteredLeads.length > 0 && (
+                                <div style={{
+                                    position: 'absolute',
+                                    top: 0,
+                                    left: 0,
+                                    right: 0,
+                                    bottom: 0,
+                                    background: 'rgba(0, 0, 0, 0.7)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    zIndex: 10,
+                                    borderRadius: '8px'
+                                }}>
+                                    <div style={{
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        alignItems: 'center',
+                                        gap: '0.75rem',
+                                        padding: '1.5rem',
+                                        background: 'rgba(0, 0, 0, 0.8)',
+                                        borderRadius: '12px',
+                                        border: '1px solid rgba(255, 255, 255, 0.1)'
+                                    }}>
+                                        <svg className="spinner" style={{ width: '32px', height: '32px', color: '#3b82f6' }} viewBox="0 0 24 24" fill="none">
+                                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                            <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                        </svg>
+                                        <p style={{ margin: 0, fontSize: '0.95rem', fontWeight: 500 }}>Loading leads...</p>
+                                    </div>
+                                </div>
+                            )}
+                            <div
+                                ref={leadsContainerRef}
+                                onScroll={handleLeadsScroll}
+                                style={{ maxHeight: '520px', overflowY: 'auto' }}
+                            >
+                                <table style={{
+                                    width: '100%',
+                                    borderCollapse: 'separate',
+                                    borderSpacing: 0,
+                                    fontSize: '0.875rem'
+                                }}>
+                                    <thead>
+                                        <tr style={{
+                                            backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                                            borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                        }}>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'rgba(255, 255, 255, 0.9)',
+                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                            }}>Founder Name</th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'rgba(255, 255, 255, 0.9)',
+                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                            }}>Email</th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'rgba(255, 255, 255, 0.9)',
+                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                            }}>Status</th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'rgba(255, 255, 255, 0.9)',
+                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                            }}>Domain</th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'rgba(255, 255, 255, 0.9)',
+                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                            }}>Campaign</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {filteredLeads.map((lead, index) => (
+                                            <tr
+                                                key={lead.id}
+                                                onClick={() => setSelectedLead(lead)}
+                                                style={{
+                                                    backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
+                                                    borderBottom: index < filteredLeads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+                                                    cursor: 'pointer',
+                                                    transition: 'background-color 0.15s ease'
+                                                }}
+                                                onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
+                                                onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
+                                            >
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    maxWidth: '220px',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap'
+                                                }}>{lead.founderName || '—'}</td>
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    maxWidth: '250px',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap'
+                                                }}>{displayEmail(lead.email, lead.status)}</td>
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    minWidth: '140px'
+                                                }}>
+                                                    {(() => {
+                                                        const meta = getLeadStatusChipMeta(lead.status);
+                                                        return (
+                                                            <span className={`lead-pastel-chip lead-pastel-chip--status-${meta.variant}`}>
+                                                                {meta.label}
+                                                            </span>
+                                                        );
+                                                    })()}
+                                                </td>
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    maxWidth: '220px',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap'
+                                                }}>{lead.domain || '—'}</td>
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    minWidth: '200px'
+                                                }}>
+                                                    {(() => {
+                                                        const names = getCampaignNamesForLead(lead);
+                                                        if (!names.length) return '—';
+                                                        const hiddenCount = names.length - 1;
+                                                        return (
+                                                            <div className="lead-pastel-chip-list">
+                                                                <span
+                                                                    className="lead-pastel-chip lead-pastel-chip--campaign"
+                                                                    style={{ paddingInline: '0.75rem' }}
+                                                                >
+                                                                    {names[0]}
+                                                                </span>
+                                                                {hiddenCount > 0 && (
+                                                                    <span
+                                                                        className="lead-pastel-chip lead-pastel-chip--campaign-more"
+                                                                        style={{ paddingInline: '0.75rem' }}
+                                                                    >
+                                                                        +{hiddenCount}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })()}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                                {(leadsLoading || leadsHasMore) && (
+                                    <div style={{ padding: '0.75rem 1rem', color: 'rgba(255,255,255,0.7)' }}>
+                                        {leadsLoading ? 'Loading leads...' : 'Scroll to load more'}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
 
     if (loading || !user) {
         return (
@@ -4145,495 +5138,7 @@ export default function ClientPage() {
                     )}
 
                     {/* Leads Tab */}
-                    {activeTab === "leads" && (
-                        <>
-                            <div style={{
-                                display: 'flex',
-                                gap: '1rem',
-                                marginTop: '2rem',
-                                flexWrap: 'wrap'
-                            }}>
-                                {campaignFilterId || leadSearch.trim() || jobIdFilter.trim() ? (
-                                    <div className="metric-chip">
-                                        <span className="metric-chip__label">Filtered Total</span>
-                                        <span className="metric-chip__value">{displayedStats.total.toLocaleString()}</span>
-                                    </div>
-                                ) : (
-                                    <div className="metric-chip">
-                                        <span className="metric-chip__label">Total Leads</span>
-                                        <span className="metric-chip__value">{displayedStats.total.toLocaleString()}</span>
-                                    </div>
-                                )}
-                            </div>
-
-                            <div style={{
-                                marginTop: '1rem',
-                                display: 'flex',
-                                gap: '0.75rem',
-                                flexWrap: 'wrap',
-                                alignItems: 'flex-end'
-                            }}>
-                                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '220px' }}>
-                                    <span className="settings-field__label">Filter by Campaign</span>
-                                    <select
-                                        value={campaignFilterId}
-                                        onChange={(e) => setCampaignFilterId(e.target.value)}
-                                        disabled={instantlyCampaignsLoading}
-                                    >
-                                        <option value="">All campaigns</option>
-                                        {instantlyCampaigns.map((c) => (
-                                            <option key={c.id} value={c.id}>{c.name}</option>
-                                        ))}
-                                    </select>
-                                </label>
-                                <label className="settings-field" style={{ flex: '2 1 260px', minWidth: '260px' }}>
-                                    <span className="settings-field__label">Search leads</span>
-                                    <input
-                                        type="text"
-                                        value={leadSearch}
-                                        onChange={(e) => setLeadSearch(e.target.value)}
-                                        placeholder="Search by domain, email, or founder name"
-                                    />
-                                </label>
-                                <label className="settings-field" style={{ flex: '1 1 220px', minWidth: '220px' }}>
-                                    <span className="settings-field__label">Job ID</span>
-                                    <input
-                                        type="text"
-                                        value={jobIdFilter}
-                                        onChange={(e) => setJobIdFilter(e.target.value)}
-                                        placeholder="Filter by exact job ID"
-                                    />
-                                </label>
-                            </div>
-
-                            <div style={{
-                                marginTop: '0.75rem',
-                                display: 'flex',
-                                gap: '0.75rem',
-                                flexWrap: 'wrap',
-                                alignItems: 'flex-end'
-                            }}>
-                                <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
-                                    <span className="settings-field__label">Founder</span>
-                                    <select
-                                        value={founderFilter}
-                                        onChange={(e) => setFounderFilter(e.target.value)}
-                                    >
-                                        <option value="">All</option>
-                                        <option value="exists">Exists</option>
-                                        <option value="not_found">Not Found</option>
-                                        <option value="other">Other</option>
-                                    </select>
-                                </label>
-                                <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
-                                    <span className="settings-field__label">Email</span>
-                                    <select
-                                        value={emailFilter}
-                                        onChange={(e) => setEmailFilter(e.target.value)}
-                                    >
-                                        <option value="">All</option>
-                                        <option value="exists">Exists</option>
-                                        <option value="not_found">Not Found</option>
-                                        <option value="not_run">Not Run</option>
-                                    </select>
-                                </label>
-                                <label className="settings-field" style={{ flex: '1 1 180px', minWidth: '180px' }}>
-                                    <span className="settings-field__label">Email Status</span>
-                                    <select
-                                        value={emailStatusFilter}
-                                        onChange={(e) => setEmailStatusFilter(e.target.value)}
-                                    >
-                                        <option value="">All</option>
-                                        <option value="not_run">Not Run</option>
-                                        <option value="not_found">Not Found</option>
-                                        <option value="valid">Valid</option>
-                                        <option value="valid-risky">Valid-Risky</option>
-                                        <option value="invalid">Invalid</option>
-                                        <option value="skipped_no_founder">Skipped (No Founder)</option>
-                                    </select>
-                                </label>
-                                {leadsLoading && (
-                                    <div style={{
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        gap: '0.5rem',
-                                        padding: '0.5rem 0.75rem',
-                                        fontSize: '0.875rem',
-                                        color: 'rgba(255, 255, 255, 0.7)'
-                                    }}>
-                                        <svg className="spinner" style={{ width: '16px', height: '16px' }} viewBox="0 0 24 24" fill="none">
-                                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
-                                            <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
-                                        </svg>
-                                        {allLeadsCached ? 'Filtering...' : 'Loading leads...'}
-                                    </div>
-                                )}
-                                <button
-                                    type="button"
-                                    className="primary-button"
-                                    onClick={async () => {
-                                        setExportingCsv(true);
-                                        try {
-                                            let leadsToExport = leads;
-                                            
-                                            // If we haven't cached all leads yet, fetch them all now from SQL
-                                            if (!allLeadsCached && user && clientId) {
-                                                const idToken = await getIdToken(user);
-                                                const params = new URLSearchParams();
-                                                params.append('clientId', clientId);
-                                                params.append('limit', '5000');
-                                                
-                                                // Apply filters to API request
-                                                if (campaignFilterId) {
-                                                    params.append('instantlyCampaignId', campaignFilterId);
-                                                }
-                                                if (emailStatusFilter) {
-                                                    params.append('emailStatus', emailStatusFilter);
-                                                }
-                                                if (leadSearch.trim()) {
-                                                    params.append('search', leadSearch.trim());
-                                                }
-                                                if (jobIdFilter.trim()) {
-                                                    params.append('jobId', jobIdFilter.trim());
-                                                }
-                                                if (founderFilter) {
-                                                    params.append('founderFilter', founderFilter);
-                                                }
-                                                if (emailFilter) {
-                                                    params.append('emailFilter', emailFilter);
-                                                }
-                                                
-                                                const collected: Lead[] = [];
-                                                let offset = 0;
-                                                let hasMore = true;
-                                                
-                                                // Fetch all pages
-                                                while (hasMore) {
-                                                    params.set('offset', String(offset));
-                                                    
-                                                    const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
-                                                        headers: {
-                                                            'Authorization': `Bearer ${idToken}`
-                                                        }
-                                                    });
-                                                    
-                                                    if (!response.ok) {
-                                                        throw new Error(`Failed to fetch leads: ${response.statusText}`);
-                                                    }
-                                                    
-                                                    const data = await response.json();
-                                                    const { leads: apiLeads, hasMore: more } = data;
-                                                    
-                                                    // Map API response to Lead type
-                                                    const mapped: Lead[] = apiLeads.map((row: any) => ({
-                                                        id: row.id,
-                                                        domain: row.domain || "",
-                                                        email: row.email || "",
-                                                        status: row.status || "",
-                                                        verified: row.verified,
-                                                        firstLine: row.firstLine || "",
-                                                        founderName: row.founderName || "",
-                                                        roleType: row.roleType || "",
-                                                        personalizationUrl: row.personalizationUrl || "",
-                                                        personalizationTitle: row.personalizationTitle || "",
-                                                        updatedAt: row.updatedAt || "",
-                                                        createdAt: row.createdAt || "",
-                                                        lastVerifiedAt: row.lastVerifiedAt || "",
-                                                        jobId: row.jobId || "",
-                                                        campaigns: row.campaigns || [],
-                                                        campaignsData: row.campaignsData || []
-                                                    }));
-                                                    
-                                                    collected.push(...mapped);
-                                                    offset += mapped.length;
-                                                    hasMore = more && mapped.length > 0;
-                                                    
-                                                    // Safety limit
-                                                    if (collected.length >= 1000000) {
-                                                        console.warn('Reached max export limit of 1,000,000 leads');
-                                                        break;
-                                                    }
-                                                }
-                                                
-                                                leadsToExport = collected;
-                                            }
-                                            
-                                            // Filters are already applied by the SQL API, just use the data directly
-                                            const filtered = leadsToExport;
-                                            
-                                            // Generate CSV
-                                            const headers = ['Founder Name', 'Email', 'Status', 'Domain', 'First Line', 'Personalization URL', 'Personalization Title', 'Campaigns', 'Updated At'];
-                                            const csvRows = [headers.join(',')];
-                                            
-                                            filtered.forEach((lead) => {
-                                                const row = [
-                                                    lead.founderName || '',
-                                                    lead.email || '',
-                                                    lead.status || '',
-                                                    lead.domain || '',
-                                                    (lead.firstLine || '').replace(/"/g, '""'),
-                                                    lead.personalizationUrl || '',
-                                                    (lead.personalizationTitle || '').replace(/"/g, '""'),
-                                                    getCampaignNamesForLead(lead).join('; '),
-                                                    lead.updatedAt || ''
-                                                ];
-                                                csvRows.push(row.map(val => `"${val}"`).join(','));
-                                            });
-                                            
-                                            const csvContent = csvRows.join('\n');
-                                            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-                                            const link = document.createElement('a');
-                                            const url = URL.createObjectURL(blob);
-                                            link.setAttribute('href', url);
-                                            link.setAttribute('download', `${clientName}_leads_${new Date().toISOString().split('T')[0]}.csv`);
-                                            link.style.visibility = 'hidden';
-                                            document.body.appendChild(link);
-                                            link.click();
-                                            document.body.removeChild(link);
-                                        } catch (error) {
-                                            console.error('CSV export failed:', error);
-                                            setToastMessage('Failed to export CSV');
-                                            setToastVisible(true);
-                                        } finally {
-                                            setExportingCsv(false);
-                                        }
-                                    }}
-                                    style={{ flex: '0 0 auto' }}
-                                    disabled={leadsLoading || exportingCsv}
-                                >
-                                    {exportingCsv ? (
-                                        <>
-                                            <svg className="spinner" style={{ width: '14px', height: '14px', marginRight: '0.5rem' }} viewBox="0 0 24 24" fill="none">
-                                                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
-                                                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
-                                            </svg>
-                                            Exporting...
-                                        </>
-                                    ) : (
-                                        `📥 Export CSV (${allLeadsCached ? filteredLeads.length : displayedStats.total})`
-                                    )}
-                                </button>
-                                {(founderFilter || emailFilter || emailStatusFilter || leadSearch.trim() || jobIdFilter.trim() || campaignFilterId) && (
-                                    <button
-                                        type="button"
-                                        className="secondary-button secondary-button--active"
-                                        onClick={() => {
-                                            setFounderFilter("");
-                                            setEmailFilter("");
-                                            setEmailStatusFilter("");
-                                            setLeadSearch("");
-                                            setJobIdFilter("");
-                                            setCampaignFilterId("");
-                                        }}
-                                        style={{ flex: '0 0 auto' }}
-                                        disabled={leadsLoading}
-                                    >
-                                        Clear Filters
-                                    </button>
-                                )}
-                            </div>
-
-                            <div style={{ marginTop: '1.5rem', position: 'relative' }}>
-                                {leadsLoading && filteredLeads.length === 0 ? (
-                                    <div className="pipeline-panel__empty">
-                                        <div style={{
-                                            display: 'flex',
-                                            flexDirection: 'column',
-                                            alignItems: 'center',
-                                            gap: '1rem'
-                                        }}>
-                                            <svg className="spinner" style={{ width: '32px', height: '32px' }} viewBox="0 0 24 24" fill="none">
-                                                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
-                                                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
-                                            </svg>
-                                            <p>Loading leads...</p>
-                                        </div>
-                                    </div>
-                                ) : filteredLeads.length === 0 ? (
-                                    <div className="pipeline-panel__empty">
-                                        <p>No leads yet.</p>
-                                        <p className="pipeline-panel__subtitle">Upload leads to start seeing them here.</p>
-                                    </div>
-                                ) : (
-                                    <div style={{
-                                        overflowX: 'auto',
-                                        border: '1px solid rgba(255, 255, 255, 0.1)',
-                                        borderRadius: '8px',
-                                        backgroundColor: 'rgba(0, 0, 0, 0.2)',
-                                        maxHeight: '520px',
-                                        overflowY: 'auto',
-                                        position: 'relative'
-                                    }}>
-                                        {leadsLoading && filteredLeads.length > 0 && (
-                                            <div style={{
-                                                position: 'absolute',
-                                                top: 0,
-                                                left: 0,
-                                                right: 0,
-                                                bottom: 0,
-                                                background: 'rgba(0, 0, 0, 0.7)',
-                                                display: 'flex',
-                                                alignItems: 'center',
-                                                justifyContent: 'center',
-                                                zIndex: 10,
-                                                borderRadius: '8px'
-                                            }}>
-                                                <div style={{
-                                                    display: 'flex',
-                                                    flexDirection: 'column',
-                                                    alignItems: 'center',
-                                                    gap: '0.75rem',
-                                                    padding: '1.5rem',
-                                                    background: 'rgba(0, 0, 0, 0.8)',
-                                                    borderRadius: '12px',
-                                                    border: '1px solid rgba(255, 255, 255, 0.1)'
-                                                }}>
-                                                    <svg className="spinner" style={{ width: '32px', height: '32px', color: '#3b82f6' }} viewBox="0 0 24 24" fill="none">
-                                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
-                                                        <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
-                                                    </svg>
-                                                    <p style={{ margin: 0, fontSize: '0.95rem', fontWeight: 500 }}>Loading leads...</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                        <div
-                                            ref={leadsContainerRef}
-                                            onScroll={handleLeadsScroll}
-                                            style={{ maxHeight: '520px', overflowY: 'auto' }}
-                                        >
-                                            <table style={{
-                                                width: '100%',
-                                                borderCollapse: 'collapse',
-                                                fontSize: '0.875rem'
-                                            }}>
-                                                <thead>
-                                                    <tr style={{
-                                                        backgroundColor: 'rgba(255, 255, 255, 0.05)',
-                                                        borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
-                                                    }}>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Founder Name</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Email</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Status</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Domain</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Campaign</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    {filteredLeads.map((lead, index) => (
-                                                        <tr
-                                                            key={lead.id}
-                                                            onClick={() => setSelectedLead(lead)}
-                                                            style={{
-                                                                backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
-                                                                borderBottom: index < filteredLeads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
-                                                                cursor: 'pointer',
-                                                                transition: 'background-color 0.15s ease'
-                                                            }}
-                                                            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
-                                                            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
-                                                        >
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '220px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{lead.founderName || '—'}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '250px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{displayEmail(lead.email, lead.status)}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                minWidth: '140px'
-                                                            }}>
-                                                                {(() => {
-                                                                    const meta = getLeadStatusChipMeta(lead.status);
-                                                                    return (
-                                                                        <span className={`lead-pastel-chip lead-pastel-chip--status-${meta.variant}`}>
-                                                                            {meta.label}
-                                                                        </span>
-                                                                    );
-                                                                })()}
-                                                            </td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '220px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{lead.domain || '—'}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                minWidth: '200px'
-                                                            }}>
-                                                                {(() => {
-                                                                    const names = getCampaignNamesForLead(lead);
-                                                                    if (!names.length) return '—';
-                                                                    const hiddenCount = names.length - 1;
-                                                                    return (
-                                                                        <div className="lead-pastel-chip-list">
-                                                                            <span
-                                                                                className="lead-pastel-chip lead-pastel-chip--campaign"
-                                                                                style={{ paddingInline: '0.75rem' }}
-                                                                            >
-                                                                                {names[0]}
-                                                                            </span>
-                                                                            {hiddenCount > 0 && (
-                                                                                <span
-                                                                                    className="lead-pastel-chip lead-pastel-chip--campaign-more"
-                                                                                    style={{ paddingInline: '0.75rem' }}
-                                                                                >
-                                                                                    +{hiddenCount}
-                                                                                </span>
-                                                                            )}
-                                                                        </div>
-                                                                    );
-                                                                })()}
-                                                            </td>
-                                                        </tr>
-                                                    ))}
-                                                </tbody>
-                                            </table>
-                                            {(leadsLoading || leadsHasMore) && (
-                                                <div style={{ padding: '0.75rem 1rem', color: 'rgba(255,255,255,0.7)' }}>
-                                                    {leadsLoading ? 'Loading leads...' : 'Scroll to load more'}
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        </>
-                    )}
+                    {activeTab === "leads" && leadTabContent}
 
                     {/* Segments Tab */}
                     {activeTab === "segments" && (
@@ -6492,6 +6997,111 @@ export default function ClientPage() {
                 </div>
             )}
 
+            {/* Lead export field modal */}
+            {leadExportModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => !exportingCsv && setLeadExportModalOpen(false)}
+                >
+                    <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '760px' }}>
+                        <div className="modal__header">
+                            <div>
+                                <h2 className="modal__title">Export lead CSV</h2>
+                                <p className="modal__description">
+                                    Choose which fields to include. Event fields use the latest Instantly event per contact.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '65vh', overflowY: 'auto' }}>
+                            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                <button
+                                    type="button"
+                                    className="secondary-button secondary-button--active"
+                                    onClick={() => setSelectedLeadExportFields(LEAD_EXPORT_FIELDS.map((field) => field.key))}
+                                    disabled={exportingCsv}
+                                >
+                                    Select All
+                                </button>
+                                <button
+                                    type="button"
+                                    className="secondary-button secondary-button--active"
+                                    onClick={() => setSelectedLeadExportFields(DEFAULT_LEAD_EXPORT_FIELD_KEYS)}
+                                    disabled={exportingCsv}
+                                >
+                                    Reset Defaults
+                                </button>
+                            </div>
+
+                            {Object.entries(leadExportFieldGroups).map(([groupName, fields]) => (
+                                <div
+                                    key={groupName}
+                                    style={{
+                                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                                        borderRadius: '12px',
+                                        background: 'rgba(255, 255, 255, 0.03)',
+                                        padding: '1rem'
+                                    }}
+                                >
+                                    <div style={{ fontWeight: 600, color: '#fff', marginBottom: '0.75rem' }}>{groupName}</div>
+                                    <div style={{ display: 'grid', gap: '0.65rem', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+                                        {fields.map((field) => (
+                                            <label
+                                                key={field.key}
+                                                style={{
+                                                    display: 'flex',
+                                                    gap: '0.6rem',
+                                                    alignItems: 'flex-start',
+                                                    padding: '0.75rem 0.85rem',
+                                                    borderRadius: '10px',
+                                                    border: selectedLeadExportFields.includes(field.key)
+                                                        ? '1px solid rgba(59, 130, 246, 0.55)'
+                                                        : '1px solid rgba(255, 255, 255, 0.08)',
+                                                    background: selectedLeadExportFields.includes(field.key)
+                                                        ? 'rgba(59, 130, 246, 0.12)'
+                                                        : 'rgba(255, 255, 255, 0.02)',
+                                                    cursor: exportingCsv ? 'default' : 'pointer'
+                                                }}
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedLeadExportFields.includes(field.key)}
+                                                    onChange={() => toggleLeadExportField(field.key)}
+                                                    disabled={exportingCsv}
+                                                    style={{ marginTop: '0.2rem' }}
+                                                />
+                                                <span style={{ color: '#fff', fontSize: '0.94rem' }}>{field.label}</span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setLeadExportModalOpen(false)}
+                                disabled={exportingCsv}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                onClick={handleExportLeadsCsv}
+                                disabled={exportingCsv || selectedLeadExportFields.length === 0}
+                            >
+                                {exportingCsv ? 'Exporting...' : `Export CSV (${selectedLeadExportFields.length} fields)`}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Download CSV scope modal */}
             {downloadModalOpen && (
                 <div
@@ -6919,7 +7529,7 @@ export default function ClientPage() {
                         className="modal-overlay"
                         role="dialog"
                         aria-modal="true"
-                        onClick={() => { setSelectedLead(null); setShowLeadAdvanced(false); }}
+                        onClick={() => { setSelectedLead(null); setShowLeadAdvanced(false); setLeadModalTab('detail'); }}
                         style={{ zIndex: 10000 }}
                     />
                     <div
@@ -6929,7 +7539,7 @@ export default function ClientPage() {
                             top: 0,
                             right: 0,
                             bottom: 0,
-                            width: '480px',
+                            width: '680px',
                             maxWidth: '90vw',
                             height: '100vh',
                             maxHeight: 'none',
@@ -7047,6 +7657,25 @@ export default function ClientPage() {
                         </div>
 
                         <div className="modal__body" style={{ paddingTop: 0 }}>
+                            <div className="tab-nav" style={{ marginTop: 0, marginBottom: '1rem' }}>
+                                {([
+                                    { key: 'detail', label: 'Detail' },
+                                    { key: 'insights', label: 'Insights' }
+                                ] as const).map((tab) => {
+                                    return (
+                                        <button
+                                            key={tab.key}
+                                            onClick={() => setLeadModalTab(tab.key)}
+                                            className={`tab-nav__button ${leadModalTab === tab.key ? 'tab-nav__button--active' : ''}`}
+                                        >
+                                            {tab.label}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+
+                            {leadModalTab === 'detail' ? (
+                                <>
 
                             {/* Lead Info — compressed metadata block */}
                             <div style={{ marginBottom: '1.25rem' }}>
@@ -7074,9 +7703,6 @@ export default function ClientPage() {
                                     <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Email</span>
                                     <span style={{ color: 'rgba(255, 255, 255, 0.9)', wordBreak: 'break-all' }}>
                                         {displayEmail(selectedLead.email, selectedLead.status)}
-                                        {selectedLead.verified && (
-                                            <span style={{ marginLeft: '0.35rem', color: '#4ade80', fontSize: '0.85rem' }}>✓</span>
-                                        )}
                                     </span>
                                     {selectedLead.createdAt && (
                                         <>
@@ -7101,47 +7727,91 @@ export default function ClientPage() {
                             {selectedLead.campaignsData && selectedLead.campaignsData.length > 0 && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginBottom: '1.25rem' }}>
                                     {selectedLead.campaignsData.map((campaign, idx) => {
-                                        const interest = (campaign.interestStatus || '').toLowerCase();
-                                        const isPositive = interest === 'interested' || interest === 'meeting_booked' || interest === 'meeting booked';
-                                        const isCompleted = (campaign.leadStatus || '').toLowerCase() === 'completed';
-                                        const isNeutral = !interest || interest === '—';
-                                        const icon = isPositive ? '✅' : isNeutral ? '📨' : '⚠️';
+                                        const interest = (campaign.interestStatus || '').toLowerCase().replace(/[_ ]+/g, ' ').trim();
+                                        const leadStatus = (campaign.leadStatus || '').toLowerCase().replace(/[_ ]+/g, ' ').trim();
+                                        const raw = interest || leadStatus;
+
+                                        const negativeStatuses = ['bounced', 'bad fit', 'risky'];
+                                        const neutralStatuses = ['contacted', 'not yet contacted', 'out of office', 'reply received'];
+                                        const positiveStatuses = ['meeting booked', 'won', 'interested', 'warm follow up', 'lead interested'];
+                                        const isDayN = /^day \d+$/i.test(raw);
+
+                                        const isNegative = negativeStatuses.includes(raw);
+                                        const isPositive = positiveStatuses.includes(raw) || isDayN;
+                                        const isNeutral = neutralStatuses.includes(raw) || (!raw || raw === '—');
+
+                                        const icon = isPositive ? '✅' : isNegative ? '❌' : '📨';
                                         const statusText = campaign.interestStatus
                                             ? formatInstantlyStateLabel(campaign.interestStatus)
-                                            : formatInstantlyStateLabel(campaign.leadStatus) || 'Sent';
+                                            : formatInstantlyStateLabel(campaign.leadStatus) || 'Not yet contacted';
+
+                                        const rowBg = isPositive
+                                            ? 'rgba(34, 197, 94, 0.08)'
+                                            : isNegative
+                                                ? 'rgba(239, 68, 68, 0.08)'
+                                                : 'rgba(255, 255, 255, 0.04)';
+                                        const rowBorder = isPositive
+                                            ? 'rgba(34, 197, 94, 0.2)'
+                                            : isNegative
+                                                ? 'rgba(239, 68, 68, 0.2)'
+                                                : 'rgba(255, 255, 255, 0.08)';
+                                        const statusColor = isPositive
+                                            ? '#4ade80'
+                                            : isNegative
+                                                ? '#f87171'
+                                                : 'rgba(255, 255, 255, 0.5)';
+
+                                        const bounceDate = campaign.lastBounceAt ? new Date(campaign.lastBounceAt) : null;
+                                        const bounceDateStr = bounceDate
+                                            ? bounceDate.toLocaleDateString('en-GB', {
+                                                day: 'numeric',
+                                                month: 'short',
+                                                ...(bounceDate.getFullYear() !== new Date().getFullYear() ? { year: 'numeric' } : {})
+                                            })
+                                            : null;
+
                                         return (
                                             <div key={idx} style={{
                                                 display: 'flex',
-                                                alignItems: 'center',
-                                                gap: '0.5rem',
+                                                flexDirection: 'column',
+                                                gap: '0.2rem',
                                                 padding: '0.5rem 0.65rem',
-                                                background: isPositive
-                                                    ? 'rgba(34, 197, 94, 0.08)'
-                                                    : 'rgba(255, 255, 255, 0.04)',
+                                                background: rowBg,
                                                 borderRadius: '8px',
-                                                border: `1px solid ${isPositive ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)'}`,
+                                                border: `1px solid ${rowBorder}`,
                                             }}>
-                                                <span style={{ fontSize: '1rem', flexShrink: 0 }}>{icon}</span>
-                                                <span style={{
-                                                    fontSize: '0.88rem',
-                                                    color: 'rgba(255, 255, 255, 0.8)',
-                                                    flex: '1 1 auto',
-                                                    minWidth: 0,
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap'
-                                                }}>
-                                                    {campaign.campaignName}
-                                                </span>
-                                                <span style={{
-                                                    fontSize: '0.8rem',
-                                                    fontWeight: 600,
-                                                    color: (isPositive || isCompleted) ? '#4ade80' : 'rgba(255, 255, 255, 0.5)',
-                                                    flexShrink: 0,
-                                                    textTransform: 'capitalize'
-                                                }}>
-                                                    {statusText}
-                                                </span>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                                    <span style={{ fontSize: '1rem', flexShrink: 0 }}>{icon}</span>
+                                                    <span style={{
+                                                        fontSize: '0.88rem',
+                                                        color: 'rgba(255, 255, 255, 0.8)',
+                                                        flex: '1 1 auto',
+                                                        minWidth: 0,
+                                                        overflow: 'hidden',
+                                                        textOverflow: 'ellipsis',
+                                                        whiteSpace: 'nowrap'
+                                                    }}>
+                                                        {campaign.campaignName}
+                                                    </span>
+                                                    <span style={{
+                                                        fontSize: '0.8rem',
+                                                        fontWeight: 600,
+                                                        color: statusColor,
+                                                        flexShrink: 0,
+                                                        textTransform: 'capitalize'
+                                                    }}>
+                                                        {statusText}
+                                                    </span>
+                                                </div>
+                                                {bounceDateStr && (
+                                                    <span style={{
+                                                        fontSize: '0.72rem',
+                                                        color: 'rgba(255, 255, 255, 0.3)',
+                                                        paddingLeft: '1.6rem'
+                                                    }}>
+                                                        {bounceDateStr}
+                                                    </span>
+                                                )}
                                             </div>
                                         );
                                     })}
@@ -7158,80 +7828,193 @@ export default function ClientPage() {
                                     letterSpacing: '0.06em',
                                     color: 'rgba(255, 255, 255, 0.4)'
                                 }}>Activity</p>
-                                {leadEventsLoading ? (
-                                    <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>Loading…</p>
-                                ) : leadEvents.length === 0 ? (
-                                    <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>No events yet</p>
-                                ) : (
-                                    <div style={{ position: 'relative', paddingLeft: '1rem' }}>
-                                        {/* Vertical line */}
-                                        <div style={{
-                                            position: 'absolute',
-                                            left: '3px',
-                                            top: '6px',
-                                            bottom: '6px',
-                                            width: '1px',
-                                            background: 'rgba(255, 255, 255, 0.1)'
-                                        }} />
-                                        {leadEvents.map((evt) => {
-                                            const typeLabel = (evt.event_type || 'unknown').replace(/_/g, ' ');
-                                            const dotColor = evt.event_type === 'email_sent' ? '#3b82f6'
-                                                : evt.event_type === 'email_opened' ? '#a855f7'
-                                                : evt.event_type === 'email_replied' ? '#22c55e'
-                                                : evt.event_type === 'email_bounced' ? '#ef4444'
-                                                : evt.event_type === 'lead_unsubscribed' ? '#f59e0b'
-                                                : 'rgba(255, 255, 255, 0.3)';
-                                            return (
-                                                <div key={evt.id} style={{
-                                                    position: 'relative',
-                                                    paddingBottom: '0.65rem',
-                                                    paddingLeft: '0.6rem'
-                                                }}>
-                                                    {/* Dot */}
-                                                    <div style={{
-                                                        position: 'absolute',
-                                                        left: '-1rem',
-                                                        top: '5px',
-                                                        width: '7px',
-                                                        height: '7px',
-                                                        borderRadius: '50%',
-                                                        background: dotColor
-                                                    }} />
-                                                    <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem', flexWrap: 'wrap' }}>
-                                                        <span style={{
-                                                            fontSize: '0.82rem',
-                                                            fontWeight: 500,
-                                                            color: 'rgba(255, 255, 255, 0.8)',
-                                                            textTransform: 'capitalize'
-                                                        }}>{typeLabel}</span>
-                                                        <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.3)' }}>
-                                                            {new Date(evt.event_timestamp).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
-                                                            {' '}
-                                                            {new Date(evt.event_timestamp).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
-                                                        </span>
-                                                    </div>
-                                                    {evt.campaign_name && (
-                                                        <p style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.35)' }}>
-                                                            {evt.campaign_name}
-                                                        </p>
-                                                    )}
-                                                    {evt.reply_category && (
-                                                        <span style={{
-                                                            display: 'inline-block',
-                                                            marginTop: '0.2rem',
-                                                            padding: '0.1rem 0.4rem',
-                                                            borderRadius: '4px',
-                                                            fontSize: '0.72rem',
-                                                            fontWeight: 500,
-                                                            background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(255, 255, 255, 0.06)',
-                                                            color: evt.reply_category === 'Interested' ? '#4ade80' : 'rgba(255, 255, 255, 0.5)'
-                                                        }}>{evt.reply_category}</span>
-                                                    )}
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                )}
+                {(() => {
+                                        // Build synthetic status-change events from campaignsData
+                                        const positiveStatuses = ['interested', 'meeting booked', 'won', 'warm follow up'];
+                                        const negativeStatuses = ['bounced', 'bad fit', 'risky', 'unsubscribed'];
+
+                                        type TimelineItem = {
+                                            id: string;
+                                            event_type: string;
+                                            displayLabel: string;
+                                            event_timestamp: string;
+                                            campaign_name: string | null;
+                                            message_text: string | null;
+                                            reply_text_snippet: string | null;
+                                            reply_category: string | null;
+                                            synthetic?: boolean;
+                                        };
+
+                                        const syntheticEvents: TimelineItem[] = [];
+                                        for (const campaign of (selectedLead.campaignsData || [])) {
+                                            const leadStatusNorm = (campaign.leadStatus || '').toLowerCase().replace(/[_ ]+/g, ' ').trim();
+                                            const interestNorm = (campaign.interestStatus || '').toLowerCase().replace(/[_ ]+/g, ' ').trim();
+
+                                            if (leadStatusNorm === 'bounced' && campaign.lastBounceAt) {
+                                                syntheticEvents.push({
+                                                    id: `syn-bounce-${campaign.campaignId}`,
+                                                    event_type: 'email_bounced',
+                                                    displayLabel: 'Bounced email',
+                                                    event_timestamp: campaign.lastBounceAt,
+                                                    campaign_name: campaign.campaignName,
+                                                    message_text: null,
+                                                    reply_text_snippet: null,
+                                                    reply_category: null,
+                                                    synthetic: true,
+                                                });
+                                            } else if (interestNorm && campaign.timestampLastInterestChange) {
+                                                syntheticEvents.push({
+                                                    id: `syn-interest-${campaign.campaignId}`,
+                                                    event_type: `interest_change`,
+                                                    displayLabel: campaign.interestStatus || interestNorm,
+                                                    event_timestamp: campaign.timestampLastInterestChange,
+                                                    campaign_name: campaign.campaignName,
+                                                    message_text: null,
+                                                    reply_text_snippet: null,
+                                                    reply_category: null,
+                                                    synthetic: true,
+                                                });
+                                            }
+                                        }
+
+                                        const realEvents: TimelineItem[] = leadEvents.map((evt) => ({
+                                            id: String(evt.id),
+                                            event_type: evt.event_type || 'unknown',
+                                            displayLabel: evt.event_type === 'email_sent' && evt.step != null
+                                                ? `email ${evt.step} sent`
+                                                : (evt.event_type || 'unknown').replace(/_/g, ' '),
+                                            event_timestamp: evt.event_timestamp,
+                                            campaign_name: evt.campaign_name || null,
+                                            message_text: evt.message_text || null,
+                                            reply_text_snippet: evt.reply_text_snippet || null,
+                                            reply_category: evt.reply_category || null,
+                                        }));
+
+                                        const allEvents = [...realEvents, ...syntheticEvents].sort(
+                                            (a, b) => new Date(b.event_timestamp).getTime() - new Date(a.event_timestamp).getTime()
+                                        );
+
+                                        if (leadEventsLoading) return (
+                                            <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>Loading…</p>
+                                        );
+                                        if (!allEvents.length) return (
+                                            <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>No events yet</p>
+                                        );
+
+                                        return (
+                                            <div style={{ position: 'relative', paddingLeft: '1rem' }}>
+                                                {/* Vertical line */}
+                                                <div style={{
+                                                    position: 'absolute',
+                                                    left: '3px',
+                                                    top: '6px',
+                                                    bottom: '6px',
+                                                    width: '1px',
+                                                    background: 'rgba(255, 255, 255, 0.1)'
+                                                }} />
+                                                {allEvents.map((evt) => {
+                                                    const labelNorm = evt.displayLabel.toLowerCase().replace(/[_ ]+/g, ' ').trim();
+                                                    const isDayN = /^day \d+$/.test(labelNorm);
+                                                    const isPositive = positiveStatuses.includes(labelNorm) || isDayN
+                                                        || evt.event_type === 'email_replied';
+                                                    const isNegative = negativeStatuses.includes(labelNorm)
+                                                        || evt.event_type === 'email_bounced';
+
+                                                    const dotColor = evt.event_type === 'added_to_campaign' ? '#f59e0b'
+                                                        : evt.event_type === 'email_sent' ? '#3b82f6'
+                                                        : evt.event_type === 'email_opened' ? '#a855f7'
+                                                        : isPositive ? '#22c55e'
+                                                        : isNegative ? '#ef4444'
+                                                        : evt.event_type === 'lead_unsubscribed' ? '#f59e0b'
+                                                        : 'rgba(255, 255, 255, 0.3)';
+
+                                                    const evtDate = new Date(evt.event_timestamp);
+                                                    const now = new Date();
+                                                    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+                                                    const isWithinLastSevenDays = (now.getTime() - evtDate.getTime()) <= sevenDaysMs;
+                                                    const isCurrentYear = evtDate.getFullYear() === now.getFullYear();
+                                                    const dateStr = isCurrentYear
+                                                        ? evtDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
+                                                        : evtDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+                                                    const timeStr = evtDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+                                                    const dateTimeStr = isWithinLastSevenDays ? `${dateStr}, ${timeStr}` : dateStr;
+
+                                                    return (
+                                                        <div key={evt.id} style={{
+                                                            position: 'relative',
+                                                            paddingBottom: '0.65rem',
+                                                            paddingLeft: '0.6rem'
+                                                        }}>
+                                                            {/* Dot */}
+                                                            <div style={{
+                                                                position: 'absolute',
+                                                                left: '-1rem',
+                                                                top: '5px',
+                                                                width: '7px',
+                                                                height: '7px',
+                                                                borderRadius: '50%',
+                                                                background: dotColor
+                                                            }} />
+                                                            <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem', flexWrap: 'wrap' }}>
+                                                                <span style={{
+                                                                    fontSize: '0.82rem',
+                                                                    fontWeight: 500,
+                                                                    color: 'rgba(255, 255, 255, 0.8)',
+                                                                    textTransform: 'capitalize'
+                                                                }}>{evt.displayLabel}</span>
+                                                                <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.3)' }}>
+                                                                    {dateTimeStr}
+                                                                </span>
+                                                            </div>
+                                                            {evt.campaign_name && (
+                                                                <span style={{
+                                                                    display: 'inline-flex',
+                                                                    alignItems: 'center',
+                                                                    gap: '0.3rem',
+                                                                    marginTop: '0.25rem',
+                                                                    padding: '0.15rem 0.5rem',
+                                                                    borderRadius: '999px',
+                                                                    background: 'rgba(255, 255, 255, 0.06)',
+                                                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                                    fontSize: '0.72rem',
+                                                                    color: 'rgba(255, 255, 255, 0.45)',
+                                                                    lineHeight: 1.4
+                                                                }}>
+                                                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.7 }}>
+                                                                        <line x1="22" y1="2" x2="11" y2="13" />
+                                                                        <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                                                                    </svg>
+                                                                    {evt.campaign_name}
+                                                                </span>
+                                                            )}
+                                                            {(() => {
+                                                                const snippet = evt.reply_text_snippet
+                                                                    || (evt.event_type === 'added_to_campaign' ? evt.message_text : null)
+                                                                    || (evt.message_text ? evt.message_text.split('\n').find(l => l.trim()) || null : null);
+                                                                return snippet ? (
+                                                                    <p style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.55)' }}>
+                                                                        {snippet.length > 160 ? snippet.slice(0, 160) + '…' : snippet}
+                                                                    </p>
+                                                                ) : null;
+                                                            })()}
+                                                            {evt.reply_category && (
+                                                                <span style={{
+                                                                    display: 'inline-block',
+                                                                    marginTop: '0.2rem',
+                                                                    padding: '0.1rem 0.4rem',
+                                                                    borderRadius: '4px',
+                                                                    fontSize: '0.72rem',
+                                                                    fontWeight: 500,
+                                                                    background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(255, 255, 255, 0.06)',
+                                                                    color: evt.reply_category === 'Interested' ? '#4ade80' : 'rgba(255, 255, 255, 0.5)'
+                                                                }}>{evt.reply_category}</span>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        );
+                                    })()}
                             </div>
 
                             {/* Advanced / IDs — collapsed by default */}
@@ -7287,6 +8070,160 @@ export default function ClientPage() {
                                     </div>
                                 )}
                             </div>
+
+                                </>
+                            ) : (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
+                                    <p style={{
+                                        margin: 0,
+                                        fontSize: '0.75rem',
+                                        fontWeight: 600,
+                                        textTransform: 'uppercase',
+                                        letterSpacing: '0.06em',
+                                        color: 'rgba(255, 255, 255, 0.4)'
+                                    }}>
+                                        Lead Insights
+                                    </p>
+
+                                    {(() => {
+                                        const insights = selectedLead.insights;
+                                        const parsedAttributes = (() => {
+                                            const rawAttributes = insights?.attributes;
+                                            if (!rawAttributes) return {} as Record<string, unknown>;
+                                            if (typeof rawAttributes === 'string') {
+                                                try {
+                                                    const parsed = JSON.parse(rawAttributes);
+                                                    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                                                        ? parsed as Record<string, unknown>
+                                                        : {};
+                                                } catch {
+                                                    return {};
+                                                }
+                                            }
+                                            return (rawAttributes && typeof rawAttributes === 'object' && !Array.isArray(rawAttributes))
+                                                ? rawAttributes as Record<string, unknown>
+                                                : {};
+                                        })();
+
+                                        const normalizeAttributeValue = (value: unknown): unknown => {
+                                            if (typeof value !== 'string') return value;
+                                            const trimmed = value.trim();
+                                            if (!trimmed) return null;
+                                            if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
+                                                return value;
+                                            }
+                                            try {
+                                                return JSON.parse(trimmed);
+                                            } catch {
+                                                return value;
+                                            }
+                                        };
+
+                                        const attributeEntries = Object.entries(parsedAttributes)
+                                            .map(([key, value]) => [key, normalizeAttributeValue(value)] as const)
+                                            .filter(([key, value]) => {
+                                                if (key.toLowerCase().includes('instantly')) return false;
+                                                if (value === null || value === undefined) return false;
+                                                return String(value).trim() !== '';
+                                            });
+
+                                        const insightRows: Array<{ label: string; value: string | null }> = [
+                                            {
+                                                label: 'Annual Revenue',
+                                                value: insights?.annualRevenueText
+                                                    || ((insights?.annualRevenueMin != null || insights?.annualRevenueMax != null)
+                                                        ? `${insights?.annualRevenueMin ?? '—'} to ${insights?.annualRevenueMax ?? '—'}`
+                                                        : null)
+                                            },
+                                            {
+                                                label: 'Uses Klaviyo',
+                                                value: insights?.usesKlaviyo == null ? null : (insights.usesKlaviyo ? 'Yes' : 'No')
+                                            },
+                                            {
+                                                label: 'Klaviyo Percent',
+                                                value: insights?.klaviyoPercent == null ? null : `${insights.klaviyoPercent}%`
+                                            },
+                                            {
+                                                label: 'Discovery Call Held',
+                                                value: insights?.discoveryCallHeld == null ? null : (insights.discoveryCallHeld ? 'Yes' : 'No')
+                                            },
+                                            {
+                                                label: 'Last Discovery Call',
+                                                value: insights?.lastDiscoveryCallAt
+                                                    ? new Date(insights.lastDiscoveryCallAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                                                    : null
+                                            },
+                                            {
+                                                label: 'Source',
+                                                value: insights?.source || null
+                                            },
+                                            {
+                                                label: 'Notes',
+                                                value: insights?.notes || null
+                                            }
+                                        ];
+
+                                        const populatedRows = insightRows.filter((row) => row.value !== null && row.value !== '');
+                                        if (!populatedRows.length && !attributeEntries.length) {
+                                            return (
+                                                <p style={{ margin: 0, fontSize: '0.86rem', color: 'rgba(255, 255, 255, 0.45)' }}>
+                                                    No insights available for this lead yet.
+                                                </p>
+                                            );
+                                        }
+
+                                        return (
+                                            <>
+                                                {populatedRows.length > 0 && (
+                                                    <div style={{
+                                                        display: 'grid',
+                                                        gridTemplateColumns: '200px 1fr',
+                                                        gap: '0.45rem 0.8rem',
+                                                        fontSize: '0.9rem',
+                                                        lineHeight: 1.5
+                                                    }}>
+                                                        {populatedRows.map((row) => (
+                                                            <div key={row.label} style={{ display: 'contents' }}>
+                                                                <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>{row.label}</span>
+                                                                <span style={{ color: 'rgba(255, 255, 255, 0.88)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{row.value}</span>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
+
+                                                {attributeEntries.length > 0 && (
+                                                    <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.8rem' }}>
+                                                        <p style={{
+                                                            margin: '0 0 0.5rem',
+                                                            fontSize: '0.75rem',
+                                                            fontWeight: 600,
+                                                            textTransform: 'uppercase',
+                                                            letterSpacing: '0.06em',
+                                                            color: 'rgba(255, 255, 255, 0.4)'
+                                                        }}>
+                                                            Attributes
+                                                        </p>
+                                                        <div style={{
+                                                            display: 'grid',
+                                                            gridTemplateColumns: '200px 1fr',
+                                                            gap: '0.45rem 0.8rem',
+                                                            fontSize: '0.9rem',
+                                                            lineHeight: 1.5
+                                                        }}>
+                                                            {attributeEntries.map(([key, value]) => (
+                                                                <div key={key} style={{ display: 'contents' }}>
+                                                                    <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>{key}</span>
+                                                                    <span style={{ color: 'rgba(255, 255, 255, 0.88)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{typeof value === 'string' ? value : JSON.stringify(value)}</span>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </>
+                                        );
+                                    })()}
+                                </div>
+                            )}
 
                         </div>
                     </div>
