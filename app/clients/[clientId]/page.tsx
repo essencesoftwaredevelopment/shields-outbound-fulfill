@@ -172,6 +172,76 @@ type InstantlySyncRun = {
     triggerSource?: string;
 };
 
+type InstantlyEventAnalyticsSummary = {
+    total_events: number;
+    unique_contacts: number;
+    unique_campaigns: number;
+    emails_sent: number;
+    positive_replies: number;
+    meetings_booked: number;
+    reply_events: number;
+    bounce_events: number;
+    first_event_at: string | null;
+    last_event_at: string | null;
+};
+
+type InstantlyEventAnalyticsByHourRow = {
+    bucket: string;
+    label: string;
+    count: number;
+};
+
+type InstantlyEventAnalyticsPeriod = "24h" | "7d" | "30d" | "90d";
+
+type InstantlyEventAnalyticsWindow = {
+    period: InstantlyEventAnalyticsPeriod;
+    label: string;
+    bucketUnit: "hour" | "day";
+    startAt: string;
+    endAt: string;
+};
+
+type InstantlyEventAnalyticsEventTypeOption = {
+    value: string;
+    label: string;
+};
+
+type InstantlyEventAnalyticsRecentEvent = {
+    id: string;
+    event_type: string;
+    reply_category?: string | null;
+    lead_email?: string | null;
+    email_account?: string | null;
+    message_text?: string | null;
+    reply_text_snippet?: string | null;
+    event_timestamp: string;
+    campaign_name?: string | null;
+};
+
+type InstantlyEventRealtimeConfig = {
+    websocketUrl: string;
+    supabaseUrl: string;
+    publishableKey: string;
+};
+
+type InstantlyEventAnalyticsPayload = {
+    clientSqlId: number | null;
+    realtimeConfig: InstantlyEventRealtimeConfig | null;
+    window: InstantlyEventAnalyticsWindow;
+    eventType: InstantlyEventAnalyticsEventTypeOption;
+    availableEventTypes: InstantlyEventAnalyticsEventTypeOption[];
+    summary: InstantlyEventAnalyticsSummary;
+    byHour: InstantlyEventAnalyticsByHourRow[];
+    recentEvents: InstantlyEventAnalyticsRecentEvent[];
+};
+
+const INSTANTLY_ANALYTICS_PERIOD_OPTIONS: Array<{ value: InstantlyEventAnalyticsPeriod; label: string }> = [
+    { value: "24h", label: "Last 24 hours" },
+    { value: "7d", label: "Last 7 days" },
+    { value: "30d", label: "Last 30 days" },
+    { value: "90d", label: "Last 90 days" }
+];
+
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
 
 const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
@@ -218,6 +288,44 @@ const DEFAULT_LEAD_EXPORT_FIELD_KEYS = LEAD_EXPORT_FIELDS
 
 function createLeadFilterId() {
     return `lead-filter-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string | null) {
+    const normalized = String(fallbackLabel || eventType || "unknown").toLowerCase().replace(/[_ ]+/g, " ").trim();
+    if (normalized === "reply received" || normalized === "reply" || normalized === "replied") return "Reply received";
+    if (normalized === "email sent") return "Email sent";
+    if (normalized === "email opened") return "Email opened";
+    if (normalized === "email link clicked") return "Link clicked";
+    if (normalized === "email bounced") return "Email bounced";
+    if (normalized === "lead unsubscribed") return "Unsubscribed";
+    if (normalized === "lead interested") return "Interested";
+    if (normalized === "lead meeting booked") return "Meeting booked";
+    if (normalized === "lead meeting completed") return "Meeting completed";
+    if (normalized === "lead closed") return "Closed won";
+    if (normalized === "lead out of office") return "Out of office";
+    if (normalized === "lead not interested") return "Not interested";
+    if (normalized === "lead wrong person") return "Wrong person";
+    if (normalized === "lead neutral") return "Neutral";
+    if (normalized === "lead no show") return "No show";
+    if (normalized === "state sync") return "State sync";
+    return normalized.replace(/\b(\w)/g, (match) => match.toUpperCase());
+}
+
+function getInstantlyActivityColor(eventType: string) {
+    const normalized = String(eventType || "").toLowerCase();
+    if (normalized === "email_sent") return "#3b82f6";
+    if (normalized === "email_opened") return "#a855f7";
+    if (normalized === "email_link_clicked") return "#0ea5e9";
+    if (normalized === "reply_received" || normalized === "lead_interested" || normalized === "lead_meeting_booked" || normalized === "lead_meeting_completed" || normalized === "lead_closed") {
+        return "#22c55e";
+    }
+    if (normalized === "email_bounced" || normalized === "lead_not_interested" || normalized === "lead_wrong_person" || normalized === "lead_no_show") {
+        return "#ef4444";
+    }
+    if (normalized === "lead_unsubscribed" || normalized === "lead_out_of_office" || normalized === "lead_neutral") {
+        return "#f59e0b";
+    }
+    return "rgba(255, 255, 255, 0.3)";
 }
 
 function getLeadCampaignNames(lead: Lead): string[] {
@@ -600,8 +708,8 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
 
-    const [activeTab, setActiveTab] = useState<"info" | "campaigns" | "leads" | "segments" | "personalizer">(
-        (searchParams?.get("tab") as "info" | "campaigns" | "leads" | "segments" | "personalizer") || "campaigns"
+    const [activeTab, setActiveTab] = useState<"analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer">(
+        (searchParams?.get("tab") as "analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer") || "analytics"
     );
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
@@ -681,7 +789,6 @@ export default function ClientPage() {
     const lastUploadErrorRef = useRef<string | null>(null);
     const jobStateRef = useRef<PipelineJob | null>(null);
     const lastFetchTimeRef = useRef<number>(0);
-    const userDeselectedRef = useRef<boolean>(false);
     const isFetchingRef = useRef<boolean>(false);
     const currentJobStatusRef = useRef<string | null>(null);
     const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
@@ -699,14 +806,6 @@ export default function ClientPage() {
     const [downloadModalOpen, setDownloadModalOpen] = useState(false);
     const [jobPendingUpload, setJobPendingUpload] = useState<string | null>(null);
 
-    // Manual upload modal state
-    const [showManualUploadModal, setShowManualUploadModal] = useState(false);
-    const [selectedJobForManual, setSelectedJobForManual] = useState<any>(null);
-    const [manualUploadCampaigns, setManualUploadCampaigns] = useState<Campaign[]>([]);
-    const [selectedManualCampaign, setSelectedManualCampaign] = useState('');
-    const [manualUploadNotes, setManualUploadNotes] = useState('');
-    const [manualUploadLoading, setManualUploadLoading] = useState(false);
-    const [qualifiedContactsCount, setQualifiedContactsCount] = useState<{qualified: number, total: number} | null>(null);
     const [jobUploadStatus, setJobUploadStatus] = useState<Record<string, any[]>>({});
     const [showInstantlyCsvImportModal, setShowInstantlyCsvImportModal] = useState(false);
     const [instantlyCsvImportFile, setInstantlyCsvImportFile] = useState<File | null>(null);
@@ -724,6 +823,15 @@ export default function ClientPage() {
     const [instantlySyncRun, setInstantlySyncRun] = useState<InstantlySyncRun | null>(null);
     const instantlySyncPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const previousInstantlySyncStatusRef = useRef<string | null>(null);
+    const [instantlyEventAnalytics, setInstantlyEventAnalytics] = useState<InstantlyEventAnalyticsPayload | null>(null);
+    const [instantlyEventAnalyticsPeriod, setInstantlyEventAnalyticsPeriod] = useState<InstantlyEventAnalyticsPeriod>("24h");
+    const [instantlyEventAnalyticsEventType, setInstantlyEventAnalyticsEventType] = useState<string>("all");
+    const [animatedRecentEventIds, setAnimatedRecentEventIds] = useState<Set<string>>(new Set());
+    const [instantlyEventAnalyticsLoading, setInstantlyEventAnalyticsLoading] = useState(false);
+    const [instantlyEventAnalyticsError, setInstantlyEventAnalyticsError] = useState<string | null>(null);
+    const [instantlyEventRealtimeError, setInstantlyEventRealtimeError] = useState<string | null>(null);
+    const previousRecentEventIdsRef = useRef<Set<string> | null>(null);
+    const recentEventAnimationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
@@ -2116,7 +2224,11 @@ export default function ClientPage() {
                 setJobPendingUpload(null);
             }
 
-            if (jobId) {
+            const shouldRestoreActiveJob = Boolean(
+                jobId && (status === "running" || status === "queued" || status === "pending-upload")
+            );
+
+            if (jobId && shouldRestoreActiveJob) {
                 setSelectedJobId(jobId);
                 const compositeKey = `${jobId}:${status ?? ""}`;
                 if (previousJobIdRef.current !== compositeKey) {
@@ -2234,7 +2346,6 @@ export default function ClientPage() {
             return;
         }
 
-        const latest = jobHistory[0];
         const selectedFromHistory = selectedJobId
             ? jobHistory.find((job) => job.id === selectedJobId) || null
             : null;
@@ -2277,21 +2388,15 @@ export default function ClientPage() {
             return;
         }
 
-        // If nothing selected yet, default to latest (unless user explicitly deselected)
+        // Keep the default state unselected until the user picks a job or an active job is restored.
         if (!selectedJobId) {
-            if (!userDeselectedRef.current) {
-                setSelectedJobId(latest.id);
-                if (!streamingSelected) {
-                    setJobState(latest);
-                }
-            }
             return;
         }
 
-        // If the previously selected job disappeared, fall back to latest
+        // If the previously selected job disappeared, clear the selection.
         if (!selectedFromHistory && !streamingSelected) {
-            setSelectedJobId(latest.id);
-            setJobState(latest);
+            setSelectedJobId(null);
+            setJobState(null);
         }
     }, [jobHistory, jobState, jobStreamConnected, selectedJobId]);
 
@@ -2332,11 +2437,301 @@ export default function ClientPage() {
         }
     }, [user, clientId, jobHistory]);
 
+    const fetchInstantlyEventAnalytics = useCallback(async (showLoading = true) => {
+        if (!user || !clientId) return;
+
+        try {
+            if (showLoading) {
+                setInstantlyEventAnalyticsLoading(true);
+            }
+            setInstantlyEventAnalyticsError(null);
+
+            const token = await user.getIdToken();
+            const params = new URLSearchParams({
+                period: instantlyEventAnalyticsPeriod,
+                eventType: instantlyEventAnalyticsEventType
+            });
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/analytics/instantly-events?${params.toString()}`,
+                {
+                    headers: {
+                        Authorization: `Bearer ${token}`
+                    }
+                }
+            );
+
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data?.error || `Failed to fetch analytics (${response.status})`);
+            }
+
+            const analyticsPayload = data as InstantlyEventAnalyticsPayload;
+            const recentEventIds = (analyticsPayload.recentEvents || []).map((event) => event.id);
+            const previousRecentEventIds = previousRecentEventIdsRef.current;
+
+            if (recentEventAnimationTimeoutRef.current) {
+                clearTimeout(recentEventAnimationTimeoutRef.current);
+                recentEventAnimationTimeoutRef.current = null;
+            }
+
+            if (!previousRecentEventIds) {
+                previousRecentEventIdsRef.current = new Set(recentEventIds);
+                setAnimatedRecentEventIds(new Set());
+            } else {
+                const newRecentEventIds = recentEventIds.filter((id) => !previousRecentEventIds.has(id));
+                previousRecentEventIdsRef.current = new Set(recentEventIds);
+
+                if (newRecentEventIds.length > 0) {
+                    setAnimatedRecentEventIds(new Set(newRecentEventIds));
+                    recentEventAnimationTimeoutRef.current = setTimeout(() => {
+                        setAnimatedRecentEventIds(new Set());
+                        recentEventAnimationTimeoutRef.current = null;
+                    }, 1800);
+                } else {
+                    setAnimatedRecentEventIds(new Set());
+                }
+            }
+
+            setInstantlyEventAnalytics(analyticsPayload);
+        } catch (error) {
+            console.error('Error fetching Instantly event analytics:', error);
+            setInstantlyEventAnalyticsError(error instanceof Error ? error.message : 'Failed to fetch Instantly event analytics.');
+        } finally {
+            if (showLoading) {
+                setInstantlyEventAnalyticsLoading(false);
+            }
+        }
+    }, [user, clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+
     useEffect(() => {
         if (jobState) {
             setSelectedJobId(jobState.id);
         }
     }, [jobState?.id]);
+
+    useEffect(() => {
+        if (activeTab !== "analytics" || !user || !clientId) {
+            return;
+        }
+
+        fetchInstantlyEventAnalytics(true);
+    }, [activeTab, user, clientId, fetchInstantlyEventAnalytics]);
+
+    useEffect(() => {
+        if (!instantlyEventAnalytics || instantlyEventAnalyticsEventType === "all") {
+            return;
+        }
+
+        const stillAvailable = (instantlyEventAnalytics.availableEventTypes || []).some(
+            (option) => option.value === instantlyEventAnalyticsEventType
+        );
+        if (!stillAvailable) {
+            setInstantlyEventAnalyticsEventType("all");
+        }
+    }, [instantlyEventAnalytics, instantlyEventAnalyticsEventType]);
+
+    useEffect(() => {
+        previousRecentEventIdsRef.current = null;
+        setAnimatedRecentEventIds(new Set());
+
+        if (recentEventAnimationTimeoutRef.current) {
+            clearTimeout(recentEventAnimationTimeoutRef.current);
+            recentEventAnimationTimeoutRef.current = null;
+        }
+    }, [clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+
+    useEffect(() => () => {
+        if (recentEventAnimationTimeoutRef.current) {
+            clearTimeout(recentEventAnimationTimeoutRef.current);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (activeTab !== "analytics") {
+            return;
+        }
+
+        if (instantlyEventAnalyticsLoading || !instantlyEventAnalytics) {
+            return;
+        }
+
+        const websocketUrl = instantlyEventAnalytics?.realtimeConfig?.websocketUrl;
+        if (!websocketUrl) {
+            setInstantlyEventRealtimeError('Supabase Realtime connection details are unavailable.');
+            return;
+        }
+
+        const sqlClientId = instantlyEventAnalytics?.clientSqlId;
+        if (!sqlClientId) {
+            return;
+        }
+
+        const topic = `realtime:analytics-contact-instantly-events-${sqlClientId}`;
+        let messageRef = 0;
+        let joinRef = "1";
+        let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+        let refreshTimeout: ReturnType<typeof setTimeout> | null = null;
+        let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+        let socket: WebSocket | null = null;
+        let closed = false;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 5;
+
+        const nextRef = () => {
+            messageRef += 1;
+            return String(messageRef);
+        };
+
+        const send = (message: Record<string, unknown>) => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify(message));
+            }
+        };
+
+        const scheduleRefresh = () => {
+            if (refreshTimeout) {
+                clearTimeout(refreshTimeout);
+            }
+            refreshTimeout = setTimeout(() => {
+                fetchInstantlyEventAnalytics(false);
+            }, 250);
+        };
+
+        const clearHeartbeat = () => {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
+            }
+        };
+
+        const scheduleReconnect = (message?: string, delay = 1500) => {
+            if (closed || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                if (message && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                    setInstantlyEventRealtimeError(message);
+                }
+                return;
+            }
+            if (reconnectTimeout) {
+                return;
+            }
+            reconnectAttempts += 1;
+            reconnectTimeout = setTimeout(() => {
+                reconnectTimeout = null;
+                connectSocket();
+            }, delay);
+        };
+
+        const connectSocket = () => {
+            clearHeartbeat();
+            socket = new WebSocket(websocketUrl);
+
+            socket.onopen = () => {
+                reconnectAttempts = 0;
+                setInstantlyEventRealtimeError(null);
+            joinRef = nextRef();
+            send({
+                topic,
+                event: "phx_join",
+                payload: {
+                    config: {
+                        broadcast: { ack: false, self: false },
+                        presence: { enabled: false },
+                        postgres_changes: [
+                            {
+                                event: "*",
+                                schema: "public",
+                                table: "contact_instantly_events",
+                                filter: `client_id=eq.${sqlClientId}`
+                            }
+                        ],
+                        private: false
+                    }
+                },
+                ref: joinRef,
+                join_ref: joinRef
+            });
+
+            heartbeatInterval = setInterval(() => {
+                send({
+                    topic: "phoenix",
+                    event: "heartbeat",
+                    payload: {},
+                    ref: nextRef(),
+                    join_ref: null
+                });
+            }, 20000);
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const payload = JSON.parse(event.data);
+                    if (payload?.event === "postgres_changes" && payload?.topic === topic) {
+                        scheduleRefresh();
+                        return;
+                    }
+                    if (payload?.event === "system" && payload?.topic === topic) {
+                        const systemMessage = String(payload?.payload?.message || "");
+                        if (systemMessage.includes("InitializingProjectConnection")) {
+                            clearHeartbeat();
+                            socket?.close();
+                            scheduleReconnect(undefined, 2000);
+                        }
+                        return;
+                    }
+                    if (payload?.event === "phx_reply" && payload?.topic === topic && payload?.payload?.status === "error") {
+                        const reason = String(payload?.payload?.response?.reason || "Supabase Realtime join failed.");
+                        if (reason.includes("InitializingProjectConnection")) {
+                            clearHeartbeat();
+                            socket?.close();
+                            scheduleReconnect(undefined, 2000);
+                            return;
+                        }
+                        setInstantlyEventRealtimeError(reason);
+                        return;
+                    }
+                    if (payload?.event === "phx_error") {
+                        scheduleReconnect("Supabase Realtime channel error.");
+                    }
+                } catch (error) {
+                    console.error("Failed to parse Supabase Realtime payload:", error);
+                }
+            };
+
+            socket.onerror = () => {
+                scheduleReconnect("Supabase Realtime connection failed.");
+            };
+
+            socket.onclose = () => {
+                clearHeartbeat();
+                if (!closed) {
+                    scheduleReconnect("Supabase Realtime disconnected.");
+                }
+            };
+        };
+
+        connectSocket();
+
+        return () => {
+            closed = true;
+            if (refreshTimeout) {
+                clearTimeout(refreshTimeout);
+            }
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+            }
+            clearHeartbeat();
+            if (socket?.readyState === WebSocket.OPEN) {
+                send({
+                    topic,
+                    event: "phx_leave",
+                    payload: {},
+                    ref: nextRef(),
+                    join_ref: joinRef
+                });
+            }
+            socket?.close();
+        };
+    }, [activeTab, instantlyEventAnalytics, instantlyEventAnalyticsLoading, fetchInstantlyEventAnalytics]);
 
     // Fetch upload status when job history changes
     useEffect(() => {
@@ -2554,7 +2949,6 @@ export default function ClientPage() {
         if (!job) {
             return;
         }
-        userDeselectedRef.current = false;
         setJobState(job);
         setSelectedJobId(job.id);
 
@@ -3580,99 +3974,6 @@ export default function ClientPage() {
         }
     };
 
-    const fetchQualifiedCount = async (jobId: string) => {
-        try {
-            const token = await user?.getIdToken();
-            const response = await fetch(
-                `${getPipelineBaseUrl()}/api/jobs/${jobId}/qualified-count?clientId=${clientId}&agencyId=${user?.uid}`,
-                { headers: { Authorization: `Bearer ${token}` } }
-            );
-            const data = await response.json();
-            return data;
-        } catch (error) {
-            console.error('Error fetching qualified count:', error);
-            return { qualifiedCount: 0, totalCount: 0 };
-        }
-    };
-
-    const handleOpenManualUpload = async (job: any) => {
-        setSelectedJobForManual(job);
-        setShowManualUploadModal(true);
-        setManualUploadLoading(true);
-        
-        try {
-            const campaigns = await fetchSqlCampaignList();
-            setManualUploadCampaigns(campaigns);
-            
-            const countData = await fetchQualifiedCount(job.id);
-            setQualifiedContactsCount(countData);
-            
-        } catch (error) {
-            console.error('Error loading manual upload data:', error);
-            setToastMessage('Failed to load campaigns. Please try again.');
-            setToastVisible(true);
-        } finally {
-            setManualUploadLoading(false);
-        }
-    };
-
-    const handleConfirmManualUpload = async () => {
-        if (!selectedManualCampaign) {
-            setToastMessage('Please select a campaign');
-            setToastVisible(true);
-            return;
-        }
-        
-        if (!qualifiedContactsCount) {
-            setToastMessage('No qualified contacts to mark');
-            setToastVisible(true);
-            return;
-        }
-
-        try {
-            setManualUploadLoading(true);
-            const token = await user?.getIdToken();
-            
-            const response = await fetch(
-                `${getPipelineBaseUrl()}/api/jobs/${selectedJobForManual.id}/mark-manual-upload`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${token}`
-                    },
-                    body: JSON.stringify({
-                        idToken: token,
-                        campaignId: selectedManualCampaign,
-                        notes: manualUploadNotes,
-                        clientId
-                    })
-                }
-            );
-
-            const data = await response.json();
-            
-            if (data.success) {
-                setToastMessage(`✅ Marked ${data.contactCount} contacts as uploaded to ${data.campaignName}`);
-                setToastVisible(true);
-                setShowManualUploadModal(false);
-                setSelectedManualCampaign('');
-                setManualUploadNotes('');
-                setQualifiedContactsCount(null);
-                fetchJobsUploadStatus();
-            } else {
-                setToastMessage(`❌ ${data.error || 'Failed to mark manual upload'}`);
-                setToastVisible(true);
-            }
-        } catch (error) {
-            console.error('Error marking manual upload:', error);
-            setToastMessage('❌ Failed to mark manual upload');
-            setToastVisible(true);
-        } finally {
-            setManualUploadLoading(false);
-        }
-    };
-
     const handleRevertManualUpload = async (jobId: string, campaignId: string, campaignName: string) => {
         if (!confirm(`Are you sure you want to revert the manual upload to "${campaignName}"?`)) {
             return;
@@ -4321,6 +4622,12 @@ export default function ClientPage() {
                     {/* Tab Navigation */}
                     <div className="tab-nav">
                         <button
+                            className={`tab-nav__button ${activeTab === "analytics" ? "tab-nav__button--active" : ""}`}
+                            onClick={() => setActiveTab("analytics")}
+                        >
+                            Analytics
+                        </button>
+                        <button
                             className={`tab-nav__button ${activeTab === "campaigns" ? "tab-nav__button--active" : ""}`}
                             onClick={() => setActiveTab("campaigns")}
                         >
@@ -4351,6 +4658,320 @@ export default function ClientPage() {
                             Info
                         </button>
                     </div>
+
+                    {activeTab === "analytics" && (
+                        <div style={{ marginTop: "2rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
+                            <div>
+                                <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                                    <h2 style={{ margin: 0, fontSize: "1.75rem", fontWeight: 700 }}>Analytics</h2>
+                                    <span style={{
+                                        display: "inline-flex",
+                                        alignItems: "center",
+                                        gap: "0.4rem",
+                                        padding: "0.35rem 0.7rem",
+                                        borderRadius: "999px",
+                                        background: "rgba(34, 197, 94, 0.12)",
+                                        border: "1px solid rgba(34, 197, 94, 0.28)",
+                                        color: "#86efac",
+                                        fontSize: "0.78rem",
+                                        fontWeight: 600
+                                    }}>
+                                        <span style={{ width: "8px", height: "8px", borderRadius: "999px", background: "#22c55e" }} />
+                                        Live
+                                    </span>
+                                    <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginLeft: "auto" }}>
+                                        <label className="settings-field" style={{ minWidth: "180px" }}>
+                                            <span className="settings-field__label">Event Type</span>
+                                            <select
+                                                value={instantlyEventAnalyticsEventType}
+                                                onChange={(e) => setInstantlyEventAnalyticsEventType(e.target.value)}
+                                                disabled={instantlyEventAnalyticsLoading}
+                                            >
+                                                {(instantlyEventAnalytics?.availableEventTypes || [{ value: "all", label: "All event types" }]).map((option) => (
+                                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                                ))}
+                                            </select>
+                                        </label>
+                                        <label className="settings-field" style={{ minWidth: "180px" }}>
+                                            <span className="settings-field__label">Time Period</span>
+                                            <select
+                                                value={instantlyEventAnalyticsPeriod}
+                                                onChange={(e) => setInstantlyEventAnalyticsPeriod(e.target.value as InstantlyEventAnalyticsPeriod)}
+                                                disabled={instantlyEventAnalyticsLoading}
+                                            >
+                                                {INSTANTLY_ANALYTICS_PERIOD_OPTIONS.map((option) => (
+                                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                                ))}
+                                            </select>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {instantlyEventAnalyticsError && (
+                                <div style={{
+                                    padding: "1rem 1.25rem",
+                                    borderRadius: "12px",
+                                    border: "1px solid rgba(239, 68, 68, 0.35)",
+                                    background: "rgba(239, 68, 68, 0.08)",
+                                    color: "#fca5a5"
+                                }}>
+                                    {instantlyEventAnalyticsError}
+                                </div>
+                            )}
+
+                            {instantlyEventRealtimeError && (
+                                <div style={{
+                                    padding: "1rem 1.25rem",
+                                    borderRadius: "12px",
+                                    border: "1px solid rgba(245, 158, 11, 0.35)",
+                                    background: "rgba(245, 158, 11, 0.08)",
+                                    color: "#fcd34d"
+                                }}>
+                                    {instantlyEventRealtimeError}
+                                </div>
+                            )}
+
+                            {instantlyEventAnalyticsLoading && !instantlyEventAnalytics && (
+                                <div className="pipeline-panel__empty" style={{ minHeight: "260px" }}>
+                                    <svg className="spinner" style={{ width: "32px", height: "32px", color: "#3b82f6" }} viewBox="0 0 24 24" fill="none">
+                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                                        <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                                    </svg>
+                                    <p style={{ margin: "0.9rem 0 0", fontSize: "0.95rem", color: "rgba(255,255,255,0.72)" }}>
+                                        Loading Instantly analytics…
+                                    </p>
+                                </div>
+                            )}
+
+                            {(!instantlyEventAnalyticsLoading || instantlyEventAnalytics) && (
+                                <>
+                            <div style={{
+                                display: "grid",
+                                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                                gap: "1rem"
+                            }}>
+                                {[
+                                    {
+                                        key: "emails_sent",
+                                        label: "Emails sent",
+                                        value: instantlyEventAnalytics?.summary.emails_sent ?? 0,
+                                        border: "rgba(255, 255, 255, 0.12)",
+                                        icon: (
+                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                <path d="M4 6h16v12H4z" />
+                                                <path d="m22 7-10 7L2 7" />
+                                            </svg>
+                                        )
+                                    },
+                                    {
+                                        key: "positive_replies",
+                                        label: "Positive replies",
+                                        value: instantlyEventAnalytics?.summary.positive_replies ?? 0,
+                                        border: "rgba(255, 255, 255, 0.12)",
+                                        icon: (
+                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                                                <path d="m9 10 2 2 4-4" />
+                                            </svg>
+                                        )
+                                    },
+                                    {
+                                        key: "meetings_booked",
+                                        label: "Meetings booked",
+                                        value: instantlyEventAnalytics?.summary.meetings_booked ?? 0,
+                                        border: "rgba(255, 255, 255, 0.12)",
+                                        icon: (
+                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                <rect x="3" y="4" width="18" height="18" rx="2" />
+                                                <path d="M16 2v4" />
+                                                <path d="M8 2v4" />
+                                                <path d="M3 10h18" />
+                                            </svg>
+                                        )
+                                    }
+                                ].map((card) => (
+                                    <div
+                                        key={card.key}
+                                        style={{
+                                            padding: "1.15rem 1.2rem",
+                                            borderRadius: "16px",
+                                            background: "transparent",
+                                            border: `1px solid ${card.border}`,
+                                            display: "flex",
+                                            flexDirection: "column",
+                                            justifyContent: "flex-start"
+                                        }}
+                                    >
+                                        <div>
+                                            <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
+                                                {card.value.toLocaleString()}
+                                            </p>
+                                            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
+                                                <div style={{
+                                                    display: "inline-flex",
+                                                    alignItems: "center",
+                                                    justifyContent: "center",
+                                                    color: "#ffffff",
+                                                    flexShrink: 0
+                                                }}>
+                                                    {card.icon}
+                                                </div>
+                                                <p style={{ margin: 0, fontSize: "0.86rem", color: "rgba(255,255,255,0.66)" }}>
+                                                    {card.label}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div style={{
+                                padding: "1.25rem",
+                                borderRadius: "16px",
+                                background: "rgba(255, 255, 255, 0.03)",
+                                border: "1px solid rgba(255, 255, 255, 0.08)"
+                            }}>
+                                <p className="eyebrow eyebrow--muted" style={{ paddingBottom: "15px" }}>Recent Events</p>
+
+                                {(() => {
+                                    const recentEvents = instantlyEventAnalytics?.recentEvents || [];
+                                    if (recentEvents.length === 0) {
+                                        return (
+                                            <div className="pipeline-panel__empty">
+                                                <p>No recent events found for the current filters.</p>
+                                            </div>
+                                        );
+                                    }
+
+                                    return (
+                                        <div style={{ position: "relative", paddingLeft: "1rem" }}>
+                                            <div style={{
+                                                position: "absolute",
+                                                left: "3px",
+                                                top: "6px",
+                                                bottom: "6px",
+                                                width: "1px",
+                                                background: "rgba(255, 255, 255, 0.1)"
+                                            }} />
+                                            {recentEvents.map((evt) => {
+                                                const dotColor = getInstantlyActivityColor(evt.event_type);
+                                                const label = formatInstantlyActivityLabel(evt.event_type);
+                                                const evtDate = new Date(evt.event_timestamp);
+                                                const now = new Date();
+                                                const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+                                                const isWithinLastSevenDays = !Number.isNaN(evtDate.getTime()) && (now.getTime() - evtDate.getTime()) <= sevenDaysMs;
+                                                const isCurrentYear = !Number.isNaN(evtDate.getTime()) && evtDate.getFullYear() === now.getFullYear();
+                                                const dateStr = Number.isNaN(evtDate.getTime())
+                                                    ? evt.event_timestamp
+                                                    : isCurrentYear
+                                                        ? evtDate.toLocaleDateString("en-GB", { day: "numeric", month: "short" })
+                                                        : evtDate.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+                                                const timeStr = Number.isNaN(evtDate.getTime())
+                                                    ? ""
+                                                    : evtDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                                                const dateTimeStr = Number.isNaN(evtDate.getTime())
+                                                    ? evt.event_timestamp
+                                                    : isWithinLastSevenDays
+                                                        ? `${dateStr}, ${timeStr}`
+                                                        : dateStr;
+                                                const snippet = evt.reply_text_snippet
+                                                    || (evt.message_text ? evt.message_text.split("\n").find((line) => line.trim()) || null : null);
+
+                                                return (
+                                                    <div
+                                                        key={evt.id}
+                                                        className={animatedRecentEventIds.has(evt.id) ? "analytics-recent-event analytics-recent-event--new" : "analytics-recent-event"}
+                                                        style={{
+                                                            position: "relative",
+                                                            paddingBottom: "0.85rem",
+                                                            paddingLeft: "0.6rem"
+                                                        }}
+                                                    >
+                                                        <div style={{
+                                                            position: "absolute",
+                                                            left: "-1rem",
+                                                            top: "5px",
+                                                            width: "7px",
+                                                            height: "7px",
+                                                            borderRadius: "50%",
+                                                            background: dotColor
+                                                        }} />
+                                                        <div style={{ display: "flex", alignItems: "baseline", gap: "0.45rem", flexWrap: "wrap" }}>
+                                                            <span style={{
+                                                                fontSize: "0.82rem",
+                                                                fontWeight: 500,
+                                                                color: "rgba(255, 255, 255, 0.84)"
+                                                            }}>
+                                                                {label}
+                                                            </span>
+                                                            <span style={{ fontSize: "0.75rem", color: "rgba(255, 255, 255, 0.3)" }}>
+                                                                {dateTimeStr}
+                                                            </span>
+                                                        </div>
+                                                        <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
+                                                            {evt.campaign_name && (
+                                                                <span style={{
+                                                                    display: "inline-flex",
+                                                                    alignItems: "center",
+                                                                    gap: "0.3rem",
+                                                                    padding: "0.15rem 0.5rem",
+                                                                    borderRadius: "999px",
+                                                                    background: "rgba(255, 255, 255, 0.06)",
+                                                                    border: "1px solid rgba(255, 255, 255, 0.08)",
+                                                                    fontSize: "0.72rem",
+                                                                    color: "rgba(255, 255, 255, 0.45)",
+                                                                    lineHeight: 1.4
+                                                                }}>
+                                                                    {evt.campaign_name}
+                                                                </span>
+                                                            )}
+                                                            {evt.lead_email && (
+                                                                <span style={{
+                                                                    display: "inline-flex",
+                                                                    alignItems: "center",
+                                                                    padding: "0.15rem 0.5rem",
+                                                                    borderRadius: "999px",
+                                                                    background: "rgba(59, 130, 246, 0.08)",
+                                                                    border: "1px solid rgba(59, 130, 246, 0.16)",
+                                                                    fontSize: "0.72rem",
+                                                                    color: "rgba(191, 219, 254, 0.85)",
+                                                                    lineHeight: 1.4
+                                                                }}>
+                                                                    {evt.lead_email}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        {snippet && (
+                                                            <p style={{ margin: "0.2rem 0 0", fontSize: "0.78rem", color: "rgba(255, 255, 255, 0.55)" }}>
+                                                                {snippet.length > 180 ? `${snippet.slice(0, 180)}…` : snippet}
+                                                            </p>
+                                                        )}
+                                                        {evt.reply_category && (
+                                                            <span style={{
+                                                                display: "inline-block",
+                                                                marginTop: "0.25rem",
+                                                                padding: "0.1rem 0.4rem",
+                                                                borderRadius: "4px",
+                                                                fontSize: "0.72rem",
+                                                                fontWeight: 500,
+                                                                background: evt.reply_category === "Interested" ? "rgba(34, 197, 94, 0.15)" : "rgba(255, 255, 255, 0.06)",
+                                                                color: evt.reply_category === "Interested" ? "#4ade80" : "rgba(255, 255, 255, 0.5)"
+                                                            }}>
+                                                                {evt.reply_category}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    );
+                                })()}
+                            </div>
+                                </>
+                            )}
+                        </div>
+                    )}
 
                     {/* Campaigns Tab */}
                     {activeTab === "campaigns" && (
@@ -4407,7 +5028,6 @@ export default function ClientPage() {
                                     <button
                                         type="button"
                                         onClick={() => {
-                                            userDeselectedRef.current = true;
                                             setSelectedJobId(null);
                                             setJobState(null);
                                             closeJobStream();
@@ -4973,38 +5593,6 @@ export default function ClientPage() {
                                                                     </div>
                                                                 </div>
                                                             )}
-
-                                                            {/* Manual Upload Button - Only for completed jobs */}
-                                                            {job.status === 'completed' && (
-                                                                <div
-                                                                    style={{
-                                                                        marginTop: '1rem',
-                                                                        display: 'flex',
-                                                                        justifyContent: 'flex-end'
-                                                                    }}
-                                                                >
-                                                                    <button
-                                                                        type="button"
-                                                                        className="primary-button"
-                                                                        onClick={(e) => {
-                                                                            e.stopPropagation();
-                                                                            handleOpenManualUpload(job);
-                                                                        }}
-                                                                        style={{
-                                                                            flex: '0 0 auto',
-                                                                            width: 'auto',
-                                                                            minWidth: '260px',
-                                                                            height: '40px',
-                                                                            minHeight: '40px',
-                                                                            fontSize: '0.8rem',
-                                                                            whiteSpace: 'nowrap'
-                                                                        }}
-                                                                    >
-                                                                        📝 Confirm Manual Upload to Instantly
-                                                                    </button>
-                                                                </div>
-                                                            )}
-
                                                             {/* Delete button */}
                                                             <button
                                                                 type="button"
@@ -8253,166 +8841,6 @@ export default function ClientPage() {
                     }}
                 >
                     {toastMessage}
-                </div>
-            )}
-
-            {/* Manual Upload Modal */}
-            {showManualUploadModal && selectedJobForManual && (
-                <div
-                    style={{
-                        position: 'fixed',
-                        top: 0,
-                        left: 0,
-                        right: 0,
-                        bottom: 0,
-                        backgroundColor: 'rgba(0, 0, 0, 0.5)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        zIndex: 10001,
-                    }}
-                    onClick={() => {
-                        setShowManualUploadModal(false);
-                        setSelectedJobForManual(null);
-                        setSelectedManualCampaign('');
-                        setManualUploadNotes('');
-                        setQualifiedContactsCount(null);
-                    }}
-                >
-                    <div
-                        style={{
-                            backgroundColor: '#1e1e1e',
-                            borderRadius: '8px',
-                            padding: '24px',
-                            maxWidth: '500px',
-                            width: '90%',
-                            maxHeight: '80vh',
-                            overflowY: 'auto',
-                            boxShadow: '0 4px 20px rgba(0, 0, 0, 0.5)',
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                    >
-                        <h3 style={{ margin: '0 0 16px 0', fontSize: '18px', fontWeight: 600 }}>
-                            Confirm Manual Instantly Upload
-                        </h3>
-                        
-                        <p style={{ margin: '0 0 20px 0', color: '#888', fontSize: '14px' }}>
-                            Job: <strong style={{ color: '#fff' }}>{selectedJobForManual.name}</strong>
-                        </p>
-
-                        {qualifiedContactsCount !== null && (
-                            <div
-                                style={{
-                                    padding: '12px',
-                                    backgroundColor: '#2a2a2a',
-                                    borderRadius: '6px',
-                                    marginBottom: '20px',
-                                    fontSize: '14px',
-                                }}
-                            >
-                                <strong>{qualifiedContactsCount.qualified || 0}</strong> qualified contact{qualifiedContactsCount.qualified !== 1 ? 's' : ''} will be marked as uploaded
-                                <div style={{ marginTop: '6px', fontSize: '12px', color: '#888' }}>
-                                    (Valid/Risky email + Valid personalization)
-                                </div>
-                            </div>
-                        )}
-
-                        <div style={{ marginBottom: '16px' }}>
-                            <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px', fontWeight: 500 }}>
-                                Select Campaign *
-                            </label>
-                            <select
-                                value={selectedManualCampaign}
-                                onChange={(e) => setSelectedManualCampaign(e.target.value)}
-                                disabled={manualUploadLoading}
-                                style={{
-                                    width: '100%',
-                                    padding: '10px',
-                                    backgroundColor: '#2a2a2a',
-                                    border: '1px solid #444',
-                                    borderRadius: '6px',
-                                    color: '#fff',
-                                    fontSize: '14px',
-                                    cursor: manualUploadLoading ? 'not-allowed' : 'pointer',
-                                }}
-                            >
-                                <option value="">-- Select a campaign --</option>
-                                {manualUploadCampaigns.map((campaign) => (
-                                    <option key={campaign.id} value={campaign.id}>
-                                        {campaign.name}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-
-                        <div style={{ marginBottom: '20px' }}>
-                            <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px', fontWeight: 500 }}>
-                                Notes (Optional)
-                            </label>
-                            <textarea
-                                value={manualUploadNotes}
-                                onChange={(e) => setManualUploadNotes(e.target.value)}
-                                disabled={manualUploadLoading}
-                                placeholder="Add any notes about this manual upload..."
-                                rows={3}
-                                style={{
-                                    width: '100%',
-                                    padding: '10px',
-                                    backgroundColor: '#2a2a2a',
-                                    border: '1px solid #444',
-                                    borderRadius: '6px',
-                                    color: '#fff',
-                                    fontSize: '14px',
-                                    fontFamily: 'inherit',
-                                    resize: 'vertical',
-                                    cursor: manualUploadLoading ? 'not-allowed' : 'text',
-                                }}
-                            />
-                        </div>
-
-                        <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
-                            <button
-                                onClick={() => {
-                                    setShowManualUploadModal(false);
-                                    setSelectedJobForManual(null);
-                                    setSelectedManualCampaign('');
-                                    setManualUploadNotes('');
-                                    setQualifiedContactsCount(null);
-                                }}
-                                disabled={manualUploadLoading}
-                                style={{
-                                    padding: '10px 20px',
-                                    backgroundColor: '#2a2a2a',
-                                    border: '1px solid #444',
-                                    borderRadius: '6px',
-                                    color: '#fff',
-                                    fontSize: '14px',
-                                    fontWeight: 500,
-                                    cursor: manualUploadLoading ? 'not-allowed' : 'pointer',
-                                    opacity: manualUploadLoading ? 0.5 : 1,
-                                }}
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={handleConfirmManualUpload}
-                                disabled={manualUploadLoading || !selectedManualCampaign}
-                                style={{
-                                    padding: '10px 20px',
-                                    backgroundColor: selectedManualCampaign && !manualUploadLoading ? '#4CAF50' : '#2a2a2a',
-                                    border: 'none',
-                                    borderRadius: '6px',
-                                    color: '#fff',
-                                    fontSize: '14px',
-                                    fontWeight: 500,
-                                    cursor: !selectedManualCampaign || manualUploadLoading ? 'not-allowed' : 'pointer',
-                                    opacity: !selectedManualCampaign || manualUploadLoading ? 0.5 : 1,
-                                }}
-                            >
-                                {manualUploadLoading ? 'Processing...' : 'Confirm Upload'}
-                            </button>
-                        </div>
-                    </div>
                 </div>
             )}
         </>

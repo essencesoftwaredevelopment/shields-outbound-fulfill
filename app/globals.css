@@ -701,6 +701,39 @@ body {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.analytics-recent-event {
+  border-radius: 12px;
+}
+
+.analytics-recent-event--new {
+  animation: analyticsEventEnter 1.8s ease-out both;
+}
+
+@keyframes analyticsEventEnter {
+  0% {
+    transform: translateX(14px);
+    opacity: 0;
+    background: rgba(59, 130, 246, 0.18);
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.22);
+  }
+
+  20% {
+    opacity: 1;
+  }
+
+  45% {
+    background: rgba(59, 130, 246, 0.12);
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.16);
+  }
+
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+    background: transparent;
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0);
+  }
+}
+
 .form-error {
   margin: 0.5rem 0 0;
   color: #f87171;

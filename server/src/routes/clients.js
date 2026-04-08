@@ -52,6 +52,120 @@ const FIRST_NAME_ALIASES = ['first name', 'first_name'];
 const LAST_NAME_ALIASES = ['last name', 'last_name'];
 const EMAIL_STATUS_ALIASES = ['email_status', 'email status', 'verification status', 'lookup_status'];
 const MAX_BIND_PARAMS_PER_QUERY = 30000;
+const DEFAULT_SUPABASE_URL = process.env.SUPABASE_URL || 'https://xfamwraegljpmvsdimrp.supabase.co';
+const DEFAULT_SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY
+    || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+    || 'sb_publishable_d2nU2wfLmfxCa4fjdyhRrw_T3pHokH3';
+const INSTANTLY_ANALYTICS_PERIODS = {
+    '24h': {
+        period: '24h',
+        label: 'Last 24 hours',
+        bucketUnit: 'hour',
+        bucketStartSql: `DATE_TRUNC('hour', NOW() - INTERVAL '23 hours')`,
+        bucketEndSql: `DATE_TRUNC('hour', NOW())`,
+        eventFloorSql: `NOW() - INTERVAL '24 hours'`,
+        bucketTruncSql: `DATE_TRUNC('hour', cie.event_timestamp)`,
+        bucketLabelSql: `TO_CHAR(hours.bucket, 'HH24:00')`
+    },
+    '7d': {
+        period: '7d',
+        label: 'Last 7 days',
+        bucketUnit: 'day',
+        bucketStartSql: `DATE_TRUNC('day', NOW() - INTERVAL '6 days')`,
+        bucketEndSql: `DATE_TRUNC('day', NOW())`,
+        eventFloorSql: `NOW() - INTERVAL '7 days'`,
+        bucketTruncSql: `DATE_TRUNC('day', cie.event_timestamp)`,
+        bucketLabelSql: `TO_CHAR(hours.bucket, 'Mon DD')`
+    },
+    '30d': {
+        period: '30d',
+        label: 'Last 30 days',
+        bucketUnit: 'day',
+        bucketStartSql: `DATE_TRUNC('day', NOW() - INTERVAL '29 days')`,
+        bucketEndSql: `DATE_TRUNC('day', NOW())`,
+        eventFloorSql: `NOW() - INTERVAL '30 days'`,
+        bucketTruncSql: `DATE_TRUNC('day', cie.event_timestamp)`,
+        bucketLabelSql: `TO_CHAR(hours.bucket, 'Mon DD')`
+    },
+    '90d': {
+        period: '90d',
+        label: 'Last 90 days',
+        bucketUnit: 'day',
+        bucketStartSql: `DATE_TRUNC('day', NOW() - INTERVAL '89 days')`,
+        bucketEndSql: `DATE_TRUNC('day', NOW())`,
+        eventFloorSql: `NOW() - INTERVAL '90 days'`,
+        bucketTruncSql: `DATE_TRUNC('day', cie.event_timestamp)`,
+        bucketLabelSql: `TO_CHAR(hours.bucket, 'Mon DD')`
+    }
+};
+const INSTANTLY_EVENT_TYPE_LABELS = {
+    all: 'All event types',
+    email_sent: 'Email Sent',
+    email_opened: 'Email Opened',
+    email_link_clicked: 'Link Clicked',
+    reply_received: 'Reply Received',
+    email_bounced: 'Email Bounced',
+    lead_unsubscribed: 'Unsubscribed',
+    lead_interested: 'Interested',
+    lead_meeting_booked: 'Meeting Booked',
+    lead_meeting_completed: 'Meeting Completed',
+    lead_closed: 'Closed Won',
+    lead_out_of_office: 'Out of Office',
+    lead_not_interested: 'Not Interested',
+    lead_wrong_person: 'Wrong Person',
+    lead_neutral: 'Neutral',
+    lead_no_show: 'No Show',
+    state_sync: 'State Sync',
+    unknown: 'Unknown'
+};
+
+function normalizeInstantlyEventType(eventType) {
+    const normalized = String(eventType || '').trim().toLowerCase();
+    if (!normalized) return 'unknown';
+    if (normalized === 'reply' || normalized === 'replied') return 'reply_received';
+    if (normalized.includes('bounce')) return 'email_bounced';
+    return normalized;
+}
+
+function formatInstantlyEventTypeLabel(eventType) {
+    const normalized = normalizeInstantlyEventType(eventType);
+    if (INSTANTLY_EVENT_TYPE_LABELS[normalized]) {
+        return INSTANTLY_EVENT_TYPE_LABELS[normalized];
+    }
+
+    return normalized
+        .split(/[_\s-]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+
+function buildInstantlyEventTypeFilterClause(eventType, tableAlias, placeholder) {
+    const normalized = normalizeInstantlyEventType(eventType);
+    if (!normalized || normalized === 'all') {
+        return { clause: '', params: [], normalized: 'all' };
+    }
+    if (normalized === 'reply_received') {
+        return {
+            clause: ` AND LOWER(COALESCE(${tableAlias}.event_type, '')) IN ('reply_received', 'reply', 'replied')`,
+            params: [],
+            normalized
+        };
+    }
+    if (normalized === 'email_bounced') {
+        return {
+            clause: ` AND LOWER(COALESCE(${tableAlias}.event_type, '')) LIKE '%bounce%'`,
+            params: [],
+            normalized
+        };
+    }
+
+    return {
+        clause: ` AND LOWER(COALESCE(${tableAlias}.event_type, '')) = ${placeholder}`,
+        params: [normalized],
+        normalized
+    };
+}
 
 function setNoStoreHeaders(res) {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -477,6 +591,170 @@ router.post('/clients/:id/instantly/sync-runs/:runId/stop', async (req, res) => 
         const statusCode = Number(error?.statusCode || 500);
         console.error('Error stopping Instantly sync run:', error);
         res.status(statusCode).json({ error: error?.message || 'Failed to stop Instantly sync run.' });
+    }
+});
+
+router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+
+        const { clientId } = req.params;
+        const agencyId = await verifyAgencyIdFromRequest(req);
+        const sqlClientId = await getOrCreateClient(agencyId, clientId);
+        const requestedPeriod = String(req.query?.period || '24h').trim().toLowerCase();
+        const periodConfig = INSTANTLY_ANALYTICS_PERIODS[requestedPeriod] || INSTANTLY_ANALYTICS_PERIODS['24h'];
+        const requestedEventType = String(req.query?.eventType || 'all').trim().toLowerCase();
+        const eventTypeFilter = buildInstantlyEventTypeFilterClause(requestedEventType, 'cie', '$3');
+        const analyticsParams = [agencyId, sqlClientId, ...eventTypeFilter.params];
+
+        let realtimeWebsocketUrl = null;
+        try {
+            const wsUrl = new URL(DEFAULT_SUPABASE_URL);
+            wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+            wsUrl.pathname = '/realtime/v1/websocket';
+            wsUrl.search = '';
+            wsUrl.searchParams.set('apikey', DEFAULT_SUPABASE_PUBLISHABLE_KEY);
+            wsUrl.searchParams.set('vsn', '1.0.0');
+            realtimeWebsocketUrl = wsUrl.toString();
+        } catch {
+            realtimeWebsocketUrl = null;
+        }
+
+        const summaryResult = await pool.query(
+            `SELECT
+                COUNT(*)::int AS total_events,
+                COUNT(DISTINCT cie.contact_id)::int AS unique_contacts,
+                COUNT(DISTINCT cie.campaign_id)::int AS unique_campaigns,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
+                )::int AS emails_sent,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(cie.reply_category, '')) = 'positive'
+                )::int AS positive_replies,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
+                )::int AS meetings_booked,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(cie.event_type, '')) IN ('reply', 'replied')
+                )::int AS reply_events,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(cie.event_type, '')) LIKE '%bounce%'
+                )::int AS bounce_events,
+                MIN(cie.event_timestamp) AS first_event_at,
+                MAX(cie.event_timestamp) AS last_event_at
+            FROM contact_instantly_events cie
+            WHERE cie.agency_id = $1
+            AND cie.client_id = $2
+            AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}`,
+            analyticsParams
+        );
+
+        const byHourResult = await pool.query(
+            `SELECT
+                TO_CHAR(hours.bucket, 'YYYY-MM-DD\"T\"HH24:00:00\"Z\"') AS bucket,
+                ${periodConfig.bucketLabelSql} AS label,
+                COALESCE(counts.count, 0)::int AS count
+            FROM generate_series(
+                ${periodConfig.bucketStartSql},
+                ${periodConfig.bucketEndSql},
+                INTERVAL '1 ${periodConfig.bucketUnit}'
+            ) AS hours(bucket)
+            LEFT JOIN (
+                SELECT
+                    ${periodConfig.bucketTruncSql} AS bucket,
+                    COUNT(*)::int AS count
+                FROM contact_instantly_events cie
+                WHERE cie.agency_id = $1
+                AND cie.client_id = $2
+                AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}
+                GROUP BY 1
+            ) counts ON counts.bucket = hours.bucket
+            ORDER BY hours.bucket ASC`,
+            analyticsParams
+        );
+
+        const eventTypeResult = await pool.query(
+            `SELECT DISTINCT LOWER(COALESCE(cie.event_type, 'unknown')) AS event_type
+            FROM contact_instantly_events cie
+            WHERE cie.agency_id = $1
+            AND cie.client_id = $2
+            AND cie.event_timestamp >= ${periodConfig.eventFloorSql}`,
+            [agencyId, sqlClientId]
+        );
+
+        const recentEventsResult = await pool.query(
+            `SELECT
+                cie.id::text AS id,
+                LOWER(COALESCE(cie.event_type, 'unknown')) AS event_type,
+                cie.reply_category,
+                cie.lead_email,
+                cie.email_account,
+                cie.message_text,
+                cie.reply_text_snippet,
+                cie.event_timestamp,
+                ic.name AS campaign_name
+            FROM contact_instantly_events cie
+            LEFT JOIN instantly_campaigns ic ON ic.id = cie.campaign_id
+            WHERE cie.agency_id = $1
+            AND cie.client_id = $2
+            AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}
+            ORDER BY cie.event_timestamp DESC NULLS LAST, cie.created_at DESC NULLS LAST, cie.id DESC
+            LIMIT 10`,
+            analyticsParams
+        );
+
+        const availableEventTypes = [
+            { value: 'all', label: formatInstantlyEventTypeLabel('all') },
+            ...Array.from(
+                new Map(
+                    eventTypeResult.rows
+                        .map((row) => normalizeInstantlyEventType(row.event_type))
+                        .filter(Boolean)
+                        .map((value) => [value, { value, label: formatInstantlyEventTypeLabel(value) }])
+                ).values()
+            )
+        ];
+
+        res.json({
+            clientSqlId: sqlClientId,
+            realtimeConfig: realtimeWebsocketUrl
+                ? {
+                    websocketUrl: realtimeWebsocketUrl,
+                    supabaseUrl: DEFAULT_SUPABASE_URL,
+                    publishableKey: DEFAULT_SUPABASE_PUBLISHABLE_KEY
+                }
+                : null,
+            window: {
+                period: periodConfig.period,
+                label: periodConfig.label,
+                bucketUnit: periodConfig.bucketUnit,
+                startAt: new Date(byHourResult.rows[0]?.bucket || Date.now()).toISOString(),
+                endAt: new Date(byHourResult.rows[byHourResult.rows.length - 1]?.bucket || Date.now()).toISOString()
+            },
+            eventType: {
+                value: eventTypeFilter.normalized,
+                label: formatInstantlyEventTypeLabel(eventTypeFilter.normalized)
+            },
+            availableEventTypes,
+            summary: summaryResult.rows[0] || {
+                total_events: 0,
+                unique_contacts: 0,
+                unique_campaigns: 0,
+                emails_sent: 0,
+                positive_replies: 0,
+                meetings_booked: 0,
+                reply_events: 0,
+                bounce_events: 0,
+                first_event_at: null,
+                last_event_at: null
+            },
+            byHour: byHourResult.rows,
+            recentEvents: recentEventsResult.rows
+        });
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        console.error('Error fetching Instantly event analytics:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to fetch Instantly event analytics.' });
     }
 });
 
