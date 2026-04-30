@@ -16,9 +16,18 @@ pm2 start ecosystem.config.cjs
 pm2 start ecosystem.config.cjs --only shields-outbound-server
 pm2 start ecosystem.config.cjs --only shields-outbound-worker
 
+# Start only follow-up worker (twice-daily automated reply sender)
+pm2 start ecosystem.config.cjs --only shields-outbound-followup-worker
+
+# Trigger a one-off follow-up run manually (without starting the scheduler)
+node src/scripts/run-follow-ups-once.js
+# Dry-run mode (renders and logs but does not send)
+FOLLOWUP_DRY_RUN=true node src/scripts/run-follow-ups-once.js
+
 # View logs
 pm2 logs shields-outbound-server
 pm2 logs shields-outbound-worker
+pm2 logs shields-outbound-followup-worker
 
 # List all processes
 pm2 list

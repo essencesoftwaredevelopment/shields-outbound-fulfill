@@ -21,7 +21,7 @@ importers:
         specifier: ^1.7.0
         version: 1.7.0(react@19.2.0)
       next:
-        specifier: ^16.0.7
+        specifier: 16.0.10
         version: 16.0.10(@babel/core@7.28.5)(react-dom@19.2.0(react@19.2.0))(react@19.2.0)
       ngrok:
         specifier: 5.0.0-beta.2
@@ -64,7 +64,7 @@ importers:
         specifier: ^9
         version: 9.39.2(jiti@2.6.1)
       eslint-config-next:
-        specifier: ^16.0.7
+        specifier: 16.0.10
         version: 16.0.10(@typescript-eslint/parser@8.50.0(eslint@9.39.2(jiti@2.6.1))(typescript@5.9.3))(eslint@9.39.2(jiti@2.6.1))(typescript@5.9.3)
       tailwindcss:
         specifier: ^4

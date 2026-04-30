@@ -51,6 +51,22 @@ module.exports = {
         ...baseEnv
       },
       autorestart: true
+    },
+    {
+      name: 'shields-outbound-followup-worker',
+      script: 'src/worker/followUpWorker.js',
+      cwd: '/root/shields-outbound/server',
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        ...baseEnv,
+        FOLLOWUP_SCHEDULE_TIMES: process.env.FOLLOWUP_SCHEDULE_TIMES || '09:00,14:00',
+        FOLLOWUP_TIMEZONE: process.env.FOLLOWUP_TIMEZONE || 'UTC',
+        FOLLOWUP_BATCH_SIZE: process.env.FOLLOWUP_BATCH_SIZE || 50,
+        FOLLOWUP_CONCURRENCY: process.env.FOLLOWUP_CONCURRENCY || 2,
+        FOLLOWUP_DRY_RUN: process.env.FOLLOWUP_DRY_RUN || 'false'
+      },
+      autorestart: true
     }
   ]
 };

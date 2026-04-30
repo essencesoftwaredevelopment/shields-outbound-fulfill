@@ -1,8 +1,11 @@
+import crypto from 'crypto';
 import express from 'express';
 import { firestore } from '../config/firebase.js';
 import { searchLead, sendToClay } from '../services/leadWebhook.js';
 import { processInstantlyWebhookEvent, validateInstantlyWebhookSecret } from '../services/instantlyState.js';
 import { upsertLead } from '../services/leads.js';
+import { pool } from '../lib/db.js';
+import { getOrCreateClient } from '../services/db/queries.js';
 
 const router = express.Router();
 
@@ -240,5 +243,109 @@ async function handleInstantlyWebhookEvent(req, res) {
 
 router.post('/webhook/instantly/events/:userId/:clientId', handleInstantlyWebhookEvent);
 router.post('/instantly/events/:userId/:clientId', handleInstantlyWebhookEvent);
+
+// ---------------------------------------------------------------------------
+// Calendly webhook – meeting booked events stored as contact timeline events
+// ---------------------------------------------------------------------------
+
+async function handleCalendlyWebhookEvent(req, res) {
+    const { userId, clientId } = req.params;
+    const body = req.body || {};
+
+    // Calendly sends { event: 'invitee.created', payload: { ... } }
+    // We store all event types but only create a timeline entry for bookings.
+    const eventName = (typeof body.event === 'string' ? body.event : '') || 'invitee.created';
+    const payload = (typeof body.payload === 'object' && body.payload) ? body.payload : body;
+
+    const invitee = (typeof payload.invitee === 'object' && payload.invitee) ? payload.invitee : {};
+    const scheduledEvent = (typeof payload.scheduled_event === 'object' && payload.scheduled_event)
+        ? payload.scheduled_event
+        : (typeof payload.event === 'object' && payload.event) ? payload.event : {};
+    const eventTypeInfo = (typeof payload.event_type === 'object' && payload.event_type) ? payload.event_type : {};
+
+    const email = [
+        invitee.email,
+        payload.email,
+        body.email
+    ].map(v => (typeof v === 'string' ? v.trim().toLowerCase() : '')).find(v => v.includes('@')) || '';
+
+    if (!email) {
+        console.warn(`[calendly-webhook][${userId}/${clientId}] missing invitee email`);
+        return res.status(200).json({ ok: true, skipped: 'no invitee email in payload' });
+    }
+
+    const inviteeName = invitee.name || `${invitee.first_name || ''} ${invitee.last_name || ''}`.trim() || null;
+    const meetingName = scheduledEvent.name || eventTypeInfo.name || null;
+    const startTime = scheduledEvent.start_time || invitee.created_at || null;
+    const inviteeUuid = invitee.uuid || null;
+    const questionsAndAnswers = invitee.questions_and_answers || payload.questions_and_answers || [];
+
+    // Map Calendly event type to a timeline event_type value
+    const timelineEventType = eventName === 'invitee.canceled' ? 'meeting_canceled' : 'meeting_booked';
+
+    // Fingerprint based on invitee UUID (unique per booking), falling back to email+start_time
+    const fingerprintBase = `calendly|${inviteeUuid || email}|${startTime || ''}|${timelineEventType}`;
+    const fingerprint = crypto.createHash('sha256').update(fingerprintBase).digest('hex');
+
+    const eventTimestamp = startTime ? new Date(startTime) : new Date();
+    if (isNaN(eventTimestamp.getTime())) {
+        console.warn(`[calendly-webhook][${userId}/${clientId}] invalid start_time '${startTime}', using now`);
+    }
+    const safeTimestamp = isNaN(eventTimestamp.getTime()) ? new Date() : eventTimestamp;
+
+    const storedPayload = {
+        calendly_event: eventName,
+        invitee_uuid: inviteeUuid,
+        meeting_name: meetingName,
+        start_time: startTime,
+        end_time: scheduledEvent.end_time || null,
+        timezone: invitee.timezone || null,
+        cancel_url: payload.cancel_url || null,
+        reschedule_url: payload.reschedule_url || null,
+        questions_and_answers: questionsAndAnswers,
+        raw: body
+    };
+
+    try {
+        const sqlClientId = await getOrCreateClient(userId, clientId);
+
+        // Look up the contact by email within this agency
+        const contactResult = await pool.query(
+            `SELECT id FROM contacts WHERE email = $1 AND agency_id = $2 LIMIT 1`,
+            [email, userId]
+        );
+        const contactId = contactResult.rows[0]?.id || null;
+
+        await pool.query(
+            `INSERT INTO contact_instantly_events (
+                agency_id, client_id, contact_id,
+                event_type, lead_email,
+                message_text, event_timestamp, fingerprint, source, payload
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'calendly', $9::jsonb)
+            ON CONFLICT (source, fingerprint) DO NOTHING`,
+            [
+                userId,
+                sqlClientId,
+                contactId,
+                timelineEventType,
+                email,
+                inviteeName ? `${inviteeName} booked: ${meetingName || 'meeting'}` : (meetingName || 'Meeting booked'),
+                safeTimestamp,
+                fingerprint,
+                JSON.stringify(storedPayload)
+            ]
+        );
+
+        console.log(`[calendly-webhook][${userId}/${clientId}] stored ${timelineEventType} for ${email} (contact_id=${contactId ?? 'unknown'})`);
+        return res.status(200).json({ ok: true });
+    } catch (error) {
+        console.error(`[calendly-webhook][${userId}/${clientId}] error:`, error?.message || error);
+        return res.status(500).json({ error: 'Failed to store Calendly event.' });
+    }
+}
+
+router.post('/webhook/calendly/:userId/:clientId', handleCalendlyWebhookEvent);
+router.post('/calendly/:userId/:clientId', handleCalendlyWebhookEvent);
 
 export default router;

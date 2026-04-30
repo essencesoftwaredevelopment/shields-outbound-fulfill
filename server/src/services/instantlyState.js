@@ -280,6 +280,20 @@ function buildEventFingerprint(event) {
     return crypto.createHash('sha256').update(base).digest('hex');
 }
 
+function extractReplyToUuid(event) {
+    return asNullableText(
+        event?.reply_to_uuid
+        || event?.email_id
+        || event?.uuid
+        || event?.id
+        || event?.email?.id
+        || event?.data?.reply_to_uuid
+        || event?.data?.email_id
+        || event?.data?.uuid
+        || event?.data?.id
+    );
+}
+
 class InstantlyRequestError extends Error {
     constructor(message, { statusCode = null, retryAfterMs = null, retryable = false, cause = null } = {}) {
         super(message);
@@ -592,6 +606,78 @@ async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {}) {
         syncRunId
     });
     return extractItems(payload);
+}
+
+async function fetchInstantlyAccounts(apiKey, { syncRunId = null } = {}) {
+    const rows = [];
+    let startingAfter = null;
+
+    while (true) {
+        const params = new URLSearchParams();
+        params.set('limit', String(INSTANTLY_SYNC_PAGE_LIMIT));
+        if (startingAfter) {
+            params.set('starting_after', startingAfter);
+        }
+
+        const payload = await instantlyRequest({
+            apiKey,
+            path: `/api/v2/accounts?${params.toString()}`,
+            method: 'GET',
+            syncRunId
+        });
+
+        const items = extractItems(payload);
+        rows.push(...items);
+
+        const next = nextStartingAfter(payload);
+        if (!next) break;
+        startingAfter = next;
+    }
+
+    return rows;
+}
+
+async function upsertEmailAccounts(db, rows) {
+    if (!rows.length) return 0;
+
+    await db.query(
+        `WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS x(
+                agency_id TEXT,
+                client_id BIGINT,
+                email TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                provider_code INTEGER,
+                signature TEXT,
+                instantly_workspace_id TEXT,
+                raw_payload JSONB,
+                last_synced_at TIMESTAMPTZ
+            )
+        )
+        INSERT INTO email_accounts (
+            agency_id, client_id, email, first_name, last_name, provider_code,
+            signature, instantly_workspace_id, raw_payload, last_synced_at, updated_at
+        )
+        SELECT
+            agency_id, client_id, LOWER(email), first_name, last_name, provider_code,
+            signature, instantly_workspace_id, raw_payload, last_synced_at, NOW()
+        FROM input
+        ON CONFLICT (client_id, email)
+        DO UPDATE SET
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            provider_code = EXCLUDED.provider_code,
+            signature = EXCLUDED.signature,
+            instantly_workspace_id = EXCLUDED.instantly_workspace_id,
+            raw_payload = EXCLUDED.raw_payload,
+            last_synced_at = EXCLUDED.last_synced_at,
+            updated_at = NOW()`,
+        [JSON.stringify(rows)]
+    );
+
+    return rows.length;
 }
 
 async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = null, logger = () => {}, onProgress = null } = {}) {
@@ -1368,6 +1454,43 @@ export async function registerInstantlyWebhook({ agencyId, clientSlug, instantly
     };
 }
 
+export async function syncClientEmailAccounts({ agencyId, clientSlug, instantlyKey, logger = () => {} }) {
+    const clientState = await resolveClientState(agencyId, clientSlug);
+    if (!clientState) {
+        throw new Error('Client not found in SQL.');
+    }
+
+    const accounts = await fetchInstantlyAccounts(instantlyKey);
+    const syncedAt = new Date().toISOString();
+    const normalizedRows = accounts
+        .map((account) => {
+            const email = normalizeEmail(account?.email);
+            if (!email) return null;
+            return {
+                agency_id: agencyId,
+                client_id: clientState.id,
+                email,
+                first_name: asNullableText(account?.first_name),
+                last_name: asNullableText(account?.last_name),
+                provider_code: asNullableInt(account?.provider_code),
+                signature: asNullableText(account?.signature),
+                instantly_workspace_id: asNullableText(account?.organization_id || account?.workspace_id || account?.organization),
+                raw_payload: asJsonObject(account),
+                last_synced_at: syncedAt
+            };
+        })
+        .filter(Boolean);
+
+    const syncedCount = await upsertEmailAccounts(pool, normalizedRows);
+    logger(`Synced ${syncedCount} email account(s) for ${agencyId}/${clientSlug}`);
+
+    return {
+        clientId: clientState.id,
+        syncedCount,
+        syncedAt
+    };
+}
+
 export async function syncClientInstantlyState({ agencyId, clientSlug, instantlyKey, syncRunId = null, logger = () => {} }) {
     const sqlClientId = await getOrCreateClient(agencyId, clientSlug);
     const syncStartedAt = new Date().toISOString();
@@ -1801,18 +1924,28 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
 
         const fingerprint = buildEventFingerprint(event);
         const eventPatch = buildEventPatch(event, eventTimestamp);
+        const replyToUuid = extractReplyToUuid(event);
         const insertEventResult = await client.query(
             `INSERT INTO contact_instantly_events (
                 agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
                 event_type, reply_category, lead_email, email_account, unibox_url, step, variant,
-                message_text, reply_text_snippet, event_timestamp, fingerprint, source, payload
+                message_text, reply_text_snippet, reply_to_uuid, event_timestamp, fingerprint, source, payload
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12, $13,
-                $14, $15, $16, $17, $18, $19::jsonb
+                $14, $15, $16, $17, $18, $19, $20::jsonb
             )
-            ON CONFLICT (source, fingerprint) DO NOTHING
+            ON CONFLICT (source, fingerprint) DO UPDATE
+            SET reply_to_uuid = COALESCE(contact_instantly_events.reply_to_uuid, EXCLUDED.reply_to_uuid),
+                email_account = COALESCE(contact_instantly_events.email_account, EXCLUDED.email_account),
+                unibox_url = COALESCE(contact_instantly_events.unibox_url, EXCLUDED.unibox_url),
+                message_text = COALESCE(contact_instantly_events.message_text, EXCLUDED.message_text),
+                reply_text_snippet = COALESCE(contact_instantly_events.reply_text_snippet, EXCLUDED.reply_text_snippet),
+                payload = CASE
+                    WHEN contact_instantly_events.payload = '{}'::jsonb THEN EXCLUDED.payload
+                    ELSE contact_instantly_events.payload
+                END
             RETURNING id`,
             [
                 agencyId,
@@ -1830,6 +1963,7 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
                 asNullableInt(event?.variant),
                 asNullableText(event?.message_text || event?.reply_text || event?.text),
                 asNullableText(event?.reply_text_snippet),
+                replyToUuid,
                 eventTimestamp,
                 fingerprint,
                 'webhook',
@@ -1963,4 +2097,21 @@ export async function listInstantlySyncClients() {
             };
         })
         .filter((item) => item.agencyId && item.clientSlug && item.instantlyKey);
+}
+
+/**
+ * Send a reply via the Instantly V2 reply endpoint.
+ * Uses the shared rate-limited, retrying HTTP helper.
+ *
+ * @param {string} apiKey       Client Instantly API key.
+ * @param {object} replyPayload Fields required by POST /api/v2/emails/reply:
+ *                              reply_to_uuid, eaccount, subject, body { html, text }
+ */
+export async function sendInstantlyReply(apiKey, replyPayload) {
+    return instantlyRequest({
+        apiKey,
+        path: '/api/v2/emails/reply',
+        method: 'POST',
+        body: replyPayload
+    });
 }

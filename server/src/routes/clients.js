@@ -16,6 +16,7 @@ import multer from 'multer';
 import { parse as csvParse } from 'csv-parse/sync';
 import { admin, firestore } from '../config/firebase.js';
 import { pool } from '../config/db.js';
+import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import {
     beginInstantlySyncRun,
@@ -24,6 +25,8 @@ import {
     getLatestInstantlySyncRun,
     requestStopInstantlySyncRun,
     registerInstantlyWebhook
+    ,
+    syncClientEmailAccounts
 } from '../services/instantlyState.js';
 import {
     choosePreferredCampaign,
@@ -37,6 +40,12 @@ import {
     normalizePersonName,
     shouldBackfillEmailStatus
 } from '../utils/instantlyImportMerge.js';
+import {
+    htmlToPlainText,
+    renderTemplate,
+    resolveTemplateVars,
+    sanitizeHtml
+} from '../services/followUpSender.js';
 
 const router = express.Router();
 const upload = multer({
@@ -538,6 +547,38 @@ router.post('/clients/:id/instantly/sync', async (req, res) => {
     } catch (error) {
         console.error('Error syncing Instantly state:', error);
         res.status(500).json({ error: 'Failed to sync Instantly state.' });
+    }
+});
+
+router.post('/clients/:id/instantly/email-accounts/sync', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const { idToken } = req.body || {};
+        const clientSlug = req.params.id;
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const agencyId = decoded.uid;
+
+        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
+        const clientSnap = await clientRef.get();
+        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
+
+        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
+        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+
+        const result = await syncClientEmailAccounts({
+            agencyId,
+            clientSlug,
+            instantlyKey,
+            logger: (message) => console.log(`[instantly-email-accounts][${agencyId}/${clientSlug}] ${message}`)
+        });
+
+        res.json(result);
+    } catch (error) {
+        console.error('Error syncing Instantly email accounts:', error);
+        res.status(500).json({ error: 'Failed to sync Instantly email accounts.' });
     }
 });
 
@@ -1269,6 +1310,227 @@ router.post('/clients/:clientId/instantly-import/merge', upload.single('file'), 
     } catch (error) {
         console.error('Error merging Instantly CSV import:', error);
         res.status(500).json({ error: 'Failed to process Instantly CSV merge import.' });
+    }
+});
+
+// ─── Follow-Up Scripts CRUD ────────────────────────────────────────────────
+
+router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId } = req.params;
+        const {
+            contactEmail,
+            campaignId,
+            scriptId,
+            htmlTemplate,
+            textTemplate
+        } = req.body || {};
+
+        if (!contactEmail || typeof contactEmail !== 'string') {
+            return res.status(400).json({ error: 'contactEmail is required' });
+        }
+
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientResult.rows[0].id;
+
+        const contactResult = await pool.query(
+            `SELECT id, email
+             FROM contacts
+             WHERE client_id = $1
+               AND LOWER(email) = LOWER($2)
+             LIMIT 1`,
+            [sqlClientId, contactEmail]
+        );
+        if (!contactResult.rows.length) {
+            return res.status(404).json({ error: 'Contact not found for this client' });
+        }
+        const contactId = contactResult.rows[0].id;
+
+        let resolvedCampaignId = Number(campaignId) || null;
+        if (!resolvedCampaignId) {
+            const campaignResult = await pool.query(
+                `SELECT cic.campaign_id
+                 FROM contact_instantly_campaigns cic
+                 WHERE cic.contact_id = $1
+                 ORDER BY cic.timestamp_last_contact DESC NULLS LAST, cic.campaign_id DESC
+                 LIMIT 1`,
+                [contactId]
+            );
+            resolvedCampaignId = Number(campaignResult.rows[0]?.campaign_id || 0) || null;
+        }
+        if (!resolvedCampaignId) {
+            return res.status(400).json({ error: 'campaignId is required when the contact has no linked campaigns' });
+        }
+
+        const emailAccountResult = await pool.query(
+            `SELECT email_account
+             FROM contact_instantly_events
+             WHERE contact_id = $1
+               AND campaign_id = $2
+               AND email_account IS NOT NULL
+             ORDER BY event_timestamp DESC
+             LIMIT 1`,
+            [contactId, resolvedCampaignId]
+        );
+        const emailAccount = emailAccountResult.rows[0]?.email_account || null;
+
+        let templateHtml = typeof htmlTemplate === 'string' ? htmlTemplate : '';
+        let templateText = typeof textTemplate === 'string' ? textTemplate : null;
+
+        if (!templateHtml) {
+            if (!scriptId) {
+                return res.status(400).json({ error: 'Provide either scriptId or htmlTemplate' });
+            }
+            const scriptResult = await pool.query(
+                `SELECT id, html_template, text_template
+                 FROM follow_up_scripts
+                 WHERE id = $1 AND client_id = $2
+                 LIMIT 1`,
+                [scriptId, sqlClientId]
+            );
+            if (!scriptResult.rows.length) {
+                return res.status(404).json({ error: 'Script not found' });
+            }
+            templateHtml = scriptResult.rows[0].html_template || '';
+            templateText = scriptResult.rows[0].text_template || null;
+        }
+
+        const vars = await resolveTemplateVars(pool, contactId, resolvedCampaignId, {
+            clientId: sqlClientId,
+            emailAccount
+        });
+        const rawHtml = renderTemplate(templateHtml, vars);
+        const renderedHtml = sanitizeHtml(rawHtml);
+        const renderedText = templateText
+            ? renderTemplate(templateText, vars)
+            : htmlToPlainText(renderedHtml);
+
+        res.json({
+            preview: {
+                contactId,
+                contactEmail: contactResult.rows[0].email,
+                campaignId: resolvedCampaignId,
+                vars,
+                renderedHtml,
+                renderedText
+            }
+        });
+    } catch (err) {
+        console.error('POST follow-up-preview error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId } = req.params;
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientResult.rows[0].id;
+        const result = await pool.query(
+            `SELECT id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at
+             FROM follow_up_scripts
+             WHERE client_id = $1
+             ORDER BY script_order ASC`,
+            [sqlClientId]
+        );
+        res.json({ scripts: result.rows });
+    } catch (err) {
+        console.error('GET follow-up-scripts error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+router.post('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId } = req.params;
+        const { active = true, scriptOrder, htmlTemplate, textTemplate } = req.body;
+        if (!htmlTemplate) {
+            return res.status(400).json({ error: 'html_template is required' });
+        }
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientResult.rows[0].id;
+        const result = await pool.query(
+            `INSERT INTO follow_up_scripts (client_id, active, script_order, name, subject_template, html_template, text_template)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at`,
+            [sqlClientId, active, scriptOrder || 1, null, '', htmlTemplate, textTemplate || null]
+        );
+        res.status(201).json({ script: result.rows[0] });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'A script with that order already exists for this client' });
+        }
+        console.error('POST follow-up-scripts error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+router.put('/clients/:clientId/follow-up-scripts/:id', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId, id } = req.params;
+        const { active, scriptOrder, htmlTemplate, textTemplate } = req.body;
+        if (!htmlTemplate) {
+            return res.status(400).json({ error: 'html_template is required' });
+        }
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientResult.rows[0].id;
+        const result = await pool.query(
+            `UPDATE follow_up_scripts
+             SET active = $1, script_order = $2, name = $3, subject_template = $4, html_template = $5, text_template = $6, updated_at = NOW()
+             WHERE id = $7 AND client_id = $8
+             RETURNING id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at`,
+            [active ?? true, scriptOrder || 1, null, '', htmlTemplate, textTemplate || null, id, sqlClientId]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Script not found' });
+        res.json({ script: result.rows[0] });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'A script with that order already exists for this client' });
+        }
+        console.error('PUT follow-up-scripts error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+router.delete('/clients/:clientId/follow-up-scripts/:id', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId, id } = req.params;
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientResult.rows[0].id;
+        const result = await pool.query(
+            'DELETE FROM follow_up_scripts WHERE id = $1 AND client_id = $2 RETURNING id',
+            [id, sqlClientId]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Script not found' });
+        res.json({ deleted: true });
+    } catch (err) {
+        console.error('DELETE follow-up-scripts error:', err);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 

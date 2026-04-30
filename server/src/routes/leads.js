@@ -15,6 +15,8 @@ import { verifyFirebaseToken } from '../middleware/auth.js';
 import * as leadsService from '../services/leads.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
+import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
+import { normalizeDomain } from '../utils/domain.js';
 
 const router = express.Router();
 
@@ -48,6 +50,10 @@ function normalizeOptionalText(value) {
     return normalized || null;
 }
 
+function isEmailLikeSearch(value) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
 function normalizeOptionalNumber(value) {
     if (value === undefined || value === null || value === '') return undefined;
     const parsed = Number(value);
@@ -73,6 +79,202 @@ function normalizeOptionalObject(value) {
     if (value === undefined) return undefined;
     if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
     return value;
+}
+
+function extractNormalizedDomains(payload) {
+    const directDomains = Array.isArray(payload?.domains) ? payload.domains : [];
+    const leadRows = Array.isArray(payload?.leads) ? payload.leads : [];
+
+    const rawDomains = [
+        ...directDomains,
+        ...leadRows.map((row) => row?.domain)
+    ];
+
+    const seen = new Set();
+    const normalized = [];
+    for (const rawDomain of rawDomains) {
+        const domain = normalizeDomain(rawDomain);
+        if (!domain || seen.has(domain)) continue;
+        seen.add(domain);
+        normalized.push(domain);
+    }
+
+    return normalized;
+}
+
+async function runKlaviyoInsightsSync({ agencyId, clientSlug, domains, concurrency = 50, onlyNullUsesKlaviyo = false }) {
+    const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+    const normalizedDomains = Array.from(new Set((domains || []).map((domain) => normalizeOptionalText(domain)).filter(Boolean)));
+
+    let domainsToCheck = normalizedDomains;
+    if (onlyNullUsesKlaviyo) {
+        const nullOnlyResult = await pool.query(
+            `SELECT DISTINCT co.domain_normalized AS domain
+             FROM companies co
+             JOIN contacts c
+               ON c.company_id = co.id
+              AND c.agency_id = $1
+             LEFT JOIN contact_insights ci
+               ON ci.contact_id = c.id
+             WHERE co.agency_id = $1
+             AND co.client_id = $2
+             AND co.domain_normalized = ANY($3::text[])
+             AND ci.uses_klaviyo IS NULL`,
+            [agencyId, clientId, normalizedDomains]
+        );
+
+        const nullOnlySet = new Set(
+            nullOnlyResult.rows
+                .map((row) => String(row.domain || '').trim())
+                .filter(Boolean)
+        );
+        domainsToCheck = normalizedDomains.filter((domain) => nullOnlySet.has(domain));
+    }
+
+    if (domainsToCheck.length === 0) {
+        return {
+            clientId: clientSlug,
+            requestedDomainCount: normalizedDomains.length,
+            checkedDomainCount: 0,
+            skippedAlreadyScoredCount: normalizedDomains.length,
+            matchedDomainCount: 0,
+            matchedContactCount: 0,
+            upsertedCount: 0,
+            klaviyoDetectedCount: 0,
+            klaviyoDetectedDomains: [],
+            unresolvedDomains: [],
+            notFoundDomains: []
+        };
+    }
+
+    const detectionMap = await batchDetectKlaviyo(
+        domainsToCheck.map((domain) => ({ domain })),
+        null,
+        concurrency
+    );
+
+    const detectionRows = domainsToCheck.map((domain) => ({
+        domain,
+        usesKlaviyo: detectionMap.get(domain)
+    }));
+
+    const resolvedDetectionRows = detectionRows.filter((row) => typeof row.usesKlaviyo === 'boolean');
+    const unresolvedDomains = detectionRows
+        .filter((row) => row.usesKlaviyo === null || row.usesKlaviyo === undefined)
+        .map((row) => row.domain);
+
+    if (resolvedDetectionRows.length === 0) {
+        return {
+            clientId: clientSlug,
+            requestedDomainCount: normalizedDomains.length,
+            checkedDomainCount: domainsToCheck.length,
+            skippedAlreadyScoredCount: Math.max(normalizedDomains.length - domainsToCheck.length, 0),
+            matchedDomainCount: 0,
+            matchedContactCount: 0,
+            upsertedCount: 0,
+            klaviyoDetectedCount: 0,
+            klaviyoDetectedDomains: [],
+            unresolvedDomains,
+            notFoundDomains: []
+        };
+    }
+
+    const domainArray = resolvedDetectionRows.map((row) => row.domain);
+    const usesKlaviyoArray = resolvedDetectionRows.map((row) => row.usesKlaviyo);
+
+    const matchedDomainsResult = await pool.query(
+        `SELECT DISTINCT co.domain_normalized AS domain
+         FROM companies co
+         WHERE co.agency_id = $1
+         AND co.client_id = $2
+         AND co.domain_normalized = ANY($3::text[])`,
+        [agencyId, clientId, domainArray]
+    );
+
+    const matchedDomainSet = new Set(
+        matchedDomainsResult.rows.map((row) => String(row.domain || '').trim()).filter(Boolean)
+    );
+
+    const updateResult = await pool.query(
+        `WITH input_domains AS (
+            SELECT *
+            FROM UNNEST($3::text[], $4::boolean[]) AS t(domain_normalized, uses_klaviyo)
+        ),
+        matched_contacts AS (
+            SELECT
+                c.id AS contact_id,
+                c.agency_id,
+                co.client_id,
+                i.uses_klaviyo
+            FROM contacts c
+            JOIN companies co ON co.id = c.company_id
+            JOIN input_domains i ON i.domain_normalized = co.domain_normalized
+            WHERE c.agency_id = $1
+            AND co.client_id = $2
+        ),
+        upserted AS (
+            INSERT INTO contact_insights (
+                contact_id,
+                agency_id,
+                client_id,
+                uses_klaviyo,
+                source,
+                source_payload
+            )
+            SELECT
+                mc.contact_id,
+                mc.agency_id,
+                mc.client_id,
+                mc.uses_klaviyo,
+                'klaviyo_dns_lookup',
+                jsonb_build_object(
+                    'checked_at', NOW(),
+                    'method', 'dns_txt_klaviyo_site_verification'
+                )
+            FROM matched_contacts mc
+            ON CONFLICT (contact_id)
+            DO UPDATE SET
+                uses_klaviyo = EXCLUDED.uses_klaviyo,
+                source = COALESCE(contact_insights.source, EXCLUDED.source),
+                source_payload = COALESCE(contact_insights.source_payload, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'klaviyo_check', jsonb_build_object(
+                            'checked_at', NOW(),
+                            'method', 'dns_txt_klaviyo_site_verification'
+                        )
+                    ),
+                updated_at = NOW()
+            RETURNING contact_id
+        )
+        SELECT
+            (SELECT COUNT(*)::int FROM matched_contacts) AS matched_contact_count,
+            (SELECT COUNT(*)::int FROM upserted) AS upserted_count`,
+        [agencyId, clientId, domainArray, usesKlaviyoArray]
+    );
+
+    const summary = updateResult.rows[0] || {
+        matched_contact_count: 0,
+        upserted_count: 0
+    };
+
+    const notFoundDomains = normalizedDomains.filter((domain) => !matchedDomainSet.has(domain));
+    const klaviyoDetectedDomains = resolvedDetectionRows
+        .filter((row) => row.usesKlaviyo === true)
+        .map((row) => row.domain);
+
+    return {
+        clientId: clientSlug,
+        requestedDomainCount: normalizedDomains.length,
+        checkedDomainCount: domainsToCheck.length,
+        skippedAlreadyScoredCount: Math.max(normalizedDomains.length - domainsToCheck.length, 0),
+        matchedDomainCount: matchedDomainSet.size,
+        matchedContactCount: Number(summary.matched_contact_count) || 0,
+        upsertedCount: Number(summary.upserted_count) || 0,
+        klaviyoDetectedCount: klaviyoDetectedDomains.length,
+        klaviyoDetectedDomains,
+        unresolvedDomains,
+        notFoundDomains
+    };
 }
 
 function buildClientMatchers(...values) {
@@ -289,6 +491,15 @@ function parseLeadFiltersQuery(rawFilters) {
     }
 
     return parsed.slice(0, 25);
+}
+
+function leadFiltersRequireCampaignStats(filters) {
+    return filters.some((filter) => {
+        const fieldKey = normalizeOptionalText(filter?.field)?.toLowerCase() || '';
+        return fieldKey === 'added_to_campaign_at'
+            || fieldKey === 'instantly_status'
+            || fieldKey === 'campaign_count_all_time';
+    });
 }
 
 function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
@@ -539,11 +750,14 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         const isCountOnly = countOnly === 'true' || countOnly === '1';
 
         const dynamicFilters = parseLeadFiltersQuery(rawFilters);
+        const searchTerm = typeof search === 'string' ? search.toLowerCase().trim() : '';
+        const isEmailSearch = isEmailLikeSearch(searchTerm);
+        const requiresFilterCampaignStats = leadFiltersRequireCampaignStats(dynamicFilters);
         const hasAnyLeadFilters = Boolean(
             emailStatus
             || emailStatusMulti
             || roleType
-            || (typeof search === 'string' && search.trim())
+            || searchTerm
             || (typeof fullName === 'string' && fullName.trim())
             || founderFilter
             || emailFilter
@@ -595,14 +809,18 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramsState.paramIndex = paramIndex;
         }
 
-        // General search filter (exact match on domain, email, or founder name)
-        if (search) {
-            const searchTerm = search.toLowerCase().trim();
-            whereClause += ` AND (
-                LOWER(co.domain_normalized) = $${paramIndex}
-                OR LOWER(c.email) = $${paramIndex}
-                OR LOWER(c.full_name) = $${paramIndex}
-            )`;
+        // General search filter. Email-shaped searches intentionally use the
+        // existing contacts_client_email_unique (client_id, email) index.
+        if (searchTerm) {
+            if (isEmailSearch) {
+                whereClause += ` AND c.email = $${paramIndex}`;
+            } else {
+                whereClause += ` AND (
+                    LOWER(co.domain_normalized) = $${paramIndex}
+                    OR LOWER(c.email) = $${paramIndex}
+                    OR LOWER(c.full_name) = $${paramIndex}
+                )`;
+            }
             params.push(searchTerm);
             paramIndex++;
             paramsState.paramIndex = paramIndex;
@@ -734,8 +952,9 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 FROM instantly_campaigns
                 WHERE agency_id = $1
                 AND client_id = $2
-            ),
-            campaign_stats AS (
+            )
+            ${requiresFilterCampaignStats ? `,
+            filter_campaign_stats AS (
                 SELECT
                     cic.contact_id,
                     COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
@@ -760,14 +979,14 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 FROM contact_instantly_campaigns cic
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 GROUP BY cic.contact_id
-            )
+            )` : ''}
         `;
         const countQuery = `
             ${baseWithClause}
             SELECT COUNT(*) as count
             FROM contacts c
             JOIN scoped_companies co ON c.company_id = co.id
-            LEFT JOIN campaign_stats cs ON cs.contact_id = c.id
+            ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
             WHERE ${whereClause}
         `;
 
@@ -819,16 +1038,28 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     c.job_id,
                     c.created_at,
                     c.updated_at,
-                    co.domain_normalized,
+                    co.domain_normalized
+                    ${requiresFilterCampaignStats ? `,
                     cs.campaign_count_all_time,
                     cs.campaign_count_active,
-                    cs.last_campaign_added_at
+                    cs.last_campaign_added_at` : ''}
                 FROM contacts c
                 JOIN scoped_companies co ON c.company_id = co.id
-                LEFT JOIN campaign_stats cs ON cs.contact_id = c.id
+                ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
                 WHERE ${whereClause}
-                ORDER BY cs.last_campaign_added_at DESC NULLS LAST, c.created_at DESC
+                ORDER BY ${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC
                 LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+            ),
+            paged_campaign_stats AS (
+                SELECT
+                    cic.contact_id,
+                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
+                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    MAX(cic.added_at) AS last_campaign_added_at
+                FROM contact_instantly_campaigns cic
+                JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
+                JOIN paged_contacts pc_scope ON pc_scope.id = cic.contact_id
+                GROUP BY cic.contact_id
             )
         `;
 
@@ -889,9 +1120,9 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 ci.source AS insight_source,
                 ci.notes AS insight_notes,
                 ci.attributes AS insight_attributes,
-                pc.campaign_count_all_time,
-                pc.campaign_count_active,
-                pc.last_campaign_added_at,
+                pcs.campaign_count_all_time,
+                pcs.campaign_count_active,
+                pcs.last_campaign_added_at,
                 ${latestEventSelect}
                 (
                     SELECT json_agg(
@@ -916,9 +1147,10 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     AND cic.active = TRUE
                 ) as campaigns_data
             FROM paged_contacts pc
+            LEFT JOIN paged_campaign_stats pcs ON pcs.contact_id = pc.id
             LEFT JOIN contact_insights ci ON ci.contact_id = pc.id
             ${latestEventJoin}
-            ORDER BY pc.last_campaign_added_at DESC NULLS LAST, pc.created_at DESC
+            ORDER BY ${requiresFilterCampaignStats ? 'pc.last_campaign_added_at DESC NULLS LAST, ' : ''}pc.created_at DESC
         `;
         params.push(parsedLimit + 1, parsedOffset);
 
@@ -1509,6 +1741,332 @@ router.get('/leads/:contactId/events', verifyFirebaseToken, async (req, res) => 
     } catch (error) {
         console.error('Error fetching lead events:', error);
         res.status(500).json({ error: 'Failed to fetch lead events' });
+    }
+});
+
+/**
+ * POST /leads/insights/klaviyo
+ *
+ * Bulk-run Klaviyo detection for domains and persist result to contact_insights.uses_klaviyo.
+ *
+ * Request body:
+ *   - clientId: string (required)
+ *   - domains: string[] (optional)
+ *   - leads: Array<{ domain: string }> (optional)
+ *   - concurrency: number (optional, default 50, max 100)
+ *   - onlyNullUsesKlaviyo: boolean (optional, default false)
+ *
+ * At least one of domains or leads must be supplied.
+ */
+router.post('/leads/insights/klaviyo', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+
+        const domains = extractNormalizedDomains(req.body);
+        if (domains.length === 0) {
+            return res.status(400).json({
+                error: 'Provide at least one domain via domains[] or leads[].'
+            });
+        }
+        if (domains.length > 1000) {
+            return res.status(400).json({
+                error: 'Maximum 1000 domains per request.'
+            });
+        }
+
+        const requestedConcurrency = Number(req.body?.concurrency);
+        const concurrency = Number.isFinite(requestedConcurrency)
+            ? Math.max(1, Math.min(Math.floor(requestedConcurrency), 100))
+            : 50;
+        const onlyNullUsesKlaviyo = normalizeOptionalBoolean(req.body?.onlyNullUsesKlaviyo) === true;
+        const summary = await runKlaviyoInsightsSync({
+            agencyId,
+            clientSlug,
+            domains,
+            concurrency,
+            onlyNullUsesKlaviyo
+        });
+
+        return res.json(summary);
+    } catch (error) {
+        console.error('Error running bulk Klaviyo insights sync:', error);
+        return res.status(500).json({
+            error: error?.message || 'Failed to sync Klaviyo insights.'
+        });
+    }
+});
+
+router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+
+        const requestedConcurrency = Number(req.body?.concurrency);
+        const concurrency = Number.isFinite(requestedConcurrency)
+            ? Math.max(1, Math.min(Math.floor(requestedConcurrency), 100))
+            : 50;
+        const onlyNullUsesKlaviyo = normalizeOptionalBoolean(req.body?.onlyNullUsesKlaviyo) !== false;
+        const queryInput = req.body?.query || {};
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const {
+            emailStatus,
+            emailStatusMulti,
+            roleType,
+            search,
+            fullName,
+            founderFilter,
+            emailFilter,
+            instantlyStatus,
+            jobId,
+            createdAfter,
+            createdBefore,
+            instantlyCampaignId
+        } = queryInput;
+
+        let dynamicFilters = [];
+        if (Array.isArray(queryInput?.filters)) {
+            dynamicFilters = queryInput.filters.slice(0, 25);
+        } else if (typeof queryInput?.filters === 'string') {
+            dynamicFilters = parseLeadFiltersQuery(queryInput.filters);
+        }
+
+        let whereClause = 'c.agency_id = $1 AND c.client_id = $2';
+        const paramsState = {
+            params: [agencyId, clientId],
+            paramIndex: 3
+        };
+        const params = paramsState.params;
+        let paramIndex = paramsState.paramIndex;
+
+        if (emailStatus) {
+            if (emailStatus === 'not_run') {
+                whereClause += ` AND (c.email_status IS NULL OR c.email_status = '')`;
+            } else {
+                whereClause += ` AND c.email_status = $${paramIndex}`;
+                params.push(emailStatus);
+                paramIndex++;
+            }
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (emailStatusMulti) {
+            const statuses = String(emailStatusMulti).split(',').filter((s) => s.trim());
+            if (statuses.length > 0) {
+                const placeholders = statuses.map((_, i) => `$${paramIndex + i}`).join(',');
+                whereClause += ` AND c.email_status IN (${placeholders})`;
+                params.push(...statuses);
+                paramIndex += statuses.length;
+                paramsState.paramIndex = paramIndex;
+            }
+        }
+
+        if (roleType) {
+            whereClause += ` AND c.role_type = $${paramIndex}`;
+            params.push(roleType);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (search) {
+            const searchTerm = String(search).toLowerCase().trim();
+            whereClause += ` AND (
+                LOWER(co.domain_normalized) = $${paramIndex}
+                OR LOWER(c.email) = $${paramIndex}
+                OR LOWER(c.full_name) = $${paramIndex}
+            )`;
+            params.push(searchTerm);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (fullName) {
+            const nameTerm = `%${String(fullName).toLowerCase()}%`;
+            whereClause += ` AND LOWER(c.full_name) LIKE $${paramIndex}`;
+            params.push(nameTerm);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (founderFilter === 'exists') {
+            whereClause += ` AND c.full_name IS NOT NULL AND c.full_name != '' AND LOWER(c.full_name) NOT LIKE '%not found%' AND LOWER(c.full_name) != 'not_found'`;
+        } else if (founderFilter === 'not_found') {
+            whereClause += ` AND (c.full_name IS NULL OR c.full_name = '' OR LOWER(c.full_name) LIKE '%not found%' OR LOWER(c.full_name) = 'not_found')`;
+        }
+
+        if (emailFilter === 'exists') {
+            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND c.email IS NOT NULL AND c.email != '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+        } else if (emailFilter === 'not_found') {
+            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND (c.email IS NULL OR c.email = '')`;
+        } else if (emailFilter === 'not_run') {
+            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '') AND (c.email IS NULL OR c.email = '')`;
+        }
+
+        if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
+            const normalizedInstantlyStatus = instantlyStatus.trim().toLowerCase();
+            whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM contact_instantly_campaigns cic_status
+                WHERE cic_status.contact_id = c.id
+                AND cic_status.active = TRUE
+                AND (
+                    LOWER(COALESCE(cic_status.interest_status_label, '')) = $${paramIndex}
+                    OR LOWER(COALESCE(cic_status.lead_status_label, '')) = $${paramIndex}
+                )
+            )`;
+            params.push(normalizedInstantlyStatus);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (typeof jobId === 'string' && jobId.trim()) {
+            whereClause += ` AND c.job_id = $${paramIndex}`;
+            params.push(jobId.trim());
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (createdAfter) {
+            whereClause += ` AND c.created_at >= $${paramIndex}::timestamp`;
+            params.push(createdAfter);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (createdBefore) {
+            whereClause += ` AND c.created_at <= $${paramIndex}::timestamp`;
+            params.push(createdBefore);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        if (instantlyCampaignId) {
+            const campaignResult = await pool.query(
+                `SELECT id
+                 FROM instantly_campaigns
+                 WHERE agency_id = $1
+                 AND client_id = $2
+                 AND instantly_campaign_id = $3
+                 LIMIT 1`,
+                [agencyId, clientId, instantlyCampaignId]
+            );
+
+            const sqlInstantlyCampaignId = campaignResult.rows[0]?.id || null;
+            if (!sqlInstantlyCampaignId) {
+                return res.json({
+                    clientId: clientSlug,
+                    requestedDomainCount: 0,
+                    checkedDomainCount: 0,
+                    skippedAlreadyScoredCount: 0,
+                    matchedDomainCount: 0,
+                    matchedContactCount: 0,
+                    upsertedCount: 0,
+                    klaviyoDetectedCount: 0,
+                    klaviyoDetectedDomains: [],
+                    unresolvedDomains: [],
+                    notFoundDomains: []
+                });
+            }
+
+            whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM contact_instantly_campaigns cic_filter
+                WHERE cic_filter.contact_id = c.id
+                AND cic_filter.campaign_id = $${paramIndex}
+                AND cic_filter.active = TRUE
+            )`;
+            params.push(sqlInstantlyCampaignId);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
+        if (dynamicClauses.length > 0) {
+            whereClause += ` AND ${dynamicClauses.map((clause) => `(${clause})`).join(' AND ')}`;
+        }
+
+        const domainResult = await pool.query(
+            `WITH scoped_companies AS (
+                SELECT
+                    id,
+                    domain_normalized
+                FROM companies
+                WHERE agency_id = $1
+                AND client_id = $2
+            ),
+            scoped_campaigns AS (
+                SELECT
+                    id,
+                    instantly_campaign_id,
+                    name
+                FROM instantly_campaigns
+                WHERE agency_id = $1
+                AND client_id = $2
+            ),
+            campaign_stats AS (
+                SELECT
+                    cic.contact_id,
+                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
+                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    MAX(cic.added_at) AS last_campaign_added_at,
+                    MAX(cic.timestamp_last_reply) AS last_reply_at,
+                    BOOL_OR(cic.email_reply_count > 0) AS has_replied,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT LOWER(cic.lead_status_label)) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.lead_status_label IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_lead_status_labels,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT LOWER(cic.interest_status_label)) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.interest_status_label IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_interest_status_labels
+                FROM contact_instantly_campaigns cic
+                JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
+                GROUP BY cic.contact_id
+            )
+            SELECT DISTINCT co.domain_normalized AS domain
+            FROM contacts c
+            JOIN scoped_companies co ON c.company_id = co.id
+            LEFT JOIN campaign_stats cs ON cs.contact_id = c.id
+            WHERE ${whereClause}`,
+            paramsState.params
+        );
+
+        const domains = Array.from(new Set(
+            domainResult.rows
+                .map((row) => String(row.domain || '').trim())
+                .filter(Boolean)
+        ));
+
+        const summary = await runKlaviyoInsightsSync({
+            agencyId,
+            clientSlug,
+            domains,
+            concurrency,
+            onlyNullUsesKlaviyo
+        });
+
+        return res.json({
+            ...summary,
+            queryMatchedDomainCount: domains.length
+        });
+    } catch (error) {
+        console.error('Error running query-based Klaviyo insights sync:', error);
+        return res.status(500).json({
+            error: error?.message || 'Failed to sync Klaviyo insights for query.'
+        });
     }
 });
 

@@ -53,6 +53,10 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 
     throw new Error('Max retries exceeded');
 }
 
+function isSingleLeadEmailSearch(value: string) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
 type Niche = {
     id: string;
     label: string;
@@ -450,8 +454,27 @@ type Segment = {
     updatedAt?: string;
 };
 
-type InstantlyCsvMergeResult = {
-    summary: {
+type FollowUpScript = {
+    id: number;
+    client_id: number;
+    active: boolean;
+    script_order: number;
+    html_template: string;
+    text_template: string | null;
+    created_at: string;
+    updated_at: string;
+};
+
+type FollowUpPreviewPayload = {
+    contactId: number;
+    contactEmail: string;
+    campaignId: number;
+    vars: Record<string, string>;
+    renderedHtml: string;
+    renderedText: string;
+};
+
+type InstantlyCsvMergeResult = {    summary: {
         rowsTotal: number;
         rowsMatched: number;
         linksInserted: number;
@@ -708,8 +731,8 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
 
-    const [activeTab, setActiveTab] = useState<"analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer">(
-        (searchParams?.get("tab") as "analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer") || "analytics"
+    const [activeTab, setActiveTab] = useState<"analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer" | "follow-ups">(
+        (searchParams?.get("tab") as "analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer" | "follow-ups") || "analytics"
     );
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
@@ -736,6 +759,28 @@ export default function ClientPage() {
     const [personalizerJobState, setPersonalizerJobState] = useState<any | null>(null);
     const [personalizerJobId, setPersonalizerJobId] = useState<string | null>(null);
     const [uploadingPersonalizer, setUploadingPersonalizer] = useState(false);
+
+    // Follow-up scripts state
+    const [followUpScripts, setFollowUpScripts] = useState<FollowUpScript[]>([]);
+    const [followUpScriptsLoading, setFollowUpScriptsLoading] = useState(false);
+    const [followUpScriptModalOpen, setFollowUpScriptModalOpen] = useState(false);
+    const [editingFollowUpScript, setEditingFollowUpScript] = useState<FollowUpScript | null>(null);
+    const [savingFollowUpScript, setSavingFollowUpScript] = useState(false);
+    const [updatingFollowUpScriptId, setUpdatingFollowUpScriptId] = useState<number | null>(null);
+    const [deletingFollowUpScriptId, setDeletingFollowUpScriptId] = useState<number | null>(null);
+    const [followUpPreviewModalOpen, setFollowUpPreviewModalOpen] = useState(false);
+    const [previewingFollowUpScript, setPreviewingFollowUpScript] = useState<FollowUpScript | null>(null);
+    const [followUpPreviewLeadSearch, setFollowUpPreviewLeadSearch] = useState('');
+    const [debouncedFollowUpPreviewLeadSearch, setDebouncedFollowUpPreviewLeadSearch] = useState('');
+    const [followUpPreviewLeadResults, setFollowUpPreviewLeadResults] = useState<Lead[]>([]);
+    const [followUpPreviewSearching, setFollowUpPreviewSearching] = useState(false);
+    const [followUpPreviewSelectedLead, setFollowUpPreviewSelectedLead] = useState<Lead | null>(null);
+    const [followUpPreviewLoading, setFollowUpPreviewLoading] = useState(false);
+    const [followUpPreviewResult, setFollowUpPreviewResult] = useState<FollowUpPreviewPayload | null>(null);
+    const [fuScriptOrder, setFuScriptOrder] = useState(1);
+    const [fuScriptActive, setFuScriptActive] = useState(true);
+    const [fuScriptHtml, setFuScriptHtml] = useState('');
+    const [fuScriptText, setFuScriptText] = useState('');
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -817,6 +862,7 @@ export default function ClientPage() {
     const [instantlyCsvCampaignsLoading, setInstantlyCsvCampaignsLoading] = useState(false);
     const [registeringInstantlyWebhook, setRegisteringInstantlyWebhook] = useState(false);
     const [syncingInstantlyState, setSyncingInstantlyState] = useState(false);
+    const [syncingInstantlyEmailAccounts, setSyncingInstantlyEmailAccounts] = useState(false);
     const [stoppingInstantlySync, setStoppingInstantlySync] = useState(false);
     const [clientInstantlyWebhookStatus, setClientInstantlyWebhookStatus] = useState<number | null>(null);
     const [clientInstantlyWebhookUpdatedAt, setClientInstantlyWebhookUpdatedAt] = useState<string | null>(null);
@@ -997,6 +1043,7 @@ export default function ClientPage() {
     const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
     const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>([]);
     const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string }>>([]);
+    const [checkingKlaviyo, setCheckingKlaviyo] = useState(false);
     const [exportingCsv, setExportingCsv] = useState(false);
     const [leadExportModalOpen, setLeadExportModalOpen] = useState(false);
     const [selectedLeadExportFields, setSelectedLeadExportFields] = useState<string[]>(DEFAULT_LEAD_EXPORT_FIELD_KEYS);
@@ -1041,6 +1088,16 @@ export default function ClientPage() {
             window.clearTimeout(timeoutId);
         };
     }, [leadSearch]);
+
+    useEffect(() => {
+        const timeoutId = window.setTimeout(() => {
+            setDebouncedFollowUpPreviewLeadSearch(followUpPreviewLeadSearch);
+        }, 250);
+
+        return () => {
+            window.clearTimeout(timeoutId);
+        };
+    }, [followUpPreviewLeadSearch]);
 
     useEffect(() => {
         if (!user) return;
@@ -1538,13 +1595,18 @@ export default function ClientPage() {
 
     useEffect(() => {
         if (!user || !clientId) return;
+        const shouldSkipTotalForSingleLeadSearch = isSingleLeadEmailSearch(debouncedLeadSearch)
+            && !campaignFilterId
+            && appliedLeadFilters.length === 0;
         
         // Reset and refetch when applied lead filters change
         setLeads([]);
         setLeadsCursor(0);
         setLeadsHasMore(true);
         fetchLeads(true);
-        fetchLeadTotal();
+        if (!shouldSkipTotalForSingleLeadSearch) {
+            fetchLeadTotal();
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters]);
 
@@ -1862,10 +1924,16 @@ export default function ClientPage() {
             
             // Use server-provided total count
             const verifiedCount = apiLeads.filter((r: any) => r.verified).length;
+            const shouldUseResultCountAsTotal = reset
+                && isSingleLeadEmailSearch(debouncedLeadSearch)
+                && !campaignFilterId
+                && appliedLeadFilters.length === 0;
             setStats((prev) => ({
-                total: prev.total,
+                total: shouldUseResultCountAsTotal ? mapped.length : prev.total,
                 verified: verifiedCount,
-                unverified: prev.total === null ? 0 : Math.max(0, prev.total - verifiedCount),
+                unverified: shouldUseResultCountAsTotal
+                    ? Math.max(0, mapped.length - verifiedCount)
+                    : prev.total === null ? 0 : Math.max(0, prev.total - verifiedCount),
             }));
 
             // Set cursor for pagination (use count of loaded items as offset)
@@ -1891,7 +1959,114 @@ export default function ClientPage() {
         } finally {
             setLeadsLoading(false);
         }
-    }, [user, clientId, leadsCursor, buildLeadQueryParams, mapApiLeadRow]);
+    }, [
+        user,
+        clientId,
+        leadsCursor,
+        buildLeadQueryParams,
+        mapApiLeadRow,
+        debouncedLeadSearch,
+        campaignFilterId,
+        appliedLeadFilters.length
+    ]);
+
+    useEffect(() => {
+        if (!followUpPreviewModalOpen || !user || !clientId) return;
+
+        const query = debouncedFollowUpPreviewLeadSearch.trim();
+        if (!query) {
+            setFollowUpPreviewLeadResults([]);
+            setFollowUpPreviewSearching(false);
+            return;
+        }
+
+        let cancelled = false;
+
+        (async () => {
+            setFollowUpPreviewSearching(true);
+            try {
+                const idToken = await getIdToken(user);
+                const params = new URLSearchParams();
+                params.append('clientId', clientId);
+                params.append('limit', '12');
+                params.append('search', query);
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                    headers: {
+                        Authorization: `Bearer ${idToken}`
+                    }
+                });
+                if (!response.ok) {
+                    throw new Error(`Failed to search leads: ${response.statusText}`);
+                }
+                const data = await response.json();
+                if (!cancelled) {
+                    const mapped: Lead[] = Array.isArray(data.leads) ? data.leads.map(mapApiLeadRow) : [];
+                    setFollowUpPreviewLeadResults(mapped);
+                }
+            } catch (err) {
+                console.error('Failed to search follow-up preview leads:', err);
+                if (!cancelled) {
+                    setFollowUpPreviewLeadResults([]);
+                }
+            } finally {
+                if (!cancelled) {
+                    setFollowUpPreviewSearching(false);
+                }
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [clientId, debouncedFollowUpPreviewLeadSearch, followUpPreviewModalOpen, mapApiLeadRow, user]);
+
+    const handleCheckKlaviyo = useCallback(async () => {
+        if (!user || !clientId) return;
+
+        setCheckingKlaviyo(true);
+        try {
+            const idToken = await getIdToken(user);
+
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/insights/klaviyo/query`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${idToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    clientId,
+                    onlyNullUsesKlaviyo: true,
+                    query: {
+                        search: debouncedLeadSearch.trim() || undefined,
+                        instantlyCampaignId: campaignFilterId || undefined,
+                        filters: appliedLeadFilters
+                    }
+                })
+            });
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || `Failed to check Klaviyo (${response.status})`);
+            }
+
+            const checkedDomainCount = Number(data?.checkedDomainCount || 0);
+            const detectedCount = Number(data?.klaviyoDetectedCount || 0);
+            const skippedCount = Number(data?.skippedAlreadyScoredCount || 0);
+            const unresolvedCount = Array.isArray(data?.unresolvedDomains) ? data.unresolvedDomains.length : 0;
+
+            setToastMessage(`Klaviyo check complete: ${detectedCount}/${checkedDomainCount} detected (${skippedCount} skipped, ${unresolvedCount} unresolved).`);
+            setToastVisible(true);
+
+            await fetchLeads(true);
+            await fetchLeadTotal();
+        } catch (error) {
+            console.error('Failed to run Klaviyo check:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to run Klaviyo check');
+            setToastVisible(true);
+        } finally {
+            setCheckingKlaviyo(false);
+        }
+    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch, fetchLeadTotal, fetchLeads, user]);
 
     const fetchInstantlySyncRun = useCallback(async (runId: number) => {
         if (!user || !clientId || !runId) return null;
@@ -2516,6 +2691,27 @@ export default function ClientPage() {
 
         fetchInstantlyEventAnalytics(true);
     }, [activeTab, user, clientId, fetchInstantlyEventAnalytics]);
+
+    useEffect(() => {
+        if (activeTab !== 'follow-ups' || !user || !clientId) return;
+        let cancelled = false;
+        setFollowUpScriptsLoading(true);
+        (async () => {
+            try {
+                const idToken = await getIdToken(user);
+                const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts`, {
+                    headers: { Authorization: `Bearer ${idToken}` }
+                });
+                const data = await res.json();
+                if (!cancelled) setFollowUpScripts(data.scripts || []);
+            } catch (err) {
+                console.error('Failed to fetch follow-up scripts:', err);
+            } finally {
+                if (!cancelled) setFollowUpScriptsLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [activeTab, user, clientId]);
 
     useEffect(() => {
         if (!instantlyEventAnalytics || instantlyEventAnalyticsEventType === "all") {
@@ -3444,6 +3640,42 @@ export default function ClientPage() {
         }
     };
 
+    const handleSyncInstantlyEmailAccounts = async () => {
+        if (!user || !clientId) return;
+        if (!clientInstantlyKey.trim()) {
+            setToastMessage('Save an Instantly API key first.');
+            setToastVisible(true);
+            return;
+        }
+
+        setSyncingInstantlyEmailAccounts(true);
+        try {
+            await persistClientInfo();
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/email-accounts/sync`,
+                {
+                    method: 'POST',
+                    cache: 'no-store',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ idToken })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to sync Instantly email accounts (${response.status})`);
+            }
+
+            setToastMessage(`Synced ${data.syncedCount ?? 0} Instantly email account${data.syncedCount === 1 ? '' : 's'}.`);
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to sync Instantly email accounts');
+            setToastVisible(true);
+        } finally {
+            setSyncingInstantlyEmailAccounts(false);
+        }
+    };
+
     const handleStopInstantlySync = async () => {
         if (!user || !clientId || !instantlySyncRun?.id) return;
 
@@ -3723,6 +3955,171 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setSegmentLeadsLoading(false);
+        }
+    };
+
+    const openFollowUpScriptModal = (script?: FollowUpScript) => {
+        if (script) {
+            setEditingFollowUpScript(script);
+            setFuScriptOrder(script.script_order);
+            setFuScriptActive(script.active);
+            setFuScriptHtml(script.html_template);
+            setFuScriptText(script.text_template || '');
+        } else {
+            setEditingFollowUpScript(null);
+            setFuScriptOrder(followUpScripts.length + 1);
+            setFuScriptActive(true);
+            setFuScriptHtml('');
+            setFuScriptText('');
+        }
+        setFollowUpScriptModalOpen(true);
+    };
+
+    const openFollowUpPreviewModal = (script: FollowUpScript) => {
+        setPreviewingFollowUpScript(script);
+        setFollowUpPreviewLeadSearch('');
+        setDebouncedFollowUpPreviewLeadSearch('');
+        setFollowUpPreviewLeadResults([]);
+        setFollowUpPreviewSelectedLead(null);
+        setFollowUpPreviewResult(null);
+        setFollowUpPreviewModalOpen(true);
+    };
+
+    const closeFollowUpPreviewModal = () => {
+        setFollowUpPreviewModalOpen(false);
+        setPreviewingFollowUpScript(null);
+        setFollowUpPreviewLeadSearch('');
+        setDebouncedFollowUpPreviewLeadSearch('');
+        setFollowUpPreviewLeadResults([]);
+        setFollowUpPreviewSelectedLead(null);
+        setFollowUpPreviewResult(null);
+        setFollowUpPreviewLoading(false);
+        setFollowUpPreviewSearching(false);
+    };
+
+    const handleSaveFollowUpScript = async () => {
+        if (!user || !clientId || !fuScriptHtml.trim()) return;
+        setSavingFollowUpScript(true);
+        try {
+            const idToken = await getIdToken(user);
+            const url = editingFollowUpScript
+                ? `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts/${editingFollowUpScript.id}`
+                : `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts`;
+            const method = editingFollowUpScript ? 'PUT' : 'POST';
+            const res = await fetchWithRetry(url, {
+                method,
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                body: JSON.stringify({
+                    active: fuScriptActive,
+                    scriptOrder: fuScriptOrder,
+                    htmlTemplate: fuScriptHtml.trim(),
+                    textTemplate: fuScriptText.trim() || null,
+                })
+            });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to save script (${res.status})`);
+            }
+            const data = await res.json();
+            if (editingFollowUpScript) {
+                setFollowUpScripts(prev => prev.map(s => s.id === data.script.id ? data.script : s));
+            } else {
+                setFollowUpScripts(prev => [...prev, data.script].sort((a, b) => a.script_order - b.script_order));
+            }
+            setFollowUpScriptModalOpen(false);
+        } catch (err) {
+            setToastMessage(err instanceof Error ? err.message : 'Failed to save script');
+            setToastVisible(true);
+        } finally {
+            setSavingFollowUpScript(false);
+        }
+    };
+
+    const handleDeleteFollowUpScript = async (id: number) => {
+        if (!user || !clientId) return;
+        const confirmed = window.confirm('Delete this follow-up script? This cannot be undone.');
+        if (!confirmed) return;
+        setDeletingFollowUpScriptId(id);
+        try {
+            const idToken = await getIdToken(user);
+            const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts/${id}`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${idToken}` }
+            });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to delete script (${res.status})`);
+            }
+            setFollowUpScripts(prev => prev.filter(s => s.id !== id));
+        } catch (err) {
+            setToastMessage(err instanceof Error ? err.message : 'Failed to delete script');
+            setToastVisible(true);
+        } finally {
+            setDeletingFollowUpScriptId(null);
+        }
+    };
+
+    const handleRunFollowUpPreview = async (lead: Lead) => {
+        if (!user || !clientId || !previewingFollowUpScript || !lead.email) return;
+        setFollowUpPreviewSelectedLead(lead);
+        setFollowUpPreviewLoading(true);
+        setFollowUpPreviewResult(null);
+        try {
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-preview`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${idToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    contactEmail: lead.email,
+                    scriptId: previewingFollowUpScript.id
+                })
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to preview follow-up (${response.status})`);
+            }
+            const data = await response.json();
+            setFollowUpPreviewResult(data.preview || null);
+        } catch (err) {
+            setToastMessage(err instanceof Error ? err.message : 'Failed to preview follow-up');
+            setToastVisible(true);
+        } finally {
+            setFollowUpPreviewLoading(false);
+        }
+    };
+
+    const handleToggleFollowUpScriptActive = async (script: FollowUpScript) => {
+        if (!user || !clientId) return;
+        setUpdatingFollowUpScriptId(script.id);
+        try {
+            const idToken = await getIdToken(user);
+            const res = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts/${script.id}`,
+                {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({
+                        active: !script.active,
+                        scriptOrder: script.script_order,
+                        htmlTemplate: script.html_template,
+                        textTemplate: script.text_template,
+                    })
+                }
+            );
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to update script (${res.status})`);
+            }
+            const data = await res.json();
+            setFollowUpScripts(prev => prev.map(s => s.id === data.script.id ? data.script : s));
+        } catch (err) {
+            setToastMessage(err instanceof Error ? err.message : 'Failed to update script');
+            setToastVisible(true);
+        } finally {
+            setUpdatingFollowUpScriptId(null);
         }
     };
 
@@ -4241,10 +4638,19 @@ export default function ClientPage() {
                 <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'flex-end', marginLeft: 'auto' }}>
                     <button
                         type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={handleCheckKlaviyo}
+                        style={{ flex: '0 0 auto' }}
+                        disabled={leadsLoading || checkingKlaviyo || leads.length === 0}
+                    >
+                        {checkingKlaviyo ? 'Checking Klaviyo...' : 'Check Klaviyo'}
+                    </button>
+                    <button
+                        type="button"
                         className="primary-button"
                         onClick={() => setLeadExportModalOpen(true)}
                         style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading || exportingCsv}
+                        disabled={leadsLoading || exportingCsv || checkingKlaviyo}
                     >
                         {exportingCsv ? (
                             <>
@@ -4650,6 +5056,12 @@ export default function ClientPage() {
                             onClick={() => setActiveTab("personalizer")}
                         >
                             🧠 Personalizer
+                        </button>
+                        <button
+                            className={`tab-nav__button ${activeTab === "follow-ups" ? "tab-nav__button--active" : ""}`}
+                            onClick={() => setActiveTab("follow-ups")}
+                        >
+                            Follow-Ups
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
@@ -6666,9 +7078,17 @@ export default function ClientPage() {
                                         type="button"
                                         className="secondary-button"
                                         onClick={handleSyncInstantlyState}
-                                        disabled={syncingInstantlyState || stoppingInstantlySync || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                        disabled={syncingInstantlyState || syncingInstantlyEmailAccounts || stoppingInstantlySync || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
                                     >
                                         {syncingInstantlyState ? 'Syncing...' : 'Sync Instantly State'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={handleSyncInstantlyEmailAccounts}
+                                        disabled={syncingInstantlyEmailAccounts || syncingInstantlyState || stoppingInstantlySync || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
+                                    >
+                                        {syncingInstantlyEmailAccounts ? 'Syncing Accounts...' : 'Sync Email Accounts'}
                                     </button>
                                     {instantlySyncRun && ACTIVE_INSTANTLY_SYNC_STATUSES.has(instantlySyncRun.status) && (
                                         <button
@@ -6678,6 +7098,7 @@ export default function ClientPage() {
                                             disabled={
                                                 stoppingInstantlySync
                                                 || syncingInstantlyState
+                                                || syncingInstantlyEmailAccounts
                                                 || instantlySyncRun.status === 'cancelling'
                                                 || registeringInstantlyWebhook
                                                 || isSavingClient
@@ -6723,8 +7144,380 @@ export default function ClientPage() {
                             </div>
                         </div>
                     )}
+
+                    {/* Follow-Ups Tab */}
+                    {activeTab === "follow-ups" && (
+                        <div style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', maxWidth: '800px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
+                                <div>
+                                    <p className="eyebrow eyebrow--muted">Automated Follow-Ups</p>
+                                    <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>
+                                        Configure same-thread follow-up body templates sent after Warm Follow Up events. The subject always reuses the existing thread subject. Use{' '}
+                                        <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{first_name}}'}</code>,{' '}
+                                        <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{company_domain}}'}</code>,{' '}
+                                        <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{campaign_name}}'}</code>.
+                                    </p>
+                                </div>
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={() => openFollowUpScriptModal()}
+                                >
+                                    + Add Script
+                                </button>
+                            </div>
+
+                            {followUpScriptsLoading ? (
+                                <p style={{ color: 'rgba(255,255,255,0.45)', fontSize: '0.875rem' }}>Loading scripts…</p>
+                            ) : followUpScripts.length === 0 ? (
+                                <div style={{
+                                    padding: '2rem',
+                                    textAlign: 'center',
+                                    border: '1px dashed rgba(255,255,255,0.15)',
+                                    borderRadius: '10px',
+                                    color: 'rgba(255,255,255,0.4)',
+                                    fontSize: '0.875rem'
+                                }}>
+                                    No follow-up scripts yet. Add one to get started.
+                                </div>
+                            ) : (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                                    {followUpScripts.map(script => (
+                                        <div
+                                            key={script.id}
+                                            style={{
+                                                padding: '1rem 1.25rem',
+                                                background: 'rgba(255,255,255,0.04)',
+                                                border: '1px solid rgba(255,255,255,0.1)',
+                                                borderRadius: '10px',
+                                                display: 'flex',
+                                                alignItems: 'flex-start',
+                                                gap: '1rem',
+                                            }}
+                                        >
+                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.25rem' }}>
+                                                    <span style={{ fontWeight: 600, fontSize: '0.95rem' }}>
+                                                        #{script.script_order}
+                                                    </span>
+                                                    <span style={{
+                                                        fontSize: '0.72rem',
+                                                        fontWeight: 600,
+                                                        textTransform: 'uppercase',
+                                                        letterSpacing: '0.04em',
+                                                        padding: '0.15rem 0.5rem',
+                                                        borderRadius: '4px',
+                                                        background: script.active ? 'rgba(34,197,94,0.15)' : 'rgba(255,255,255,0.08)',
+                                                        color: script.active ? '#86efac' : 'rgba(255,255,255,0.35)',
+                                                    }}>
+                                                        {script.active ? 'Active' : 'Inactive'}
+                                                    </span>
+                                                </div>
+                                                <div
+                                                    className="fu-script-preview"
+                                                    style={{
+                                                        marginTop: '0.65rem',
+                                                        padding: '0.85rem 0.95rem',
+                                                        borderRadius: '8px',
+                                                        border: '1px solid rgba(255,255,255,0.08)',
+                                                        background: 'rgba(0,0,0,0.18)',
+                                                        color: 'rgba(255,255,255,0.82)',
+                                                        fontSize: '0.82rem',
+                                                        lineHeight: 1.5,
+                                                    }}
+                                                    dangerouslySetInnerHTML={{ __html: script.html_template }}
+                                                />
+                                            </div>
+                                            <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
+                                                <label
+                                                    style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        gap: '0.4rem',
+                                                        padding: '0.35rem 0.6rem',
+                                                        borderRadius: '8px',
+                                                        border: '1px solid rgba(255,255,255,0.1)',
+                                                        background: 'rgba(255,255,255,0.04)',
+                                                        fontSize: '0.78rem',
+                                                        color: 'rgba(255,255,255,0.72)',
+                                                        cursor: updatingFollowUpScriptId === script.id ? 'wait' : 'pointer',
+                                                    }}
+                                                >
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={script.active}
+                                                        onChange={() => handleToggleFollowUpScriptActive(script)}
+                                                        disabled={updatingFollowUpScriptId === script.id}
+                                                        style={{ width: '0.95rem', height: '0.95rem', margin: 0 }}
+                                                    />
+                                                    {updatingFollowUpScriptId === script.id ? 'Saving…' : 'Active'}
+                                                </label>
+                                                <button
+                                                    type="button"
+                                                    className="secondary-button"
+                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                    onClick={() => openFollowUpPreviewModal(script)}
+                                                    disabled={updatingFollowUpScriptId === script.id}
+                                                >
+                                                    Preview
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="secondary-button"
+                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                    onClick={() => openFollowUpScriptModal(script)}
+                                                    disabled={updatingFollowUpScriptId === script.id}
+                                                >
+                                                    Edit
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="destructive-button"
+                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                    onClick={() => handleDeleteFollowUpScript(script.id)}
+                                                    disabled={deletingFollowUpScriptId === script.id || updatingFollowUpScriptId === script.id}
+                                                >
+                                                    {deletingFollowUpScriptId === script.id ? '…' : 'Delete'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
                 </section>
             </AppShell>
+
+            {/* Follow-Up Script Modal */}
+            {followUpScriptModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => setFollowUpScriptModalOpen(false)}
+                >
+                    <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '640px' }}>
+                        <div className="modal__header">
+                            <div>
+                                <p className="eyebrow eyebrow--muted">Follow-Up Script</p>
+                                <h2 className="modal__title">{editingFollowUpScript ? 'Edit Script' : 'New Script'}</h2>
+                            </div>
+                        </div>
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            <div style={{ display: 'flex', gap: '1rem' }}>
+                                <label className="settings-field" style={{ width: '100px', flexShrink: 0 }}>
+                                    <span className="settings-field__label">Order</span>
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        value={fuScriptOrder}
+                                        onChange={(e) => setFuScriptOrder(Number(e.target.value))}
+                                    />
+                                </label>
+                            </div>
+                            <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.75rem' }}>
+                                <input
+                                    type="checkbox"
+                                    checked={fuScriptActive}
+                                    onChange={(e) => setFuScriptActive(e.target.checked)}
+                                    style={{ width: '1rem', height: '1rem', flexShrink: 0 }}
+                                />
+                                <span className="settings-field__label" style={{ margin: 0 }}>Active</span>
+                            </label>
+                            <label className="settings-field">
+                                <span className="settings-field__label">HTML Body Template</span>
+                                <textarea
+                                    value={fuScriptHtml}
+                                    onChange={(e) => setFuScriptHtml(e.target.value)}
+                                    placeholder="<p>Hi {{first_name}},</p><p>Just wanted to follow up…</p>"
+                                    rows={8}
+                                    style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}
+                                />
+                            </label>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Plain Text Body Template <span style={{ fontWeight: 400, opacity: 0.5 }}>(optional)</span></span>
+                                <textarea
+                                    value={fuScriptText}
+                                    onChange={(e) => setFuScriptText(e.target.value)}
+                                    placeholder="Hi {{first_name}}, Just wanted to follow up…"
+                                    rows={4}
+                                    style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}
+                                />
+                            </label>
+                        </div>
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="primary-button"
+                                onClick={handleSaveFollowUpScript}
+                                disabled={savingFollowUpScript || !fuScriptHtml.trim()}
+                            >
+                                {savingFollowUpScript ? 'Saving…' : editingFollowUpScript ? 'Save Changes' : 'Create Script'}
+                            </button>
+                            <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={() => setFollowUpScriptModalOpen(false)}
+                                disabled={savingFollowUpScript}
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {followUpPreviewModalOpen && previewingFollowUpScript && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={closeFollowUpPreviewModal}
+                >
+                    <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '860px' }}>
+                        <div className="modal__header">
+                            <div>
+                                <p className="eyebrow eyebrow--muted">Follow-Up Preview</p>
+                                <h2 className="modal__title">Script #{previewingFollowUpScript.script_order}</h2>
+                                <p className="modal__description">
+                                    Search for a lead, then preview the rendered HTML for this follow-up script without sending anything.
+                                </p>
+                            </div>
+                        </div>
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Search Leads</span>
+                                <input
+                                    type="text"
+                                    value={followUpPreviewLeadSearch}
+                                    onChange={(e) => setFollowUpPreviewLeadSearch(e.target.value)}
+                                    placeholder="Search by email, domain, or founder name"
+                                />
+                            </label>
+
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                {followUpPreviewSearching ? (
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>Searching leads…</p>
+                                ) : debouncedFollowUpPreviewLeadSearch.trim() && followUpPreviewLeadResults.length === 0 ? (
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.45)' }}>No matching leads found.</p>
+                                ) : null}
+
+                                {followUpPreviewLeadResults.length > 0 && (
+                                    <div style={{
+                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        borderRadius: '10px',
+                                        overflow: 'hidden',
+                                        background: 'rgba(255,255,255,0.03)'
+                                    }}>
+                                        {followUpPreviewLeadResults.map((lead) => {
+                                            const isSelected = followUpPreviewSelectedLead?.id === lead.id;
+                                            return (
+                                                <button
+                                                    key={lead.id}
+                                                    type="button"
+                                                    onClick={() => handleRunFollowUpPreview(lead)}
+                                                    disabled={followUpPreviewLoading}
+                                                    style={{
+                                                        width: '100%',
+                                                        textAlign: 'left',
+                                                        padding: '0.9rem 1rem',
+                                                        border: 'none',
+                                                        borderTop: '1px solid rgba(255,255,255,0.08)',
+                                                        background: isSelected ? 'rgba(59,130,246,0.16)' : 'transparent',
+                                                        color: 'inherit',
+                                                        cursor: followUpPreviewLoading ? 'wait' : 'pointer',
+                                                    }}
+                                                >
+                                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
+                                                        <div style={{ minWidth: 0 }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: 'rgba(255,255,255,0.94)' }}>
+                                                                {lead.founderName || lead.email || lead.domain || 'Unnamed lead'}
+                                                            </div>
+                                                            <div style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.58)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                {lead.email || 'No email'}{lead.domain ? ` · ${lead.domain}` : ''}
+                                                            </div>
+                                                        </div>
+                                                        <span style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.58)', flexShrink: 0 }}>
+                                                            {followUpPreviewLoading && isSelected ? 'Rendering…' : 'Preview'}
+                                                        </span>
+                                                    </div>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+
+                            {followUpPreviewResult && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                    <div style={{
+                                        padding: '0.9rem 1rem',
+                                        borderRadius: '10px',
+                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        background: 'rgba(255,255,255,0.03)'
+                                    }}>
+                                        <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.35rem' }}>
+                                            Previewing
+                                        </div>
+                                        <div style={{ fontWeight: 600, color: 'rgba(255,255,255,0.92)' }}>
+                                            {followUpPreviewResult.contactEmail}
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.5rem' }}>
+                                            Rendered HTML
+                                        </div>
+                                        <div style={{
+                                            padding: '1rem',
+                                            borderRadius: '10px',
+                                            border: '1px solid rgba(255,255,255,0.1)',
+                                            background: '#fff',
+                                            color: '#111827',
+                                            minHeight: '160px'
+                                        }}>
+                                            <style>{`.followup-preview-render a { color: #2563eb; text-decoration: underline; }`}</style>
+                                            <div
+                                                className="followup-preview-render"
+                                                dangerouslySetInnerHTML={{ __html: followUpPreviewResult.renderedHtml }}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.5rem' }}>
+                                            Variables
+                                        </div>
+                                        <pre style={{
+                                            margin: 0,
+                                            padding: '1rem',
+                                            borderRadius: '10px',
+                                            border: '1px solid rgba(255,255,255,0.1)',
+                                            background: 'rgba(255,255,255,0.03)',
+                                            color: 'rgba(255,255,255,0.82)',
+                                            fontSize: '0.78rem',
+                                            overflowX: 'auto',
+                                            whiteSpace: 'pre-wrap',
+                                            wordBreak: 'break-word'
+                                        }}>{JSON.stringify(followUpPreviewResult.vars, null, 2)}</pre>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={closeFollowUpPreviewModal}
+                                disabled={followUpPreviewLoading}
+                            >
+                                Close
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Upload Modal - Wizard */}
             {modalOpen && (
