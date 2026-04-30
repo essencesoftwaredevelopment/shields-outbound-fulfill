@@ -21,6 +21,7 @@ import leadsRouter from './routes/leads.js';
 import webhooksRouter from './routes/webhooks.js';
 import domainsRouter from './routes/domains.js';
 import microserviceRouter from './routes/microservice.js';
+import interestedAutoResponderRouter from './routes/interestedAutoResponder.js';
 import { startEmbeddedQueueWorker } from './worker/embeddedWorker.js';
 
 const app = express();
@@ -90,6 +91,7 @@ app.use('/api', clientsRouter);
 app.use('/api', leadsRouter);
 app.use('/api', domainsRouter);
 app.use('/api', microserviceRouter);
+app.use('/api', interestedAutoResponderRouter);
 app.use('/webhook', webhooksRouter);
 
 // Health check

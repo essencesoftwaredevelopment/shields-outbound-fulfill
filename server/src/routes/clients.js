@@ -46,6 +46,7 @@ import {
     resolveTemplateVars,
     sanitizeHtml
 } from '../services/followUpSender.js';
+import { runFollowUpsForClient } from '../services/followUpSender.js';
 
 const router = express.Router();
 const upload = multer({
@@ -582,6 +583,45 @@ router.post('/clients/:id/instantly/email-accounts/sync', async (req, res) => {
     }
 });
 
+router.post('/clients/:id/follow-ups/run-now', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const { idToken, dryRun = false } = req.body || {};
+        const clientSlug = req.params.id;
+        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
+
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const agencyId = decoded.uid;
+
+        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
+        const clientSnap = await clientRef.get();
+        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
+
+        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
+        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+
+        const sqlClientId = await getOrCreateClient(agencyId, clientSlug);
+        const summary = await runFollowUpsForClient({
+            agencyId,
+            clientSlug,
+            instantlyKey,
+            clientId: sqlClientId,
+            dryRun: dryRun === true,
+            logger: (message) => console.log(`[follow-ups-run-now][${agencyId}/${clientSlug}] ${message}`)
+        });
+
+        res.json({
+            clientId: sqlClientId,
+            dryRun: dryRun === true,
+            summary
+        });
+    } catch (error) {
+        console.error('Error running follow-ups now:', error);
+        res.status(500).json({ error: 'Failed to run follow-ups now.' });
+    }
+});
+
 router.get('/clients/:id/instantly/sync-runs/latest', async (req, res) => {
     try {
         setNoStoreHeaders(res);
@@ -740,7 +780,7 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             AND cie.client_id = $2
             AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}
             ORDER BY cie.event_timestamp DESC NULLS LAST, cie.created_at DESC NULLS LAST, cie.id DESC
-            LIMIT 10`,
+            LIMIT 25`,
             analyticsParams
         );
 

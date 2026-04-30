@@ -14,6 +14,7 @@
 import { pool } from '../config/db.js';
 import { firestore } from '../config/firebase.js';
 import { sendInstantlyReply } from './instantlyState.js';
+import crypto from 'crypto';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -428,17 +429,89 @@ async function updateSendOutcome(db, sendId, { status, errorCode, errorMessage, 
     );
 }
 
+/**
+ * Insert a synthetic Instantly-style activity row for a successful server-side
+ * follow-up send so it appears in lead activity even when Instantly does not
+ * emit a webhook for the outbound reply.
+ */
+async function persistSentFollowUpActivity(db, {
+    agencyId,
+    clientId,
+    contactId,
+    campaignId,
+    instantlyCampaignId,
+    instantlyLeadId,
+    email,
+    eaccount,
+    parentReplyToUuid,
+    sentReplyId,
+    renderedSubject,
+    renderedHtml,
+    renderedText,
+    sendId
+}) {
+    const eventTimestamp = new Date().toISOString();
+    const fingerprint = crypto
+        .createHash('sha256')
+        .update(`follow-up-email-sent|${sendId}`)
+        .digest('hex');
+    const payload = {
+        event_type: 'email_sent',
+        source: 'server_follow_up',
+        subject: renderedSubject || null,
+        email_subject: renderedSubject || null,
+        email_text: renderedText || null,
+        email_html: renderedHtml || null,
+        email_id: sentReplyId || null,
+        parent_reply_to_uuid: parentReplyToUuid || null,
+        follow_up_send_id: sendId
+    };
+
+    await db.query(
+        `INSERT INTO contact_instantly_events (
+            agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
+            event_type, reply_category, lead_email, email_account, message_text,
+            reply_text_snippet, reply_to_uuid, event_timestamp, fingerprint, source, payload
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17::jsonb
+        )
+        ON CONFLICT (source, fingerprint) DO NOTHING`,
+        [
+            agencyId,
+            clientId,
+            contactId,
+            campaignId,
+            instantlyCampaignId || null,
+            instantlyLeadId || null,
+            'email_sent',
+            null,
+            email || null,
+            eaccount || null,
+            renderedText || null,
+            renderedText ? renderedText.split('\n').find((line) => line.trim()) || null : null,
+            sentReplyId || parentReplyToUuid || null,
+            eventTimestamp,
+            fingerprint,
+            'server_follow_up',
+            JSON.stringify(payload)
+        ]
+    );
+}
+
 // ─── Sending ─────────────────────────────────────────────────────────────────
 
 /**
  * Send a single follow-up reply via Instantly and record the outcome.
  */
 async function sendFollowUpForProspect({
-    prospect, script, vars, apiKey, clientId, sentForDate, dryRun, logger
+    prospect, script, vars, apiKey, agencyId, clientId, sentForDate, logger, dryRun
 }) {
     const { contact_id: contactId, campaign_id: campaignId, company_id: companyId,
             instantly_lead_id: instantlyLeadId, reply_to_uuid: replyToUuid,
-            eaccount, email, thread_subject: threadSubject } = prospect;
+            eaccount, email, thread_subject: threadSubject, instantly_campaign_id: instantlyCampaignId } = prospect;
 
     const renderedSubject = threadSubject || null;
     const rawHtml = renderTemplate(script.html_template, vars);
@@ -488,9 +561,25 @@ async function sendFollowUpForProspect({
             replyPayload.subject = renderedSubject;
         }
 
-        await sendInstantlyReply(apiKey, replyPayload);
+        const replyResult = await sendInstantlyReply(apiKey, replyPayload);
 
         await updateSendOutcome(pool, sendId, { status: 'sent', retryable: false });
+        await persistSentFollowUpActivity(pool, {
+            agencyId,
+            clientId,
+            contactId,
+            campaignId,
+            instantlyCampaignId,
+            instantlyLeadId,
+            email,
+            eaccount,
+            parentReplyToUuid: replyToUuid,
+            sentReplyId: replyResult?.id || replyResult?.email_id || null,
+            renderedSubject,
+            renderedHtml,
+            renderedText,
+            sendId
+        });
         logger(`[follow-up] Sent to ${email} (contact=${contactId}) subject="${renderedSubject || '(thread subject)'}"`);
         return { sent: true, sendId };
     } catch (err) {
@@ -560,7 +649,7 @@ export async function runFollowUpsForClient({
 
         const result = await sendFollowUpForProspect({
             prospect, script, vars, apiKey: instantlyKey,
-            clientId, sentForDate, dryRun, logger
+            agencyId, clientId, sentForDate, dryRun, logger
         });
 
         if (result.sent) summary.sent += 1;

@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { firestore } from '../config/firebase.js';
 import { pool } from '../config/db.js';
 import { getOrCreateClient } from './db/queries.js';
+import { createInterestedAutoResponderDraftFromEvent } from './interestedAutoResponder.js';
 
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_SYNC_PAGE_LIMIT = Math.max(1, Math.min(parseInt(process.env.INSTANTLY_SYNC_PAGE_LIMIT || '100', 10) || 100, 100));
@@ -2067,6 +2068,26 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
         );
 
         await client.query('COMMIT');
+
+        const insertedEventId = insertEventResult.rows[0]?.id || null;
+        const normalizedEventType = asNullableText(event?.event_type)?.toLowerCase();
+        if (normalizedEventType === 'lead_interested' && insertedEventId && sqlCampaignId && contactId) {
+            try {
+                await createInterestedAutoResponderDraftFromEvent({
+                    agencyId,
+                    clientSlug,
+                    clientId: clientState.id,
+                    campaignId: sqlCampaignId,
+                    contactId,
+                    instantlyLeadId: asNullableText(event?.lead_id || event?.instantly_lead_id),
+                    sourceEventId: insertedEventId,
+                    leadEmail: normalizedEmail,
+                    logger
+                });
+            } catch (draftError) {
+                logger(`Interested auto-responder draft creation failed: ${draftError.message}`);
+            }
+        }
 
         logger(`Stored Instantly webhook event ${event?.event_type || 'unknown'} for ${agencyId}/${clientSlug}`);
         return {

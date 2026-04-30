@@ -239,12 +239,49 @@ type InstantlyEventAnalyticsPayload = {
     recentEvents: InstantlyEventAnalyticsRecentEvent[];
 };
 
+type CollatableActivityEvent = {
+    id: string;
+    event_type: string;
+    event_timestamp: string;
+    campaign_name?: string | null;
+    lead_email?: string | null;
+    message_text?: string | null;
+    reply_text_snippet?: string | null;
+    reply_category?: string | null;
+    displayLabel?: string | null;
+    synthetic?: boolean;
+};
+
+type CollatedActivityEvent = CollatableActivityEvent & {
+    displayLabel: string;
+    secondaryLabel?: string | null;
+    combined?: boolean;
+};
+
 const INSTANTLY_ANALYTICS_PERIOD_OPTIONS: Array<{ value: InstantlyEventAnalyticsPeriod; label: string }> = [
     { value: "24h", label: "Last 24 hours" },
     { value: "7d", label: "Last 7 days" },
     { value: "30d", label: "Last 30 days" },
     { value: "90d", label: "Last 90 days" }
 ];
+
+const INTEREST_ACTIVITY_TYPES = new Set([
+    "lead_interested",
+    "lead_meeting_booked",
+    "lead_meeting_completed",
+    "lead_closed",
+    "lead_not_interested",
+    "lead_wrong_person",
+    "lead_neutral",
+    "lead_no_show",
+    "lead_out_of_office",
+    "interest_change"
+]);
+
+const ACTIVITY_COLLATION_WINDOW_MS = 60 * 1000;
+const POSITIVE_ACTIVITY_LABELS = new Set(["interested", "meeting booked", "meeting completed", "closed won", "won"]);
+const NEGATIVE_ACTIVITY_LABELS = new Set(["not interested", "wrong person", "lost", "bad fit", "risky", "bounced"]);
+const NEUTRAL_ACTIVITY_LABELS = new Set(["out of office", "neutral", "no show", "unsubscribed"]);
 
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
 
@@ -311,15 +348,31 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
     if (normalized === "lead wrong person") return "Wrong person";
     if (normalized === "lead neutral") return "Neutral";
     if (normalized === "lead no show") return "No show";
+    if (normalized === "warm follow up") return "Marked as warm follow up";
+    if (String(eventType || "").toLowerCase() === "interest_change") {
+        return `Marked as ${normalized}`;
+    }
     if (normalized === "state sync") return "State sync";
     return normalized.replace(/\b(\w)/g, (match) => match.toUpperCase());
 }
 
-function getInstantlyActivityColor(eventType: string) {
+function getActivityDisplayTone(label?: string | null) {
+    const normalized = String(label || "").toLowerCase().replace(/[_ ]+/g, " ").trim();
+    if (POSITIVE_ACTIVITY_LABELS.has(normalized)) return "positive";
+    if (NEGATIVE_ACTIVITY_LABELS.has(normalized)) return "negative";
+    if (NEUTRAL_ACTIVITY_LABELS.has(normalized)) return "neutral";
+    if (normalized === "warm follow up" || normalized === "marked as warm follow up") return "manual";
+    return "default";
+}
+
+function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | null) {
     const normalized = String(eventType || "").toLowerCase();
+    const displayLabel = formatInstantlyActivityLabel(eventType, fallbackLabel);
+    const displayTone = getActivityDisplayTone(displayLabel);
     if (normalized === "email_sent") return "#3b82f6";
     if (normalized === "email_opened") return "#a855f7";
     if (normalized === "email_link_clicked") return "#0ea5e9";
+    if (normalized === "warm follow up" || normalized === "warm_follow_up" || displayTone === "manual") return "#eab308";
     if (normalized === "reply_received" || normalized === "lead_interested" || normalized === "lead_meeting_booked" || normalized === "lead_meeting_completed" || normalized === "lead_closed") {
         return "#22c55e";
     }
@@ -329,7 +382,136 @@ function getInstantlyActivityColor(eventType: string) {
     if (normalized === "lead_unsubscribed" || normalized === "lead_out_of_office" || normalized === "lead_neutral") {
         return "#f59e0b";
     }
+    if (normalized === "interest_change") {
+        if (displayTone === "positive") return "#22c55e";
+        if (displayTone === "negative") return "#ef4444";
+        if (displayTone === "neutral") return "#f59e0b";
+    }
     return "rgba(255, 255, 255, 0.3)";
+}
+
+function isReplyActivityEvent(eventType: string) {
+    const normalized = String(eventType || "").toLowerCase();
+    return normalized === "reply_received" || normalized === "reply" || normalized === "replied";
+}
+
+function isInterestActivityEvent(event: CollatableActivityEvent) {
+    const normalized = String(event.event_type || "").toLowerCase();
+    if (INTEREST_ACTIVITY_TYPES.has(normalized)) return true;
+    return normalized === "interest_change" || Boolean(event.synthetic && event.displayLabel);
+}
+
+function getActivityEventTimeMs(event: CollatableActivityEvent) {
+    const ts = new Date(event.event_timestamp).getTime();
+    return Number.isNaN(ts) ? null : ts;
+}
+
+function getActivityEventGroupKey(event: CollatableActivityEvent) {
+    const email = String(event.lead_email || "").trim().toLowerCase();
+    const campaign = String(event.campaign_name || "").trim().toLowerCase();
+    return `${email}::${campaign}`;
+}
+
+function buildCollatedActivityEvents<T extends CollatableActivityEvent>(events: T[]) {
+    if (!Array.isArray(events) || events.length === 0) return [] as Array<T & CollatedActivityEvent>;
+
+    const dedupedEvents = events.filter((event) => {
+        if (!event.synthetic || !isInterestActivityEvent(event)) return true;
+
+        const eventMs = getActivityEventTimeMs(event);
+        if (eventMs === null) return true;
+
+        return !events.some((candidate) => {
+            if (candidate.id === event.id || candidate.synthetic || !isInterestActivityEvent(candidate)) return false;
+            if (getActivityEventGroupKey(candidate) !== getActivityEventGroupKey(event)) return false;
+            const candidateMs = getActivityEventTimeMs(candidate);
+            if (candidateMs === null) return false;
+            return Math.abs(candidateMs - eventMs) <= ACTIVITY_COLLATION_WINDOW_MS;
+        });
+    });
+
+    const usedIds = new Set<string>();
+    const collatedEvents: Array<T & CollatedActivityEvent> = [];
+    const sortedEvents = [...dedupedEvents].sort((a, b) => {
+        const timeDiff = (getActivityEventTimeMs(b) || 0) - (getActivityEventTimeMs(a) || 0);
+        if (timeDiff !== 0) return timeDiff;
+        return String(b.id).localeCompare(String(a.id));
+    });
+
+    for (const event of sortedEvents) {
+        if (usedIds.has(event.id)) continue;
+
+        const eventMs = getActivityEventTimeMs(event);
+        const canPair = eventMs !== null && (isReplyActivityEvent(event.event_type) || isInterestActivityEvent(event));
+
+        if (canPair) {
+            const counterpart = sortedEvents
+                .filter((candidate) => {
+                    if (candidate.id === event.id || usedIds.has(candidate.id)) return false;
+                    const candidateMs = getActivityEventTimeMs(candidate);
+                    if (candidateMs === null) return false;
+                    if (getActivityEventGroupKey(candidate) !== getActivityEventGroupKey(event)) return false;
+                    if (Math.abs(candidateMs - eventMs) > ACTIVITY_COLLATION_WINDOW_MS) return false;
+
+                    const eventIsReply = isReplyActivityEvent(event.event_type);
+                    const candidateIsReply = isReplyActivityEvent(candidate.event_type);
+                    const eventIsInterest = isInterestActivityEvent(event);
+                    const candidateIsInterest = isInterestActivityEvent(candidate);
+                    return (eventIsReply && candidateIsInterest) || (eventIsInterest && candidateIsReply);
+                })
+                .sort((a, b) => {
+                    const aMs = getActivityEventTimeMs(a) || 0;
+                    const bMs = getActivityEventTimeMs(b) || 0;
+                    const diffA = Math.abs(aMs - eventMs);
+                    const diffB = Math.abs(bMs - eventMs);
+                    if (diffA !== diffB) return diffA - diffB;
+                    if (Boolean(a.synthetic) !== Boolean(b.synthetic)) return a.synthetic ? 1 : -1;
+                    return String(a.id).localeCompare(String(b.id));
+                })[0];
+
+            if (counterpart) {
+                usedIds.add(event.id);
+                usedIds.add(counterpart.id);
+
+                const replyEvent = isReplyActivityEvent(event.event_type) ? event : counterpart;
+                const interestEvent = isInterestActivityEvent(event) ? event : counterpart;
+                const mergedTimestamp = new Date(
+                    Math.max(getActivityEventTimeMs(replyEvent) || 0, getActivityEventTimeMs(interestEvent) || 0)
+                ).toISOString();
+                const primaryEvent = interestEvent;
+                const displayLabel = formatInstantlyActivityLabel(primaryEvent.event_type, primaryEvent.displayLabel);
+                const secondaryLabel = formatInstantlyActivityLabel(replyEvent.event_type, replyEvent.displayLabel);
+
+                collatedEvents.push({
+                    ...(primaryEvent as T),
+                    id: `${primaryEvent.id}::${replyEvent.id}`,
+                    event_type: primaryEvent.event_type,
+                    event_timestamp: mergedTimestamp,
+                    campaign_name: primaryEvent.campaign_name || replyEvent.campaign_name || null,
+                    lead_email: primaryEvent.lead_email || replyEvent.lead_email || null,
+                    message_text: replyEvent.message_text || primaryEvent.message_text || null,
+                    reply_text_snippet: replyEvent.reply_text_snippet || primaryEvent.reply_text_snippet || null,
+                    reply_category: replyEvent.reply_category || primaryEvent.reply_category || null,
+                    displayLabel,
+                    secondaryLabel: secondaryLabel === displayLabel ? null : secondaryLabel,
+                    combined: true
+                });
+                continue;
+            }
+        }
+
+        usedIds.add(event.id);
+        collatedEvents.push({
+            ...(event as T),
+            displayLabel: formatInstantlyActivityLabel(event.event_type, event.displayLabel)
+        });
+    }
+
+    return collatedEvents.sort((a, b) => {
+        const timeDiff = (getActivityEventTimeMs(b) || 0) - (getActivityEventTimeMs(a) || 0);
+        if (timeDiff !== 0) return timeDiff;
+        return String(b.id).localeCompare(String(a.id));
+    });
 }
 
 function getLeadCampaignNames(lead: Lead): string[] {
@@ -461,6 +643,19 @@ type FollowUpScript = {
     script_order: number;
     html_template: string;
     text_template: string | null;
+    created_at: string;
+    updated_at: string;
+};
+
+type InterestedAutoResponderPrompt = {
+    id: number;
+    agency_id: string;
+    client_id: number;
+    campaign_id: number;
+    campaign_name: string;
+    version: string;
+    system_prompt: string;
+    active: boolean;
     created_at: string;
     updated_at: string;
 };
@@ -730,13 +925,17 @@ export default function ClientPage() {
     const searchParams = useSearchParams();
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
+    const allowedTabs = ["analytics", "info", "campaigns", "leads", "personalizer", "follow-ups"] as const;
+    type ClientTab = typeof allowedTabs[number];
+    const initialTab = searchParams?.get("tab");
 
-    const [activeTab, setActiveTab] = useState<"analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer" | "follow-ups">(
-        (searchParams?.get("tab") as "analytics" | "info" | "campaigns" | "leads" | "segments" | "personalizer" | "follow-ups") || "analytics"
+    const [activeTab, setActiveTab] = useState<ClientTab>(
+        initialTab && allowedTabs.includes(initialTab as ClientTab) ? (initialTab as ClientTab) : "analytics"
     );
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
     const [clientInstantlyKey, setClientInstantlyKey] = useState<string>("");
+    const [clientNtfyTopic, setClientNtfyTopic] = useState<string>("");
     const [emailProvider, setEmailProvider] = useState<'trykitt' | 'self_hosted'>('trykitt');
 
     // Personalizer state
@@ -768,6 +967,7 @@ export default function ClientPage() {
     const [savingFollowUpScript, setSavingFollowUpScript] = useState(false);
     const [updatingFollowUpScriptId, setUpdatingFollowUpScriptId] = useState<number | null>(null);
     const [deletingFollowUpScriptId, setDeletingFollowUpScriptId] = useState<number | null>(null);
+    const [runningFollowUpsNow, setRunningFollowUpsNow] = useState(false);
     const [followUpPreviewModalOpen, setFollowUpPreviewModalOpen] = useState(false);
     const [previewingFollowUpScript, setPreviewingFollowUpScript] = useState<FollowUpScript | null>(null);
     const [followUpPreviewLeadSearch, setFollowUpPreviewLeadSearch] = useState('');
@@ -781,6 +981,17 @@ export default function ClientPage() {
     const [fuScriptActive, setFuScriptActive] = useState(true);
     const [fuScriptHtml, setFuScriptHtml] = useState('');
     const [fuScriptText, setFuScriptText] = useState('');
+    const [interestedAutoResponderPrompts, setInterestedAutoResponderPrompts] = useState<InterestedAutoResponderPrompt[]>([]);
+    const [interestedAutoResponderPromptsLoading, setInterestedAutoResponderPromptsLoading] = useState(false);
+    const [autoResponderCampaigns, setAutoResponderCampaigns] = useState<Campaign[]>([]);
+    const [autoResponderPromptModalOpen, setAutoResponderPromptModalOpen] = useState(false);
+    const [editingAutoResponderPrompt, setEditingAutoResponderPrompt] = useState<InterestedAutoResponderPrompt | null>(null);
+    const [savingAutoResponderPrompt, setSavingAutoResponderPrompt] = useState(false);
+    const [deletingAutoResponderPromptId, setDeletingAutoResponderPromptId] = useState<number | null>(null);
+    const [autoResponderPromptCampaignId, setAutoResponderPromptCampaignId] = useState('');
+    const [autoResponderPromptVersion, setAutoResponderPromptVersion] = useState('v1');
+    const [autoResponderPromptSystemPrompt, setAutoResponderPromptSystemPrompt] = useState('');
+    const [autoResponderPromptActive, setAutoResponderPromptActive] = useState(true);
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -1526,6 +1737,7 @@ export default function ClientPage() {
                 setClientName((data.name as string) || clientId);
                 setClientIndustry((data.industry as Niche["id"]) || "ecom");
                 setClientInstantlyKey((data.instantly_key as string) || "");
+                setClientNtfyTopic((data.ntfy_topic as string) || "");
                 setClientTotalLeads((data.totalLeads as number) || 0);
                 setClientInstantlyWebhookStatus(typeof data.instantlyWebhookStatus === 'number' ? data.instantlyWebhookStatus : null);
                 setClientInstantlyWebhookUpdatedAt(data.instantlyWebhookUpdatedAt?.toDate ? data.instantlyWebhookUpdatedAt.toDate().toLocaleString() : null);
@@ -1535,6 +1747,7 @@ export default function ClientPage() {
                 setClientName(clientId);
                 setClientIndustry("ecom");
                 setClientInstantlyKey("");
+                setClientNtfyTopic("");
                 setClientTotalLeads(0);
                 setClientInstantlyWebhookStatus(null);
                 setClientInstantlyWebhookUpdatedAt(null);
@@ -2696,18 +2909,30 @@ export default function ClientPage() {
         if (activeTab !== 'follow-ups' || !user || !clientId) return;
         let cancelled = false;
         setFollowUpScriptsLoading(true);
+        setInterestedAutoResponderPromptsLoading(true);
         (async () => {
             try {
                 const idToken = await getIdToken(user);
-                const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts`, {
-                    headers: { Authorization: `Bearer ${idToken}` }
-                });
-                const data = await res.json();
-                if (!cancelled) setFollowUpScripts(data.scripts || []);
+                const [scriptsResponse, prompts, campaignOptions] = await Promise.all([
+                    fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts`, {
+                        headers: { Authorization: `Bearer ${idToken}` }
+                    }),
+                    fetchInterestedAutoResponderPrompts(),
+                    fetchSqlCampaignList()
+                ]);
+                const scriptData = await scriptsResponse.json();
+                if (!cancelled) {
+                    setFollowUpScripts(scriptData.scripts || []);
+                    setInterestedAutoResponderPrompts(prompts);
+                    setAutoResponderCampaigns(campaignOptions);
+                }
             } catch (err) {
                 console.error('Failed to fetch follow-up scripts:', err);
             } finally {
-                if (!cancelled) setFollowUpScriptsLoading(false);
+                if (!cancelled) {
+                    setFollowUpScriptsLoading(false);
+                    setInterestedAutoResponderPromptsLoading(false);
+                }
             }
         })();
         return () => { cancelled = true; };
@@ -3549,9 +3774,10 @@ export default function ClientPage() {
         await setDoc(ref, {
             name: clientName?.trim() || clientId,
             industry: clientIndustry,
-            instantly_key: clientInstantlyKey?.trim() || ""
+            instantly_key: clientInstantlyKey?.trim() || "",
+            ntfy_topic: clientNtfyTopic?.trim() || ""
         }, { merge: true });
-    }, [user, clientId, clientName, clientIndustry, clientInstantlyKey]);
+    }, [user, clientId, clientName, clientIndustry, clientInstantlyKey, clientNtfyTopic]);
 
     const handleSaveClientInfo = async () => {
         if (!user || !clientId) return;
@@ -3673,6 +3899,158 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setSyncingInstantlyEmailAccounts(false);
+        }
+    };
+
+    const handleRunFollowUpsNow = async () => {
+        if (!user || !clientId) return;
+        if (!clientInstantlyKey.trim()) {
+            setToastMessage('Save an Instantly API key first.');
+            setToastVisible(true);
+            return;
+        }
+
+        setRunningFollowUpsNow(true);
+        try {
+            await persistClientInfo();
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-ups/run-now`,
+                {
+                    method: 'POST',
+                    cache: 'no-store',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ idToken })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to run follow-ups now (${response.status})`);
+            }
+
+            const summary = data.summary || {};
+            setToastMessage(
+                `Follow-ups run complete. Eligible: ${summary.eligible ?? 0}, sent: ${summary.sent ?? 0}, blocked: ${summary.blocked ?? 0}, skipped: ${summary.skipped ?? 0}, failed: ${summary.failed ?? 0}.`
+            );
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to run follow-ups now');
+            setToastVisible(true);
+        } finally {
+            setRunningFollowUpsNow(false);
+        }
+    };
+
+    const openAutoResponderPromptModal = (prompt?: InterestedAutoResponderPrompt) => {
+        if (prompt) {
+            setEditingAutoResponderPrompt(prompt);
+            setAutoResponderPromptCampaignId(String(prompt.campaign_id));
+            setAutoResponderPromptVersion(prompt.version || 'v1');
+            setAutoResponderPromptSystemPrompt(prompt.system_prompt || '');
+            setAutoResponderPromptActive(prompt.active);
+        } else {
+            setEditingAutoResponderPrompt(null);
+            setAutoResponderPromptCampaignId(autoResponderCampaigns[0]?.id || '');
+            setAutoResponderPromptVersion('v1');
+            setAutoResponderPromptSystemPrompt('');
+            setAutoResponderPromptActive(true);
+        }
+        setAutoResponderPromptModalOpen(true);
+    };
+
+    const handleSaveAutoResponderPrompt = async () => {
+        if (!user || !clientId) return;
+        if (!autoResponderPromptCampaignId) {
+            setToastMessage('Select a campaign first.');
+            setToastVisible(true);
+            return;
+        }
+        if (!autoResponderPromptVersion.trim()) {
+            setToastMessage('Version is required.');
+            setToastVisible(true);
+            return;
+        }
+        if (!autoResponderPromptSystemPrompt.trim()) {
+            setToastMessage('System prompt is required.');
+            setToastVisible(true);
+            return;
+        }
+
+        setSavingAutoResponderPrompt(true);
+        try {
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts${editingAutoResponderPrompt ? `/${editingAutoResponderPrompt.id}` : ''}`,
+                {
+                    method: editingAutoResponderPrompt ? 'PUT' : 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${idToken}`
+                    },
+                    body: JSON.stringify({
+                        campaignId: Number(autoResponderPromptCampaignId),
+                        version: autoResponderPromptVersion.trim(),
+                        systemPrompt: autoResponderPromptSystemPrompt.trim(),
+                        active: autoResponderPromptActive
+                    })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to save auto-responder prompt (${response.status})`);
+            }
+
+            const savedPrompt = data.prompt as InterestedAutoResponderPrompt;
+            setInterestedAutoResponderPrompts((prev) => {
+                const next = prev
+                    .filter((item) => item.id !== savedPrompt.id)
+                    .map((item) => (
+                        savedPrompt.active && item.campaign_id === savedPrompt.campaign_id
+                            ? { ...item, active: false }
+                            : item
+                    ));
+                return [...next, savedPrompt].sort((a, b) => {
+                    if (a.active !== b.active) return a.active ? -1 : 1;
+                    return a.campaign_name.localeCompare(b.campaign_name);
+                });
+            });
+            setToastMessage(editingAutoResponderPrompt ? 'Auto-responder prompt updated.' : 'Auto-responder prompt created.');
+            setToastVisible(true);
+            setAutoResponderPromptModalOpen(false);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save auto-responder prompt');
+            setToastVisible(true);
+        } finally {
+            setSavingAutoResponderPrompt(false);
+        }
+    };
+
+    const handleDeleteAutoResponderPrompt = async (promptId: number) => {
+        if (!user || !clientId) return;
+        if (!window.confirm('Delete this auto-responder prompt?')) return;
+
+        setDeletingAutoResponderPromptId(promptId);
+        try {
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts/${promptId}`,
+                {
+                    method: 'DELETE',
+                    headers: { Authorization: `Bearer ${idToken}` }
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to delete auto-responder prompt (${response.status})`);
+            }
+            setInterestedAutoResponderPrompts((prev) => prev.filter((prompt) => prompt.id !== promptId));
+            setToastMessage('Auto-responder prompt deleted.');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to delete auto-responder prompt');
+            setToastVisible(true);
+        } finally {
+            setDeletingAutoResponderPromptId(null);
         }
     };
 
@@ -4349,6 +4727,19 @@ export default function ClientPage() {
 
         const campaignsData = await campaignsResponse.json();
         return (campaignsData.campaigns || []) as Campaign[];
+    };
+
+    const fetchInterestedAutoResponderPrompts = async () => {
+        const token = await user?.getIdToken();
+        const response = await fetch(
+            `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!response.ok) {
+            throw new Error(`Failed to fetch auto-responder prompts: ${response.status}`);
+        }
+        const data = await response.json();
+        return (data.prompts || []) as InterestedAutoResponderPrompt[];
     };
 
     const handleOpenInstantlyCsvImportModal = async () => {
@@ -5046,16 +5437,10 @@ export default function ClientPage() {
                             All Leads
                         </button>
                         <button
-                            className={`tab-nav__button ${activeTab === "segments" ? "tab-nav__button--active" : ""}`}
-                            onClick={() => setActiveTab("segments")}
-                        >
-                            Segments
-                        </button>
-                        <button
                             className={`tab-nav__button ${activeTab === "personalizer" ? "tab-nav__button--active" : ""}`}
                             onClick={() => setActiveTab("personalizer")}
                         >
-                            🧠 Personalizer
+                            Personalizer
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "follow-ups" ? "tab-nav__button--active" : ""}`}
@@ -5247,7 +5632,7 @@ export default function ClientPage() {
                                 <p className="eyebrow eyebrow--muted" style={{ paddingBottom: "15px" }}>Recent Events</p>
 
                                 {(() => {
-                                    const recentEvents = instantlyEventAnalytics?.recentEvents || [];
+                                    const recentEvents = buildCollatedActivityEvents(instantlyEventAnalytics?.recentEvents || []).slice(0, 10);
                                     if (recentEvents.length === 0) {
                                         return (
                                             <div className="pipeline-panel__empty">
@@ -5267,8 +5652,8 @@ export default function ClientPage() {
                                                 background: "rgba(255, 255, 255, 0.1)"
                                             }} />
                                             {recentEvents.map((evt) => {
-                                                const dotColor = getInstantlyActivityColor(evt.event_type);
-                                                const label = formatInstantlyActivityLabel(evt.event_type);
+                                                const dotColor = getInstantlyActivityColor(evt.event_type, evt.displayLabel);
+                                                const label = evt.displayLabel;
                                                 const evtDate = new Date(evt.event_timestamp);
                                                 const now = new Date();
                                                 const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
@@ -5321,6 +5706,11 @@ export default function ClientPage() {
                                                                 {dateTimeStr}
                                                             </span>
                                                         </div>
+                                                        {evt.secondaryLabel && (
+                                                            <p style={{ margin: "0.18rem 0 0", fontSize: "0.72rem", color: "rgba(191, 219, 254, 0.72)" }}>
+                                                                Includes {evt.secondaryLabel.toLowerCase()}
+                                                            </p>
+                                                        )}
                                                         <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
                                                             {evt.campaign_name && (
                                                                 <span style={{
@@ -6140,305 +6530,6 @@ export default function ClientPage() {
                     {/* Leads Tab */}
                     {activeTab === "leads" && leadTabContent}
 
-                    {/* Segments Tab */}
-                    {activeTab === "segments" && (
-                        <>
-                            <div style={{ marginTop: '2rem', display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                                <button
-                                    type="button"
-                                    className="primary-button"
-                                    onClick={() => handleOpenSegmentModal()}
-                                >
-                                    ➕ Create Segment
-                                </button>
-                            </div>
-
-                            {segments.length === 0 ? (
-                                <div className="pipeline-panel__empty" style={{ marginTop: '2rem' }}>
-                                    <p>No segments yet.</p>
-                                    <p className="pipeline-panel__subtitle">Create segments to filter leads with custom criteria.</p>
-                                </div>
-                            ) : (
-                                <div style={{ marginTop: '2rem' }}>
-                                    <p className="eyebrow eyebrow--muted">Saved Segments</p>
-                                    <div style={{
-                                        marginTop: '1rem',
-                                        display: 'grid',
-                                        gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
-                                        gap: '1rem'
-                                    }}>
-                                        {segments.map((segment) => (
-                                            <div
-                                                key={segment.id}
-                                                style={{
-                                                    border: selectedSegmentId === segment.id ? '2px solid #3b82f6' : '1px solid rgba(255, 255, 255, 0.15)',
-                                                    borderRadius: '16px',
-                                                    padding: '1.25rem',
-                                                    background: selectedSegmentId === segment.id ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255, 255, 255, 0.05)',
-                                                    transition: 'all 0.2s ease',
-                                                    cursor: 'pointer'
-                                                }}
-                                                onClick={() => handleLoadSegmentLeads(segment.id)}
-                                            >
-                                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                                                    <h3 style={{
-                                                        margin: 0,
-                                                        fontSize: '1.1rem',
-                                                        fontWeight: 600,
-                                                        color: '#ffffff'
-                                                    }}>{segment.name}</h3>
-                                                    <span style={{
-                                                        display: 'inline-flex',
-                                                        alignItems: 'center',
-                                                        padding: '0.25rem 0.65rem',
-                                                        borderRadius: '999px',
-                                                        fontSize: '0.75rem',
-                                                        fontWeight: 600,
-                                                        background: 'rgba(59, 130, 246, 0.15)',
-                                                        color: '#60a5fa',
-                                                        border: '1px solid rgba(59, 130, 246, 0.3)',
-                                                        whiteSpace: 'nowrap'
-                                                    }}>
-                                                        {segmentCounts[segment.id] !== undefined ? segmentCounts[segment.id].toLocaleString() : '...'} leads
-                                                    </span>
-                                                </div>
-                                                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
-                                                    <button
-                                                        type="button"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleDownloadSegmentCSV(segment.id);
-                                                        }}
-                                                        disabled={downloadingSegmentId === segment.id}
-                                                        style={{
-                                                            background: 'rgba(34, 197, 94, 0.1)',
-                                                            border: '1px solid rgba(34, 197, 94, 0.3)',
-                                                            borderRadius: '6px',
-                                                            padding: '0.35rem 0.5rem',
-                                                            fontSize: '0.8rem',
-                                                            cursor: 'pointer',
-                                                            color: '#22c55e'
-                                                        }}
-                                                    >
-                                                        {downloadingSegmentId === segment.id ? '⏳' : '📥'} CSV
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleOpenSegmentModal(segment);
-                                                        }}
-                                                        style={{
-                                                            background: 'rgba(255, 255, 255, 0.1)',
-                                                            border: '1px solid rgba(255, 255, 255, 0.2)',
-                                                            borderRadius: '6px',
-                                                            padding: '0.35rem 0.5rem',
-                                                            fontSize: '0.8rem',
-                                                            cursor: 'pointer',
-                                                            color: '#fff'
-                                                        }}
-                                                    >
-                                                        Edit
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleDeleteSegment(segment.id);
-                                                        }}
-                                                        disabled={deletingSegmentId === segment.id}
-                                                        style={{
-                                                            background: 'rgba(239, 68, 68, 0.1)',
-                                                            border: '1px solid rgba(239, 68, 68, 0.3)',
-                                                            borderRadius: '6px',
-                                                            padding: '0.35rem 0.5rem',
-                                                            fontSize: '0.8rem',
-                                                            cursor: 'pointer',
-                                                            color: '#ef4444'
-                                                        }}
-                                                    >
-                                                        {deletingSegmentId === segment.id ? '...' : 'Delete'}
-                                                    </button>
-                                                </div>
-                                                {segment.description && (
-                                                    <p style={{
-                                                        margin: '0 0 0.75rem 0',
-                                                        fontSize: '0.9rem',
-                                                        color: 'rgba(255, 255, 255, 0.7)'
-                                                    }}>{segment.description}</p>
-                                                )}
-                                                <div style={{
-                                                    display: 'flex',
-                                                    flexDirection: 'column',
-                                                    gap: '0.35rem',
-                                                    fontSize: '0.85rem',
-                                                    color: 'rgba(255, 255, 255, 0.6)',
-                                                    marginTop: '0.75rem',
-                                                    paddingTop: '0.75rem',
-                                                    borderTop: '1px solid rgba(255, 255, 255, 0.1)'
-                                                }}>
-                                                    {segment.filters.fullName && (
-                                                        <div><strong>Name contains:</strong> {segment.filters.fullName}</div>
-                                                    )}
-                                                    {segment.filters.founder && (
-                                                        <div><strong>Founder:</strong> {segment.filters.founder === 'exists' ? 'Exists' : 'Not Found'}</div>
-                                                    )}
-                                                    {segment.filters.email && (
-                                                        <div><strong>Email:</strong> {segment.filters.email === 'found' ? 'Found' : segment.filters.email === 'not_found' ? 'Not Found' : 'Not Run'}</div>
-                                                    )}
-                                                    {segment.filters.emailStatus && segment.filters.emailStatus.length > 0 && (
-                                                        <div><strong>Status:</strong> {segment.filters.emailStatus.join(', ')}</div>
-                                                    )}
-                                                    {segment.filters.createdAfter && (
-                                                        <div><strong>After:</strong> {new Date(segment.filters.createdAfter).toLocaleDateString()}</div>
-                                                    )}
-                                                    {segment.filters.createdBefore && (
-                                                        <div><strong>Before:</strong> {new Date(segment.filters.createdBefore).toLocaleDateString()}</div>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* Segment Leads Display */}
-                            {selectedSegmentId && (
-                                <div style={{ marginTop: '2rem' }}>
-                                    <p className="eyebrow eyebrow--muted">
-                                        Segment Results: {segments.find(s => s.id === selectedSegmentId)?.name}
-                                    </p>
-                                    {segmentLeadsLoading ? (
-                                        <div className="pipeline-panel__empty" style={{ marginTop: '1rem' }}>
-                                            <div style={{
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                alignItems: 'center',
-                                                gap: '1rem'
-                                            }}>
-                                                <svg className="spinner" style={{ width: '32px', height: '32px' }} viewBox="0 0 24 24" fill="none">
-                                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
-                                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
-                                                </svg>
-                                                <p>Loading segment leads...</p>
-                                            </div>
-                                        </div>
-                                    ) : segmentLeads.length === 0 ? (
-                                        <div className="pipeline-panel__empty" style={{ marginTop: '1rem' }}>
-                                            <p>No leads match this segment.</p>
-                                        </div>
-                                    ) : (
-                                        <div style={{
-                                            marginTop: '1rem',
-                                            overflowX: 'auto',
-                                            border: '1px solid rgba(255, 255, 255, 0.1)',
-                                            borderRadius: '8px',
-                                            backgroundColor: 'rgba(0, 0, 0, 0.2)',
-                                            maxHeight: '520px',
-                                            overflowY: 'auto'
-                                        }}>
-                                            <table style={{
-                                                width: '100%',
-                                                borderCollapse: 'collapse',
-                                                fontSize: '0.875rem'
-                                            }}>
-                                                <thead>
-                                                    <tr style={{
-                                                        backgroundColor: 'rgba(255, 255, 255, 0.05)',
-                                                        borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
-                                                    }}>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Founder Name</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Email</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Status</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Domain</th>
-                                                        <th style={{
-                                                            textAlign: 'left',
-                                                            padding: '0.75rem 1rem',
-                                                            fontWeight: 600,
-                                                            color: 'rgba(255, 255, 255, 0.9)'
-                                                        }}>Created</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    {segmentLeads.map((lead, index) => (
-                                                        <tr
-                                                            key={lead.id}
-                                                            onClick={() => setSelectedLead(lead)}
-                                                            style={{
-                                                                backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
-                                                                borderBottom: index < segmentLeads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
-                                                                cursor: 'pointer',
-                                                                transition: 'background-color 0.15s ease'
-                                                            }}
-                                                            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
-                                                            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
-                                                        >
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '220px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{lead.founderName || '—'}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '250px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{displayEmail(lead.email, lead.status)}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '140px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{displayEmailStatus(lead.status)}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '220px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{lead.domain || '—'}</td>
-                                                            <td style={{
-                                                                padding: '0.75rem 1rem',
-                                                                maxWidth: '180px',
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap'
-                                                            }}>{lead.updatedAt || '—'}</td>
-                                                        </tr>
-                                                    ))}
-                                                </tbody>
-                                            </table>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-                        </>
-                    )}
-
                     {/* Personalizer Tab */}
                     {activeTab === "personalizer" && (
                         <div style={{ marginTop: '2rem', maxWidth: '720px' }}>
@@ -7148,6 +7239,140 @@ export default function ClientPage() {
                     {/* Follow-Ups Tab */}
                     {activeTab === "follow-ups" && (
                         <div style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', maxWidth: '800px' }}>
+                            <div style={{ padding: '1rem 1.1rem', borderRadius: '12px', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <div>
+                                        <p className="eyebrow eyebrow--muted">Interested Lead Auto-Responder</p>
+                                        <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>
+                                            Create AI draft replies for <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>lead_interested</code> events and send tokened review links via ntfy.
+                                        </p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="primary-button"
+                                        onClick={() => openAutoResponderPromptModal()}
+                                        disabled={interestedAutoResponderPromptsLoading}
+                                    >
+                                        + Add Prompt
+                                    </button>
+                                </div>
+
+                                <label className="settings-field" style={{ marginTop: '1rem' }}>
+                                    <span className="settings-field__label">ntfy Topic / Channel</span>
+                                    <input
+                                        type="text"
+                                        value={clientNtfyTopic}
+                                        onChange={(event) => setClientNtfyTopic(event.target.value)}
+                                        placeholder="essence-interested-leads"
+                                    />
+                                    <span className="settings-field__hint">Used for tokened review link notifications when a new AI draft is created.</span>
+                                </label>
+
+                                <div className="modal__actions" style={{ justifyContent: 'flex-start', marginTop: '0.75rem' }}>
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={handleSaveClientInfo}
+                                        disabled={isSavingClient}
+                                    >
+                                        {isSavingClient ? 'Saving...' : 'Save Notification Topic'}
+                                    </button>
+                                </div>
+
+                                {interestedAutoResponderPromptsLoading ? (
+                                    <p style={{ marginTop: '1rem', color: 'rgba(255,255,255,0.45)', fontSize: '0.875rem' }}>Loading auto-responder prompts…</p>
+                                ) : interestedAutoResponderPrompts.length === 0 ? (
+                                    <div style={{
+                                        marginTop: '1rem',
+                                        padding: '1rem',
+                                        textAlign: 'center',
+                                        border: '1px dashed rgba(255,255,255,0.15)',
+                                        borderRadius: '10px',
+                                        color: 'rgba(255,255,255,0.4)',
+                                        fontSize: '0.875rem'
+                                    }}>
+                                        No campaign prompts yet. Add one active prompt per campaign to enable AI draft generation.
+                                    </div>
+                                ) : (
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '1rem' }}>
+                                        {interestedAutoResponderPrompts.map((prompt) => (
+                                            <div
+                                                key={prompt.id}
+                                                style={{
+                                                    padding: '1rem',
+                                                    borderRadius: '10px',
+                                                    border: '1px solid rgba(255,255,255,0.1)',
+                                                    background: 'rgba(0,0,0,0.16)',
+                                                    display: 'flex',
+                                                    gap: '1rem',
+                                                    alignItems: 'flex-start'
+                                                }}
+                                            >
+                                                <div style={{ flex: 1, minWidth: 0 }}>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                                        <span style={{ fontWeight: 600 }}>{prompt.campaign_name}</span>
+                                                        <span style={{
+                                                            fontSize: '0.72rem',
+                                                            padding: '0.15rem 0.45rem',
+                                                            borderRadius: '999px',
+                                                            background: 'rgba(255,255,255,0.08)',
+                                                            color: 'rgba(255,255,255,0.72)'
+                                                        }}>
+                                                            {prompt.version}
+                                                        </span>
+                                                        <span style={{
+                                                            fontSize: '0.72rem',
+                                                            fontWeight: 600,
+                                                            textTransform: 'uppercase',
+                                                            letterSpacing: '0.04em',
+                                                            padding: '0.15rem 0.5rem',
+                                                            borderRadius: '4px',
+                                                            background: prompt.active ? 'rgba(34,197,94,0.15)' : 'rgba(255,255,255,0.08)',
+                                                            color: prompt.active ? '#86efac' : 'rgba(255,255,255,0.35)',
+                                                        }}>
+                                                            {prompt.active ? 'Active' : 'Inactive'}
+                                                        </span>
+                                                    </div>
+                                                    <pre style={{
+                                                        margin: '0.7rem 0 0',
+                                                        padding: '0.85rem',
+                                                        borderRadius: '8px',
+                                                        border: '1px solid rgba(255,255,255,0.08)',
+                                                        background: 'rgba(255,255,255,0.03)',
+                                                        color: 'rgba(255,255,255,0.7)',
+                                                        fontSize: '0.78rem',
+                                                        whiteSpace: 'pre-wrap',
+                                                        overflow: 'hidden',
+                                                        maxHeight: '180px'
+                                                    }}>
+                                                        {prompt.system_prompt}
+                                                    </pre>
+                                                </div>
+                                                <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
+                                                    <button
+                                                        type="button"
+                                                        className="secondary-button"
+                                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                        onClick={() => openAutoResponderPromptModal(prompt)}
+                                                    >
+                                                        Edit
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="destructive-button"
+                                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                        onClick={() => handleDeleteAutoResponderPrompt(prompt.id)}
+                                                        disabled={deletingAutoResponderPromptId === prompt.id}
+                                                    >
+                                                        {deletingAutoResponderPromptId === prompt.id ? '…' : 'Delete'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+
                             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
                                 <div>
                                     <p className="eyebrow eyebrow--muted">Automated Follow-Ups</p>
@@ -7158,13 +7383,23 @@ export default function ClientPage() {
                                         <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{campaign_name}}'}</code>.
                                     </p>
                                 </div>
-                                <button
-                                    type="button"
-                                    className="primary-button"
-                                    onClick={() => openFollowUpScriptModal()}
-                                >
-                                    + Add Script
-                                </button>
+                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={handleRunFollowUpsNow}
+                                        disabled={runningFollowUpsNow}
+                                    >
+                                        {runningFollowUpsNow ? 'Running...' : 'Check and Run Now'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="primary-button"
+                                        onClick={() => openFollowUpScriptModal()}
+                                    >
+                                        + Add Script
+                                    </button>
+                                </div>
                             </div>
 
                             {followUpScriptsLoading ? (
@@ -7288,6 +7523,82 @@ export default function ClientPage() {
                     )}
                 </section>
             </AppShell>
+
+            {autoResponderPromptModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => setAutoResponderPromptModalOpen(false)}
+                >
+                    <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '720px' }}>
+                        <div className="modal__header">
+                            <div>
+                                <p className="eyebrow eyebrow--muted">Interested Auto-Responder Prompt</p>
+                                <h2 className="modal__title">{editingAutoResponderPrompt ? 'Edit Prompt' : 'New Prompt'}</h2>
+                            </div>
+                        </div>
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Campaign</span>
+                                <select
+                                    value={autoResponderPromptCampaignId}
+                                    onChange={(event) => setAutoResponderPromptCampaignId(event.target.value)}
+                                >
+                                    <option value="">Select campaign…</option>
+                                    {autoResponderCampaigns.map((campaign) => (
+                                        <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
+                                    ))}
+                                </select>
+                            </label>
+                            <label className="settings-field" style={{ maxWidth: '180px' }}>
+                                <span className="settings-field__label">Version</span>
+                                <input
+                                    type="text"
+                                    value={autoResponderPromptVersion}
+                                    onChange={(event) => setAutoResponderPromptVersion(event.target.value)}
+                                    placeholder="v1"
+                                />
+                            </label>
+                            <label className="settings-field">
+                                <span className="settings-field__label">System Prompt</span>
+                                <textarea
+                                    value={autoResponderPromptSystemPrompt}
+                                    onChange={(event) => setAutoResponderPromptSystemPrompt(event.target.value)}
+                                    rows={14}
+                                />
+                            </label>
+                            <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.75rem' }}>
+                                <input
+                                    type="checkbox"
+                                    checked={autoResponderPromptActive}
+                                    onChange={(event) => setAutoResponderPromptActive(event.target.checked)}
+                                    style={{ width: '1rem', height: '1rem', flexShrink: 0 }}
+                                />
+                                <span className="settings-field__label" style={{ margin: 0 }}>Set active for this campaign</span>
+                            </label>
+                        </div>
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setAutoResponderPromptModalOpen(false)}
+                                disabled={savingAutoResponderPrompt}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                onClick={handleSaveAutoResponderPrompt}
+                                disabled={savingAutoResponderPrompt}
+                            >
+                                {savingAutoResponderPrompt ? 'Saving...' : (editingAutoResponderPrompt ? 'Update Prompt' : 'Create Prompt')}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Follow-Up Script Modal */}
             {followUpScriptModalOpen && (
@@ -9211,15 +9522,13 @@ export default function ClientPage() {
                                 }}>Activity</p>
                 {(() => {
                                         // Build synthetic status-change events from campaignsData
-                                        const positiveStatuses = ['interested', 'meeting booked', 'won', 'warm follow up'];
-                                        const negativeStatuses = ['bounced', 'bad fit', 'risky', 'unsubscribed'];
-
                                         type TimelineItem = {
                                             id: string;
                                             event_type: string;
                                             displayLabel: string;
                                             event_timestamp: string;
                                             campaign_name: string | null;
+                                            lead_email?: string | null;
                                             message_text: string | null;
                                             reply_text_snippet: string | null;
                                             reply_category: string | null;
@@ -9238,6 +9547,7 @@ export default function ClientPage() {
                                                     displayLabel: 'Bounced email',
                                                     event_timestamp: campaign.lastBounceAt,
                                                     campaign_name: campaign.campaignName,
+                                                    lead_email: selectedLead.email || null,
                                                     message_text: null,
                                                     reply_text_snippet: null,
                                                     reply_category: null,
@@ -9250,6 +9560,7 @@ export default function ClientPage() {
                                                     displayLabel: campaign.interestStatus || interestNorm,
                                                     event_timestamp: campaign.timestampLastInterestChange,
                                                     campaign_name: campaign.campaignName,
+                                                    lead_email: selectedLead.email || null,
                                                     message_text: null,
                                                     reply_text_snippet: null,
                                                     reply_category: null,
@@ -9266,14 +9577,13 @@ export default function ClientPage() {
                                                 : (evt.event_type || 'unknown').replace(/_/g, ' '),
                                             event_timestamp: evt.event_timestamp,
                                             campaign_name: evt.campaign_name || null,
+                                            lead_email: evt.lead_email || selectedLead.email || null,
                                             message_text: evt.message_text || null,
                                             reply_text_snippet: evt.reply_text_snippet || null,
                                             reply_category: evt.reply_category || null,
                                         }));
 
-                                        const allEvents = [...realEvents, ...syntheticEvents].sort(
-                                            (a, b) => new Date(b.event_timestamp).getTime() - new Date(a.event_timestamp).getTime()
-                                        );
+                                        const allEvents = buildCollatedActivityEvents([...realEvents, ...syntheticEvents]);
 
                                         if (leadEventsLoading) return (
                                             <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>Loading…</p>
@@ -9296,18 +9606,11 @@ export default function ClientPage() {
                                                 {allEvents.map((evt) => {
                                                     const labelNorm = evt.displayLabel.toLowerCase().replace(/[_ ]+/g, ' ').trim();
                                                     const isDayN = /^day \d+$/.test(labelNorm);
-                                                    const isPositive = positiveStatuses.includes(labelNorm) || isDayN
-                                                        || evt.event_type === 'email_replied';
-                                                    const isNegative = negativeStatuses.includes(labelNorm)
-                                                        || evt.event_type === 'email_bounced';
-
-                                                    const dotColor = evt.event_type === 'added_to_campaign' ? '#f59e0b'
-                                                        : evt.event_type === 'email_sent' ? '#3b82f6'
-                                                        : evt.event_type === 'email_opened' ? '#a855f7'
-                                                        : isPositive ? '#22c55e'
-                                                        : isNegative ? '#ef4444'
-                                                        : evt.event_type === 'lead_unsubscribed' ? '#f59e0b'
-                                                        : 'rgba(255, 255, 255, 0.3)';
+                                                    const dotColor = evt.event_type === 'added_to_campaign'
+                                                        ? '#f59e0b'
+                                                        : isDayN
+                                                            ? '#22c55e'
+                                                            : getInstantlyActivityColor(evt.event_type, evt.displayLabel);
 
                                                     const evtDate = new Date(evt.event_timestamp);
                                                     const now = new Date();
@@ -9347,6 +9650,11 @@ export default function ClientPage() {
                                                                     {dateTimeStr}
                                                                 </span>
                                                             </div>
+                                                            {evt.secondaryLabel && (
+                                                                <p style={{ margin: '0.18rem 0 0', fontSize: '0.72rem', color: 'rgba(191, 219, 254, 0.72)' }}>
+                                                                    Includes {evt.secondaryLabel.toLowerCase()}
+                                                                </p>
+                                                            )}
                                                             {evt.campaign_name && (
                                                                 <span style={{
                                                                     display: 'inline-flex',
