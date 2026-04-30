@@ -20,7 +20,7 @@ function getPublicAppBaseUrl() {
         process.env.NEXT_PUBLIC_APP_URL
         || process.env.APP_BASE_URL
         || process.env.PUBLIC_APP_URL
-        || 'http://localhost:3000'
+        || 'https://shields-outbound-fulfill.vercel.app'
     ).trim();
     return baseUrl.replace(/\/$/, '');
 }
