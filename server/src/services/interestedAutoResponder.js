@@ -143,7 +143,7 @@ async function fetchLatestThreadMetadata(db, contactId, campaignId) {
     return result.rows[0] || {};
 }
 
-async function fetchAgencyAndClientSettings(agencyId, clientSlug) {
+export async function fetchAgencyAndClientSettings(agencyId, clientSlug) {
     const [agencySnap, clientSnap] = await Promise.all([
         firestore.collection('users').doc(agencyId).get(),
         firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug).get()
@@ -154,7 +154,7 @@ async function fetchAgencyAndClientSettings(agencyId, clientSlug) {
     };
 }
 
-async function generateDraftReply({ openaiKey, systemPrompt, campaignName, leadEmail, threadSubject, previousLeadMessage }) {
+export async function generateDraftReply({ openaiKey, systemPrompt, campaignName, leadEmail, threadSubject, previousLeadMessage }) {
     const client = new OpenAI({ apiKey: openaiKey });
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,

@@ -992,6 +992,16 @@ export default function ClientPage() {
     const [autoResponderPromptVersion, setAutoResponderPromptVersion] = useState('v1');
     const [autoResponderPromptSystemPrompt, setAutoResponderPromptSystemPrompt] = useState('');
     const [autoResponderPromptActive, setAutoResponderPromptActive] = useState(true);
+    const [autoResponderTestModalOpen, setAutoResponderTestModalOpen] = useState(false);
+    const [testingAutoResponderPrompt, setTestingAutoResponderPrompt] = useState<InterestedAutoResponderPrompt | null>(null);
+    const [autoResponderTestLeadSearch, setAutoResponderTestLeadSearch] = useState('');
+    const [debouncedAutoResponderTestLeadSearch, setDebouncedAutoResponderTestLeadSearch] = useState('');
+    const [autoResponderTestLeadResults, setAutoResponderTestLeadResults] = useState<Lead[]>([]);
+    const [autoResponderTestLeadSearching, setAutoResponderTestLeadSearching] = useState(false);
+    const [autoResponderTestSelectedLead, setAutoResponderTestSelectedLead] = useState<Lead | null>(null);
+    const [autoResponderTestLoading, setAutoResponderTestLoading] = useState(false);
+    const [autoResponderTestResult, setAutoResponderTestResult] = useState<{ renderedText: string; model: string; promptVersion: string; reviewUrl?: string } | null>(null);
+    const [autoResponderTestMessage, setAutoResponderTestMessage] = useState('');
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -1309,6 +1319,13 @@ export default function ClientPage() {
             window.clearTimeout(timeoutId);
         };
     }, [followUpPreviewLeadSearch]);
+
+    useEffect(() => {
+        const timeoutId = window.setTimeout(() => {
+            setDebouncedAutoResponderTestLeadSearch(autoResponderTestLeadSearch);
+        }, 250);
+        return () => { window.clearTimeout(timeoutId); };
+    }, [autoResponderTestLeadSearch]);
 
     useEffect(() => {
         if (!user) return;
@@ -2232,6 +2249,41 @@ export default function ClientPage() {
             cancelled = true;
         };
     }, [clientId, debouncedFollowUpPreviewLeadSearch, followUpPreviewModalOpen, mapApiLeadRow, user]);
+
+    useEffect(() => {
+        if (!autoResponderTestModalOpen || !user || !clientId) return;
+        const query = debouncedAutoResponderTestLeadSearch.trim();
+        if (!query) {
+            setAutoResponderTestLeadResults([]);
+            setAutoResponderTestLeadSearching(false);
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            setAutoResponderTestLeadSearching(true);
+            try {
+                const idToken = await getIdToken(user);
+                const params = new URLSearchParams();
+                params.append('clientId', clientId);
+                params.append('limit', '12');
+                params.append('search', query);
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                    headers: { Authorization: `Bearer ${idToken}` }
+                });
+                if (!response.ok) throw new Error('Failed to search leads');
+                const data = await response.json();
+                if (!cancelled) {
+                    setAutoResponderTestLeadResults(Array.isArray(data.leads) ? data.leads.map(mapApiLeadRow) : []);
+                }
+            } catch (err) {
+                console.error('Failed to search auto-responder test leads:', err);
+                if (!cancelled) setAutoResponderTestLeadResults([]);
+            } finally {
+                if (!cancelled) setAutoResponderTestLeadSearching(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [clientId, debouncedAutoResponderTestLeadSearch, autoResponderTestModalOpen, mapApiLeadRow, user]);
 
     const handleCheckKlaviyo = useCallback(async () => {
         if (!user || !clientId) return;
@@ -4051,6 +4103,50 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setDeletingAutoResponderPromptId(null);
+        }
+    };
+
+    const openAutoResponderTestModal = (prompt: InterestedAutoResponderPrompt) => {
+        setTestingAutoResponderPrompt(prompt);
+        setAutoResponderTestLeadSearch('');
+        setDebouncedAutoResponderTestLeadSearch('');
+        setAutoResponderTestLeadResults([]);
+        setAutoResponderTestSelectedLead(null);
+        setAutoResponderTestResult(null);
+        setAutoResponderTestMessage('');
+        setAutoResponderTestModalOpen(true);
+    };
+
+    const closeAutoResponderTestModal = () => {
+        setAutoResponderTestModalOpen(false);
+        setTestingAutoResponderPrompt(null);
+    };
+
+    const handleRunAutoResponderTest = async (lead: Lead) => {
+        if (!user || !clientId || !testingAutoResponderPrompt) return;
+        setAutoResponderTestSelectedLead(lead);
+        setAutoResponderTestLoading(true);
+        setAutoResponderTestResult(null);
+        try {
+            const idToken = await getIdToken(user);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts/${testingAutoResponderPrompt.id}/test`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({
+                        contactId: lead.id
+                    })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || `Failed to generate test reply (${response.status})`);
+            setAutoResponderTestResult(data);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to generate test reply');
+            setToastVisible(true);
+        } finally {
+            setAutoResponderTestLoading(false);
         }
     };
 
@@ -7353,6 +7449,14 @@ export default function ClientPage() {
                                                         type="button"
                                                         className="secondary-button"
                                                         style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                        onClick={() => openAutoResponderTestModal(prompt)}
+                                                    >
+                                                        Test
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="secondary-button"
+                                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
                                                         onClick={() => openAutoResponderPromptModal(prompt)}
                                                     >
                                                         Edit
@@ -7594,6 +7698,153 @@ export default function ClientPage() {
                                 disabled={savingAutoResponderPrompt}
                             >
                                 {savingAutoResponderPrompt ? 'Saving...' : (editingAutoResponderPrompt ? 'Update Prompt' : 'Create Prompt')}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Auto-Responder Test Modal */}
+            {autoResponderTestModalOpen && testingAutoResponderPrompt && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={closeAutoResponderTestModal}
+                >
+                    <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '860px' }}>
+                        <div className="modal__header">
+                            <div>
+                                <p className="eyebrow eyebrow--muted">Auto-Responder Test</p>
+                                <h2 className="modal__title">{testingAutoResponderPrompt.campaign_name} · {testingAutoResponderPrompt.version}</h2>
+                                <p className="modal__description">
+                                    Search for an interested lead, provide an optional mock message, then generate a test reply without sending anything.
+                                </p>
+                            </div>
+                        </div>
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            <label className="settings-field">
+                                <span className="settings-field__label">Search Leads</span>
+                                <input
+                                    type="text"
+                                    value={autoResponderTestLeadSearch}
+                                    onChange={(e) => setAutoResponderTestLeadSearch(e.target.value)}
+                                    placeholder="Search by email, domain, or founder name"
+                                />
+                            </label>
+
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                {autoResponderTestLeadSearching ? (
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>Searching leads…</p>
+                                ) : debouncedAutoResponderTestLeadSearch.trim() && autoResponderTestLeadResults.length === 0 ? (
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.45)' }}>No matching leads found.</p>
+                                ) : null}
+
+                                {autoResponderTestLeadResults.length > 0 && (
+                                    <div style={{
+                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        borderRadius: '10px',
+                                        overflow: 'hidden',
+                                        background: 'rgba(255,255,255,0.03)'
+                                    }}>
+                                        {autoResponderTestLeadResults.map((lead) => {
+                                            const isSelected = autoResponderTestSelectedLead?.id === lead.id;
+                                            return (
+                                                <button
+                                                    key={lead.id}
+                                                    type="button"
+                                                    onClick={() => handleRunAutoResponderTest(lead)}
+                                                    disabled={autoResponderTestLoading}
+                                                    style={{
+                                                        width: '100%',
+                                                        textAlign: 'left',
+                                                        padding: '0.9rem 1rem',
+                                                        border: 'none',
+                                                        borderTop: '1px solid rgba(255,255,255,0.08)',
+                                                        background: isSelected ? 'rgba(59,130,246,0.16)' : 'transparent',
+                                                        color: 'inherit',
+                                                        cursor: autoResponderTestLoading ? 'wait' : 'pointer',
+                                                    }}
+                                                >
+                                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
+                                                        <div style={{ minWidth: 0 }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: 'rgba(255,255,255,0.94)' }}>
+                                                                {lead.founderName || lead.email || lead.domain || 'Unnamed lead'}
+                                                            </div>
+                                                            <div style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.58)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                {lead.email || 'No email'}{lead.domain ? ` · ${lead.domain}` : ''}
+                                                            </div>
+                                                        </div>
+                                                        <span style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.58)', flexShrink: 0 }}>
+                                                            {autoResponderTestLoading && isSelected ? 'Generating…' : 'Generate'}
+                                                        </span>
+                                                    </div>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+
+                            {autoResponderTestResult && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                    <div style={{
+                                        padding: '0.9rem 1rem',
+                                        borderRadius: '10px',
+                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        background: 'rgba(255,255,255,0.03)'
+                                    }}>
+                                        <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.35rem' }}>
+                                            Generated for
+                                        </div>
+                                        <div style={{ fontWeight: 600, color: 'rgba(255,255,255,0.92)' }}>
+                                            {autoResponderTestSelectedLead?.email || autoResponderTestSelectedLead?.domain || 'Unknown lead'}
+                                        </div>
+                                        <div style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.45)', marginTop: '0.2rem' }}>
+                                            Model: {autoResponderTestResult.model}
+                                        </div>
+                                        {autoResponderTestResult.reviewUrl && (
+                                            <div style={{ marginTop: '0.5rem' }}>
+                                                <a
+                                                    href={autoResponderTestResult.reviewUrl}
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                    style={{ fontSize: '0.82rem', color: '#60a5fa', textDecoration: 'underline' }}
+                                                >
+                                                    Open review &amp; approve page →
+                                                </a>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div>
+                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.5rem' }}>
+                                            Generated Reply (plain text)
+                                        </div>
+                                        <pre style={{
+                                            margin: 0,
+                                            padding: '1rem',
+                                            borderRadius: '10px',
+                                            border: '1px solid rgba(255,255,255,0.1)',
+                                            background: 'rgba(255,255,255,0.03)',
+                                            color: 'rgba(255,255,255,0.88)',
+                                            fontSize: '0.85rem',
+                                            lineHeight: 1.6,
+                                            whiteSpace: 'pre-wrap',
+                                            wordBreak: 'break-word'
+                                        }}>{autoResponderTestResult.renderedText}</pre>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={closeAutoResponderTestModal}
+                                disabled={autoResponderTestLoading}
+                            >
+                                Close
                             </button>
                         </div>
                     </div>
