@@ -42,13 +42,26 @@ function escapeHtml(value = '') {
         .replace(/'/g, '&#39;');
 }
 
+function linkifyEscapedText(escapedText) {
+    // escapedText has already been HTML-escaped, but URLs with & are escaped as &amp;
+    // We re-detect URLs in the original-ish form by reversing &amp; → & for URL matching
+    return escapedText.replace(/https?:\/\/[^\s<>"']+/g, (url) => {
+        const href = url.replace(/&amp;/g, '&');
+        return `<a href="${href}" style="color:#2563eb;">${url}</a>`;
+    });
+}
+
 function plainTextToHtml(text = '') {
     const trimmed = String(text || '').trim();
     if (!trimmed) return '';
-    return trimmed
+    const paragraphs = trimmed
         .split(/\n{2,}/)
-        .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, '<br>')}</p>`)
+        .map((paragraph) => {
+            const escaped = escapeHtml(paragraph).replace(/\n/g, '<br>');
+            return `<p style="margin:0 0 1em 0;">${linkifyEscapedText(escaped)}</p>`;
+        })
         .join('\n');
+    return `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;color:#222;">\n${paragraphs}\n</body></html>`;
 }
 
 function buildReplySnippet(text = '') {

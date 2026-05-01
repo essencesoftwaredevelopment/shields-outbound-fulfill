@@ -311,7 +311,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         );
 
         const appBaseUrl = String(
-            process.env.NEXT_PUBLIC_APP_URL || process.env.APP_BASE_URL || process.env.PUBLIC_APP_URL || 'http://localhost:3000'
+            process.env.NEXT_PUBLIC_APP_URL || process.env.APP_BASE_URL || process.env.PUBLIC_APP_URL || 'https://shields-outbound-fulfill.vercel.app'
         ).trim().replace(/\/$/, '');
         const reviewUrl = `${appBaseUrl}/interested-autoresponder/${encodeURIComponent(reviewToken)}`;
 
