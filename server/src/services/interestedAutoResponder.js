@@ -64,6 +64,58 @@ function plainTextToHtml(text = '') {
     return `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;color:#222;">\n${paragraphs}\n</body></html>`;
 }
 
+function decodeBasicHtmlEntities(text = '') {
+    return String(text || '')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#x27;/gi, "'")
+        .replace(/&#x2F;/gi, '/');
+}
+
+function htmlToPlainText(html = '') {
+    if (!html || typeof html !== 'string') return '';
+
+    let text = html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '');
+
+    text = text.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_match, attrs, label) => {
+        const hrefMatch = String(attrs || '').match(/\bhref\s*=\s*["']([^"']+)["']/i);
+        const href = decodeBasicHtmlEntities(hrefMatch?.[1] || '').trim();
+        const cleanLabel = htmlToPlainText(label).trim();
+        if (!href) return cleanLabel;
+        if (!cleanLabel || cleanLabel === href) return href;
+        return `${cleanLabel}: ${href}`;
+    });
+
+    return decodeBasicHtmlEntities(text)
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/p>/gi, '\n\n')
+        .replace(/<\/div>/gi, '\n')
+        .replace(/<\/li>/gi, '\n')
+        .replace(/<\/h[1-6]>/gi, '\n\n')
+        .replace(/<\/blockquote>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function normalizeOutgoingReplyText(text = '') {
+    const normalized = String(text || '').trim();
+    if (!normalized) return '';
+    const decoded = decodeBasicHtmlEntities(normalized);
+    if (!/<\/?[a-z][\s\S]*>/i.test(normalized) && !/<\/?[a-z][\s\S]*>/i.test(decoded)) {
+        return decoded;
+    }
+    return htmlToPlainText(decoded);
+}
+
 function buildReplySnippet(text = '') {
     if (!text) return null;
     const firstLine = String(text)
@@ -682,12 +734,12 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         throw error;
     }
 
+    const outgoingText = normalizeOutgoingReplyText(draft.rendered_text);
     const replyPayload = {
         reply_to_uuid: replyToUuid,
         eaccount,
         body: {
-            text: draft.rendered_text,
-            html: plainTextToHtml(draft.rendered_text || '')
+            html: plainTextToHtml(outgoingText)
         }
     };
     if (threadSubject) {
@@ -711,7 +763,7 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
             threadSubject,
             sentReplyId: replyResult?.id || replyResult?.email_id || null,
             parentReplyToUuid: replyToUuid,
-            renderedText: draft.rendered_text
+            renderedText: outgoingText
         });
         await client.query(
             `UPDATE interested_autoresponder_drafts
