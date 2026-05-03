@@ -223,16 +223,31 @@ export async function resolveTemplateVars(db, contactId, campaignId, options = {
 // ─── DB helpers ───────────────────────────────────────────────────────────────
 
 /**
- * Fetch the first active follow_up_script for a client, ordered by script_order.
+ * Fetch the next active follow_up_script for a specific contact+campaign.
+ *
+ * Counts how many successful sends have already been recorded for this
+ * contact+campaign, then returns the script at that offset in the ordered
+ * sequence (script_order ASC). Returns null when the sequence is exhausted.
  */
-async function getActiveScript(db, clientId) {
+async function getNextScriptForProspect(db, clientId, contactId, campaignId) {
+    const countResult = await db.query(
+        `SELECT COUNT(*) AS sent_count
+         FROM follow_up_sends
+         WHERE client_id = $1
+           AND contact_id = $2
+           AND campaign_id = $3
+           AND status = 'sent'`,
+        [clientId, contactId, campaignId]
+    );
+    const sentCount = parseInt(countResult.rows[0]?.sent_count || '0', 10);
+
     const result = await db.query(
-        `SELECT id, name, html_template, text_template
+        `SELECT id, name, html_template, text_template, script_order
          FROM follow_up_scripts
          WHERE client_id = $1 AND active = TRUE
          ORDER BY script_order ASC
-         LIMIT 1`,
-        [clientId]
+         LIMIT 1 OFFSET $2`,
+        [clientId, sentCount]
     );
     return result.rows[0] || null;
 }
@@ -611,14 +626,20 @@ export async function runFollowUpsForClient({
 }) {
     const summary = { eligible: 0, sent: 0, blocked: 0, skipped: 0, failed: 0, dryRun: 0 };
 
-    const script = await getActiveScript(pool, clientId);
-    if (!script) {
-        logger(`[follow-up] No active follow_up_script for client ${clientId} (${agencyId}/${clientSlug}), skipping`);
-        return summary;
-    }
-
     // Use today in UTC; worker can override sentForDate to apply timezone offset externally
     const sentForDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+    // Enforce client-configured send-day schedule (DOW: 0=Sun … 6=Sat, matching Date.getUTCDay())
+    const clientRow = await pool.query(
+        'SELECT follow_up_send_days FROM clients WHERE id = $1',
+        [clientId]
+    );
+    const sendDays = clientRow.rows[0]?.follow_up_send_days ?? [1, 2, 3, 4, 5];
+    const todayDow = new Date().getUTCDay();
+    if (!sendDays.includes(todayDow)) {
+        logger(`[follow-up] Skipping client=${clientId}: today (DOW=${todayDow}) not in send schedule [${sendDays.join(',')}]`);
+        return summary;
+    }
 
     const prospects = await getEligibleProspects(pool, clientId, sentForDate);
     summary.eligible = prospects.length;
@@ -634,6 +655,15 @@ export async function runFollowUpsForClient({
             summary.skipped += 1;
             continue;
         }
+
+        // Determine the next script in the sequence for this specific prospect
+        const script = await getNextScriptForProspect(pool, clientId, prospect.contact_id, prospect.campaign_id);
+        if (!script) {
+            logger(`[follow-up] Sequence exhausted for contact=${prospect.contact_id} campaign=${prospect.campaign_id}, skipping`);
+            summary.skipped += 1;
+            continue;
+        }
+        logger(`[follow-up] contact=${prospect.contact_id} → script_order=${script.script_order} (id=${script.id})`);
 
         let vars;
         try {

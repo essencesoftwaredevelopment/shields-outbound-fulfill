@@ -239,10 +239,9 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         const contact = contactResult.rows[0];
         if (!contact) return res.status(404).json({ error: 'Contact not found.' });
 
-        // Fetch thread context and template vars in parallel
-        const [{ openaiKey, ntfyTopic }, templateVars, threadResult] = await Promise.all([
+        // Fetch thread context in parallel; template vars resolved after we know the eaccount
+        const [{ openaiKey, ntfyTopic }, threadResult] = await Promise.all([
             fetchAgencyAndClientSettings(req.agencyId, req.params.clientId),
-            resolveTemplateVars(pool, contactId, prompt.campaign_id, { clientId: clientRow.id }),
             pool.query(
                 `SELECT
                     COALESCE(
@@ -250,6 +249,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                         e.payload->>'email_subject',
                         e.payload->>'thread_subject'
                     ) AS thread_subject,
+                    e.email_account,
                     e.message_text,
                     e.reply_text_snippet
                  FROM contact_instantly_events e
@@ -261,6 +261,13 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                 [contactId, prompt.campaign_id]
             )
         ]);
+
+        // Derive eaccount from most recent thread event that has one
+        const previewEaccount = threadResult.rows.find(r => r.email_account)?.email_account || null;
+        const templateVars = await resolveTemplateVars(pool, contactId, prompt.campaign_id, {
+            clientId: clientRow.id,
+            emailAccount: previewEaccount
+        });
 
         if (!openaiKey) {
             return res.status(400).json({ error: 'No OpenAI API key configured for this agency.' });
@@ -315,7 +322,34 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         ).trim().replace(/\/$/, '');
         const reviewUrl = `${appBaseUrl}/interested-autoresponder/${encodeURIComponent(reviewToken)}`;
 
-        res.json({ renderedText, model, promptVersion: prompt.version, reviewUrl });
+        res.json({
+            renderedText,
+            model,
+            promptVersion: prompt.version,
+            reviewUrl,
+            debug: {
+                lead: {
+                    email: contact.email,
+                    name: templateVars.full_name || null,
+                    firstName: templateVars.first_name || null,
+                    companyDomain: templateVars.company_domain || null,
+                    roleType: templateVars.role_type || null,
+                },
+                sender: {
+                    eaccount: previewEaccount || null,
+                    firstName: templateVars.email_account_first_name || null,
+                    lastName: templateVars.email_account_last_name || null,
+                },
+                threadSubject: threadSubject || null,
+                renderedSystemPrompt,
+                contextSentToAI: {
+                    campaignName: prompt.campaign_name,
+                    leadEmail: contact.email,
+                    threadSubject: threadSubject || null,
+                    previousLeadMessage: previousLeadMessage || null,
+                },
+            }
+        });
 
         // Fire ntfy notification (non-blocking)
         if (ntfyTopic) {

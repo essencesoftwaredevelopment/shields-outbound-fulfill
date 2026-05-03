@@ -784,6 +784,28 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             analyticsParams
         );
 
+        const followUpStatsResult = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (
+                    WHERE fus.sent_for_date = CURRENT_DATE
+                )::int AS follow_up_sent_today,
+                COUNT(*) FILTER (
+                    WHERE fus.sent_for_date = CURRENT_DATE - INTERVAL '1 day'
+                )::int AS follow_up_sent_yesterday,
+                COUNT(*) FILTER (
+                    WHERE fus.sent_for_date >= CURRENT_DATE - INTERVAL '6 days'
+                )::int AS follow_up_sent_7d
+            FROM follow_up_sends fus
+            WHERE fus.client_id = $1
+              AND fus.status = 'sent'`,
+            [sqlClientId]
+        );
+        const followUpStats = followUpStatsResult.rows[0] || {
+            follow_up_sent_today: 0,
+            follow_up_sent_yesterday: 0,
+            follow_up_sent_7d: 0
+        };
+
         const availableEventTypes = [
             { value: 'all', label: formatInstantlyEventTypeLabel('all') },
             ...Array.from(
@@ -817,17 +839,20 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
                 label: formatInstantlyEventTypeLabel(eventTypeFilter.normalized)
             },
             availableEventTypes,
-            summary: summaryResult.rows[0] || {
-                total_events: 0,
-                unique_contacts: 0,
-                unique_campaigns: 0,
-                emails_sent: 0,
-                positive_replies: 0,
-                meetings_booked: 0,
-                reply_events: 0,
-                bounce_events: 0,
-                first_event_at: null,
-                last_event_at: null
+            summary: {
+                ...(summaryResult.rows[0] || {
+                    total_events: 0,
+                    unique_contacts: 0,
+                    unique_campaigns: 0,
+                    emails_sent: 0,
+                    positive_replies: 0,
+                    meetings_booked: 0,
+                    reply_events: 0,
+                    bounce_events: 0,
+                    first_event_at: null,
+                    last_event_at: null
+                }),
+                ...followUpStats
             },
             byHour: byHourResult.rows,
             recentEvents: recentEventsResult.rows
@@ -1471,11 +1496,12 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
         const agencyId = req.agencyId;
         const { clientId } = req.params;
         const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            'SELECT id, follow_up_send_days FROM clients WHERE agency_id = $1 AND name = $2',
             [agencyId, clientId]
         );
         if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
         const sqlClientId = clientResult.rows[0].id;
+        const sendDays = clientResult.rows[0].follow_up_send_days ?? [1, 2, 3, 4, 5];
         const result = await pool.query(
             `SELECT id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at
              FROM follow_up_scripts
@@ -1483,7 +1509,7 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
              ORDER BY script_order ASC`,
             [sqlClientId]
         );
-        res.json({ scripts: result.rows });
+        res.json({ scripts: result.rows, send_days: sendDays });
     } catch (err) {
         console.error('GET follow-up-scripts error:', err);
         res.status(500).json({ error: 'Internal server error' });
@@ -1570,6 +1596,38 @@ router.delete('/clients/:clientId/follow-up-scripts/:id', requireAuth, async (re
         res.json({ deleted: true });
     } catch (err) {
         console.error('DELETE follow-up-scripts error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+router.put('/clients/:clientId/follow-up-schedule', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId } = req.params;
+        const { send_days } = req.body;
+
+        if (!Array.isArray(send_days) || send_days.length === 0) {
+            return res.status(400).json({ error: 'send_days must be a non-empty array of day-of-week integers (0=Sun … 6=Sat)' });
+        }
+        const normalized = send_days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6);
+        if (normalized.length === 0) {
+            return res.status(400).json({ error: 'send_days contained no valid day integers (0–6)' });
+        }
+
+        const clientResult = await pool.query(
+            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
+            [agencyId, clientId]
+        );
+        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientResult.rows[0].id;
+
+        await pool.query(
+            'UPDATE clients SET follow_up_send_days = $1, updated_at = NOW() WHERE id = $2',
+            [normalized, sqlClientId]
+        );
+        res.json({ send_days: normalized });
+    } catch (err) {
+        console.error('PUT follow-up-schedule error:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

@@ -701,12 +701,53 @@ body {
   background: rgba(255, 255, 255, 0.03);
 }
 
+/* ── Analytics Recent Events feed ─────────────────────────────── */
+
+/* Old classes kept for backwards compat (used in lead-detail modal) */
 .analytics-recent-event {
-  border-radius: 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 0.5rem;
 }
 
 .analytics-recent-event--new {
   animation: analyticsEventEnter 1.8s ease-out both;
+}
+
+/* New compact feed rows */
+.are-event {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: 8px;
+  transition: background 0.12s ease;
+}
+
+.are-event:hover {
+  background: rgba(255, 255, 255, 0.05) !important;
+}
+
+.are-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex-shrink: 0;
+}
+
+.are-dot--pulse {
+  animation: areDotPulse 2.4s ease-in-out infinite;
+}
+
+.are-event--new {
+  animation: analyticsEventEnter 1.8s ease-out both;
+}
+
+@keyframes areDotPulse {
+  0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+  50%       { box-shadow: 0 0 0 5px rgba(255,255,255,0); opacity: 0.7; }
 }
 
 @keyframes analyticsEventEnter {
@@ -729,7 +770,7 @@ body {
   100% {
     transform: translateX(0);
     opacity: 1;
-    background: transparent;
+    background: rgba(255, 255, 255, 0.04);
     box-shadow: 0 0 0 1px rgba(59, 130, 246, 0);
   }
 }

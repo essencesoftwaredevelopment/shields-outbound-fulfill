@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
 import { firestore } from '../config/firebase.js';
+import { resolveTemplateVars, renderTemplate } from './followUpSender.js';
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.3-chat-latest').trim() || 'gpt-5.3-chat-latest';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -493,9 +494,14 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
         let generation;
         try {
+            const templateVars = await resolveTemplateVars(client, contactId, campaignId, {
+                clientId,
+                emailAccount: eaccount
+            });
+            const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
             generation = await generateDraftReply({
                 openaiKey: settings.openaiKey,
-                systemPrompt: promptConfig.system_prompt,
+                systemPrompt: renderedSystemPrompt,
                 campaignName: promptConfig.campaign_name,
                 leadEmail: normalizedLeadEmail,
                 threadSubject,

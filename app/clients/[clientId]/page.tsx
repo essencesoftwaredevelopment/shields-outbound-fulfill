@@ -187,6 +187,9 @@ type InstantlyEventAnalyticsSummary = {
     bounce_events: number;
     first_event_at: string | null;
     last_event_at: string | null;
+    follow_up_sent_today: number;
+    follow_up_sent_yesterday: number;
+    follow_up_sent_7d: number;
 };
 
 type InstantlyEventAnalyticsByHourRow = {
@@ -967,9 +970,11 @@ export default function ClientPage() {
     const [savingFollowUpScript, setSavingFollowUpScript] = useState(false);
     const [updatingFollowUpScriptId, setUpdatingFollowUpScriptId] = useState<number | null>(null);
     const [deletingFollowUpScriptId, setDeletingFollowUpScriptId] = useState<number | null>(null);
-    const [runningFollowUpsNow, setRunningFollowUpsNow] = useState(false);
     const [followUpPreviewModalOpen, setFollowUpPreviewModalOpen] = useState(false);
     const [previewingFollowUpScript, setPreviewingFollowUpScript] = useState<FollowUpScript | null>(null);
+    // Follow-up schedule (DOW: 0=Sun … 6=Sat). Weekdays by default.
+    const [followUpSendDays, setFollowUpSendDays] = useState<number[]>([1, 2, 3, 4, 5]);
+    const [savingFollowUpSchedule, setSavingFollowUpSchedule] = useState(false);
     const [followUpPreviewLeadSearch, setFollowUpPreviewLeadSearch] = useState('');
     const [debouncedFollowUpPreviewLeadSearch, setDebouncedFollowUpPreviewLeadSearch] = useState('');
     const [followUpPreviewLeadResults, setFollowUpPreviewLeadResults] = useState<Lead[]>([]);
@@ -1000,8 +1005,21 @@ export default function ClientPage() {
     const [autoResponderTestLeadSearching, setAutoResponderTestLeadSearching] = useState(false);
     const [autoResponderTestSelectedLead, setAutoResponderTestSelectedLead] = useState<Lead | null>(null);
     const [autoResponderTestLoading, setAutoResponderTestLoading] = useState(false);
-    const [autoResponderTestResult, setAutoResponderTestResult] = useState<{ renderedText: string; model: string; promptVersion: string; reviewUrl?: string } | null>(null);
+    const [autoResponderTestResult, setAutoResponderTestResult] = useState<{
+        renderedText: string;
+        model: string;
+        promptVersion: string;
+        reviewUrl?: string;
+        debug?: {
+            lead: { email: string; name?: string | null; firstName?: string | null; companyDomain?: string | null; roleType?: string | null };
+            sender: { eaccount?: string | null; firstName?: string | null; lastName?: string | null };
+            threadSubject?: string | null;
+            renderedSystemPrompt?: string | null;
+            contextSentToAI?: { campaignName?: string; leadEmail?: string; threadSubject?: string | null; previousLeadMessage?: string | null };
+        };
+    } | null>(null);
     const [autoResponderTestMessage, setAutoResponderTestMessage] = useState('');
+    const [autoResponderTestExpandedSteps, setAutoResponderTestExpandedSteps] = useState<Set<number>>(new Set());
 
     // Campaign state
     const [modalOpen, setModalOpen] = useState(false);
@@ -1094,6 +1112,7 @@ export default function ClientPage() {
     const [instantlyEventAnalyticsPeriod, setInstantlyEventAnalyticsPeriod] = useState<InstantlyEventAnalyticsPeriod>("24h");
     const [instantlyEventAnalyticsEventType, setInstantlyEventAnalyticsEventType] = useState<string>("all");
     const [animatedRecentEventIds, setAnimatedRecentEventIds] = useState<Set<string>>(new Set());
+    const [expandedRecentEventId, setExpandedRecentEventId] = useState<string | null>(null);
     const [instantlyEventAnalyticsLoading, setInstantlyEventAnalyticsLoading] = useState(false);
     const [instantlyEventAnalyticsError, setInstantlyEventAnalyticsError] = useState<string | null>(null);
     const [instantlyEventRealtimeError, setInstantlyEventRealtimeError] = useState<string | null>(null);
@@ -1253,6 +1272,7 @@ export default function ClientPage() {
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
     const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
+    const [activityReplyPopup, setActivityReplyPopup] = useState<{ html: string; isHtml: boolean; x: number; y: number } | null>(null);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
@@ -2975,6 +2995,9 @@ export default function ClientPage() {
                 const scriptData = await scriptsResponse.json();
                 if (!cancelled) {
                     setFollowUpScripts(scriptData.scripts || []);
+                    if (Array.isArray(scriptData.send_days) && scriptData.send_days.length > 0) {
+                        setFollowUpSendDays(scriptData.send_days);
+                    }
                     setInterestedAutoResponderPrompts(prompts);
                     setAutoResponderCampaigns(campaignOptions);
                 }
@@ -3954,42 +3977,29 @@ export default function ClientPage() {
         }
     };
 
-    const handleRunFollowUpsNow = async () => {
+    const handleSaveFollowUpSchedule = async (days: number[]) => {
         if (!user || !clientId) return;
-        if (!clientInstantlyKey.trim()) {
-            setToastMessage('Save an Instantly API key first.');
-            setToastVisible(true);
-            return;
-        }
-
-        setRunningFollowUpsNow(true);
+        setSavingFollowUpSchedule(true);
         try {
-            await persistClientInfo();
             const idToken = await getIdToken(user);
             const response = await fetchWithRetry(
-                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-ups/run-now`,
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-schedule`,
                 {
-                    method: 'POST',
-                    cache: 'no-store',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ idToken })
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ send_days: days })
                 }
             );
             const data = await response.json().catch(() => ({}));
-            if (!response.ok) {
-                throw new Error(data.error || `Failed to run follow-ups now (${response.status})`);
-            }
-
-            const summary = data.summary || {};
-            setToastMessage(
-                `Follow-ups run complete. Eligible: ${summary.eligible ?? 0}, sent: ${summary.sent ?? 0}, blocked: ${summary.blocked ?? 0}, skipped: ${summary.skipped ?? 0}, failed: ${summary.failed ?? 0}.`
-            );
+            if (!response.ok) throw new Error(data.error || 'Failed to save schedule');
+            setFollowUpSendDays(data.send_days ?? days);
+            setToastMessage('Follow-up schedule saved.');
             setToastVisible(true);
         } catch (error) {
-            setToastMessage(error instanceof Error ? error.message : 'Failed to run follow-ups now');
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save schedule');
             setToastVisible(true);
         } finally {
-            setRunningFollowUpsNow(false);
+            setSavingFollowUpSchedule(false);
         }
     };
 
@@ -4114,6 +4124,7 @@ export default function ClientPage() {
         setAutoResponderTestSelectedLead(null);
         setAutoResponderTestResult(null);
         setAutoResponderTestMessage('');
+        setAutoResponderTestExpandedSteps(new Set());
         setAutoResponderTestModalOpen(true);
     };
 
@@ -4122,11 +4133,13 @@ export default function ClientPage() {
         setTestingAutoResponderPrompt(null);
     };
 
-    const handleRunAutoResponderTest = async (lead: Lead) => {
-        if (!user || !clientId || !testingAutoResponderPrompt) return;
-        setAutoResponderTestSelectedLead(lead);
+    const handleRunAutoResponderTest = async (lead?: Lead) => {
+        const targetLead = lead ?? autoResponderTestSelectedLead;
+        if (!user || !clientId || !testingAutoResponderPrompt || !targetLead) return;
+        if (lead) setAutoResponderTestSelectedLead(lead);
         setAutoResponderTestLoading(true);
         setAutoResponderTestResult(null);
+        setAutoResponderTestExpandedSteps(new Set());
         try {
             const idToken = await getIdToken(user);
             const response = await fetchWithRetry(
@@ -4135,13 +4148,15 @@ export default function ClientPage() {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
                     body: JSON.stringify({
-                        contactId: lead.id
+                        contactId: targetLead.id,
+                        testMessage: autoResponderTestMessage.trim() || undefined
                     })
                 }
             );
             const data = await response.json().catch(() => ({}));
             if (!response.ok) throw new Error(data.error || `Failed to generate test reply (${response.status})`);
             setAutoResponderTestResult(data);
+            setAutoResponderTestExpandedSteps(new Set([4]));
         } catch (error) {
             setToastMessage(error instanceof Error ? error.message : 'Failed to generate test reply');
             setToastVisible(true);
@@ -5682,6 +5697,21 @@ export default function ClientPage() {
                                                 <path d="M3 10h18" />
                                             </svg>
                                         )
+                                    },
+                                    {
+                                        key: "follow_up_sent_today",
+                                        label: "Warm Follow-ups",
+                                        value: instantlyEventAnalytics?.summary.follow_up_sent_today ?? 0,
+                                        subLabel: instantlyEventAnalytics
+                                            ? `${instantlyEventAnalytics.summary.follow_up_sent_yesterday} yesterday · ${instantlyEventAnalytics.summary.follow_up_sent_7d} last 7d`
+                                            : undefined,
+                                        border: "rgba(234, 179, 8, 0.28)",
+                                        icon: (
+                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" />
+                                                <path d="M8 12.5l2.5 2.5L16 9" />
+                                            </svg>
+                                        )
                                     }
                                 ].map((card) => (
                                     <div
@@ -5714,6 +5744,11 @@ export default function ClientPage() {
                                                     {card.label}
                                                 </p>
                                             </div>
+                                            {"subLabel" in card && card.subLabel && (
+                                                <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
+                                                    {card.subLabel}
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
                                 ))}
@@ -5728,7 +5763,7 @@ export default function ClientPage() {
                                 <p className="eyebrow eyebrow--muted" style={{ paddingBottom: "15px" }}>Recent Events</p>
 
                                 {(() => {
-                                    const recentEvents = buildCollatedActivityEvents(instantlyEventAnalytics?.recentEvents || []).slice(0, 10);
+                                    const recentEvents = buildCollatedActivityEvents(instantlyEventAnalytics?.recentEvents || []).slice(0, 25);
                                     if (recentEvents.length === 0) {
                                         return (
                                             <div className="pipeline-panel__empty">
@@ -5737,127 +5772,216 @@ export default function ClientPage() {
                                         );
                                     }
 
+                                    // Group events by day bucket for separators
+                                    const now = new Date();
+                                    const todayStr = now.toDateString();
+                                    const yesterdayStr = new Date(now.getTime() - 86400000).toDateString();
+
+                                    function getDayLabel(ts: string) {
+                                        const d = new Date(ts);
+                                        if (Number.isNaN(d.getTime())) return null;
+                                        const ds = d.toDateString();
+                                        if (ds === todayStr) return `Today · ${d.toLocaleDateString("en-GB", { day: "numeric", month: "short" })}`;
+                                        if (ds === yesterdayStr) return `Yesterday · ${d.toLocaleDateString("en-GB", { day: "numeric", month: "short" })}`;
+                                        return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: d.getFullYear() !== now.getFullYear() ? "numeric" : undefined });
+                                    }
+
+                                    // Group consecutive email_sent by same campaign into one row
+                                    type OrigEvt = typeof recentEvents[0];
+                                    type GroupedEvt = OrigEvt & { batchCount: number; batchItems: OrigEvt[] };
+                                    const grouped: GroupedEvt[] = [];
+                                    for (const evt of recentEvents) {
+                                        const isEmailSent = String(evt.event_type).toLowerCase() === "email_sent";
+                                        const last = grouped[grouped.length - 1];
+                                        if (
+                                            isEmailSent && last &&
+                                            String(last.event_type).toLowerCase() === "email_sent" &&
+                                            last.campaign_name === evt.campaign_name &&
+                                            new Date(last.event_timestamp).toDateString() === new Date(evt.event_timestamp).toDateString()
+                                        ) {
+                                            last.batchCount += 1;
+                                            last.batchItems.push(evt);
+                                        } else {
+                                            grouped.push({ ...evt, batchCount: 1, batchItems: [evt] });
+                                        }
+                                    }
+
+                                    let lastDayLabel: string | null = null;
+
                                     return (
-                                        <div style={{ position: "relative", paddingLeft: "1rem" }}>
-                                            <div style={{
-                                                position: "absolute",
-                                                left: "3px",
-                                                top: "6px",
-                                                bottom: "6px",
-                                                width: "1px",
-                                                background: "rgba(255, 255, 255, 0.1)"
-                                            }} />
-                                            {recentEvents.map((evt) => {
-                                                const dotColor = getInstantlyActivityColor(evt.event_type, evt.displayLabel);
-                                                const label = evt.displayLabel;
+                                        <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+                                            {grouped.map((evt, idx) => {
+                                                const isFirst = idx === 0;
+                                                const eventTypeNorm = String(evt.event_type).toLowerCase();
+                                                const isEmailSent = eventTypeNorm === "email_sent";
+                                                const isReply = eventTypeNorm === "reply_received";
+                                                const isBounce = eventTypeNorm === "email_bounced";
+                                                const isNotInterested = eventTypeNorm === "lead_not_interested" || eventTypeNorm === "lead_wrong_person" || eventTypeNorm === "lead_no_show";
+                                                const isPositive = eventTypeNorm === "lead_interested" || eventTypeNorm === "lead_meeting_booked" || eventTypeNorm === "lead_meeting_completed" || eventTypeNorm === "lead_closed" || isReply;
+                                                const isNegative = isBounce || isNotInterested;
+
+                                                // Color family
+                                                const colorFamily = isEmailSent
+                                                    ? { dot: "#3b82f6", pill: "rgba(59,130,246,0.15)", pillText: "#93c5fd", pillBorder: "rgba(59,130,246,0.25)", rowBg: "transparent" }
+                                                    : isPositive
+                                                        ? { dot: "#22c55e", pill: "rgba(34,197,94,0.15)", pillText: "#4ade80", pillBorder: "rgba(34,197,94,0.25)", rowBg: "rgba(34,197,94,0.04)" }
+                                                        : isNegative
+                                                            ? { dot: "#ef4444", pill: "rgba(239,68,68,0.15)", pillText: "#fca5a5", pillBorder: "rgba(239,68,68,0.25)", rowBg: "transparent" }
+                                                            : { dot: getInstantlyActivityColor(evt.event_type, evt.displayLabel), pill: "rgba(255,255,255,0.07)", pillText: "rgba(255,255,255,0.55)", pillBorder: "rgba(255,255,255,0.12)", rowBg: "transparent" };
+
                                                 const evtDate = new Date(evt.event_timestamp);
-                                                const now = new Date();
-                                                const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-                                                const isWithinLastSevenDays = !Number.isNaN(evtDate.getTime()) && (now.getTime() - evtDate.getTime()) <= sevenDaysMs;
-                                                const isCurrentYear = !Number.isNaN(evtDate.getTime()) && evtDate.getFullYear() === now.getFullYear();
-                                                const dateStr = Number.isNaN(evtDate.getTime())
-                                                    ? evt.event_timestamp
-                                                    : isCurrentYear
-                                                        ? evtDate.toLocaleDateString("en-GB", { day: "numeric", month: "short" })
-                                                        : evtDate.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
-                                                const timeStr = Number.isNaN(evtDate.getTime())
-                                                    ? ""
-                                                    : evtDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-                                                const dateTimeStr = Number.isNaN(evtDate.getTime())
-                                                    ? evt.event_timestamp
-                                                    : isWithinLastSevenDays
-                                                        ? `${dateStr}, ${timeStr}`
-                                                        : dateStr;
+                                                const timeStr = Number.isNaN(evtDate.getTime()) ? "" : evtDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+                                                // Day separator
+                                                const dayLabel = getDayLabel(evt.event_timestamp);
+                                                const showSeparator = dayLabel !== lastDayLabel;
+                                                if (showSeparator) lastDayLabel = dayLabel;
+
+                                                // Recipient display
+                                                const email = evt.lead_email || "";
+                                                const domain = email.includes("@") ? email.split("@")[1] : "";
+                                                const localPart = email.includes("@") ? email.split("@")[0] : email;
+                                                // Prettify local part: j.smith → J Smith, john.smith → John Smith
+                                                const recipientName = localPart
+                                                    .replace(/[._-]+/g, " ")
+                                                    .replace(/\b\w/g, (c) => c.toUpperCase())
+                                                    .trim();
+
                                                 const snippet = evt.reply_text_snippet
-                                                    || (evt.message_text ? evt.message_text.split("\n").find((line) => line.trim()) || null : null);
+                                                    || (evt.message_text ? evt.message_text.split("\n").find((l) => l.trim()) || null : null);
+                                                const fullContent = evt.message_text || snippet || "";
+                                                const isBatch = evt.batchCount > 1;
+                                                const isExpanded = expandedRecentEventId === evt.id;
+                                                const hasExpandable = isBatch || Boolean(fullContent && fullContent.length > 80);
+
+                                                const isAnimated = animatedRecentEventIds.has(evt.id);
+                                                const pillLabel = isBatch
+                                                    ? `${evt.batchCount}× ${evt.displayLabel}`
+                                                    : evt.displayLabel;
 
                                                 return (
-                                                    <div
-                                                        key={evt.id}
-                                                        className={animatedRecentEventIds.has(evt.id) ? "analytics-recent-event analytics-recent-event--new" : "analytics-recent-event"}
-                                                        style={{
-                                                            position: "relative",
-                                                            paddingBottom: "0.85rem",
-                                                            paddingLeft: "0.6rem"
-                                                        }}
-                                                    >
-                                                        <div style={{
-                                                            position: "absolute",
-                                                            left: "-1rem",
-                                                            top: "5px",
-                                                            width: "7px",
-                                                            height: "7px",
-                                                            borderRadius: "50%",
-                                                            background: dotColor
-                                                        }} />
-                                                        <div style={{ display: "flex", alignItems: "baseline", gap: "0.45rem", flexWrap: "wrap" }}>
-                                                            <span style={{
-                                                                fontSize: "0.82rem",
-                                                                fontWeight: 500,
-                                                                color: "rgba(255, 255, 255, 0.84)"
+                                                    <div key={evt.id}>
+                                                        {showSeparator && dayLabel && (
+                                                            <div style={{
+                                                                padding: "0.45rem 0 0.35rem",
+                                                                marginTop: idx > 0 ? "0.25rem" : 0,
+                                                                fontSize: "0.7rem",
+                                                                fontWeight: 600,
+                                                                textTransform: "uppercase",
+                                                                letterSpacing: "0.07em",
+                                                                color: "rgba(255,255,255,0.28)",
+                                                                borderTop: idx > 0 ? "1px solid rgba(255,255,255,0.06)" : "none",
                                                             }}>
-                                                                {label}
-                                                            </span>
-                                                            <span style={{ fontSize: "0.75rem", color: "rgba(255, 255, 255, 0.3)" }}>
-                                                                {dateTimeStr}
-                                                            </span>
-                                                        </div>
-                                                        {evt.secondaryLabel && (
-                                                            <p style={{ margin: "0.18rem 0 0", fontSize: "0.72rem", color: "rgba(191, 219, 254, 0.72)" }}>
-                                                                Includes {evt.secondaryLabel.toLowerCase()}
-                                                            </p>
+                                                                {dayLabel}
+                                                            </div>
                                                         )}
-                                                        <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
-                                                            {evt.campaign_name && (
-                                                                <span style={{
-                                                                    display: "inline-flex",
-                                                                    alignItems: "center",
-                                                                    gap: "0.3rem",
-                                                                    padding: "0.15rem 0.5rem",
-                                                                    borderRadius: "999px",
-                                                                    background: "rgba(255, 255, 255, 0.06)",
-                                                                    border: "1px solid rgba(255, 255, 255, 0.08)",
-                                                                    fontSize: "0.72rem",
-                                                                    color: "rgba(255, 255, 255, 0.45)",
-                                                                    lineHeight: 1.4
-                                                                }}>
-                                                                    {evt.campaign_name}
-                                                                </span>
-                                                            )}
-                                                            {evt.lead_email && (
-                                                                <span style={{
-                                                                    display: "inline-flex",
-                                                                    alignItems: "center",
-                                                                    padding: "0.15rem 0.5rem",
-                                                                    borderRadius: "999px",
-                                                                    background: "rgba(59, 130, 246, 0.08)",
-                                                                    border: "1px solid rgba(59, 130, 246, 0.16)",
-                                                                    fontSize: "0.72rem",
-                                                                    color: "rgba(191, 219, 254, 0.85)",
-                                                                    lineHeight: 1.4
-                                                                }}>
-                                                                    {evt.lead_email}
-                                                                </span>
-                                                            )}
+                                                        <div
+                                                            className={isAnimated ? "are-event are-event--new" : "are-event"}
+                                                            style={{
+                                                                background: colorFamily.rowBg,
+                                                                cursor: hasExpandable ? "pointer" : "default",
+                                                            }}
+                                                            onClick={() => {
+                                                                if (hasExpandable) {
+                                                                    setExpandedRecentEventId(isExpanded ? null : evt.id);
+                                                                    setActivityReplyPopup(null);
+                                                                }
+                                                            }}
+                                                        >
+                                                            {/* Dot */}
+                                                            <div style={{ position: "relative", flexShrink: 0, width: "20px", display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: "2px" }}>
+                                                                <div
+                                                                    className={isFirst ? "are-dot are-dot--pulse" : "are-dot"}
+                                                                    style={{ background: colorFamily.dot, boxShadow: isFirst ? `0 0 0 3px ${colorFamily.dot}33` : "none" }}
+                                                                />
+                                                            </div>
+
+                                                            {/* Content */}
+                                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                                {/* Row 1: recipient + pill + time */}
+                                                                <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", flexWrap: "nowrap" }}>
+                                                                    <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "rgba(255,255,255,0.85)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "160px", flexShrink: 0 }}>
+                                                                        {recipientName || email || "—"}
+                                                                    </span>
+                                                                    {domain && (
+                                                                        <span style={{ fontSize: "0.72rem", color: "rgba(255,255,255,0.3)", whiteSpace: "nowrap", flexShrink: 0 }}>
+                                                                            {domain}
+                                                                        </span>
+                                                                    )}
+                                                                    <div style={{ flex: 1 }} />
+                                                                    <span style={{
+                                                                        display: "inline-flex",
+                                                                        alignItems: "center",
+                                                                        padding: "0.1rem 0.45rem",
+                                                                        borderRadius: "999px",
+                                                                        border: `1px solid ${colorFamily.pillBorder}`,
+                                                                        background: colorFamily.pill,
+                                                                        fontSize: "0.7rem",
+                                                                        fontWeight: 600,
+                                                                        color: colorFamily.pillText,
+                                                                        whiteSpace: "nowrap",
+                                                                        flexShrink: 0,
+                                                                        textTransform: "capitalize",
+                                                                    }}>
+                                                                        {pillLabel}
+                                                                    </span>
+                                                                    <span style={{
+                                                                        fontSize: "0.7rem",
+                                                                        color: "rgba(255,255,255,0.28)",
+                                                                        flexShrink: 0,
+                                                                        fontVariantNumeric: "tabular-nums",
+                                                                    }}>
+                                                                        {timeStr}
+                                                                    </span>
+                                                                </div>
+
+                                                                {/* Row 2: snippet (hidden when batch is expanded) */}
+                                                                {snippet && !isExpanded && (
+                                                                    <p style={{ margin: "0.15rem 0 0", fontSize: "0.76rem", color: "rgba(255,255,255,0.45)", lineHeight: 1.45, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                                                                        {snippet}
+                                                                    </p>
+                                                                )}
+                                                                {isExpanded && !isBatch && fullContent && (
+                                                                    <div style={{ marginTop: "0.3rem", fontSize: "0.76rem", color: "rgba(255,255,255,0.6)", lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                                                        {fullContent}
+                                                                    </div>
+                                                                )}
+                                                                {evt.secondaryLabel && (
+                                                                    <p style={{ margin: "0.1rem 0 0", fontSize: "0.7rem", color: "rgba(191,219,254,0.55)" }}>
+                                                                        Includes {evt.secondaryLabel.toLowerCase()}
+                                                                    </p>
+                                                                )}
+                                                            </div>
                                                         </div>
-                                                        {snippet && (
-                                                            <p style={{ margin: "0.2rem 0 0", fontSize: "0.78rem", color: "rgba(255, 255, 255, 0.55)" }}>
-                                                                {snippet.length > 180 ? `${snippet.slice(0, 180)}…` : snippet}
-                                                            </p>
-                                                        )}
-                                                        {evt.reply_category && (
-                                                            <span style={{
-                                                                display: "inline-block",
-                                                                marginTop: "0.25rem",
-                                                                padding: "0.1rem 0.4rem",
-                                                                borderRadius: "4px",
-                                                                fontSize: "0.72rem",
-                                                                fontWeight: 500,
-                                                                background: evt.reply_category === "Interested" ? "rgba(34, 197, 94, 0.15)" : "rgba(255, 255, 255, 0.06)",
-                                                                color: evt.reply_category === "Interested" ? "#4ade80" : "rgba(255, 255, 255, 0.5)"
-                                                            }}>
-                                                                {evt.reply_category}
-                                                            </span>
+                                                        {/* Expanded batch: individual sends */}
+                                                        {isExpanded && isBatch && (
+                                                            <div style={{ marginLeft: "9px", paddingLeft: "1rem", borderLeft: "1px solid rgba(255,255,255,0.08)", marginBottom: "0.25rem" }}>
+                                                                {evt.batchItems.map((item) => {
+                                                                    const itemDate = new Date(item.event_timestamp);
+                                                                    const itemTime = Number.isNaN(itemDate.getTime()) ? "" : itemDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                                                                    const itemEmail = item.lead_email || "";
+                                                                    const itemDomain = itemEmail.includes("@") ? itemEmail.split("@")[1] : "";
+                                                                    const itemLocal = itemEmail.includes("@") ? itemEmail.split("@")[0] : itemEmail;
+                                                                    const itemName = itemLocal.replace(/[._-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()).trim();
+                                                                    const itemSnippet = item.reply_text_snippet || (item.message_text ? item.message_text.split("\n").find((l) => l.trim()) || null : null);
+                                                                    return (
+                                                                        <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.25rem 0.5rem" }}>
+                                                                            <div className="are-dot" style={{ background: "#3b82f6", flexShrink: 0 }} />
+                                                                            <span style={{ fontSize: "0.81rem", fontWeight: 500, color: "rgba(255,255,255,0.8)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "140px", flexShrink: 0 }}>
+                                                                                {itemName || itemEmail || "—"}
+                                                                            </span>
+                                                                            {itemDomain && (
+                                                                                <span style={{ fontSize: "0.72rem", color: "rgba(255,255,255,0.3)", whiteSpace: "nowrap", flexShrink: 0 }}>{itemDomain}</span>
+                                                                            )}
+                                                                            <div style={{ flex: 1 }} />
+                                                                            {itemSnippet && (
+                                                                                <span style={{ fontSize: "0.72rem", color: "rgba(255,255,255,0.4)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "120px", flexShrink: 1 }}>{itemSnippet}</span>
+                                                                            )}
+                                                                            <span style={{ fontSize: "0.7rem", color: "rgba(255,255,255,0.28)", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{itemTime}</span>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
                                                         )}
                                                     </div>
                                                 );
@@ -7490,14 +7614,6 @@ export default function ClientPage() {
                                 <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
                                     <button
                                         type="button"
-                                        className="secondary-button"
-                                        onClick={handleRunFollowUpsNow}
-                                        disabled={runningFollowUpsNow}
-                                    >
-                                        {runningFollowUpsNow ? 'Running...' : 'Check and Run Now'}
-                                    </button>
-                                    <button
-                                        type="button"
                                         className="primary-button"
                                         onClick={() => openFollowUpScriptModal()}
                                     >
@@ -7505,6 +7621,76 @@ export default function ClientPage() {
                                     </button>
                                 </div>
                             </div>
+
+                            {/* Send-day schedule picker */}
+                            {(() => {
+                                const DAYS = [
+                                    { dow: 1, label: 'Mon' },
+                                    { dow: 2, label: 'Tue' },
+                                    { dow: 3, label: 'Wed' },
+                                    { dow: 4, label: 'Thu' },
+                                    { dow: 5, label: 'Fri' },
+                                    { dow: 6, label: 'Sat' },
+                                    { dow: 0, label: 'Sun' },
+                                ];
+                                const toggleDay = (dow: number) => {
+                                    const next = followUpSendDays.includes(dow)
+                                        ? followUpSendDays.filter((d) => d !== dow)
+                                        : [...followUpSendDays, dow];
+                                    setFollowUpSendDays(next);
+                                };
+                                return (
+                                    <div style={{
+                                        padding: '0.9rem 1rem',
+                                        borderRadius: '10px',
+                                        background: 'rgba(255,255,255,0.03)',
+                                        border: '1px solid rgba(255,255,255,0.08)',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '1rem',
+                                        flexWrap: 'wrap'
+                                    }}>
+                                        <span style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.5)', fontWeight: 500, flexShrink: 0 }}>
+                                            Send days
+                                        </span>
+                                        <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                                            {DAYS.map(({ dow, label }) => {
+                                                const active = followUpSendDays.includes(dow);
+                                                return (
+                                                    <button
+                                                        key={dow}
+                                                        type="button"
+                                                        onClick={() => toggleDay(dow)}
+                                                        disabled={savingFollowUpSchedule}
+                                                        style={{
+                                                            padding: '0.3rem 0.65rem',
+                                                            borderRadius: '6px',
+                                                            fontSize: '0.78rem',
+                                                            fontWeight: 600,
+                                                            cursor: 'pointer',
+                                                            border: active ? '1px solid rgba(234,179,8,0.5)' : '1px solid rgba(255,255,255,0.12)',
+                                                            background: active ? 'rgba(234,179,8,0.15)' : 'transparent',
+                                                            color: active ? '#fde68a' : 'rgba(255,255,255,0.4)',
+                                                            transition: 'all 0.15s'
+                                                        }}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                        <button
+                                            type="button"
+                                            className="secondary-button"
+                                            style={{ padding: '0.3rem 0.75rem', fontSize: '0.8rem', marginLeft: 'auto', flexShrink: 0 }}
+                                            onClick={() => handleSaveFollowUpSchedule(followUpSendDays)}
+                                            disabled={savingFollowUpSchedule}
+                                        >
+                                            {savingFollowUpSchedule ? 'Saving…' : 'Save'}
+                                        </button>
+                                    </div>
+                                );
+                            })()}
 
                             {followUpScriptsLoading ? (
                                 <p style={{ color: 'rgba(255,255,255,0.45)', fontSize: '0.875rem' }}>Loading scripts…</p>
@@ -7723,6 +7909,8 @@ export default function ClientPage() {
                             </div>
                         </div>
                         <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+
+                            {/* Lead search */}
                             <label className="settings-field">
                                 <span className="settings-field__label">Search Leads</span>
                                 <input
@@ -7730,6 +7918,7 @@ export default function ClientPage() {
                                     value={autoResponderTestLeadSearch}
                                     onChange={(e) => setAutoResponderTestLeadSearch(e.target.value)}
                                     placeholder="Search by email, domain, or founder name"
+                                    disabled={autoResponderTestLoading}
                                 />
                             </label>
 
@@ -7753,7 +7942,11 @@ export default function ClientPage() {
                                                 <button
                                                     key={lead.id}
                                                     type="button"
-                                                    onClick={() => handleRunAutoResponderTest(lead)}
+                                                    onClick={() => {
+                                                        setAutoResponderTestSelectedLead(lead);
+                                                        setAutoResponderTestResult(null);
+                                                        setAutoResponderTestExpandedSteps(new Set());
+                                                    }}
                                                     disabled={autoResponderTestLoading}
                                                     style={{
                                                         width: '100%',
@@ -7761,23 +7954,23 @@ export default function ClientPage() {
                                                         padding: '0.9rem 1rem',
                                                         border: 'none',
                                                         borderTop: '1px solid rgba(255,255,255,0.08)',
-                                                        background: isSelected ? 'rgba(59,130,246,0.16)' : 'transparent',
+                                                        background: isSelected ? 'rgba(59,130,246,0.12)' : 'transparent',
                                                         color: 'inherit',
                                                         cursor: autoResponderTestLoading ? 'wait' : 'pointer',
                                                     }}
                                                 >
                                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
                                                         <div style={{ minWidth: 0 }}>
-                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: 'rgba(255,255,255,0.94)' }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: isSelected ? '#93c5fd' : 'rgba(255,255,255,0.94)' }}>
                                                                 {lead.founderName || lead.email || lead.domain || 'Unnamed lead'}
                                                             </div>
                                                             <div style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.58)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                                 {lead.email || 'No email'}{lead.domain ? ` · ${lead.domain}` : ''}
                                                             </div>
                                                         </div>
-                                                        <span style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.58)', flexShrink: 0 }}>
-                                                            {autoResponderTestLoading && isSelected ? 'Generating…' : 'Generate'}
-                                                        </span>
+                                                        {isSelected && (
+                                                            <span style={{ fontSize: '0.75rem', color: '#93c5fd', flexShrink: 0 }}>Selected</span>
+                                                        )}
                                                     </div>
                                                 </button>
                                             );
@@ -7786,56 +7979,217 @@ export default function ClientPage() {
                                 )}
                             </div>
 
-                            {autoResponderTestResult && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                                    <div style={{
-                                        padding: '0.9rem 1rem',
-                                        borderRadius: '10px',
-                                        border: '1px solid rgba(255,255,255,0.1)',
-                                        background: 'rgba(255,255,255,0.03)'
-                                    }}>
-                                        <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.35rem' }}>
-                                            Generated for
-                                        </div>
-                                        <div style={{ fontWeight: 600, color: 'rgba(255,255,255,0.92)' }}>
-                                            {autoResponderTestSelectedLead?.email || autoResponderTestSelectedLead?.domain || 'Unknown lead'}
-                                        </div>
-                                        <div style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.45)', marginTop: '0.2rem' }}>
-                                            Model: {autoResponderTestResult.model}
-                                        </div>
-                                        {autoResponderTestResult.reviewUrl && (
-                                            <div style={{ marginTop: '0.5rem' }}>
-                                                <a
-                                                    href={autoResponderTestResult.reviewUrl}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    style={{ fontSize: '0.82rem', color: '#60a5fa', textDecoration: 'underline' }}
-                                                >
-                                                    Open review &amp; approve page →
-                                                </a>
-                                            </div>
-                                        )}
-                                    </div>
-
-                                    <div>
-                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.5rem' }}>
-                                            Generated Reply (plain text)
-                                        </div>
-                                        <pre style={{
-                                            margin: 0,
-                                            padding: '1rem',
-                                            borderRadius: '10px',
-                                            border: '1px solid rgba(255,255,255,0.1)',
-                                            background: 'rgba(255,255,255,0.03)',
-                                            color: 'rgba(255,255,255,0.88)',
-                                            fontSize: '0.85rem',
-                                            lineHeight: 1.6,
-                                            whiteSpace: 'pre-wrap',
-                                            wordBreak: 'break-word'
-                                        }}>{autoResponderTestResult.renderedText}</pre>
-                                    </div>
+                            {/* Optional mock message + Generate button — shown when a lead is selected */}
+                            {autoResponderTestSelectedLead && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Optional Mock Message <span style={{ fontWeight: 400, color: 'rgba(255,255,255,0.4)' }}>(overrides thread context)</span></span>
+                                        <textarea
+                                            rows={3}
+                                            value={autoResponderTestMessage}
+                                            onChange={(e) => setAutoResponderTestMessage(e.target.value)}
+                                            placeholder="Paste a lead reply here to test against a specific message…"
+                                            disabled={autoResponderTestLoading}
+                                            style={{ resize: 'vertical', fontFamily: 'monospace', fontSize: '0.82rem' }}
+                                        />
+                                    </label>
+                                    <button
+                                        type="button"
+                                        className="primary-button"
+                                        onClick={() => handleRunAutoResponderTest()}
+                                        disabled={autoResponderTestLoading}
+                                        style={{ alignSelf: 'flex-start' }}
+                                    >
+                                        {autoResponderTestLoading ? 'Generating…' : 'Generate Reply'}
+                                    </button>
                                 </div>
                             )}
+
+                            {/* Multi-step result accordion */}
+                            {(autoResponderTestLoading || autoResponderTestResult) && (() => {
+                                const r = autoResponderTestResult;
+                                const d = r?.debug;
+
+                                const stepStyle = (stepNum: number): React.CSSProperties => ({
+                                    borderRadius: '10px',
+                                    border: '1px solid rgba(255,255,255,0.1)',
+                                    background: 'rgba(255,255,255,0.02)',
+                                    overflow: 'hidden',
+                                });
+
+                                const stepHeaderStyle: React.CSSProperties = {
+                                    width: '100%',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.75rem',
+                                    padding: '0.75rem 1rem',
+                                    background: 'transparent',
+                                    border: 'none',
+                                    color: 'inherit',
+                                    textAlign: 'left',
+                                    cursor: 'pointer',
+                                };
+
+                                const badgeStyle = (complete: boolean, active: boolean): React.CSSProperties => ({
+                                    width: '22px',
+                                    height: '22px',
+                                    borderRadius: '50%',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 700,
+                                    flexShrink: 0,
+                                    background: complete ? 'rgba(34,197,94,0.2)' : active ? 'rgba(59,130,246,0.25)' : 'rgba(255,255,255,0.08)',
+                                    color: complete ? '#4ade80' : active ? '#93c5fd' : 'rgba(255,255,255,0.4)',
+                                    border: complete ? '1px solid rgba(34,197,94,0.35)' : active ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.12)',
+                                });
+
+                                const kvRow = (label: string, value: string | null | undefined) => value ? (
+                                    <div key={label} style={{ display: 'flex', gap: '0.5rem', fontSize: '0.82rem', lineHeight: 1.5 }}>
+                                        <span style={{ color: 'rgba(255,255,255,0.4)', flexShrink: 0, minWidth: '140px' }}>{label}</span>
+                                        <span style={{ color: 'rgba(255,255,255,0.88)', wordBreak: 'break-all' }}>{value}</span>
+                                    </div>
+                                ) : null;
+
+                                const toggleStep = (n: number) => {
+                                    setAutoResponderTestExpandedSteps(prev => {
+                                        const next = new Set(prev);
+                                        next.has(n) ? next.delete(n) : next.add(n);
+                                        return next;
+                                    });
+                                };
+
+                                const isExpanded = (n: number) => autoResponderTestExpandedSteps.has(n);
+                                const done = !!r;
+                                const loading = autoResponderTestLoading;
+
+                                const steps = [
+                                    {
+                                        n: 1,
+                                        label: 'Lead data',
+                                        summary: d ? `${d.lead.name || d.lead.email}${d.lead.companyDomain ? ' · ' + d.lead.companyDomain : ''}` : loading ? 'Fetching lead…' : null,
+                                        content: d ? (
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', padding: '0 1rem 0.9rem' }}>
+                                                {kvRow('Email', d.lead.email)}
+                                                {kvRow('Name', d.lead.name)}
+                                                {kvRow('First name', d.lead.firstName)}
+                                                {kvRow('Company domain', d.lead.companyDomain)}
+                                                {kvRow('Role type', d.lead.roleType)}
+                                            </div>
+                                        ) : null,
+                                    },
+                                    {
+                                        n: 2,
+                                        label: 'Sender account',
+                                        summary: d ? (d.sender.eaccount ? `${d.sender.firstName ? d.sender.firstName + ' · ' : ''}${d.sender.eaccount}` : 'No sender account found') : loading ? 'Resolving sender…' : null,
+                                        content: d ? (
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', padding: '0 1rem 0.9rem' }}>
+                                                {kvRow('Email account', d.sender.eaccount || 'Not found')}
+                                                {kvRow('First name', d.sender.firstName)}
+                                                {kvRow('Last name', d.sender.lastName)}
+                                            </div>
+                                        ) : null,
+                                    },
+                                    {
+                                        n: 3,
+                                        label: 'Context sent to AI',
+                                        summary: d ? `System prompt rendered · ${d.contextSentToAI?.previousLeadMessage ? 'Thread context included' : 'No thread context'}` : loading ? 'Building system prompt…' : null,
+                                        content: d ? (
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '0 1rem 0.9rem' }}>
+                                                <div>
+                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '0.35rem' }}>System Prompt (rendered)</div>
+                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.25)', color: 'rgba(255,255,255,0.8)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{d.renderedSystemPrompt || '—'}</pre>
+                                                </div>
+                                                <div>
+                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '0.35rem' }}>User message sent to model</div>
+                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.25)', color: 'rgba(255,255,255,0.8)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{[
+                                                        `Campaign: ${d.contextSentToAI?.campaignName || '—'}`,
+                                                        `Lead email: ${d.contextSentToAI?.leadEmail || '—'}`,
+                                                        `Thread subject: ${d.contextSentToAI?.threadSubject || '(none)'}`,
+                                                        '',
+                                                        'Lead message/thread context:',
+                                                        d.contextSentToAI?.previousLeadMessage || '(no message text available)',
+                                                    ].join('\n')}</pre>
+                                                </div>
+                                            </div>
+                                        ) : null,
+                                    },
+                                    {
+                                        n: 4,
+                                        label: 'AI result',
+                                        summary: r ? `Model: ${r.model}` : loading ? 'Waiting for AI response…' : null,
+                                        content: r ? (
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '0 1rem 0.9rem' }}>
+                                                <div>
+                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '0.35rem' }}>Generated Reply</div>
+                                                    <div
+                                                        style={{ padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.25)', color: 'rgba(255,255,255,0.88)', fontSize: '0.85rem', lineHeight: 1.6 }}
+                                                        dangerouslySetInnerHTML={{ __html: r.renderedText }}
+                                                    />
+                                                </div>
+                                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                                                    {kvRow('Sender first name', d?.sender.firstName)}
+                                                    {kvRow('Sender email account', d?.sender.eaccount)}
+                                                    {kvRow('Reply thread subject', d?.threadSubject)}
+                                                    {kvRow('Model', r.model)}
+                                                </div>
+                                                {r.reviewUrl && (
+                                                    <a
+                                                        href={r.reviewUrl}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        style={{ fontSize: '0.82rem', color: '#60a5fa', textDecoration: 'underline', alignSelf: 'flex-start' }}
+                                                    >
+                                                        Open review &amp; approve page →
+                                                    </a>
+                                                )}
+                                            </div>
+                                        ) : null,
+                                    },
+                                ];
+
+                                return (
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                        {steps.map(({ n, label, summary, content }) => {
+                                            const complete = done && n < 4 ? true : done && n === 4;
+                                            const active = loading && !done;
+                                            const expanded = isExpanded(n);
+                                            const canExpand = !!content;
+                                            return (
+                                                <div key={n} style={stepStyle(n)}>
+                                                    <button
+                                                        type="button"
+                                                        style={stepHeaderStyle}
+                                                        onClick={() => canExpand && toggleStep(n)}
+                                                        disabled={!canExpand}
+                                                    >
+                                                        <span style={badgeStyle(complete, active)}>
+                                                            {complete ? '✓' : n}
+                                                        </span>
+                                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.88rem', color: complete ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.5)' }}>
+                                                                {label}
+                                                            </div>
+                                                            {summary && (
+                                                                <div style={{ fontSize: '0.78rem', color: complete ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.35)', marginTop: '0.1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                    {summary}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                        {canExpand && (
+                                                            <span style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.35)', flexShrink: 0 }}>
+                                                                {expanded ? '▲' : '▼'}
+                                                            </span>
+                                                        )}
+                                                    </button>
+                                                    {expanded && content}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                );
+                            })()}
                         </div>
                         <div className="modal__actions">
                             <button
@@ -9877,8 +10231,11 @@ export default function ClientPage() {
                                                     return (
                                                         <div key={evt.id} style={{
                                                             position: 'relative',
-                                                            paddingBottom: '0.65rem',
-                                                            paddingLeft: '0.6rem'
+                                                            padding: '0.5rem 0.6rem',
+                                                            marginBottom: '0.5rem',
+                                                            background: 'rgba(255, 255, 255, 0.04)',
+                                                            border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                            borderRadius: '10px',
                                                         }}>
                                                             {/* Dot */}
                                                             <div style={{
@@ -9931,8 +10288,18 @@ export default function ClientPage() {
                                                                 const snippet = evt.reply_text_snippet
                                                                     || (evt.event_type === 'added_to_campaign' ? evt.message_text : null)
                                                                     || (evt.message_text ? evt.message_text.split('\n').find(l => l.trim()) || null : null);
+                                                                const fullContent = evt.message_text || snippet;
                                                                 return snippet ? (
-                                                                    <p style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.55)' }}>
+                                                                    <p
+                                                                        style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.55)', cursor: 'default' }}
+                                                                        onMouseEnter={(e) => {
+                                                                            if (fullContent) setActivityReplyPopup({ html: fullContent, isHtml: Boolean(evt.message_text && evt.message_text.includes('<')), x: e.clientX, y: e.clientY });
+                                                                        }}
+                                                                        onMouseMove={(e) => {
+                                                                            setActivityReplyPopup(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null);
+                                                                        }}
+                                                                        onMouseLeave={() => setActivityReplyPopup(null)}
+                                                                    >
                                                                         {snippet.length > 160 ? snippet.slice(0, 160) + '…' : snippet}
                                                                     </p>
                                                                 ) : null;
@@ -10168,6 +10535,36 @@ export default function ClientPage() {
                         </div>
                     </div>
                 </>
+            )}
+
+            {/* Activity Reply Hover Popup */}
+            {activityReplyPopup && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        zIndex: 99999,
+                        left: activityReplyPopup.x + 16,
+                        top: activityReplyPopup.y + 16,
+                        width: '360px',
+                        maxHeight: '420px',
+                        overflowY: 'auto',
+                        background: 'rgb(14, 14, 24)',
+                        border: '1px solid rgba(255, 255, 255, 0.15)',
+                        borderRadius: '10px',
+                        padding: '0.75rem',
+                        boxShadow: '0 8px 32px rgba(0, 0, 0, 0.8)',
+                        fontSize: '0.8rem',
+                        color: 'rgba(255, 255, 255, 0.82)',
+                        lineHeight: '1.55',
+                        wordBreak: 'break-word',
+                        pointerEvents: 'none',
+                    }}
+                >
+                    {activityReplyPopup.isHtml
+                        ? <div dangerouslySetInnerHTML={{ __html: activityReplyPopup.html }} />
+                        : <span style={{ whiteSpace: 'pre-wrap' }}>{activityReplyPopup.html}</span>
+                    }
+                </div>
             )}
 
             {/* Toast Notification */}
