@@ -133,7 +133,7 @@ type LeadFilterOption = {
 type LeadFilterField = {
     key: string;
     label: string;
-    type: "text" | "number" | "date" | "enum";
+    type: "text" | "number" | "date" | "enum" | "boolean";
     operators: LeadFilterOperator[];
     options: LeadFilterOption[];
 };
@@ -143,6 +143,7 @@ type LeadFilterClause = {
     field: string;
     op: string;
     value: string;
+    joinOp: 'AND' | 'OR'; // connector after this clause (ignored for last clause)
 };
 
 type LeadExportFieldDef = {
@@ -337,6 +338,7 @@ function createLeadFilterId() {
 function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string | null) {
     const normalized = String(fallbackLabel || eventType || "unknown").toLowerCase().replace(/[_ ]+/g, " ").trim();
     if (normalized === "reply received" || normalized === "reply" || normalized === "replied") return "Reply received";
+    if (normalized === "interested reply sent") return "Autoresponder reply";
     if (normalized === "email sent") return "Email sent";
     if (normalized === "email opened") return "Email opened";
     if (normalized === "email link clicked") return "Link clicked";
@@ -372,25 +374,29 @@ function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | n
     const normalized = String(eventType || "").toLowerCase();
     const displayLabel = formatInstantlyActivityLabel(eventType, fallbackLabel);
     const displayTone = getActivityDisplayTone(displayLabel);
-    if (normalized === "email_sent") return "#3b82f6";
-    if (normalized === "email_opened") return "#a855f7";
-    if (normalized === "email_link_clicked") return "#0ea5e9";
-    if (normalized === "warm follow up" || normalized === "warm_follow_up" || displayTone === "manual") return "#eab308";
+    if (normalized === "interested_reply_sent") return "var(--app-event-auto-reply)";
+    if (normalized === "email_sent") return "var(--app-event-email-sent)";
+    if (normalized === "email_opened") return "var(--app-event-email-opened)";
+    if (normalized === "email_link_clicked") return "var(--app-event-link-clicked)";
+    if (normalized === "warm follow up" || normalized === "warm_follow_up" || displayTone === "manual") return "var(--app-event-warm-followup)";
     if (normalized === "reply_received" || normalized === "lead_interested" || normalized === "lead_meeting_booked" || normalized === "lead_meeting_completed" || normalized === "lead_closed") {
-        return "#22c55e";
+        return "var(--app-event-positive)";
     }
     if (normalized === "email_bounced" || normalized === "lead_not_interested" || normalized === "lead_wrong_person" || normalized === "lead_no_show") {
-        return "#ef4444";
+        return "var(--app-event-negative)";
     }
-    if (normalized === "lead_unsubscribed" || normalized === "lead_out_of_office" || normalized === "lead_neutral") {
-        return "#f59e0b";
+    if (normalized === "lead_unsubscribed" || normalized === "lead_out_of_office") {
+        return "var(--app-event-warning)";
+    }
+    if (normalized === "lead_neutral") {
+        return "var(--app-event-neutral)";
     }
     if (normalized === "interest_change") {
-        if (displayTone === "positive") return "#22c55e";
-        if (displayTone === "negative") return "#ef4444";
-        if (displayTone === "neutral") return "#f59e0b";
+        if (displayTone === "positive") return "var(--app-event-positive)";
+        if (displayTone === "negative") return "var(--app-event-negative)";
+        if (displayTone === "neutral") return "var(--app-event-neutral)";
     }
-    return "rgba(255, 255, 255, 0.3)";
+    return "var(--app-event-default)";
 }
 
 function isReplyActivityEvent(eventType: string) {
@@ -1091,6 +1097,26 @@ export default function ClientPage() {
     const [jobPendingUpload, setJobPendingUpload] = useState<string | null>(null);
 
     const [jobUploadStatus, setJobUploadStatus] = useState<Record<string, any[]>>({});
+    // Verification CSV import state
+    const [verificationImportModalOpen, setVerificationImportModalOpen] = useState(false);
+    const [verificationImportFile, setVerificationImportFile] = useState<File | null>(null);
+    const [verificationImportStep, setVerificationImportStep] = useState<1 | 2>(1);
+    const [verificationImportHeaders, setVerificationImportHeaders] = useState<string[]>([]);
+    const [verificationImportPreviewRows, setVerificationImportPreviewRows] = useState<Record<string, string>[]>([]);
+    const [verificationImportTotalRows, setVerificationImportTotalRows] = useState<number>(0);
+    const [verificationImportEmailCol, setVerificationImportEmailCol] = useState('');
+    const [verificationImportStatusCol, setVerificationImportStatusCol] = useState('');
+    const [verificationImportVerifiedAtCol, setVerificationImportVerifiedAtCol] = useState('');
+    const [verificationImportParsing, setVerificationImportParsing] = useState(false);
+    const [verificationImportLoading, setVerificationImportLoading] = useState(false);
+    const [verificationImportResult, setVerificationImportResult] = useState<{
+        totalRows: number;
+        matched: number;
+        updated: number;
+        skipped: number;
+        notFound: number;
+    } | null>(null);
+
     const [showInstantlyCsvImportModal, setShowInstantlyCsvImportModal] = useState(false);
     const [instantlyCsvImportFile, setInstantlyCsvImportFile] = useState<File | null>(null);
     const [instantlyCsvImportNotes, setInstantlyCsvImportNotes] = useState('');
@@ -1283,7 +1309,7 @@ export default function ClientPage() {
     const [leadFilterFields, setLeadFilterFields] = useState<LeadFilterField[]>([]);
     const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
     const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>([]);
-    const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string }>>([]);
+    const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string; joinOp: 'AND' | 'OR' }>>([]);
     const [checkingKlaviyo, setCheckingKlaviyo] = useState(false);
     const [exportingCsv, setExportingCsv] = useState(false);
     const [leadExportModalOpen, setLeadExportModalOpen] = useState(false);
@@ -1555,14 +1581,17 @@ export default function ClientPage() {
         const field = leadFilterFieldMap.get(fieldKey);
         if (!field) return false;
         if (!field.operators.some((operator) => operator.key === operatorKey)) return false;
-        return operatorKey !== 'is_empty' && operatorKey !== 'not_empty';
+        const noValueOps = ['is_empty', 'not_empty', 'is_true', 'is_false'];
+        return !noValueOps.includes(operatorKey);
     }, [leadFilterFieldMap]);
 
-    const getLeadFilterInputMode = useCallback((fieldKey: string, operatorKey: string) => {
+    const getLeadFilterInputMode = useCallback((fieldKey: string, operatorKey: string): string | null => {
         const field = leadFilterFieldMap.get(fieldKey);
         if (!field) return null;
         if (!doesLeadFilterRequireValue(fieldKey, operatorKey)) return null;
         if (operatorKey === 'older_than_days') return 'number';
+        if (operatorKey === 'between') return 'between';
+        if (operatorKey === 'in' || operatorKey === 'not_in') return 'multi';
         return field.type;
     }, [doesLeadFilterRequireValue, leadFilterFieldMap]);
 
@@ -1578,7 +1607,8 @@ export default function ClientPage() {
             .map((filter) => ({
                 field: filter.field,
                 op: filter.op,
-                value: filter.value
+                value: filter.value,
+                joinOp: filter.joinOp
             }));
     }, [doesLeadFilterRequireValue, leadFilterFieldMap, leadFilters]);
 
@@ -1596,7 +1626,8 @@ export default function ClientPage() {
                     id: createLeadFilterId(),
                     field: firstField.key,
                     op: firstField.operators[0]?.key || '',
-                    value: ''
+                    value: '',
+                    joinOp: 'AND'
                 }
             ];
         });
@@ -1619,17 +1650,39 @@ export default function ClientPage() {
     const leadFilterContent = useMemo(() => {
         if (leadFilterFieldsLoading) {
             return (
-                <p style={{ margin: 0, fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.45)' }}>
+                <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--app-text-faint)' }}>
                     Loading filter fields...
                 </p>
             );
         }
 
-        return leadFilters.map((filter) => {
+        // Split leadFilters into AND-groups (split wherever a preceding clause has joinOp 'OR')
+        type FilterGroup = { clauses: LeadFilterClause[]; groupIndex: number };
+        const groups: FilterGroup[] = [];
+        let current: LeadFilterClause[] = [];
+        for (let i = 0; i < leadFilters.length; i++) {
+            current.push(leadFilters[i]);
+            // The connector AFTER clause i lives in leadFilters[i].joinOp
+            // If it's OR (and there is a next clause), close this group
+            if (i < leadFilters.length - 1 && leadFilters[i].joinOp === 'OR') {
+                groups.push({ clauses: current, groupIndex: groups.length });
+                current = [];
+            }
+        }
+        if (current.length > 0) groups.push({ clauses: current, groupIndex: groups.length });
+
+        const hasMultipleGroups = groups.length > 1;
+
+        const renderClauseRow = (filter: LeadFilterClause) => {
             const field = leadFilterFieldMap.get(filter.field) || leadFilterFields[0];
             const operators = field?.operators || [];
             const selectedOperator = operators.find((operator) => operator.key === filter.op) || operators[0];
             const valueMode = getLeadFilterInputMode(filter.field, selectedOperator?.key || '');
+
+            const parsedArrayValue: string[] = (() => {
+                try { return JSON.parse(filter.value || '[]'); } catch { return []; }
+            })();
+            const setArrayValue = (arr: string[]) => updateLeadFilter(filter.id, { value: JSON.stringify(arr) });
 
             return (
                 <div
@@ -1687,9 +1740,9 @@ export default function ClientPage() {
                                 alignItems: 'center',
                                 padding: '0 0.9rem',
                                 borderRadius: '10px',
-                                border: '1px solid rgba(255,255,255,0.08)',
-                                background: 'rgba(255,255,255,0.03)',
-                                color: 'rgba(255,255,255,0.45)',
+                                border: '1px solid var(--app-border)',
+                                background: 'var(--app-surface-3)',
+                                color: 'var(--app-text-faint)',
                                 fontSize: '0.9rem'
                             }}>
                                 No value needed
@@ -1704,6 +1757,36 @@ export default function ClientPage() {
                                     <option key={option.value} value={option.value}>{option.label}</option>
                                 ))}
                             </select>
+                        ) : valueMode === 'multi' ? (
+                            <select
+                                multiple
+                                value={parsedArrayValue}
+                                onChange={(e) => {
+                                    const selected = Array.from(e.target.selectedOptions).map((o) => o.value);
+                                    setArrayValue(selected);
+                                }}
+                                style={{ minHeight: '80px' }}
+                            >
+                                {(field?.options || []).map((option) => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                            </select>
+                        ) : valueMode === 'between' ? (
+                            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                                <input
+                                    type="date"
+                                    value={parsedArrayValue[0] || ''}
+                                    onChange={(e) => setArrayValue([e.target.value, parsedArrayValue[1] || ''])}
+                                    style={{ flex: 1 }}
+                                />
+                                <span style={{ color: 'var(--app-text-faint)', fontSize: '0.8rem' }}>to</span>
+                                <input
+                                    type="date"
+                                    value={parsedArrayValue[1] || ''}
+                                    onChange={(e) => setArrayValue([parsedArrayValue[0] || '', e.target.value])}
+                                    style={{ flex: 1 }}
+                                />
+                            </div>
                         ) : (
                             <input
                                 type={valueMode === 'number' ? 'number' : valueMode === 'date' ? 'date' : 'text'}
@@ -1725,6 +1808,103 @@ export default function ClientPage() {
                     >
                         Remove
                     </button>
+                </div>
+            );
+        };
+
+        // Pill toggle for the connector after a clause (AND / OR)
+        const renderConnector = (afterClause: LeadFilterClause, label: 'AND' | 'OR') => (
+            <div style={{ display: 'flex', alignItems: 'center', padding: '0.15rem 0' }}>
+                <div style={{
+                    display: 'inline-flex',
+                    background: 'var(--app-surface-2)',
+                    border: '1px solid var(--app-border-mid)',
+                    borderRadius: '6px',
+                    padding: '2px',
+                    gap: '2px'
+                }}>
+                    {(['AND', 'OR'] as const).map((opt) => {
+                        const selected = afterClause.joinOp === opt;
+                        return (
+                            <button
+                                key={opt}
+                                type="button"
+                                onClick={() => updateLeadFilter(afterClause.id, { joinOp: opt })}
+                                style={{
+                                    padding: '2px 10px',
+                                    fontSize: '0.7rem',
+                                    fontWeight: selected ? 600 : 400,
+                                    letterSpacing: '0.04em',
+                                    lineHeight: 1,
+                                    height: '22px',
+                                    border: 'none',
+                                    borderRadius: '4px',
+                                    cursor: 'pointer',
+                                    transition: 'background 0.15s, color 0.15s',
+                                    background: selected ? 'var(--app-surface-hover)' : 'transparent',
+                                    color: selected ? 'var(--app-text)' : 'var(--app-text-ghost)',
+                                    boxShadow: selected ? '0 1px 3px rgba(0,0,0,0.3)' : 'none',
+                                }}
+                            >
+                                {opt}
+                            </button>
+                        );
+                    })}
+                </div>
+            </div>
+        );
+
+        return groups.map(({ clauses, groupIndex }) => {
+            const isLastGroup = groupIndex === groups.length - 1;
+            // The OR connector that PRECEDES this group lives on the last clause of the previous group
+            // We render it ABOVE this group (except for the first group)
+            const precedingOrClause = groupIndex > 0 ? groups[groupIndex - 1].clauses[groups[groupIndex - 1].clauses.length - 1] : null;
+
+            return (
+                <div key={`group-${groupIndex}`} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {/* OR separator between groups */}
+                    {precedingOrClause && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.25rem 0' }}>
+                            <div style={{ flex: 1, height: '1px', background: 'var(--app-border)' }} />
+                            {renderConnector(precedingOrClause, 'OR')}
+                            <div style={{ flex: 1, height: '1px', background: 'var(--app-border)' }} />
+                        </div>
+                    )}
+
+                    {/* Group container — bordered when there are multiple groups */}
+                    <div style={hasMultipleGroups ? {
+                        border: '1px solid var(--app-border-mid)',
+                        borderRadius: '10px',
+                        padding: '0.75rem',
+                        background: 'var(--app-surface-3)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.5rem'
+                    } : { display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                        {clauses.map((clause, clauseIdx) => {
+                            const isLastInGroup = clauseIdx === clauses.length - 1;
+                            return (
+                                <div key={clause.id} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                    {renderClauseRow(clause)}
+                                    {/* AND connector within the group (not after the last clause in the group) */}
+                                    {!isLastInGroup && renderConnector(clause, 'AND')}
+                                    {/* OR connector toggle — shown after last clause in group, unless it's the last group */}
+                                    {isLastInGroup && !isLastGroup && null /* rendered above next group as precedingOrClause */}
+                                    {/* Allow changing last clause connector to OR (shown only when not last group already handled) */}
+                                    {isLastInGroup && isLastGroup && leadFilters.length > 1 && (
+                                        // Still show connector on last clause so user can switch to OR
+                                        // only if there's a next filter to connect to — i.e. this clause is not the very last filter
+                                        leadFilters[leadFilters.length - 1].id !== clause.id
+                                            ? null
+                                            : null
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {/* Connector after this group (shown when not the last group — handled as precedingOrClause above)
+                        But we also need to show it on the last clause of the last group so user can add an OR to the next filter */}
                 </div>
             );
         });
@@ -2048,7 +2228,7 @@ export default function ClientPage() {
         }
 
         if (appliedLeadFilters.length > 0) {
-            params.append('filters', JSON.stringify(appliedLeadFilters));
+            params.append('filters', JSON.stringify({ clauses: appliedLeadFilters }));
         }
 
         if (typeof offset === 'number' && Number.isFinite(offset) && offset > 0) {
@@ -2324,7 +2504,9 @@ export default function ClientPage() {
                     query: {
                         search: debouncedLeadSearch.trim() || undefined,
                         instantlyCampaignId: campaignFilterId || undefined,
-                        filters: appliedLeadFilters
+                        filters: appliedLeadFilters.length > 0
+                            ? { clauses: appliedLeadFilters }
+                            : undefined
                     }
                 })
             });
@@ -4853,6 +5035,98 @@ export default function ClientPage() {
         return (data.prompts || []) as InterestedAutoResponderPrompt[];
     };
 
+    const handleOpenVerificationImportModal = () => {
+        setVerificationImportModalOpen(true);
+        setVerificationImportFile(null);
+        setVerificationImportStep(1);
+        setVerificationImportHeaders([]);
+        setVerificationImportPreviewRows([]);
+        setVerificationImportTotalRows(0);
+        setVerificationImportEmailCol('');
+        setVerificationImportStatusCol('');
+        setVerificationImportVerifiedAtCol('');
+        setVerificationImportResult(null);
+    };
+
+    const handleVerificationImportFileChange = async (file: File | null) => {
+        setVerificationImportFile(file);
+        setVerificationImportResult(null);
+        if (!file) {
+            setVerificationImportStep(1);
+            setVerificationImportHeaders([]);
+            setVerificationImportPreviewRows([]);
+            setVerificationImportTotalRows(0);
+            return;
+        }
+        try {
+            setVerificationImportParsing(true);
+            const idToken = await user?.getIdToken();
+            const formData = new FormData();
+            formData.append('file', file);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/verification-import/preview`,
+                { method: 'POST', headers: { Authorization: `Bearer ${idToken}` }, body: formData }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || `Parse failed (${response.status})`);
+            const headers: string[] = data.headers || [];
+            setVerificationImportHeaders(headers);
+            setVerificationImportPreviewRows(data.previewRows || []);
+            setVerificationImportTotalRows(data.totalRows || 0);
+            // Auto-detect columns
+            const emailGuess = headers.find((h) => /^email$/i.test(h)) || headers.find((h) => /email/i.test(h)) || '';
+            const statusGuess = headers.find((h) => /^(email_status|status|result|verification_status|deliverability)$/i.test(h)) || headers.find((h) => /status|result|verif/i.test(h)) || '';
+            const verifiedAtGuess = headers.find((h) => /verified_at|verified|checked_at/i.test(h)) || '';
+            setVerificationImportEmailCol(emailGuess);
+            setVerificationImportStatusCol(statusGuess);
+            setVerificationImportVerifiedAtCol(verifiedAtGuess);
+            setVerificationImportStep(2);
+        } catch (error) {
+            console.error('Error previewing verification CSV:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to parse CSV');
+            setToastVisible(true);
+        } finally {
+            setVerificationImportParsing(false);
+        }
+    };
+
+    const handleSubmitVerificationImport = async () => {
+        if (!user || !clientId || !verificationImportFile) return;
+        if (!verificationImportEmailCol || !verificationImportStatusCol) {
+            setToastMessage('Please map the Email and Email Status columns before importing.');
+            setToastVisible(true);
+            return;
+        }
+        try {
+            setVerificationImportLoading(true);
+            const idToken = await getIdToken(user);
+            const formData = new FormData();
+            formData.append('file', verificationImportFile);
+            formData.append('clientId', clientId);
+            formData.append('emailColumn', verificationImportEmailCol);
+            formData.append('statusColumn', verificationImportStatusCol);
+            if (verificationImportVerifiedAtCol) {
+                formData.append('verifiedAtColumn', verificationImportVerifiedAtCol);
+            }
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/verification-import`,
+                { method: 'POST', headers: { Authorization: `Bearer ${idToken}` }, body: formData }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || `Import failed (${response.status})`);
+            setVerificationImportResult(data);
+            setToastMessage(`Verification import complete: ${data.updated} leads updated.`);
+            setToastVisible(true);
+            fetchLeads(true);
+        } catch (error) {
+            console.error('Error running verification import:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to import verification CSV');
+            setToastVisible(true);
+        } finally {
+            setVerificationImportLoading(false);
+        }
+    };
+
     const handleOpenInstantlyCsvImportModal = async () => {
         setShowInstantlyCsvImportModal(true);
         setInstantlyCsvImportFile(null);
@@ -5149,6 +5423,15 @@ export default function ClientPage() {
                     </button>
                     <button
                         type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={handleOpenVerificationImportModal}
+                        style={{ flex: '0 0 auto' }}
+                        disabled={leadsLoading}
+                    >
+                        📋 Import Verification CSV
+                    </button>
+                    <button
+                        type="button"
                         className="primary-button"
                         onClick={() => setLeadExportModalOpen(true)}
                         style={{ flex: '0 0 auto' }}
@@ -5193,19 +5476,19 @@ export default function ClientPage() {
             }}>
                 <div style={{
                     padding: '1rem',
-                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                    border: '1px solid var(--app-border)',
                     borderRadius: '10px',
-                    background: 'rgba(255, 255, 255, 0.03)',
+                    background: 'var(--app-surface-3)',
                     display: 'flex',
                     flexDirection: 'column',
                     gap: '0.75rem'
                 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
                         <div>
-                            <div style={{ fontSize: '0.78rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'rgba(255, 255, 255, 0.45)' }}>
+                            <div style={{ fontSize: '0.78rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--app-text-faint)' }}>
                                 Filters
                             </div>
-                            <div style={{ fontSize: '0.88rem', color: 'rgba(255, 255, 255, 0.65)', marginTop: '0.2rem' }}>
+                            <div style={{ fontSize: '0.88rem', color: 'var(--app-text-muted)', marginTop: '0.2rem' }}>
                                 Build lead filters locally, then run the query when you are ready.
                             </div>
                         </div>
@@ -5250,7 +5533,7 @@ export default function ClientPage() {
                             gap: '0.5rem',
                             padding: '0.5rem 0.75rem',
                             fontSize: '0.875rem',
-                            color: 'rgba(255, 255, 255, 0.7)'
+                            color: 'var(--app-text-muted)'
                         }}>
                             <svg className="spinner" style={{ width: '16px', height: '16px' }} viewBox="0 0 24 24" fill="none">
                                 <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
@@ -5285,9 +5568,9 @@ export default function ClientPage() {
                     ) : (
                         <div style={{
                             overflowX: 'auto',
-                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                            border: '1px solid var(--app-border)',
                             borderRadius: '8px',
-                            backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                            backgroundColor: 'var(--app-bg-inset)',
                             maxHeight: '520px',
                             overflowY: 'auto',
                             position: 'relative'
@@ -5314,7 +5597,7 @@ export default function ClientPage() {
                                         padding: '1.5rem',
                                         background: 'rgba(0, 0, 0, 0.8)',
                                         borderRadius: '12px',
-                                        border: '1px solid rgba(255, 255, 255, 0.1)'
+                                        border: '1px solid var(--app-border)'
                                     }}>
                                         <svg className="spinner" style={{ width: '32px', height: '32px', color: '#3b82f6' }} viewBox="0 0 24 24" fill="none">
                                             <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
@@ -5337,63 +5620,74 @@ export default function ClientPage() {
                                 }}>
                                     <thead>
                                         <tr style={{
-                                            backgroundColor: 'rgba(255, 255, 255, 0.05)',
-                                            borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                            backgroundColor: 'var(--app-surface-2)',
+                                            borderBottom: '1px solid var(--app-border)'
                                         }}>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
                                                 zIndex: 2,
-                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                backgroundColor: 'var(--app-bg)',
                                                 textAlign: 'left',
                                                 padding: '0.75rem 1rem',
                                                 fontWeight: 600,
-                                                color: 'rgba(255, 255, 255, 0.9)',
-                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
                                             }}>Founder Name</th>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
                                                 zIndex: 2,
-                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                backgroundColor: 'var(--app-bg)',
                                                 textAlign: 'left',
                                                 padding: '0.75rem 1rem',
                                                 fontWeight: 600,
-                                                color: 'rgba(255, 255, 255, 0.9)',
-                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
                                             }}>Email</th>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
                                                 zIndex: 2,
-                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                backgroundColor: 'var(--app-bg)',
                                                 textAlign: 'left',
                                                 padding: '0.75rem 1rem',
                                                 fontWeight: 600,
-                                                color: 'rgba(255, 255, 255, 0.9)',
-                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
-                                            }}>Status</th>
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
+                                            }}>Email Status</th>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
                                                 zIndex: 2,
-                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                backgroundColor: 'var(--app-bg)',
                                                 textAlign: 'left',
                                                 padding: '0.75rem 1rem',
                                                 fontWeight: 600,
-                                                color: 'rgba(255, 255, 255, 0.9)',
-                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
+                                            }}>Lead Status</th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'var(--app-bg)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
                                             }}>Domain</th>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
                                                 zIndex: 2,
-                                                backgroundColor: 'rgba(18, 24, 38, 0.96)',
+                                                backgroundColor: 'var(--app-bg)',
                                                 textAlign: 'left',
                                                 padding: '0.75rem 1rem',
                                                 fontWeight: 600,
-                                                color: 'rgba(255, 255, 255, 0.9)',
-                                                borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
                                             }}>Campaign</th>
                                         </tr>
                                     </thead>
@@ -5403,13 +5697,13 @@ export default function ClientPage() {
                                                 key={lead.id}
                                                 onClick={() => setSelectedLead(lead)}
                                                 style={{
-                                                    backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)',
-                                                    borderBottom: index < filteredLeads.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+                                                    backgroundColor: index % 2 === 0 ? 'transparent' : 'var(--app-surface-3)',
+                                                    borderBottom: index < filteredLeads.length - 1 ? '1px solid var(--app-border)' : 'none',
                                                     cursor: 'pointer',
                                                     transition: 'background-color 0.15s ease'
                                                 }}
-                                                onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.08)'}
-                                                onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'rgba(255, 255, 255, 0.03)'}
+                                                onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--app-surface-2)'}
+                                                onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'var(--app-surface-3)'}
                                             >
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
@@ -5434,6 +5728,21 @@ export default function ClientPage() {
                                                         return (
                                                             <span className={`lead-pastel-chip lead-pastel-chip--status-${meta.variant}`}>
                                                                 {meta.label}
+                                                            </span>
+                                                        );
+                                                    })()}
+                                                </td>
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    minWidth: '140px'
+                                                }}>
+                                                    {(() => {
+                                                        const latestCampaignData = lead.campaignsData?.[0];
+                                                        const raw = latestCampaignData?.interestStatus || latestCampaignData?.leadStatus;
+                                                        if (!raw) return <span style={{ color: 'var(--app-text-ghost)' }}>—</span>;
+                                                        return (
+                                                            <span className="lead-pastel-chip">
+                                                                {formatInstantlyStateLabel(raw)}
                                                             </span>
                                                         );
                                                     })()}
@@ -5478,7 +5787,7 @@ export default function ClientPage() {
                                     </tbody>
                                 </table>
                                 {(leadsLoading || leadsHasMore) && (
-                                    <div style={{ padding: '0.75rem 1rem', color: 'rgba(255,255,255,0.7)' }}>
+                                    <div style={{ padding: '0.75rem 1rem', color: 'var(--app-text-muted)' }}>
                                         {leadsLoading ? 'Loading leads...' : 'Scroll to load more'}
                                     </div>
                                 )}
@@ -5646,7 +5955,7 @@ export default function ClientPage() {
                                         <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
                                         <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                                     </svg>
-                                    <p style={{ margin: "0.9rem 0 0", fontSize: "0.95rem", color: "rgba(255,255,255,0.72)" }}>
+                                    <p style={{ margin: "0.9rem 0 0", fontSize: "0.95rem", color: "var(--app-text-muted)" }}>
                                         Loading Instantly analytics…
                                     </p>
                                 </div>
@@ -5664,7 +5973,7 @@ export default function ClientPage() {
                                         key: "emails_sent",
                                         label: "Emails sent",
                                         value: instantlyEventAnalytics?.summary.emails_sent ?? 0,
-                                        border: "rgba(255, 255, 255, 0.12)",
+                                        border: "var(--app-border-mid)",
                                         icon: (
                                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                                                 <path d="M4 6h16v12H4z" />
@@ -5676,7 +5985,7 @@ export default function ClientPage() {
                                         key: "positive_replies",
                                         label: "Positive replies",
                                         value: instantlyEventAnalytics?.summary.positive_replies ?? 0,
-                                        border: "rgba(255, 255, 255, 0.12)",
+                                        border: "var(--app-border-mid)",
                                         icon: (
                                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                                                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -5688,7 +5997,7 @@ export default function ClientPage() {
                                         key: "meetings_booked",
                                         label: "Meetings booked",
                                         value: instantlyEventAnalytics?.summary.meetings_booked ?? 0,
-                                        border: "rgba(255, 255, 255, 0.12)",
+                                        border: "var(--app-border-mid)",
                                         icon: (
                                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                                                 <rect x="3" y="4" width="18" height="18" rx="2" />
@@ -5735,17 +6044,17 @@ export default function ClientPage() {
                                                     display: "inline-flex",
                                                     alignItems: "center",
                                                     justifyContent: "center",
-                                                    color: "#ffffff",
+                                                    color: "var(--app-text)",
                                                     flexShrink: 0
                                                 }}>
                                                     {card.icon}
                                                 </div>
-                                                <p style={{ margin: 0, fontSize: "0.86rem", color: "rgba(255,255,255,0.66)" }}>
+                                                <p style={{ margin: 0, fontSize: "0.86rem", color: "var(--app-text-muted)" }}>
                                                     {card.label}
                                                 </p>
                                             </div>
                                             {"subLabel" in card && card.subLabel && (
-                                                <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
+                                                <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "var(--app-text-ghost)" }}>
                                                     {card.subLabel}
                                                 </p>
                                             )}
@@ -5757,8 +6066,8 @@ export default function ClientPage() {
                             <div style={{
                                 padding: "1.25rem",
                                 borderRadius: "16px",
-                                background: "rgba(255, 255, 255, 0.03)",
-                                border: "1px solid rgba(255, 255, 255, 0.08)"
+                                background: "var(--app-surface-3)",
+                                border: "1px solid var(--app-border)"
                             }}>
                                 <p className="eyebrow eyebrow--muted" style={{ paddingBottom: "15px" }}>Recent Events</p>
 
@@ -5786,7 +6095,7 @@ export default function ClientPage() {
                                         return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: d.getFullYear() !== now.getFullYear() ? "numeric" : undefined });
                                     }
 
-                                    // Group consecutive email_sent by same campaign into one row
+                                    // Step 1: Group consecutive email_sent by same campaign into one row
                                     type OrigEvt = typeof recentEvents[0];
                                     type GroupedEvt = OrigEvt & { batchCount: number; batchItems: OrigEvt[] };
                                     const grouped: GroupedEvt[] = [];
@@ -5806,61 +6115,89 @@ export default function ClientPage() {
                                         }
                                     }
 
+                                    // Step 2: Group all events for the same lead together (preserve first-appearance order)
+                                    type LeadGroup = { email: string; items: GroupedEvt[] };
+                                    const leadGroupMap = new Map<string, LeadGroup>();
+                                    const leadGroupOrder: string[] = [];
+                                    for (const evt of grouped) {
+                                        const key = (evt.lead_email || "").toLowerCase() || evt.id;
+                                        if (leadGroupMap.has(key)) {
+                                            leadGroupMap.get(key)!.items.push(evt);
+                                        } else {
+                                            leadGroupMap.set(key, { email: evt.lead_email || "", items: [evt] });
+                                            leadGroupOrder.push(key);
+                                        }
+                                    }
+                                    const leadGroups = leadGroupOrder.map(k => leadGroupMap.get(k)!);
+
+                                    // Helper: color dot for a sub-event
+                                    function subDotColor(et: string, dl?: string | null): string {
+                                        const n = String(et).toLowerCase();
+                                        if (n === "email_sent") return "#3b82f6";
+                                        if (n === "reply_received" || n === "lead_interested" || n === "lead_meeting_booked" || n === "lead_meeting_completed" || n === "lead_closed") return "#22c55e";
+                                        if (n === "email_bounced" || n === "lead_not_interested" || n === "lead_wrong_person" || n === "lead_no_show") return "#ef4444";
+                                        return getInstantlyActivityColor(et, dl);
+                                    }
+
                                     let lastDayLabel: string | null = null;
 
                                     return (
                                         <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-                                            {grouped.map((evt, idx) => {
+                                            {leadGroups.map((group, idx) => {
+                                                const primaryEvt = group.items[0];
                                                 const isFirst = idx === 0;
-                                                const eventTypeNorm = String(evt.event_type).toLowerCase();
+                                                const hasMultiple = group.items.length > 1;
+                                                const isBatch = primaryEvt.batchCount > 1;
+
+                                                const eventTypeNorm = String(primaryEvt.event_type).toLowerCase();
                                                 const isEmailSent = eventTypeNorm === "email_sent";
+                                                const isAutoReply = eventTypeNorm === "interested_reply_sent";
                                                 const isReply = eventTypeNorm === "reply_received";
                                                 const isBounce = eventTypeNorm === "email_bounced";
                                                 const isNotInterested = eventTypeNorm === "lead_not_interested" || eventTypeNorm === "lead_wrong_person" || eventTypeNorm === "lead_no_show";
                                                 const isPositive = eventTypeNorm === "lead_interested" || eventTypeNorm === "lead_meeting_booked" || eventTypeNorm === "lead_meeting_completed" || eventTypeNorm === "lead_closed" || isReply;
                                                 const isNegative = isBounce || isNotInterested;
 
-                                                // Color family
-                                                const colorFamily = isEmailSent
-                                                    ? { dot: "#3b82f6", pill: "rgba(59,130,246,0.15)", pillText: "#93c5fd", pillBorder: "rgba(59,130,246,0.25)", rowBg: "transparent" }
-                                                    : isPositive
-                                                        ? { dot: "#22c55e", pill: "rgba(34,197,94,0.15)", pillText: "#4ade80", pillBorder: "rgba(34,197,94,0.25)", rowBg: "rgba(34,197,94,0.04)" }
-                                                        : isNegative
-                                                            ? { dot: "#ef4444", pill: "rgba(239,68,68,0.15)", pillText: "#fca5a5", pillBorder: "rgba(239,68,68,0.25)", rowBg: "transparent" }
-                                                            : { dot: getInstantlyActivityColor(evt.event_type, evt.displayLabel), pill: "rgba(255,255,255,0.07)", pillText: "rgba(255,255,255,0.55)", pillBorder: "rgba(255,255,255,0.12)", rowBg: "transparent" };
+                                                // Color family (based on primary event)
+                                                const colorFamily = isAutoReply
+                                                    ? { dot: "#8b5cf6", pill: "rgba(139,92,246,0.15)", pillText: "var(--app-evtpill-purple)", pillBorder: "rgba(139,92,246,0.25)", rowBg: "rgba(139,92,246,0.04)" }
+                                                    : isEmailSent
+                                                        ? { dot: "#3b82f6", pill: "rgba(59,130,246,0.15)", pillText: "var(--app-evtpill-blue)", pillBorder: "rgba(59,130,246,0.25)", rowBg: "transparent" }
+                                                        : isPositive
+                                                            ? { dot: "#22c55e", pill: "rgba(34,197,94,0.15)", pillText: "var(--app-evtpill-green)", pillBorder: "rgba(34,197,94,0.25)", rowBg: "rgba(34,197,94,0.04)" }
+                                                            : isNegative
+                                                                ? { dot: "#ef4444", pill: "rgba(239,68,68,0.15)", pillText: "var(--app-evtpill-red)", pillBorder: "rgba(239,68,68,0.25)", rowBg: "transparent" }
+                                                                : { dot: getInstantlyActivityColor(primaryEvt.event_type, primaryEvt.displayLabel), pill: "var(--app-evtrow-default-pill)", pillText: "var(--app-evtrow-default-text)", pillBorder: "var(--app-evtrow-default-border)", rowBg: "transparent" };
 
-                                                const evtDate = new Date(evt.event_timestamp);
+                                                const evtDate = new Date(primaryEvt.event_timestamp);
                                                 const timeStr = Number.isNaN(evtDate.getTime()) ? "" : evtDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 
                                                 // Day separator
-                                                const dayLabel = getDayLabel(evt.event_timestamp);
+                                                const dayLabel = getDayLabel(primaryEvt.event_timestamp);
                                                 const showSeparator = dayLabel !== lastDayLabel;
                                                 if (showSeparator) lastDayLabel = dayLabel;
 
-                                                // Recipient display
-                                                const email = evt.lead_email || "";
-                                                const domain = email.includes("@") ? email.split("@")[1] : "";
-                                                const localPart = email.includes("@") ? email.split("@")[0] : email;
-                                                // Prettify local part: j.smith → J Smith, john.smith → John Smith
-                                                const recipientName = localPart
-                                                    .replace(/[._-]+/g, " ")
-                                                    .replace(/\b\w/g, (c) => c.toUpperCase())
-                                                    .trim();
+                                                const email = primaryEvt.lead_email || "";
 
-                                                const snippet = evt.reply_text_snippet
-                                                    || (evt.message_text ? evt.message_text.split("\n").find((l) => l.trim()) || null : null);
-                                                const fullContent = evt.message_text || snippet || "";
-                                                const isBatch = evt.batchCount > 1;
-                                                const isExpanded = expandedRecentEventId === evt.id;
-                                                const hasExpandable = isBatch || Boolean(fullContent && fullContent.length > 80);
+                                                const snippet = primaryEvt.reply_text_snippet
+                                                    || (primaryEvt.message_text ? primaryEvt.message_text.split("\n").find((l) => l.trim()) || null : null);
+                                                const fullContent = primaryEvt.message_text || snippet || "";
+                                                const isExpanded = expandedRecentEventId === primaryEvt.id;
+                                                const hasExpandable = hasMultiple || isBatch || Boolean(fullContent && fullContent.length > 80);
 
-                                                const isAnimated = animatedRecentEventIds.has(evt.id);
+                                                const isAnimated = animatedRecentEventIds.has(primaryEvt.id);
                                                 const pillLabel = isBatch
-                                                    ? `${evt.batchCount}× ${evt.displayLabel}`
-                                                    : evt.displayLabel;
+                                                    ? `${primaryEvt.batchCount}× ${primaryEvt.displayLabel}`
+                                                    : primaryEvt.displayLabel;
+
+                                                // Total individual events across this lead group
+                                                const totalEvtCount = group.items.reduce((sum, g) => sum + g.batchCount, 0);
+
+                                                // Find matching lead for modal
+                                                const matchedLead = email ? leads.find(l => l.email?.toLowerCase() === email.toLowerCase()) ?? null : null;
 
                                                 return (
-                                                    <div key={evt.id}>
+                                                    <div key={primaryEvt.id}>
                                                         {showSeparator && dayLabel && (
                                                             <div style={{
                                                                 padding: "0.45rem 0 0.35rem",
@@ -5869,8 +6206,8 @@ export default function ClientPage() {
                                                                 fontWeight: 600,
                                                                 textTransform: "uppercase",
                                                                 letterSpacing: "0.07em",
-                                                                color: "rgba(255,255,255,0.28)",
-                                                                borderTop: idx > 0 ? "1px solid rgba(255,255,255,0.06)" : "none",
+                                                                color: "var(--app-text-ghost)",
+                                                                borderTop: idx > 0 ? "1px solid var(--app-border)" : "none",
                                                             }}>
                                                                 {dayLabel}
                                                             </div>
@@ -5883,7 +6220,7 @@ export default function ClientPage() {
                                                             }}
                                                             onClick={() => {
                                                                 if (hasExpandable) {
-                                                                    setExpandedRecentEventId(isExpanded ? null : evt.id);
+                                                                    setExpandedRecentEventId(isExpanded ? null : primaryEvt.id);
                                                                     setActivityReplyPopup(null);
                                                                 }
                                                             }}
@@ -5898,14 +6235,14 @@ export default function ClientPage() {
 
                                                             {/* Content */}
                                                             <div style={{ flex: 1, minWidth: 0 }}>
-                                                                {/* Row 1: recipient + pill + time */}
+                                                                {/* Row 1: email + count badge + pill + time + modal button */}
                                                                 <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", flexWrap: "nowrap" }}>
-                                                                    <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "rgba(255,255,255,0.85)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "160px", flexShrink: 0 }}>
-                                                                        {recipientName || email || "—"}
+                                                                    <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "var(--app-text-high)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "180px", flexShrink: 1 }}>
+                                                                        {email || "—"}
                                                                     </span>
-                                                                    {domain && (
-                                                                        <span style={{ fontSize: "0.72rem", color: "rgba(255,255,255,0.3)", whiteSpace: "nowrap", flexShrink: 0 }}>
-                                                                            {domain}
+                                                                    {totalEvtCount > 1 && (
+                                                                        <span style={{ fontSize: "0.68rem", fontWeight: 600, color: "var(--app-text-ghost)", background: "var(--app-surface-3)", borderRadius: "999px", padding: "0.05rem 0.35rem", flexShrink: 0 }}>
+                                                                            {totalEvtCount}
                                                                         </span>
                                                                     )}
                                                                     <div style={{ flex: 1 }} />
@@ -5927,60 +6264,97 @@ export default function ClientPage() {
                                                                     </span>
                                                                     <span style={{
                                                                         fontSize: "0.7rem",
-                                                                        color: "rgba(255,255,255,0.28)",
+                                                                        color: "var(--app-text-ghost)",
                                                                         flexShrink: 0,
                                                                         fontVariantNumeric: "tabular-nums",
                                                                     }}>
                                                                         {timeStr}
                                                                     </span>
+                                                                    {matchedLead && (
+                                                                        <button
+                                                                            type="button"
+                                                                            title="Open lead detail"
+                                                                            onClick={(e) => { e.stopPropagation(); setSelectedLead(matchedLead); }}
+                                                                            style={{
+                                                                                flexShrink: 0,
+                                                                                display: "inline-flex",
+                                                                                alignItems: "center",
+                                                                                justifyContent: "center",
+                                                                                width: "18px",
+                                                                                height: "18px",
+                                                                                borderRadius: "4px",
+                                                                                border: "1px solid var(--app-border-mid)",
+                                                                                background: "var(--app-surface-2)",
+                                                                                color: "var(--app-text-faint)",
+                                                                                fontSize: "0.65rem",
+                                                                                cursor: "pointer",
+                                                                                lineHeight: 1,
+                                                                            }}
+                                                                        >
+                                                                            ↗
+                                                                        </button>
+                                                                    )}
                                                                 </div>
 
-                                                                {/* Row 2: snippet (hidden when batch is expanded) */}
+                                                                {/* Row 2: snippet (hidden when expanded) */}
                                                                 {snippet && !isExpanded && (
-                                                                    <p style={{ margin: "0.15rem 0 0", fontSize: "0.76rem", color: "rgba(255,255,255,0.45)", lineHeight: 1.45, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                                                                    <p style={{ margin: "0.15rem 0 0", fontSize: "0.76rem", color: "var(--app-text-faint)", lineHeight: 1.45, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
                                                                         {snippet}
                                                                     </p>
                                                                 )}
-                                                                {isExpanded && !isBatch && fullContent && (
-                                                                    <div style={{ marginTop: "0.3rem", fontSize: "0.76rem", color: "rgba(255,255,255,0.6)", lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                                                {isExpanded && !hasMultiple && !isBatch && fullContent && (
+                                                                    <div style={{ marginTop: "0.3rem", fontSize: "0.76rem", color: "var(--app-text-muted)", lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                                                                         {fullContent}
                                                                     </div>
                                                                 )}
-                                                                {evt.secondaryLabel && (
-                                                                    <p style={{ margin: "0.1rem 0 0", fontSize: "0.7rem", color: "rgba(191,219,254,0.55)" }}>
-                                                                        Includes {evt.secondaryLabel.toLowerCase()}
+                                                                {primaryEvt.secondaryLabel && (
+                                                                    <p style={{ margin: "0.1rem 0 0", fontSize: "0.7rem", color: "var(--app-text-muted)" }}>
+                                                                        Includes {primaryEvt.secondaryLabel.toLowerCase()}
                                                                     </p>
                                                                 )}
                                                             </div>
                                                         </div>
-                                                        {/* Expanded batch: individual sends */}
-                                                        {isExpanded && isBatch && (
-                                                            <div style={{ marginLeft: "9px", paddingLeft: "1rem", borderLeft: "1px solid rgba(255,255,255,0.08)", marginBottom: "0.25rem" }}>
-                                                                {evt.batchItems.map((item) => {
-                                                                    const itemDate = new Date(item.event_timestamp);
-                                                                    const itemTime = Number.isNaN(itemDate.getTime()) ? "" : itemDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-                                                                    const itemEmail = item.lead_email || "";
-                                                                    const itemDomain = itemEmail.includes("@") ? itemEmail.split("@")[1] : "";
-                                                                    const itemLocal = itemEmail.includes("@") ? itemEmail.split("@")[0] : itemEmail;
-                                                                    const itemName = itemLocal.replace(/[._-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()).trim();
-                                                                    const itemSnippet = item.reply_text_snippet || (item.message_text ? item.message_text.split("\n").find((l) => l.trim()) || null : null);
-                                                                    return (
-                                                                        <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.25rem 0.5rem" }}>
-                                                                            <div className="are-dot" style={{ background: "#3b82f6", flexShrink: 0 }} />
-                                                                            <span style={{ fontSize: "0.81rem", fontWeight: 500, color: "rgba(255,255,255,0.8)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "140px", flexShrink: 0 }}>
-                                                                                {itemName || itemEmail || "—"}
-                                                                            </span>
-                                                                            {itemDomain && (
-                                                                                <span style={{ fontSize: "0.72rem", color: "rgba(255,255,255,0.3)", whiteSpace: "nowrap", flexShrink: 0 }}>{itemDomain}</span>
-                                                                            )}
-                                                                            <div style={{ flex: 1 }} />
-                                                                            {itemSnippet && (
-                                                                                <span style={{ fontSize: "0.72rem", color: "rgba(255,255,255,0.4)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "120px", flexShrink: 1 }}>{itemSnippet}</span>
-                                                                            )}
-                                                                            <span style={{ fontSize: "0.7rem", color: "rgba(255,255,255,0.28)", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{itemTime}</span>
-                                                                        </div>
-                                                                    );
-                                                                })}
+
+                                                        {/* Expanded: show all events for this lead, or batch items */}
+                                                        {isExpanded && (hasMultiple || isBatch) && (
+                                                            <div style={{ marginLeft: "9px", paddingLeft: "1rem", borderLeft: "1px solid var(--app-border)", marginBottom: "0.25rem" }}>
+                                                                {hasMultiple
+                                                                    ? group.items.map((item) => {
+                                                                        const itemDate = new Date(item.event_timestamp);
+                                                                        const itemTime = Number.isNaN(itemDate.getTime()) ? "" : itemDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                                                                        const itemLabel = item.batchCount > 1 ? `${item.batchCount}× ${item.displayLabel}` : item.displayLabel;
+                                                                        const itemColor = subDotColor(item.event_type, item.displayLabel);
+                                                                        const itemSnippet = item.reply_text_snippet || (item.message_text ? item.message_text.split("\n").find((l) => l.trim()) || null : null);
+                                                                        return (
+                                                                            <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.25rem 0.5rem" }}>
+                                                                                <div className="are-dot" style={{ background: itemColor, flexShrink: 0 }} />
+                                                                                <span style={{ fontSize: "0.78rem", fontWeight: 500, color: "var(--app-text-mid)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "140px", flexShrink: 0, textTransform: "capitalize" }}>{itemLabel}</span>
+                                                                                <div style={{ flex: 1 }} />
+                                                                                {itemSnippet && (
+                                                                                    <span style={{ fontSize: "0.72rem", color: "var(--app-text-ghost)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100px", flexShrink: 1 }}>{itemSnippet}</span>
+                                                                                )}
+                                                                                <span style={{ fontSize: "0.7rem", color: "var(--app-text-ghost)", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{itemTime}</span>
+                                                                            </div>
+                                                                        );
+                                                                    })
+                                                                    : primaryEvt.batchItems.map((item) => {
+                                                                        const itemDate = new Date(item.event_timestamp);
+                                                                        const itemTime = Number.isNaN(itemDate.getTime()) ? "" : itemDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                                                                        const itemEmail = item.lead_email || "";
+                                                                        const itemSnippet = item.reply_text_snippet || (item.message_text ? item.message_text.split("\n").find((l) => l.trim()) || null : null);
+                                                                        return (
+                                                                            <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.25rem 0.5rem" }}>
+                                                                                <div className="are-dot" style={{ background: "#3b82f6", flexShrink: 0 }} />
+                                                                                <span style={{ fontSize: "0.78rem", color: "var(--app-text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "160px", flexShrink: 0 }}>{itemEmail || "—"}</span>
+                                                                                <div style={{ flex: 1 }} />
+                                                                                {itemSnippet && (
+                                                                                    <span style={{ fontSize: "0.72rem", color: "var(--app-text-ghost)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100px", flexShrink: 1 }}>{itemSnippet}</span>
+                                                                                )}
+                                                                                <span style={{ fontSize: "0.7rem", color: "var(--app-text-ghost)", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{itemTime}</span>
+                                                                            </div>
+                                                                        );
+                                                                    })
+                                                                }
                                                             </div>
                                                         )}
                                                     </div>
@@ -6030,7 +6404,7 @@ export default function ClientPage() {
                                         {syncingCampaigns ? 'Refreshing...' : 'Refresh campaigns'}
                                     </button>
                                     {campaignSyncMessage && (
-                                        <span style={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.9rem' }}>
+                                        <span style={{ color: 'var(--app-text-muted)', fontSize: '0.9rem' }}>
                                             {campaignSyncMessage}
                                         </span>
                                     )}
@@ -6041,8 +6415,8 @@ export default function ClientPage() {
                             {pipelineVisible && jobState && (
                                 <div style={{ 
                                     marginTop: '2rem',
-                                    background: 'rgba(255, 255, 255, 0.03)',
-                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                    background: 'var(--app-surface-3)',
+                                    border: '1px solid var(--app-border)',
                                     borderRadius: '16px',
                                     padding: '2rem',
                                     position: 'relative'
@@ -6059,8 +6433,8 @@ export default function ClientPage() {
                                             position: 'absolute',
                                             top: '1rem',
                                             right: '1rem',
-                                            background: 'rgba(255, 255, 255, 0.05)',
-                                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                                            background: 'var(--app-surface-3)',
+                                            border: '1px solid var(--app-border)',
                                             borderRadius: '8px',
                                             width: '32px',
                                             height: '32px',
@@ -6068,20 +6442,20 @@ export default function ClientPage() {
                                             alignItems: 'center',
                                             justifyContent: 'center',
                                             cursor: 'pointer',
-                                            color: 'rgba(255, 255, 255, 0.6)',
+                                            color: 'var(--app-text-muted)',
                                             fontSize: '1.25rem',
                                             transition: 'all 0.2s ease',
                                             padding: 0
                                         }}
                                         onMouseEnter={(e) => {
-                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)';
-                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.2)';
-                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)';
+                                            e.currentTarget.style.background = 'var(--app-surface-hover)';
+                                            e.currentTarget.style.borderColor = 'var(--app-border-mid)';
+                                            e.currentTarget.style.color = 'var(--app-text)';
                                         }}
                                         onMouseLeave={(e) => {
-                                            e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
-                                            e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.1)';
-                                            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.6)';
+                                            e.currentTarget.style.background = 'var(--app-surface-3)';
+                                            e.currentTarget.style.borderColor = 'var(--app-border)';
+                                            e.currentTarget.style.color = 'var(--app-text-muted)';
                                         }}
                                     >
                                         ×
@@ -6244,9 +6618,9 @@ export default function ClientPage() {
                                                     alignItems: 'center', 
                                                     gap: '0.75rem',
                                                     padding: '1rem 1.5rem',
-                                                    background: 'rgba(255, 255, 255, 0.03)',
+                                                    background: 'var(--app-surface-3)',
                                                     borderRadius: '8px',
-                                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                    border: '1px solid var(--app-border)',
                                                     marginTop: '1.5rem',
                                                     fontSize: '0.875rem',
                                                     fontVariantNumeric: 'tabular-nums'
@@ -6417,7 +6791,7 @@ export default function ClientPage() {
                                 <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem' }}>
                                     <p className="eyebrow eyebrow--muted">Job history</p>
                                         {jobHistory.length > 0 && (
-                                            <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.55)' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--app-text-faint)' }}>
                                                 {jobHistory.length} run{jobHistory.length === 1 ? '' : 's'} saved
                                             </span>
                                         )}
@@ -6461,8 +6835,8 @@ export default function ClientPage() {
                                                                 flexDirection: 'column',
                                                                 padding: '1.25rem',
                                                                 borderRadius: '12px',
-                                                                border: `1px solid ${isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)'}`,
-                                                                background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+                                                                border: `1px solid ${isSelected ? 'rgba(59, 130, 246, 0.65)' : 'var(--app-border)'}`,
+                                                                background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'var(--app-surface-3)',
                                                                 cursor: 'pointer',
                                                                 transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.2s ease',
                                                                 position: 'relative'
@@ -6475,7 +6849,7 @@ export default function ClientPage() {
                                                             }}
                                                             onMouseLeave={(event) => {
                                                                 event.currentTarget.style.transform = 'translateY(0)';
-                                                                event.currentTarget.style.borderColor = isSelected ? 'rgba(59, 130, 246, 0.65)' : 'rgba(255, 255, 255, 0.08)';
+                                                                event.currentTarget.style.borderColor = isSelected ? 'rgba(59, 130, 246, 0.65)' : 'var(--app-border)';
                                                             }}
                                                         >
                                                             {/* Top row: Filename + Badge */}
@@ -6484,7 +6858,7 @@ export default function ClientPage() {
                                                                     <p style={{
                                                                         margin: 0,
                                                                         fontWeight: 700,
-                                                                        color: '#ffffff',
+                                                                        color: 'var(--app-text-high)',
                                                                         fontSize: '1.05rem',
                                                                         overflow: 'hidden',
                                                                         textOverflow: 'ellipsis',
@@ -6493,7 +6867,7 @@ export default function ClientPage() {
                                                                     <p style={{
                                                                         margin: '0.4rem 0 0',
                                                                         fontSize: '0.8rem',
-                                                                        color: 'rgba(255, 255, 255, 0.55)'
+                                                                        color: 'var(--app-text-faint)'
                                                                     }}>Started {formatJobDate(job.createdAt)}</p>
                                                                 </div>
                                                                 
@@ -6524,7 +6898,7 @@ export default function ClientPage() {
                                                                         alignItems: 'baseline',
                                                                         marginBottom: '0.4rem'
                                                                     }}>
-                                                                        <span style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.7)' }}>
+                                                                        <span style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>
                                                                             Processing: {progress.processed.toLocaleString()} / {progress.total.toLocaleString()} rows
                                                                         </span>
                                                                         <span style={{ fontSize: '0.85rem', fontWeight: 600, color: statusColor }}>
@@ -6534,7 +6908,7 @@ export default function ClientPage() {
                                                                     <div style={{
                                                                         width: '100%',
                                                                         height: '6px',
-                                                                        background: 'rgba(255, 255, 255, 0.1)',
+                                                                        background: 'var(--app-surface-2)',
                                                                         borderRadius: '999px',
                                                                         overflow: 'hidden'
                                                                     }}>
@@ -6553,14 +6927,14 @@ export default function ClientPage() {
                                                                 <div style={{
                                                                     marginTop: '1rem',
                                                                     paddingTop: '1rem',
-                                                                    borderTop: '1px solid rgba(255, 255, 255, 0.06)'
+                                                                    borderTop: '1px solid var(--app-border)'
                                                                 }}>
                                                                     <p style={{
                                                                         margin: '0 0 0.75rem 0',
                                                                         fontSize: '0.7rem',
                                                                         textTransform: 'uppercase',
                                                                         letterSpacing: '0.05em',
-                                                                        color: 'rgba(255, 255, 255, 0.5)',
+                                                                        color: 'var(--app-text-ghost)',
                                                                         fontWeight: 600
                                                                     }}>Instantly Uploads</p>
                                                                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
@@ -6696,7 +7070,7 @@ export default function ClientPage() {
                                                                         <p style={{
                                                                             margin: 0,
                                                                             fontSize: '0.85rem',
-                                                                            color: 'rgba(255, 255, 255, 0.8)',
+                                                                            color: 'var(--app-text-high)',
                                                                             marginBottom: '1rem',
                                                                             lineHeight: 1.5
                                                                         }}>
@@ -6709,7 +7083,7 @@ export default function ClientPage() {
                                                                             display: 'flex',
                                                                             gap: '0.75rem',
                                                                             paddingTop: '1rem',
-                                                                            borderTop: '1px solid rgba(255, 255, 255, 0.1)'
+                                                                            borderTop: '1px solid var(--app-border)'
                                                                         }}>
                                                                             <button
                                                                                 type="button"
@@ -6760,7 +7134,7 @@ export default function ClientPage() {
                                     <h2 className="pipeline-panel__title" style={{ fontSize: '1.5rem', marginTop: '0.5rem' }}>
                                         {personalizerWizardStep === 1 ? '📤 Upload CSV' : '⚙️ Configure Options'}
                                     </h2>
-                            <p style={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.95rem', marginTop: '0.5rem' }}>
+                            <p style={{ color: 'var(--app-text-muted)', fontSize: '0.95rem', marginTop: '0.5rem' }}>
                                 {personalizerWizardStep === 1 
                                     ? 'Upload a CSV file with your leads to personalize' 
                                     : 'Configure personalization settings for your Shopify store'}
@@ -6780,7 +7154,7 @@ export default function ClientPage() {
                                             flex: 1,
                                             height: '4px',
                                             borderRadius: '2px',
-                                            background: step <= personalizerWizardStep ? '#3b82f6' : 'rgba(255, 255, 255, 0.15)',
+                                            background: step <= personalizerWizardStep ? '#3b82f6' : 'var(--app-surface-2)',
                                             transition: 'background 0.3s ease'
                                         }}
                                     />
@@ -6823,22 +7197,22 @@ export default function ClientPage() {
                                         }}>
                                             <span style={{ fontSize: '1.25rem' }}>✅</span>
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 600, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                <div style={{ fontWeight: 600, color: 'var(--app-text)' }}>
                                                     {processingPersonalizerFile ? 'Analyzing domains...' : 'File ready'}
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.25rem' }}>
                                                     {personalizerFile.name} ({(personalizerFile.size / 1024).toFixed(2)} KB)
                                                 </div>
                                                 {personalizerDomainStats && (
-                                                    <div style={{ fontSize: '0.875rem', marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
-                                                        <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    <div style={{ fontSize: '0.875rem', marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid var(--app-border)' }}>
+                                                        <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'var(--app-text)' }}>
                                                             📊 Domain Analysis
                                                         </div>
                                                         
                                                         {/* Row 1: Basic counts */}
-                                                        <div style={{ display: 'flex', gap: '1rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+                                                        <div style={{ display: 'flex', gap: '1rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
                                                             <span>
-                                                                <strong style={{ color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                                <strong style={{ color: 'var(--app-text)' }}>
                                                                     {personalizerDomainStats.total.toLocaleString()}
                                                                 </strong> total
                                                             </span>
@@ -6857,7 +7231,7 @@ export default function ClientPage() {
                                                         </div>
 
                                                         {/* Row 2: Run status */}
-                                                        <div style={{ display: 'flex', gap: '1rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)', marginBottom: '0.5rem' }}>
+                                                        <div style={{ display: 'flex', gap: '1rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)', marginBottom: '0.5rem' }}>
                                                             <span>
                                                                 <strong style={{ color: '#22c55e' }}>
                                                                     {personalizerDomainStats.run.toLocaleString()}
@@ -6871,7 +7245,7 @@ export default function ClientPage() {
                                                         </div>
 
                                                         {/* Row 3: Data enrichment */}
-                                                        <div style={{ display: 'flex', gap: '1rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                                                        <div style={{ display: 'flex', gap: '1rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)' }}>
                                                             <span>
                                                                 <strong style={{ color: '#8b5cf6' }}>
                                                                     {personalizerDomainStats.withFounders.toLocaleString()}
@@ -6916,13 +7290,13 @@ export default function ClientPage() {
                                         <span className="settings-field__label">Platform</span>
                                         <div style={{
                                             padding: '0.75rem 1rem',
-                                            background: 'rgba(255, 255, 255, 0.05)',
-                                            border: '1px solid rgba(255, 255, 255, 0.15)',
+                                            background: 'var(--app-surface-3)',
+                                            border: '1px solid var(--app-border-mid)',
                                             borderRadius: '8px',
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.5rem',
-                                            color: 'rgba(255, 255, 255, 0.9)',
+                                            color: 'var(--app-text)',
                                             fontWeight: 500
                                         }}>
                                             <span style={{ fontSize: '1.25rem' }}>🛍️</span>
@@ -6948,7 +7322,7 @@ export default function ClientPage() {
                                             cursor: 'pointer',
                                             padding: '0.75rem',
                                             background: checkKlaviyo ? 'rgba(59, 130, 246, 0.1)' : 'transparent',
-                                            border: '1px solid ' + (checkKlaviyo ? 'rgba(59, 130, 246, 0.3)' : 'rgba(255, 255, 255, 0.1)'),
+                                            border: '1px solid ' + (checkKlaviyo ? 'rgba(59, 130, 246, 0.3)' : 'var(--app-border)'),
                                             borderRadius: '8px',
                                             transition: 'all 0.2s ease'
                                         }}>
@@ -6959,10 +7333,10 @@ export default function ClientPage() {
                                                 style={{ width: '20px', height: '20px', cursor: 'pointer' }}
                                             />
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)', fontSize: '1rem' }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)', fontSize: '1rem' }}>
                                                     Check Klaviyo Integration
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.25rem' }}>
                                                     Verify if the store has Klaviyo email marketing installed
                                                 </div>
                                             </div>
@@ -6981,10 +7355,10 @@ export default function ClientPage() {
                                                     style={{
                                                         flex: 1,
                                                         padding: '0.75rem',
-                                                        background: productsToPull === num ? 'rgba(59, 130, 246, 0.2)' : 'rgba(255, 255, 255, 0.05)',
-                                                        border: '1px solid ' + (productsToPull === num ? 'rgba(59, 130, 246, 0.5)' : 'rgba(255, 255, 255, 0.15)'),
+                                                        background: productsToPull === num ? 'rgba(59, 130, 246, 0.2)' : 'var(--app-surface-3)',
+                                                        border: '1px solid ' + (productsToPull === num ? 'rgba(59, 130, 246, 0.5)' : 'var(--app-border)'),
                                                         borderRadius: '6px',
-                                                        color: productsToPull === num ? '#93c5fd' : 'rgba(255, 255, 255, 0.7)',
+                                                        color: productsToPull === num ? '#93c5fd' : 'var(--app-text-muted)',
                                                         cursor: 'pointer',
                                                         fontWeight: 600,
                                                         fontSize: '1rem',
@@ -7007,7 +7381,7 @@ export default function ClientPage() {
                                             cursor: 'pointer',
                                             padding: '0.75rem',
                                             background: removeB2B ? 'rgba(59, 130, 246, 0.1)' : 'transparent',
-                                            border: '1px solid ' + (removeB2B ? 'rgba(59, 130, 246, 0.3)' : 'rgba(255, 255, 255, 0.1)'),
+                                            border: '1px solid ' + (removeB2B ? 'rgba(59, 130, 246, 0.3)' : 'var(--app-border)'),
                                             borderRadius: '8px',
                                             transition: 'all 0.2s ease'
                                         }}>
@@ -7018,10 +7392,10 @@ export default function ClientPage() {
                                                 style={{ width: '20px', height: '20px', cursor: 'pointer' }}
                                             />
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)', fontSize: '1rem' }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)', fontSize: '1rem' }}>
                                                     Remove B2B Content
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.25rem' }}>
                                                     Filter out business-to-business products and focus on B2C items
                                                 </div>
                                             </div>
@@ -7074,7 +7448,7 @@ export default function ClientPage() {
                                                 {personalizerJobState.status === 'completed' ? 'Completed' : 
                                                  personalizerJobState.status === 'failed' ? 'Failed' : 'Processing...'}
                                             </h2>
-                                            <p style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.25rem' }}>
+                                            <p style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.25rem' }}>
                                                 {personalizerJobState.fileName}
                                             </p>
                                         </div>
@@ -7108,8 +7482,8 @@ export default function ClientPage() {
                                                     key={stageKey}
                                                     style={{
                                                         padding: '1.25rem',
-                                                        background: 'rgba(255, 255, 255, 0.03)',
-                                                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                        background: 'var(--app-surface-3)',
+                                                        border: '1px solid var(--app-border)',
                                                         borderRadius: '12px'
                                                     }}
                                                 >
@@ -7126,27 +7500,27 @@ export default function ClientPage() {
                                                             background: stage.status === 'completed' ? 'rgba(34, 197, 94, 0.2)' :
                                                                        stage.status === 'running' ? 'rgba(59, 130, 246, 0.2)' :
                                                                        stage.status === 'failed' ? 'rgba(239, 68, 68, 0.2)' :
-                                                                       'rgba(255, 255, 255, 0.1)',
+                                                                       'var(--app-surface-2)',
                                                             color: stage.status === 'completed' ? '#22c55e' :
                                                                    stage.status === 'running' ? '#3b82f6' :
                                                                    stage.status === 'failed' ? '#ef4444' :
-                                                                   'rgba(255, 255, 255, 0.6)'
+                                                                   'var(--app-text-muted)'
                                                         }}>
                                                             {stage.status}
                                                         </span>
                                                     </div>
                                                     {stage.summary?.skipped && (
-                                                        <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', fontStyle: 'italic' }}>
+                                                        <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', fontStyle: 'italic' }}>
                                                             Skipped: {stage.summary.reason || 'N/A'}
                                                         </div>
                                                     )}
                                                     {stage.progress && !stage.summary?.skipped && (
-                                                        <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.7)' }}>
+                                                        <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
                                                             Progress: {stage.progress.processed || 0} / {stage.progress.total || 0}
                                                         </div>
                                                     )}
                                                     {stage.summary && !stage.summary.skipped && (
-                                                        <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.7)', marginTop: '0.5rem' }}>
+                                                        <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.5rem' }}>
                                                             {stage.summary.total && <div>Total: {stage.summary.total}</div>}
                                                             {stage.summary.shopifyStores !== undefined && <div>Shopify Stores: {stage.summary.shopifyStores}</div>}
                                                             {stage.summary.klaviyoStores !== undefined && <div>Klaviyo Stores: {stage.summary.klaviyoStores}</div>}
@@ -7179,35 +7553,35 @@ export default function ClientPage() {
                                             </h3>
                                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem', fontSize: '0.875rem' }}>
                                                 <div>
-                                                    <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Shopify Stores:</span>
-                                                    <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                    <span style={{ color: 'var(--app-text-muted)' }}>Shopify Stores:</span>
+                                                    <strong style={{ marginLeft: '0.5rem', color: 'var(--app-text-high)' }}>
                                                         {personalizerJobState.result.shopifyStores}
                                                     </strong>
                                                 </div>
                                                 {personalizerJobState.config?.checkKlaviyo && (
                                                     <div>
-                                                        <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Klaviyo Stores:</span>
-                                                        <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                        <span style={{ color: 'var(--app-text-muted)' }}>Klaviyo Stores:</span>
+                                                        <strong style={{ marginLeft: '0.5rem', color: 'var(--app-text-high)' }}>
                                                             {personalizerJobState.result.klaviyoStores}
                                                         </strong>
                                                     </div>
                                                 )}
                                                 <div>
-                                                    <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Products Fetched:</span>
-                                                    <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                    <span style={{ color: 'var(--app-text-muted)' }}>Products Fetched:</span>
+                                                    <strong style={{ marginLeft: '0.5rem', color: 'var(--app-text-high)' }}>
                                                         {personalizerJobState.result.productsFetched}
                                                     </strong>
                                                 </div>
                                                 <div>
-                                                    <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Personalized:</span>
+                                                    <span style={{ color: 'var(--app-text-muted)' }}>Personalized:</span>
                                                     <strong style={{ marginLeft: '0.5rem', color: '#22c55e' }}>
                                                         {personalizerJobState.result.personalized}
                                                     </strong>
                                                 </div>
                                                 {personalizerJobState.result.estimatedCost && (
                                                     <div>
-                                                        <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>Estimated Cost:</span>
-                                                        <strong style={{ marginLeft: '0.5rem', color: '#fff' }}>
+                                                        <span style={{ color: 'var(--app-text-muted)' }}>Estimated Cost:</span>
+                                                        <strong style={{ marginLeft: '0.5rem', color: 'var(--app-text-high)' }}>
                                                             ${personalizerJobState.result.estimatedCost.toFixed(4)}
                                                         </strong>
                                                     </div>
@@ -7296,9 +7670,9 @@ export default function ClientPage() {
                                             width: 'auto',
                                             padding: '0.35rem 0.45rem',
                                             borderRadius: '8px',
-                                            border: '1px solid rgba(255,255,255,0.15)',
-                                            background: 'rgba(255,255,255,0.05)',
-                                            color: '#fff'
+                                            border: '1px solid var(--app-border-mid)',
+                                            background: 'var(--app-surface-3)',
+                                            color: 'var(--app-text)'
                                         }}
                                     >
                                         {copiedWebhook ? '✓' : '📋'}
@@ -7307,7 +7681,7 @@ export default function ClientPage() {
                                 <span className="settings-field__hint">
                                     This is the live Instantly event endpoint for this client.
                                 </span>
-                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.5rem', fontSize: '0.875rem', color: 'rgba(255,255,255,0.72)' }}>
+                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.5rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
                                     <span>Webhook status: {clientInstantlyWebhookStatus === null ? 'Not registered' : String(clientInstantlyWebhookStatus)}</span>
                                     {clientInstantlyWebhookUpdatedAt && <span>Registered: {clientInstantlyWebhookUpdatedAt}</span>}
                                 </div>
@@ -7316,11 +7690,11 @@ export default function ClientPage() {
                                         marginTop: '0.75rem',
                                         padding: '0.9rem',
                                         borderRadius: '10px',
-                                        background: 'rgba(255,255,255,0.04)',
-                                        border: '1px solid rgba(255,255,255,0.08)'
+                                        background: 'var(--app-surface-3)',
+                                        border: '1px solid var(--app-border)'
                                     }}>
-                                        <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', fontSize: '0.875rem', color: 'rgba(255,255,255,0.78)' }}>
-                                            <span>Status: <strong style={{ color: '#fff' }}>{instantlySyncRun.status}</strong></span>
+                                        <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
+                                            <span>Status: <strong style={{ color: 'var(--app-text-high)' }}>{instantlySyncRun.status}</strong></span>
                                             {instantlySyncRun.updatedAt && <span>Updated: {new Date(instantlySyncRun.updatedAt).toLocaleString()}</span>}
                                             {instantlySyncRun.completedAt && <span>Completed: {new Date(instantlySyncRun.completedAt).toLocaleString()}</span>}
                                         </div>
@@ -7330,7 +7704,7 @@ export default function ClientPage() {
                                             </div>
                                         )}
                                         {instantlySyncRun.progressMessage && (
-                                            <div style={{ marginTop: '0.5rem', color: '#fff', fontSize: '0.95rem' }}>
+                                            <div style={{ marginTop: '0.5rem', color: 'var(--app-text)', fontSize: '0.95rem' }}>
                                                 {instantlySyncRun.progressMessage}
                                             </div>
                                         )}
@@ -7346,11 +7720,11 @@ export default function ClientPage() {
                                                     Current campaign: {instantlySyncRun.currentCampaignName}
                                                 </div>
                                                 {typeof instantlySyncRun.currentCampaignProcessedLeads === 'number' && typeof instantlySyncRun.currentCampaignLeadTotal === 'number' && (
-                                                    <div style={{ marginTop: '0.4rem', color: '#fff', fontSize: '0.95rem' }}>
+                                                    <div style={{ marginTop: '0.4rem', color: 'var(--app-text)', fontSize: '0.95rem' }}>
                                                         {instantlySyncRun.currentCampaignProcessedLeads}/{instantlySyncRun.currentCampaignLeadTotal} leads processed in {instantlySyncRun.currentCampaignName}
                                                     </div>
                                                 )}
-                                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.45rem', fontSize: '0.82rem', color: 'rgba(255,255,255,0.72)' }}>
+                                                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.45rem', fontSize: '0.82rem', color: 'var(--app-text-muted)' }}>
                                                     {typeof instantlySyncRun.currentCampaignFetchedLeads === 'number' && (
                                                         <span>Fetched: {instantlySyncRun.currentCampaignFetchedLeads}</span>
                                                     )}
@@ -7363,7 +7737,7 @@ export default function ClientPage() {
                                                 </div>
                                             </div>
                                         )}
-                                        <div style={{ display: 'flex', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.6rem', fontSize: '0.85rem', color: 'rgba(255,255,255,0.72)' }}>
+                                        <div style={{ display: 'flex', gap: '0.9rem', flexWrap: 'wrap', marginTop: '0.6rem', fontSize: '0.85rem', color: 'var(--app-text-muted)' }}>
                                             <span>Campaigns: {instantlySyncRun.campaignsCompleted}/{instantlySyncRun.totalCampaigns}</span>
                                             <span>Seen: {instantlySyncRun.totalLeadsSeen}</span>
                                             <span>Matched: {instantlySyncRun.matchedLeads}</span>
@@ -7459,12 +7833,12 @@ export default function ClientPage() {
                     {/* Follow-Ups Tab */}
                     {activeTab === "follow-ups" && (
                         <div style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', maxWidth: '800px' }}>
-                            <div style={{ padding: '1rem 1.1rem', borderRadius: '12px', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                            <div style={{ padding: '1rem 1.1rem', borderRadius: '12px', background: 'var(--app-surface-3)', border: '1px solid var(--app-border)' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
                                     <div>
                                         <p className="eyebrow eyebrow--muted">Interested Lead Auto-Responder</p>
-                                        <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>
-                                            Create AI draft replies for <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>lead_interested</code> events and send tokened review links via ntfy.
+                                        <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>
+                                            Create AI draft replies for <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>lead_interested</code> events and send tokened review links via ntfy.
                                         </p>
                                     </div>
                                     <button
@@ -7500,15 +7874,15 @@ export default function ClientPage() {
                                 </div>
 
                                 {interestedAutoResponderPromptsLoading ? (
-                                    <p style={{ marginTop: '1rem', color: 'rgba(255,255,255,0.45)', fontSize: '0.875rem' }}>Loading auto-responder prompts…</p>
+                                    <p style={{ marginTop: '1rem', color: 'var(--app-text-faint)', fontSize: '0.875rem' }}>Loading auto-responder prompts…</p>
                                 ) : interestedAutoResponderPrompts.length === 0 ? (
                                     <div style={{
                                         marginTop: '1rem',
                                         padding: '1rem',
                                         textAlign: 'center',
-                                        border: '1px dashed rgba(255,255,255,0.15)',
+                                        border: '1px dashed var(--app-border-mid)',
                                         borderRadius: '10px',
-                                        color: 'rgba(255,255,255,0.4)',
+                                        color: 'var(--app-text-ghost)',
                                         fontSize: '0.875rem'
                                     }}>
                                         No campaign prompts yet. Add one active prompt per campaign to enable AI draft generation.
@@ -7521,7 +7895,7 @@ export default function ClientPage() {
                                                 style={{
                                                     padding: '1rem',
                                                     borderRadius: '10px',
-                                                    border: '1px solid rgba(255,255,255,0.1)',
+                                                    border: '1px solid var(--app-border)',
                                                     background: 'rgba(0,0,0,0.16)',
                                                     display: 'flex',
                                                     gap: '1rem',
@@ -7535,8 +7909,8 @@ export default function ClientPage() {
                                                             fontSize: '0.72rem',
                                                             padding: '0.15rem 0.45rem',
                                                             borderRadius: '999px',
-                                                            background: 'rgba(255,255,255,0.08)',
-                                                            color: 'rgba(255,255,255,0.72)'
+                                                            background: 'var(--app-surface-3)',
+                                                            color: 'var(--app-text-muted)'
                                                         }}>
                                                             {prompt.version}
                                                         </span>
@@ -7547,8 +7921,8 @@ export default function ClientPage() {
                                                             letterSpacing: '0.04em',
                                                             padding: '0.15rem 0.5rem',
                                                             borderRadius: '4px',
-                                                            background: prompt.active ? 'rgba(34,197,94,0.15)' : 'rgba(255,255,255,0.08)',
-                                                            color: prompt.active ? '#86efac' : 'rgba(255,255,255,0.35)',
+                                                            background: prompt.active ? 'rgba(34,197,94,0.15)' : 'var(--app-surface-3)',
+                                                            color: prompt.active ? '#86efac' : 'var(--app-text-ghost)',
                                                         }}>
                                                             {prompt.active ? 'Active' : 'Inactive'}
                                                         </span>
@@ -7557,9 +7931,9 @@ export default function ClientPage() {
                                                         margin: '0.7rem 0 0',
                                                         padding: '0.85rem',
                                                         borderRadius: '8px',
-                                                        border: '1px solid rgba(255,255,255,0.08)',
-                                                        background: 'rgba(255,255,255,0.03)',
-                                                        color: 'rgba(255,255,255,0.7)',
+                                                        border: '1px solid var(--app-border)',
+                                                        background: 'var(--app-surface-3)',
+                                                        color: 'var(--app-text-muted)',
                                                         fontSize: '0.78rem',
                                                         whiteSpace: 'pre-wrap',
                                                         overflow: 'hidden',
@@ -7604,11 +7978,11 @@ export default function ClientPage() {
                             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
                                 <div>
                                     <p className="eyebrow eyebrow--muted">Automated Follow-Ups</p>
-                                    <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>
+                                    <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>
                                         Configure same-thread follow-up body templates sent after Warm Follow Up events. The subject always reuses the existing thread subject. Use{' '}
-                                        <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{first_name}}'}</code>,{' '}
-                                        <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{company_domain}}'}</code>,{' '}
-                                        <code style={{ background: 'rgba(255,255,255,0.08)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{campaign_name}}'}</code>.
+                                        <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{first_name}}'}</code>,{' '}
+                                        <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{company_domain}}'}</code>,{' '}
+                                        <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{campaign_name}}'}</code>.
                                     </p>
                                 </div>
                                 <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
@@ -7643,14 +8017,14 @@ export default function ClientPage() {
                                     <div style={{
                                         padding: '0.9rem 1rem',
                                         borderRadius: '10px',
-                                        background: 'rgba(255,255,255,0.03)',
-                                        border: '1px solid rgba(255,255,255,0.08)',
+                                        background: 'var(--app-surface-3)',
+                                        border: '1px solid var(--app-border)',
                                         display: 'flex',
                                         alignItems: 'center',
                                         gap: '1rem',
                                         flexWrap: 'wrap'
                                     }}>
-                                        <span style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.5)', fontWeight: 500, flexShrink: 0 }}>
+                                        <span style={{ fontSize: '0.8rem', color: 'var(--app-text-ghost)', fontWeight: 500, flexShrink: 0 }}>
                                             Send days
                                         </span>
                                         <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
@@ -7668,9 +8042,9 @@ export default function ClientPage() {
                                                             fontSize: '0.78rem',
                                                             fontWeight: 600,
                                                             cursor: 'pointer',
-                                                            border: active ? '1px solid rgba(234,179,8,0.5)' : '1px solid rgba(255,255,255,0.12)',
+                                                            border: active ? '1px solid rgba(234,179,8,0.5)' : '1px solid var(--app-border)',
                                                             background: active ? 'rgba(234,179,8,0.15)' : 'transparent',
-                                                            color: active ? '#fde68a' : 'rgba(255,255,255,0.4)',
+                                                            color: active ? '#fde68a' : 'var(--app-text-ghost)',
                                                             transition: 'all 0.15s'
                                                         }}
                                                     >
@@ -7693,14 +8067,14 @@ export default function ClientPage() {
                             })()}
 
                             {followUpScriptsLoading ? (
-                                <p style={{ color: 'rgba(255,255,255,0.45)', fontSize: '0.875rem' }}>Loading scripts…</p>
+                                <p style={{ color: 'var(--app-text-faint)', fontSize: '0.875rem' }}>Loading scripts…</p>
                             ) : followUpScripts.length === 0 ? (
                                 <div style={{
                                     padding: '2rem',
                                     textAlign: 'center',
-                                    border: '1px dashed rgba(255,255,255,0.15)',
+                                    border: '1px dashed var(--app-border-mid)',
                                     borderRadius: '10px',
-                                    color: 'rgba(255,255,255,0.4)',
+                                    color: 'var(--app-text-ghost)',
                                     fontSize: '0.875rem'
                                 }}>
                                     No follow-up scripts yet. Add one to get started.
@@ -7712,8 +8086,8 @@ export default function ClientPage() {
                                             key={script.id}
                                             style={{
                                                 padding: '1rem 1.25rem',
-                                                background: 'rgba(255,255,255,0.04)',
-                                                border: '1px solid rgba(255,255,255,0.1)',
+                                                background: 'var(--app-surface-3)',
+                                                border: '1px solid var(--app-border)',
                                                 borderRadius: '10px',
                                                 display: 'flex',
                                                 alignItems: 'flex-start',
@@ -7732,8 +8106,8 @@ export default function ClientPage() {
                                                         letterSpacing: '0.04em',
                                                         padding: '0.15rem 0.5rem',
                                                         borderRadius: '4px',
-                                                        background: script.active ? 'rgba(34,197,94,0.15)' : 'rgba(255,255,255,0.08)',
-                                                        color: script.active ? '#86efac' : 'rgba(255,255,255,0.35)',
+                                                        background: script.active ? 'rgba(34,197,94,0.15)' : 'var(--app-surface-3)',
+                                                        color: script.active ? '#86efac' : 'var(--app-text-ghost)',
                                                     }}>
                                                         {script.active ? 'Active' : 'Inactive'}
                                                     </span>
@@ -7744,9 +8118,9 @@ export default function ClientPage() {
                                                         marginTop: '0.65rem',
                                                         padding: '0.85rem 0.95rem',
                                                         borderRadius: '8px',
-                                                        border: '1px solid rgba(255,255,255,0.08)',
+                                                        border: '1px solid var(--app-border)',
                                                         background: 'rgba(0,0,0,0.18)',
-                                                        color: 'rgba(255,255,255,0.82)',
+                                                        color: 'var(--app-text-high)',
                                                         fontSize: '0.82rem',
                                                         lineHeight: 1.5,
                                                     }}
@@ -7761,10 +8135,10 @@ export default function ClientPage() {
                                                         gap: '0.4rem',
                                                         padding: '0.35rem 0.6rem',
                                                         borderRadius: '8px',
-                                                        border: '1px solid rgba(255,255,255,0.1)',
-                                                        background: 'rgba(255,255,255,0.04)',
+                                                        border: '1px solid var(--app-border)',
+                                                        background: 'var(--app-surface-3)',
                                                         fontSize: '0.78rem',
-                                                        color: 'rgba(255,255,255,0.72)',
+                                                        color: 'var(--app-text-muted)',
                                                         cursor: updatingFollowUpScriptId === script.id ? 'wait' : 'pointer',
                                                     }}
                                                 >
@@ -7924,17 +8298,17 @@ export default function ClientPage() {
 
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                                 {autoResponderTestLeadSearching ? (
-                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>Searching leads…</p>
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>Searching leads…</p>
                                 ) : debouncedAutoResponderTestLeadSearch.trim() && autoResponderTestLeadResults.length === 0 ? (
-                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.45)' }}>No matching leads found.</p>
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>No matching leads found.</p>
                                 ) : null}
 
                                 {autoResponderTestLeadResults.length > 0 && (
                                     <div style={{
-                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        border: '1px solid var(--app-border)',
                                         borderRadius: '10px',
                                         overflow: 'hidden',
-                                        background: 'rgba(255,255,255,0.03)'
+                                        background: 'var(--app-surface-3)'
                                     }}>
                                         {autoResponderTestLeadResults.map((lead) => {
                                             const isSelected = autoResponderTestSelectedLead?.id === lead.id;
@@ -7953,7 +8327,7 @@ export default function ClientPage() {
                                                         textAlign: 'left',
                                                         padding: '0.9rem 1rem',
                                                         border: 'none',
-                                                        borderTop: '1px solid rgba(255,255,255,0.08)',
+                                                        borderTop: '1px solid var(--app-border)',
                                                         background: isSelected ? 'rgba(59,130,246,0.12)' : 'transparent',
                                                         color: 'inherit',
                                                         cursor: autoResponderTestLoading ? 'wait' : 'pointer',
@@ -7961,10 +8335,10 @@ export default function ClientPage() {
                                                 >
                                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
                                                         <div style={{ minWidth: 0 }}>
-                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: isSelected ? '#93c5fd' : 'rgba(255,255,255,0.94)' }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: isSelected ? '#93c5fd' : 'var(--app-text)' }}>
                                                                 {lead.founderName || lead.email || lead.domain || 'Unnamed lead'}
                                                             </div>
-                                                            <div style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.58)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            <div style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                                 {lead.email || 'No email'}{lead.domain ? ` · ${lead.domain}` : ''}
                                                             </div>
                                                         </div>
@@ -7983,7 +8357,7 @@ export default function ClientPage() {
                             {autoResponderTestSelectedLead && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                                     <label className="settings-field">
-                                        <span className="settings-field__label">Optional Mock Message <span style={{ fontWeight: 400, color: 'rgba(255,255,255,0.4)' }}>(overrides thread context)</span></span>
+                                        <span className="settings-field__label">Optional Mock Message <span style={{ fontWeight: 400, color: 'var(--app-text-ghost)' }}>(overrides thread context)</span></span>
                                         <textarea
                                             rows={3}
                                             value={autoResponderTestMessage}
@@ -8012,8 +8386,8 @@ export default function ClientPage() {
 
                                 const stepStyle = (stepNum: number): React.CSSProperties => ({
                                     borderRadius: '10px',
-                                    border: '1px solid rgba(255,255,255,0.1)',
-                                    background: 'rgba(255,255,255,0.02)',
+                                    border: '1px solid var(--app-border)',
+                                    background: 'var(--app-surface-3)',
                                     overflow: 'hidden',
                                 });
 
@@ -8040,15 +8414,15 @@ export default function ClientPage() {
                                     fontSize: '0.7rem',
                                     fontWeight: 700,
                                     flexShrink: 0,
-                                    background: complete ? 'rgba(34,197,94,0.2)' : active ? 'rgba(59,130,246,0.25)' : 'rgba(255,255,255,0.08)',
-                                    color: complete ? '#4ade80' : active ? '#93c5fd' : 'rgba(255,255,255,0.4)',
-                                    border: complete ? '1px solid rgba(34,197,94,0.35)' : active ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.12)',
+                                    background: complete ? 'rgba(34,197,94,0.2)' : active ? 'rgba(59,130,246,0.25)' : 'var(--app-surface-3)',
+                                    color: complete ? '#4ade80' : active ? '#93c5fd' : 'var(--app-text-ghost)',
+                                    border: complete ? '1px solid rgba(34,197,94,0.35)' : active ? '1px solid rgba(59,130,246,0.4)' : '1px solid var(--app-border)',
                                 });
 
                                 const kvRow = (label: string, value: string | null | undefined) => value ? (
                                     <div key={label} style={{ display: 'flex', gap: '0.5rem', fontSize: '0.82rem', lineHeight: 1.5 }}>
-                                        <span style={{ color: 'rgba(255,255,255,0.4)', flexShrink: 0, minWidth: '140px' }}>{label}</span>
-                                        <span style={{ color: 'rgba(255,255,255,0.88)', wordBreak: 'break-all' }}>{value}</span>
+                                        <span style={{ color: 'var(--app-text-ghost)', flexShrink: 0, minWidth: '140px' }}>{label}</span>
+                                        <span style={{ color: 'var(--app-text-high)', wordBreak: 'break-all' }}>{value}</span>
                                     </div>
                                 ) : null;
 
@@ -8098,12 +8472,12 @@ export default function ClientPage() {
                                         content: d ? (
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '0 1rem 0.9rem' }}>
                                                 <div>
-                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '0.35rem' }}>System Prompt (rendered)</div>
-                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.25)', color: 'rgba(255,255,255,0.8)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{d.renderedSystemPrompt || '—'}</pre>
+                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-ghost)', marginBottom: '0.35rem' }}>System Prompt (rendered)</div>
+                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'rgba(0,0,0,0.25)', color: 'var(--app-text-high)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{d.renderedSystemPrompt || '—'}</pre>
                                                 </div>
                                                 <div>
-                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '0.35rem' }}>User message sent to model</div>
-                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.25)', color: 'rgba(255,255,255,0.8)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{[
+                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-ghost)', marginBottom: '0.35rem' }}>User message sent to model</div>
+                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'rgba(0,0,0,0.25)', color: 'var(--app-text-high)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{[
                                                         `Campaign: ${d.contextSentToAI?.campaignName || '—'}`,
                                                         `Lead email: ${d.contextSentToAI?.leadEmail || '—'}`,
                                                         `Thread subject: ${d.contextSentToAI?.threadSubject || '(none)'}`,
@@ -8122,9 +8496,9 @@ export default function ClientPage() {
                                         content: r ? (
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '0 1rem 0.9rem' }}>
                                                 <div>
-                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '0.35rem' }}>Generated Reply</div>
+                                                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-ghost)', marginBottom: '0.35rem' }}>Generated Reply</div>
                                                     <div
-                                                        style={{ padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.25)', color: 'rgba(255,255,255,0.88)', fontSize: '0.85rem', lineHeight: 1.6 }}
+                                                        style={{ padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'rgba(0,0,0,0.25)', color: 'var(--app-text-high)', fontSize: '0.85rem', lineHeight: 1.6 }}
                                                         dangerouslySetInnerHTML={{ __html: r.renderedText }}
                                                     />
                                                 </div>
@@ -8168,17 +8542,17 @@ export default function ClientPage() {
                                                             {complete ? '✓' : n}
                                                         </span>
                                                         <div style={{ flex: 1, minWidth: 0 }}>
-                                                            <div style={{ fontWeight: 600, fontSize: '0.88rem', color: complete ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.5)' }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.88rem', color: complete ? 'var(--app-text-high)' : 'var(--app-text-ghost)' }}>
                                                                 {label}
                                                             </div>
                                                             {summary && (
-                                                                <div style={{ fontSize: '0.78rem', color: complete ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.35)', marginTop: '0.1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                <div style={{ fontSize: '0.78rem', color: complete ? 'var(--app-text-muted)' : 'var(--app-text-ghost)', marginTop: '0.1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                                     {summary}
                                                                 </div>
                                                             )}
                                                         </div>
                                                         {canExpand && (
-                                                            <span style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.35)', flexShrink: 0 }}>
+                                                            <span style={{ fontSize: '0.75rem', color: 'var(--app-text-ghost)', flexShrink: 0 }}>
                                                                 {expanded ? '▲' : '▼'}
                                                             </span>
                                                         )}
@@ -8314,17 +8688,17 @@ export default function ClientPage() {
 
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                                 {followUpPreviewSearching ? (
-                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.55)' }}>Searching leads…</p>
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>Searching leads…</p>
                                 ) : debouncedFollowUpPreviewLeadSearch.trim() && followUpPreviewLeadResults.length === 0 ? (
-                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'rgba(255,255,255,0.45)' }}>No matching leads found.</p>
+                                    <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>No matching leads found.</p>
                                 ) : null}
 
                                 {followUpPreviewLeadResults.length > 0 && (
                                     <div style={{
-                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        border: '1px solid var(--app-border)',
                                         borderRadius: '10px',
                                         overflow: 'hidden',
-                                        background: 'rgba(255,255,255,0.03)'
+                                        background: 'var(--app-surface-3)'
                                     }}>
                                         {followUpPreviewLeadResults.map((lead) => {
                                             const isSelected = followUpPreviewSelectedLead?.id === lead.id;
@@ -8339,7 +8713,7 @@ export default function ClientPage() {
                                                         textAlign: 'left',
                                                         padding: '0.9rem 1rem',
                                                         border: 'none',
-                                                        borderTop: '1px solid rgba(255,255,255,0.08)',
+                                                        borderTop: '1px solid var(--app-border)',
                                                         background: isSelected ? 'rgba(59,130,246,0.16)' : 'transparent',
                                                         color: 'inherit',
                                                         cursor: followUpPreviewLoading ? 'wait' : 'pointer',
@@ -8347,14 +8721,14 @@ export default function ClientPage() {
                                                 >
                                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
                                                         <div style={{ minWidth: 0 }}>
-                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: 'rgba(255,255,255,0.94)' }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: 'var(--app-text)' }}>
                                                                 {lead.founderName || lead.email || lead.domain || 'Unnamed lead'}
                                                             </div>
-                                                            <div style={{ fontSize: '0.8rem', color: 'rgba(255,255,255,0.58)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            <div style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                                 {lead.email || 'No email'}{lead.domain ? ` · ${lead.domain}` : ''}
                                                             </div>
                                                         </div>
-                                                        <span style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.58)', flexShrink: 0 }}>
+                                                        <span style={{ fontSize: '0.78rem', color: 'var(--app-text-muted)', flexShrink: 0 }}>
                                                             {followUpPreviewLoading && isSelected ? 'Rendering…' : 'Preview'}
                                                         </span>
                                                     </div>
@@ -8370,25 +8744,25 @@ export default function ClientPage() {
                                     <div style={{
                                         padding: '0.9rem 1rem',
                                         borderRadius: '10px',
-                                        border: '1px solid rgba(255,255,255,0.1)',
-                                        background: 'rgba(255,255,255,0.03)'
+                                        border: '1px solid var(--app-border)',
+                                        background: 'var(--app-surface-3)'
                                     }}>
-                                        <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.35rem' }}>
+                                        <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.35rem' }}>
                                             Previewing
                                         </div>
-                                        <div style={{ fontWeight: 600, color: 'rgba(255,255,255,0.92)' }}>
+                                        <div style={{ fontWeight: 600, color: 'var(--app-text)' }}>
                                             {followUpPreviewResult.contactEmail}
                                         </div>
                                     </div>
 
                                     <div>
-                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.5rem' }}>
+                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
                                             Rendered HTML
                                         </div>
                                         <div style={{
                                             padding: '1rem',
                                             borderRadius: '10px',
-                                            border: '1px solid rgba(255,255,255,0.1)',
+                                            border: '1px solid var(--app-border)',
                                             background: '#fff',
                                             color: '#111827',
                                             minHeight: '160px'
@@ -8402,16 +8776,16 @@ export default function ClientPage() {
                                     </div>
 
                                     <div>
-                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.45)', marginBottom: '0.5rem' }}>
+                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
                                             Variables
                                         </div>
                                         <pre style={{
                                             margin: 0,
                                             padding: '1rem',
                                             borderRadius: '10px',
-                                            border: '1px solid rgba(255,255,255,0.1)',
-                                            background: 'rgba(255,255,255,0.03)',
-                                            color: 'rgba(255,255,255,0.82)',
+                                            border: '1px solid var(--app-border)',
+                                            background: 'var(--app-surface-3)',
+                                            color: 'var(--app-text-high)',
                                             fontSize: '0.78rem',
                                             overflowX: 'auto',
                                             whiteSpace: 'pre-wrap',
@@ -8476,7 +8850,7 @@ export default function ClientPage() {
                                             flex: 1,
                                             height: '4px',
                                             borderRadius: '2px',
-                                            background: step <= wizardStep ? '#3b82f6' : 'rgba(255, 255, 255, 0.15)',
+                                            background: step <= wizardStep ? '#3b82f6' : 'var(--app-surface-2)',
                                             transition: 'background 0.3s ease'
                                         }}
                                     />
@@ -8513,11 +8887,11 @@ export default function ClientPage() {
                                             fontSize: '0.875rem'
                                         }}>
                                             {checkingDomains ? (
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'rgba(255, 255, 255, 0.7)' }}>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--app-text-muted)' }}>
                                                     <div style={{
                                                         width: '14px',
                                                         height: '14px',
-                                                        border: '2px solid rgba(255, 255, 255, 0.3)',
+                                                        border: '2px solid var(--app-border-mid)',
                                                         borderTopColor: '#3b82f6',
                                                         borderRadius: '50%',
                                                         animation: 'spin 0.8s linear infinite'
@@ -8525,15 +8899,15 @@ export default function ClientPage() {
                                                     Checking domains...
                                                 </div>
                                             ) : domainCheckStats ? (
-                                                <div style={{ color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                <div style={{ color: 'var(--app-text)' }}>
                                                     <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>
                                                         📊 Domain Analysis
                                                     </div>
                                                     
                                                     {/* Row 1: Basic counts */}
-                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
                                                         <span>
-                                                            <strong style={{ color: 'rgba(255, 255, 255, 0.9)' }}>{domainCheckStats.total.toLocaleString()}</strong> total
+                                                            <strong style={{ color: 'var(--app-text)' }}>{domainCheckStats.total.toLocaleString()}</strong> total
                                                         </span>
                                                         <span>
                                                             <strong style={{ color: '#60a5fa' }}>{domainCheckStats.unique.toLocaleString()}</strong> unique
@@ -8547,7 +8921,7 @@ export default function ClientPage() {
                                                     </div>
 
                                                     {/* Row 2: Run status */}
-                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)', marginBottom: '0.5rem' }}>
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)', marginBottom: '0.5rem' }}>
                                                         <span>
                                                             <strong style={{ color: '#22c55e' }}>{domainCheckStats.run.toLocaleString()}</strong> run
                                                         </span>
@@ -8557,7 +8931,7 @@ export default function ClientPage() {
                                                     </div>
 
                                                     {/* Row 3: Data enrichment */}
-                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'rgba(255, 255, 255, 0.7)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                                                    <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)' }}>
                                                         <span>
                                                             <strong style={{ color: '#8b5cf6' }}>{domainCheckStats.withFounders.toLocaleString()}</strong> w/ founders
                                                         </span>
@@ -8584,7 +8958,7 @@ export default function ClientPage() {
                             {/* Step 2: Column Mapping */}
                             {wizardStep === 2 && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                                    <div style={{ fontSize: '0.95rem', color: 'rgba(255,255,255,0.8)' }}>
+                                    <div style={{ fontSize: '0.95rem', color: 'var(--app-text-high)' }}>
                                         Map the CSV columns so the pipeline knows where to find required fields.
                                     </div>
 
@@ -8669,9 +9043,9 @@ export default function ClientPage() {
                                         flexDirection: 'column',
                                         gap: '0.75rem',
                                         padding: '1rem',
-                                        background: 'rgba(255, 255, 255, 0.03)',
+                                        background: 'var(--app-surface-3)',
                                         borderRadius: '8px',
-                                        border: '1px solid rgba(255, 255, 255, 0.1)'
+                                        border: '1px solid var(--app-border)'
                                     }}>
                                         <label style={{
                                             display: 'flex',
@@ -8693,10 +9067,10 @@ export default function ClientPage() {
                                                 }}
                                             />
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                     Run domain DNS check
                                                 </div>
-                                                <div style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.15rem' }}>
+                                                <div style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)', marginTop: '0.15rem' }}>
                                                     {runDomainCheck
                                                         ? 'Filters obviously dead domains during Domain Prep.'
                                                         : 'Skips DNS filtering; domains still get normalized and deduped.'}
@@ -8731,7 +9105,7 @@ export default function ClientPage() {
                                                     cursor: 'pointer',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: '2px solid rgba(255, 255, 255, 0.3)',
+                                                    border: '2px solid var(--app-border-mid)',
                                                     background: findFounder ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
@@ -8759,10 +9133,10 @@ export default function ClientPage() {
                                                 </svg>
                                             )}
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                     Find Founder
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                     {skipFounderFinder
                                                         ? 'Skipped - using founder names from your CSV'
                                                         : 'Search for founder names using Serper + OpenAI'}
@@ -8796,7 +9170,7 @@ export default function ClientPage() {
                                                     cursor: (findFounder || skipFounderFinder) ? 'pointer' : 'not-allowed',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${(findFounder || skipFounderFinder) ? '0.3' : '0.15'})`,
+                                                    border: (findFounder || skipFounderFinder) ? '2px solid var(--app-border-mid)' : '2px solid var(--app-border)',
                                                     background: findEmail ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
@@ -8824,10 +9198,10 @@ export default function ClientPage() {
                                                 </svg>
                                             )}
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                     Find Email
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                     {skipEmailFinder 
                                                         ? 'Skipped - using emails from your CSV' 
                                                         : `Discover email addresses with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`}
@@ -8854,7 +9228,7 @@ export default function ClientPage() {
                                                     cursor: (findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? 'pointer' : 'not-allowed',
                                                     borderRadius: '4px',
                                                     appearance: 'none',
-                                                    border: `2px solid rgba(255, 255, 255, ${(findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? '0.3' : '0.15'})`,
+                                                    border: (findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? '2px solid var(--app-border-mid)' : '2px solid var(--app-border)',
                                                     background: (verifyEmail && emailProvider !== 'self_hosted') ? '#3b82f6' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
@@ -8882,10 +9256,10 @@ export default function ClientPage() {
                                                 </svg>
                                             )}
                                             <div style={{ flex: 1 }}>
-                                                <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                     Verify Email
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                     {emailProvider === 'self_hosted'
                                                         ? 'Automatically skipped - self-hosted finding already verifies emails'
                                                         : skipEmailFinder 
@@ -8920,9 +9294,9 @@ export default function ClientPage() {
                                         flexDirection: 'column',
                                         gap: '0.75rem',
                                         padding: '1rem',
-                                        background: 'rgba(255, 255, 255, 0.03)',
+                                        background: 'var(--app-surface-3)',
                                         borderRadius: '8px',
-                                        border: '1px solid rgba(255, 255, 255, 0.1)'
+                                        border: '1px solid var(--app-border)'
                                     }}>
                                         {clientIndustry === 'ecom' && (
                                             <label style={{
@@ -8939,10 +9313,10 @@ export default function ClientPage() {
                                                     style={{ width: '18px', height: '18px', cursor: 'pointer', marginTop: '0.15rem' }}
                                                 />
                                                 <div style={{ flex: 1 }}>
-                                                    <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                         Personalize with Product Data
                                                     </div>
-                                                    <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                    <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                         Generate first line based on Shopify products
                                                     </div>
                                                     {personalizeFirstLine && (
@@ -8953,8 +9327,8 @@ export default function ClientPage() {
                                                             gap: '0.625rem',
                                                             padding: '0.75rem',
                                                             borderRadius: '8px',
-                                                            background: 'rgba(255, 255, 255, 0.04)',
-                                                            border: '1px solid rgba(255, 255, 255, 0.12)'
+                                                            background: 'var(--app-surface-3)',
+                                                            border: '1px solid var(--app-border-mid)'
                                                         }}>
                                                             <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                                                                 <input
@@ -8971,13 +9345,13 @@ export default function ClientPage() {
                                                                     }}
                                                                     style={{ width: '16px', height: '16px', cursor: 'pointer' }}
                                                                 />
-                                                                <span style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                                <span style={{ fontSize: '0.875rem', color: 'var(--app-text)' }}>
                                                                     New Prompt (gpt-5-mini)
                                                                 </span>
                                                             </label>
 
                                                             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: '1.5rem' }}>
-                                                                <span style={{ fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.65)' }}>Products:</span>
+                                                                <span style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>Products:</span>
                                                                 <select
                                                                     value={productPromptProducts}
                                                                     onChange={(e) => setProductPromptProducts(Number(e.target.value))}
@@ -9008,7 +9382,7 @@ export default function ClientPage() {
                                                                     }}
                                                                     style={{ width: '16px', height: '16px', cursor: 'pointer' }}
                                                                 />
-                                                                <span style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                                <span style={{ fontSize: '0.875rem', color: 'var(--app-text)' }}>
                                                                     Old Prompt
                                                                 </span>
                                                             </label>
@@ -9033,10 +9407,10 @@ export default function ClientPage() {
                                                     style={{ width: '18px', height: '18px', cursor: 'pointer' }}
                                                 />
                                                 <div style={{ flex: 1 }}>
-                                                    <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                         Personalize with Feature/Benefit
                                                     </div>
-                                                    <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                    <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                         Generate first line based on SaaS features
                                                     </div>
                                                 </div>
@@ -9058,10 +9432,10 @@ export default function ClientPage() {
                                                     style={{ width: '18px', height: '18px', cursor: 'pointer' }}
                                                 />
                                                 <div style={{ flex: 1 }}>
-                                                    <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                         Personalize with Website Info
                                                     </div>
-                                                    <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                    <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                         Generate first line referencing website content
                                                     </div>
                                                 </div>
@@ -9083,10 +9457,10 @@ export default function ClientPage() {
                                                     style={{ width: '18px', height: '18px', cursor: 'pointer' }}
                                                 />
                                                 <div style={{ flex: 1 }}>
-                                                    <div style={{ fontWeight: 500, color: 'rgba(255, 255, 255, 0.9)' }}>
+                                                    <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                         Personalize with Service Offering
                                                     </div>
-                                                    <div style={{ fontSize: '0.875rem', color: 'rgba(255, 255, 255, 0.6)', marginTop: '0.125rem' }}>
+                                                    <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
                                                         Generate first line based on local services
                                                     </div>
                                                 </div>
@@ -9170,7 +9544,7 @@ export default function ClientPage() {
                             </label>
 
                             <div style={{ marginBottom: '2rem' }}>
-                                <h3 style={{ fontSize: '1rem', marginBottom: '1rem', color: 'rgba(255, 255, 255, 0.9)' }}>Standard Variables</h3>
+                                <h3 style={{ fontSize: '1rem', marginBottom: '1rem', color: 'var(--app-text)' }}>Standard Variables</h3>
                                 {['email', 'personalization', 'lastName', 'firstName', 'companyName', 'assignedTo'].map((field) => {
                                     const displayName =
                                         field === 'firstName' ? 'First Name' :
@@ -9239,10 +9613,10 @@ export default function ClientPage() {
                                                 </div>
                                             )}
                                         {columnMapping[field]?.column && csvPreviewRows.length > 0 && (
-                                                <div style={{ marginTop: '0.5rem', padding: '0.75rem', background: 'rgba(255, 255, 255, 0.03)', borderRadius: '6px', fontSize: '0.875rem' }}>
-                                                    <div style={{ color: 'rgba(255, 255, 255, 0.6)', marginBottom: '0.5rem' }}>Preview:</div>
+                                                <div style={{ marginTop: '0.5rem', padding: '0.75rem', background: 'var(--app-surface-3)', borderRadius: '6px', fontSize: '0.875rem' }}>
+                                                    <div style={{ color: 'var(--app-text-muted)', marginBottom: '0.5rem' }}>Preview:</div>
                                                     {csvPreviewRows.slice(0, 3).map((row, idx) => (
-                                                        <div key={idx} style={{ padding: '0.375rem 0', color: 'rgba(255, 255, 255, 0.8)', borderBottom: idx < 2 ? '1px solid rgba(255, 255, 255, 0.1)' : 'none' }}>
+                                                        <div key={idx} style={{ padding: '0.375rem 0', color: 'var(--app-text-high)', borderBottom: idx < 2 ? '1px solid var(--app-border)' : 'none' }}>
                                                             {row[columnMapping[field].column] || '(empty)'}
                                                         </div>
                                                     ))}
@@ -9253,8 +9627,8 @@ export default function ClientPage() {
                                 })}
                             </div>
 
-                            <div style={{ marginBottom: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
-                                <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'rgba(255,255,255,0.9)' }}>Duplicate handling</div>
+                            <div style={{ marginBottom: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--app-border)' }}>
+                                <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'var(--app-text)' }}>Duplicate handling</div>
                                 <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
                                     <input
                                         type="checkbox"
@@ -9294,9 +9668,222 @@ export default function ClientPage() {
                 </div>
             )}
 
-            {/* Lead export field modal */}
-            {leadExportModalOpen && (
+            {/* Verification CSV Import Modal */}
+            {verificationImportModalOpen && (
                 <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => { if (!verificationImportLoading && !verificationImportParsing) setVerificationImportModalOpen(false); }}
+                >
+                    <div
+                        className="modal"
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ maxWidth: '700px', maxHeight: '92vh', display: 'flex', flexDirection: 'column' }}
+                    >
+                        <div className="modal__header">
+                            <div>
+                                <h2 className="modal__title">Import Verification CSV</h2>
+                                <p className="modal__description">
+                                    Upload a CSV from your email verification tool. Matched leads will have their email status and <em>last verified at</em> timestamp updated.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', overflowY: 'auto' }}>
+                            {/* Step 1 – File upload */}
+                            <div>
+                                <label className="settings-field">
+                                    <span className="settings-field__label">CSV File {verificationImportStep === 1 ? '*' : ''}</span>
+                                    <input
+                                        type="file"
+                                        accept=".csv,text/csv"
+                                        disabled={verificationImportParsing || verificationImportLoading}
+                                        onChange={(e) => handleVerificationImportFileChange(e.target.files?.[0] || null)}
+                                    />
+                                    <span className="settings-field__hint">
+                                        The CSV must have a column for the email address and a column for the verification status (e.g. valid, invalid, risky, unknown).
+                                    </span>
+                                </label>
+                                {verificationImportParsing && (
+                                    <div style={{ fontSize: '0.85rem', color: 'var(--app-text-muted)', marginTop: '0.5rem' }}>
+                                        Parsing CSV…
+                                    </div>
+                                )}
+                                {verificationImportStep === 2 && !verificationImportParsing && (
+                                    <div style={{ marginTop: '0.4rem', fontSize: '0.85rem', color: 'var(--app-text-ghost)' }}>
+                                        {verificationImportTotalRows.toLocaleString()} data rows detected · {verificationImportHeaders.length} columns
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Step 2 – Column mapping */}
+                            {verificationImportStep === 2 && (
+                                <>
+                                    <div style={{
+                                        padding: '1rem',
+                                        border: '1px solid var(--app-border)',
+                                        borderRadius: '10px',
+                                        background: 'var(--app-surface-3)',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '1rem'
+                                    }}>
+                                        <div style={{ fontWeight: 600, color: 'var(--app-text-high)', fontSize: '0.9rem' }}>Column Mapping</div>
+
+                                        <label className="settings-field">
+                                            <span className="settings-field__label">Email column *</span>
+                                            <select
+                                                value={verificationImportEmailCol}
+                                                onChange={(e) => setVerificationImportEmailCol(e.target.value)}
+                                                disabled={verificationImportLoading}
+                                            >
+                                                <option value="">— select —</option>
+                                                {verificationImportHeaders.map((h) => (
+                                                    <option key={h} value={h}>{h}</option>
+                                                ))}
+                                            </select>
+                                            <span className="settings-field__hint">Column that contains the contact&apos;s email address (used to match existing leads).</span>
+                                        </label>
+
+                                        <label className="settings-field">
+                                            <span className="settings-field__label">Email status column *</span>
+                                            <select
+                                                value={verificationImportStatusCol}
+                                                onChange={(e) => setVerificationImportStatusCol(e.target.value)}
+                                                disabled={verificationImportLoading}
+                                            >
+                                                <option value="">— select —</option>
+                                                {verificationImportHeaders.map((h) => (
+                                                    <option key={h} value={h}>{h}</option>
+                                                ))}
+                                            </select>
+                                            <span className="settings-field__hint">
+                                                Accepted values: <strong>valid</strong>, <strong>invalid</strong>, <strong>risky</strong>, <strong>unknown</strong>.
+                                                Common tool values like <em>found / deliverable</em> are mapped automatically.
+                                            </span>
+                                        </label>
+
+                                        <label className="settings-field">
+                                            <span className="settings-field__label">Verified at column (optional)</span>
+                                            <select
+                                                value={verificationImportVerifiedAtCol}
+                                                onChange={(e) => setVerificationImportVerifiedAtCol(e.target.value)}
+                                                disabled={verificationImportLoading}
+                                            >
+                                                <option value="">Use current timestamp (default)</option>
+                                                {verificationImportHeaders.map((h) => (
+                                                    <option key={h} value={h}>{h}</option>
+                                                ))}
+                                            </select>
+                                            <span className="settings-field__hint">If left blank, <em>last verified at</em> is set to right now for every updated lead.</span>
+                                        </label>
+                                    </div>
+
+                                    {/* Preview table */}
+                                    {verificationImportPreviewRows.length > 0 && verificationImportEmailCol && verificationImportStatusCol && (
+                                        <div>
+                                            <div style={{ fontSize: '0.78rem', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
+                                                Preview (first {verificationImportPreviewRows.length} rows)
+                                            </div>
+                                            <div style={{ overflowX: 'auto', borderRadius: '8px', border: '1px solid var(--app-border)' }}>
+                                                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.83rem' }}>
+                                                    <thead>
+                                                        <tr style={{ background: 'var(--app-surface-3)' }}>
+                                                            <th style={{ padding: '0.5rem 0.75rem', textAlign: 'left', color: 'var(--app-text-faint)', fontWeight: 600, whiteSpace: 'nowrap' }}>Email</th>
+                                                            <th style={{ padding: '0.5rem 0.75rem', textAlign: 'left', color: 'var(--app-text-faint)', fontWeight: 600, whiteSpace: 'nowrap' }}>Status</th>
+                                                            {verificationImportVerifiedAtCol && (
+                                                                <th style={{ padding: '0.5rem 0.75rem', textAlign: 'left', color: 'var(--app-text-faint)', fontWeight: 600, whiteSpace: 'nowrap' }}>Verified At</th>
+                                                            )}
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {verificationImportPreviewRows.map((row, i) => (
+                                                            <tr key={i} style={{ borderTop: '1px solid var(--app-border)' }}>
+                                                                <td style={{ padding: '0.45rem 0.75rem', color: 'var(--app-text-high)', fontFamily: 'monospace' }}>
+                                                                    {row[verificationImportEmailCol] || <em style={{ color: 'var(--app-text-ghost)' }}>—</em>}
+                                                                </td>
+                                                                <td style={{ padding: '0.45rem 0.75rem', color: 'var(--app-text-high)' }}>
+                                                                    {row[verificationImportStatusCol] || <em style={{ color: 'var(--app-text-ghost)' }}>—</em>}
+                                                                </td>
+                                                                {verificationImportVerifiedAtCol && (
+                                                                    <td style={{ padding: '0.45rem 0.75rem', color: 'var(--app-text-muted)', fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                                                                        {row[verificationImportVerifiedAtCol] || <em style={{ color: 'var(--app-text-ghost)' }}>—</em>}
+                                                                    </td>
+                                                                )}
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Result summary */}
+                                    {verificationImportResult && (
+                                        <div style={{
+                                            padding: '1rem',
+                                            borderRadius: '10px',
+                                            border: '1px solid rgba(134,239,172,0.25)',
+                                            background: 'rgba(134,239,172,0.05)',
+                                            display: 'flex',
+                                            flexDirection: 'column',
+                                            gap: '0.5rem'
+                                        }}>
+                                            <div style={{ fontWeight: 600, color: '#86efac' }}>Import Complete</div>
+                                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '0.5rem', fontSize: '0.9rem' }}>
+                                                <div>Total rows: <strong>{verificationImportResult.totalRows.toLocaleString()}</strong></div>
+                                                <div>Matched: <strong>{verificationImportResult.matched.toLocaleString()}</strong></div>
+                                                <div>Updated: <strong style={{ color: '#86efac' }}>{verificationImportResult.updated.toLocaleString()}</strong></div>
+                                                <div>Not found: <strong style={{ color: verificationImportResult.notFound > 0 ? '#fca5a5' : undefined }}>{verificationImportResult.notFound.toLocaleString()}</strong></div>
+                                                <div>Skipped: <strong>{verificationImportResult.skipped.toLocaleString()}</strong></div>
+                                            </div>
+                                            {verificationImportResult.notFound > 0 && (
+                                                <div style={{ fontSize: '0.82rem', color: 'var(--app-text-faint)', marginTop: '0.25rem' }}>
+                                                    Emails not found in your leads database are skipped — they are not created.
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </>
+                            )}
+                        </div>
+
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setVerificationImportModalOpen(false)}
+                                disabled={verificationImportLoading || verificationImportParsing}
+                            >
+                                {verificationImportResult ? 'Close' : 'Cancel'}
+                            </button>
+                            {verificationImportStep === 2 && (
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={handleSubmitVerificationImport}
+                                    disabled={
+                                        verificationImportLoading ||
+                                        verificationImportParsing ||
+                                        !verificationImportEmailCol ||
+                                        !verificationImportStatusCol
+                                    }
+                                >
+                                    {verificationImportLoading
+                                        ? 'Importing…'
+                                        : verificationImportResult
+                                            ? `Re-run Import (${verificationImportTotalRows.toLocaleString()} rows)`
+                                            : `Import ${verificationImportTotalRows.toLocaleString()} rows`}
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Lead export field modal */}
+            {leadExportModalOpen && (                <div
                     className="modal-overlay"
                     role="dialog"
                     aria-modal="true"
@@ -9336,13 +9923,13 @@ export default function ClientPage() {
                                 <div
                                     key={groupName}
                                     style={{
-                                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                                        border: '1px solid var(--app-border)',
                                         borderRadius: '12px',
-                                        background: 'rgba(255, 255, 255, 0.03)',
+                                        background: 'var(--app-surface-3)',
                                         padding: '1rem'
                                     }}
                                 >
-                                    <div style={{ fontWeight: 600, color: '#fff', marginBottom: '0.75rem' }}>{groupName}</div>
+                                    <div style={{ fontWeight: 600, color: 'var(--app-text-high)', marginBottom: '0.75rem' }}>{groupName}</div>
                                     <div style={{ display: 'grid', gap: '0.65rem', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
                                         {fields.map((field) => (
                                             <label
@@ -9355,10 +9942,10 @@ export default function ClientPage() {
                                                     borderRadius: '10px',
                                                     border: selectedLeadExportFields.includes(field.key)
                                                         ? '1px solid rgba(59, 130, 246, 0.55)'
-                                                        : '1px solid rgba(255, 255, 255, 0.08)',
+                                                        : '1px solid var(--app-border)',
                                                     background: selectedLeadExportFields.includes(field.key)
                                                         ? 'rgba(59, 130, 246, 0.12)'
-                                                        : 'rgba(255, 255, 255, 0.02)',
+                                                        : 'var(--app-surface-3)',
                                                     cursor: exportingCsv ? 'default' : 'pointer'
                                                 }}
                                             >
@@ -9369,7 +9956,7 @@ export default function ClientPage() {
                                                     disabled={exportingCsv}
                                                     style={{ marginTop: '0.2rem' }}
                                                 />
-                                                <span style={{ color: '#fff', fontSize: '0.94rem' }}>{field.label}</span>
+                                                <span style={{ color: 'var(--app-text)', fontSize: '0.94rem' }}>{field.label}</span>
                                             </label>
                                         ))}
                                     </div>
@@ -9430,8 +10017,8 @@ export default function ClientPage() {
                                         alignItems: 'flex-start',
                                         padding: '0.85rem 1rem',
                                         borderRadius: '10px',
-                                        border: downloadScope === option.value ? '1px solid rgba(59, 130, 246, 0.6)' : '1px solid rgba(255, 255, 255, 0.08)',
-                                        background: downloadScope === option.value ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+                                        border: downloadScope === option.value ? '1px solid rgba(59, 130, 246, 0.6)' : '1px solid var(--app-border)',
+                                        background: downloadScope === option.value ? 'rgba(59, 130, 246, 0.12)' : 'var(--app-surface-3)',
                                         cursor: 'pointer'
                                     }}
                                 >
@@ -9444,8 +10031,8 @@ export default function ClientPage() {
                                         style={{ marginTop: '0.35rem', cursor: 'pointer' }}
                                     />
                                     <div>
-                                        <div style={{ fontWeight: 600, color: '#fff' }}>{option.label}</div>
-                                        <div style={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.9rem', marginTop: '0.25rem' }}>
+                                        <div style={{ fontWeight: 600, color: 'var(--app-text-high)' }}>{option.label}</div>
+                                        <div style={{ color: 'var(--app-text-muted)', fontSize: '0.9rem', marginTop: '0.25rem' }}>
                                             {option.description}
                                         </div>
                                     </div>
@@ -9529,7 +10116,7 @@ export default function ClientPage() {
                                 />
                             </label>
                             {instantlyCsvCampaignsLoading && (
-                                <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.65)' }}>
+                                <div style={{ fontSize: '0.85rem', color: 'var(--app-text-muted)' }}>
                                     Loading campaign options for manual mapping...
                                 </div>
                             )}
@@ -9538,13 +10125,13 @@ export default function ClientPage() {
                                 <div style={{
                                     padding: '1rem',
                                     borderRadius: '10px',
-                                    border: '1px solid rgba(255,255,255,0.1)',
-                                    background: 'rgba(255,255,255,0.03)',
+                                    border: '1px solid var(--app-border)',
+                                    background: 'var(--app-surface-3)',
                                     display: 'flex',
                                     flexDirection: 'column',
                                     gap: '0.85rem'
                                 }}>
-                                    <div style={{ fontWeight: 600, color: '#fff' }}>Last Import Result</div>
+                                    <div style={{ fontWeight: 600, color: 'var(--app-text-high)' }}>Last Import Result</div>
                                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.5rem', fontSize: '0.9rem' }}>
                                         <div>Rows: <strong>{instantlyCsvImportResult.summary.rowsTotal}</strong></div>
                                         <div>Matched: <strong>{instantlyCsvImportResult.summary.rowsMatched}</strong></div>
@@ -9556,7 +10143,7 @@ export default function ClientPage() {
 
                                     {instantlyCsvImportResult.unresolvedCampaignNames.length > 0 && (
                                         <div>
-                                            <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '0.25rem' }}>
+                                            <div style={{ fontSize: '0.85rem', color: 'var(--app-text-muted)', marginBottom: '0.25rem' }}>
                                                 Unresolved campaign names
                                             </div>
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
@@ -9580,8 +10167,8 @@ export default function ClientPage() {
                                                                 padding: '0.4rem 0.5rem',
                                                                 borderRadius: '6px',
                                                                 background: 'rgba(0,0,0,0.2)',
-                                                                color: '#fff',
-                                                                border: '1px solid rgba(255,255,255,0.2)'
+                                                                color: 'var(--app-text)',
+                                                                border: '1px solid var(--app-border-mid)'
                                                             }}
                                                         >
                                                             <option value="">Map manually...</option>
@@ -9599,7 +10186,7 @@ export default function ClientPage() {
                                                     </div>
                                                 )}
                                                 {instantlyCsvImportResult.unresolvedCampaignNames.length > 10 && (
-                                                    <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)' }}>
+                                                    <div style={{ fontSize: '0.75rem', color: 'var(--app-text-muted)' }}>
                                                         +{instantlyCsvImportResult.unresolvedCampaignNames.length - 10} more unresolved names
                                                     </div>
                                                 )}
@@ -9609,10 +10196,10 @@ export default function ClientPage() {
 
                                     {instantlyCsvImportResult.skippedRows.length > 0 && (
                                         <div>
-                                            <div style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '0.25rem' }}>
+                                            <div style={{ fontSize: '0.85rem', color: 'var(--app-text-muted)', marginBottom: '0.25rem' }}>
                                                 Skipped rows (first 12)
                                             </div>
-                                            <div style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.85)', lineHeight: 1.45 }}>
+                                            <div style={{ fontSize: '0.82rem', color: 'var(--app-text-high)', lineHeight: 1.45 }}>
                                                 {instantlyCsvImportResult.skippedRows.slice(0, 12).map((item) => (
                                                     <div key={`${item.row}-${item.reason}`}>Row {item.row}: {item.reason}</div>
                                                 ))}
@@ -9693,9 +10280,9 @@ export default function ClientPage() {
 
                             <div style={{
                                 padding: '1.25rem',
-                                background: 'rgba(255, 255, 255, 0.03)',
+                                background: 'var(--app-surface-3)',
                                 borderRadius: '8px',
-                                border: '1px solid rgba(255, 255, 255, 0.1)'
+                                border: '1px solid var(--app-border)'
                             }}>
                                 <p className="eyebrow eyebrow--muted" style={{ marginBottom: '1rem' }}>Filters</p>
 
@@ -9797,7 +10384,7 @@ export default function ClientPage() {
                             </div>
                         </div>
 
-                        <div className="modal__actions" style={{ flexShrink: 0, borderTop: '1px solid rgba(255, 255, 255, 0.1)', paddingTop: '1rem', marginTop: '1rem' }}>
+                        <div className="modal__actions" style={{ flexShrink: 0, borderTop: '1px solid var(--app-border)', paddingTop: '1rem', marginTop: '1rem' }}>
                             <button
                                 type="button"
                                 className="secondary-button secondary-button--active"
@@ -9873,7 +10460,7 @@ export default function ClientPage() {
                                                 width: '32px',
                                                 height: '32px',
                                                 borderRadius: '6px',
-                                                background: 'rgba(255, 255, 255, 0.1)',
+                                                background: 'var(--app-surface-2)',
                                                 padding: '4px',
                                                 flexShrink: 0
                                             }}
@@ -9885,7 +10472,7 @@ export default function ClientPage() {
                                             margin: 0,
                                             fontSize: '1.25rem',
                                             fontWeight: 600,
-                                            color: '#ffffff',
+                                            color: 'var(--app-text-high)',
                                             whiteSpace: 'nowrap',
                                             overflow: 'hidden',
                                             textOverflow: 'ellipsis'
@@ -9893,7 +10480,7 @@ export default function ClientPage() {
                                             {selectedLead.founderName || selectedLead.domain || '—'}
                                         </h2>
                                         {selectedLead.founderName && selectedLead.domain && (
-                                            <span style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.5)' }}>
+                                            <span style={{ fontSize: '0.85rem', color: 'var(--app-text-ghost)' }}>
                                                 {selectedLead.domain}
                                             </span>
                                         )}
@@ -9907,10 +10494,10 @@ export default function ClientPage() {
                                             'valid': { bg: 'rgba(34, 197, 94, 0.15)', border: 'rgba(34, 197, 94, 0.4)', text: '#4ade80' },
                                             'valid-risky': { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)', text: '#facc15' },
                                             'invalid': { bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.4)', text: '#f87171' },
-                                            'not-found': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.5)' },
-                                            'not-run': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.4)' },
-                                            'skipped': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.5)' },
-                                            'default': { bg: 'rgba(255, 255, 255, 0.06)', border: 'rgba(255, 255, 255, 0.15)', text: 'rgba(255, 255, 255, 0.6)' },
+                                            'not-found': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-ghost)' },
+                                            'not-run': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-ghost)' },
+                                            'skipped': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-ghost)' },
+                                            'default': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-muted)' },
                                         };
                                         const colors = colorMap[chip.variant] || colorMap['default'];
                                         return (
@@ -9939,7 +10526,7 @@ export default function ClientPage() {
                                             borderRadius: '999px',
                                             background: 'rgba(139, 92, 246, 0.12)',
                                             border: '1px solid rgba(139, 92, 246, 0.3)',
-                                            color: '#c4b5fd',
+                                            color: 'var(--app-evtpill-purple)',
                                             fontSize: '0.8rem',
                                             fontWeight: 500
                                         }}>
@@ -9982,7 +10569,7 @@ export default function ClientPage() {
                                     fontWeight: 600,
                                     textTransform: 'uppercase',
                                     letterSpacing: '0.06em',
-                                    color: 'rgba(255, 255, 255, 0.4)'
+                                    color: 'var(--app-text-ghost)'
                                 }}>Lead Info</p>
                                 <div style={{
                                     display: 'grid',
@@ -9993,26 +10580,26 @@ export default function ClientPage() {
                                 }}>
                                     {selectedLead.founderName && (
                                         <>
-                                            <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Founder</span>
-                                            <span style={{ color: 'rgba(255, 255, 255, 0.9)' }}>{selectedLead.founderName}</span>
+                                            <span style={{ color: 'var(--app-text-faint)' }}>Founder</span>
+                                            <span style={{ color: 'var(--app-text-high)' }}>{selectedLead.founderName}</span>
                                         </>
                                     )}
-                                    <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Email</span>
-                                    <span style={{ color: 'rgba(255, 255, 255, 0.9)', wordBreak: 'break-all' }}>
+                                    <span style={{ color: 'var(--app-text-faint)' }}>Email</span>
+                                    <span style={{ color: 'var(--app-text-high)', wordBreak: 'break-all' }}>
                                         {displayEmail(selectedLead.email, selectedLead.status)}
                                     </span>
                                     {selectedLead.createdAt && (
                                         <>
-                                            <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Created</span>
-                                            <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>
+                                            <span style={{ color: 'var(--app-text-faint)' }}>Created</span>
+                                            <span style={{ color: 'var(--app-text-muted)' }}>
                                                 {new Date(selectedLead.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
                                             </span>
                                         </>
                                     )}
                                     {selectedLead.campaigns && selectedLead.campaigns.length > 0 && (
                                         <>
-                                            <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>Source</span>
-                                            <span style={{ color: 'rgba(255, 255, 255, 0.6)' }}>
+                                            <span style={{ color: 'var(--app-text-faint)' }}>Source</span>
+                                            <span style={{ color: 'var(--app-text-muted)' }}>
                                                 {getCampaignNamesForLead(selectedLead)[0] || 'Pipeline'}
                                             </span>
                                         </>
@@ -10046,17 +10633,17 @@ export default function ClientPage() {
                                             ? 'rgba(34, 197, 94, 0.08)'
                                             : isNegative
                                                 ? 'rgba(239, 68, 68, 0.08)'
-                                                : 'rgba(255, 255, 255, 0.04)';
+                                                : 'var(--app-surface-3)';
                                         const rowBorder = isPositive
                                             ? 'rgba(34, 197, 94, 0.2)'
                                             : isNegative
                                                 ? 'rgba(239, 68, 68, 0.2)'
-                                                : 'rgba(255, 255, 255, 0.08)';
+                                                : 'var(--app-border)';
                                         const statusColor = isPositive
                                             ? '#4ade80'
                                             : isNegative
                                                 ? '#f87171'
-                                                : 'rgba(255, 255, 255, 0.5)';
+                                                : 'var(--app-text-ghost)';
 
                                         const bounceDate = campaign.lastBounceAt ? new Date(campaign.lastBounceAt) : null;
                                         const bounceDateStr = bounceDate
@@ -10081,7 +10668,7 @@ export default function ClientPage() {
                                                     <span style={{ fontSize: '1rem', flexShrink: 0 }}>{icon}</span>
                                                     <span style={{
                                                         fontSize: '0.88rem',
-                                                        color: 'rgba(255, 255, 255, 0.8)',
+                                                        color: 'var(--app-text-high)',
                                                         flex: '1 1 auto',
                                                         minWidth: 0,
                                                         overflow: 'hidden',
@@ -10103,7 +10690,7 @@ export default function ClientPage() {
                                                 {bounceDateStr && (
                                                     <span style={{
                                                         fontSize: '0.72rem',
-                                                        color: 'rgba(255, 255, 255, 0.3)',
+                                                        color: 'var(--app-text-ghost)',
                                                         paddingLeft: '1.6rem'
                                                     }}>
                                                         {bounceDateStr}
@@ -10116,14 +10703,14 @@ export default function ClientPage() {
                             )}
 
                             {/* Events Timeline */}
-                            <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.75rem', marginBottom: '0.75rem' }}>
+                            <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: '0.75rem', marginBottom: '0.75rem' }}>
                                 <p style={{
                                     margin: '0 0 0.6rem',
                                     fontSize: '0.75rem',
                                     fontWeight: 600,
                                     textTransform: 'uppercase',
                                     letterSpacing: '0.06em',
-                                    color: 'rgba(255, 255, 255, 0.4)'
+                                    color: 'var(--app-text-ghost)'
                                 }}>Activity</p>
                 {(() => {
                                         // Build synthetic status-change events from campaignsData
@@ -10191,10 +10778,10 @@ export default function ClientPage() {
                                         const allEvents = buildCollatedActivityEvents([...realEvents, ...syntheticEvents]);
 
                                         if (leadEventsLoading) return (
-                                            <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>Loading…</p>
+                                            <p style={{ fontSize: '0.85rem', color: 'var(--app-text-ghost)', margin: 0 }}>Loading…</p>
                                         );
                                         if (!allEvents.length) return (
-                                            <p style={{ fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.3)', margin: 0 }}>No events yet</p>
+                                            <p style={{ fontSize: '0.85rem', color: 'var(--app-text-ghost)', margin: 0 }}>No events yet</p>
                                         );
 
                                         return (
@@ -10206,7 +10793,7 @@ export default function ClientPage() {
                                                     top: '6px',
                                                     bottom: '6px',
                                                     width: '1px',
-                                                    background: 'rgba(255, 255, 255, 0.1)'
+                                                    background: 'var(--app-surface-2)'
                                                 }} />
                                                 {allEvents.map((evt) => {
                                                     const labelNorm = evt.displayLabel.toLowerCase().replace(/[_ ]+/g, ' ').trim();
@@ -10233,8 +10820,8 @@ export default function ClientPage() {
                                                             position: 'relative',
                                                             padding: '0.5rem 0.6rem',
                                                             marginBottom: '0.5rem',
-                                                            background: 'rgba(255, 255, 255, 0.04)',
-                                                            border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                            background: 'var(--app-surface-3)',
+                                                            border: '1px solid var(--app-border)',
                                                             borderRadius: '10px',
                                                         }}>
                                                             {/* Dot */}
@@ -10251,10 +10838,10 @@ export default function ClientPage() {
                                                                 <span style={{
                                                                     fontSize: '0.82rem',
                                                                     fontWeight: 500,
-                                                                    color: 'rgba(255, 255, 255, 0.8)',
+                                                                    color: 'var(--app-text-high)',
                                                                     textTransform: 'capitalize'
                                                                 }}>{evt.displayLabel}</span>
-                                                                <span style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.3)' }}>
+                                                                <span style={{ fontSize: '0.75rem', color: 'var(--app-text-ghost)' }}>
                                                                     {dateTimeStr}
                                                                 </span>
                                                             </div>
@@ -10271,10 +10858,10 @@ export default function ClientPage() {
                                                                     marginTop: '0.25rem',
                                                                     padding: '0.15rem 0.5rem',
                                                                     borderRadius: '999px',
-                                                                    background: 'rgba(255, 255, 255, 0.06)',
-                                                                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                                                                    background: 'var(--app-surface-3)',
+                                                                    border: '1px solid var(--app-border)',
                                                                     fontSize: '0.72rem',
-                                                                    color: 'rgba(255, 255, 255, 0.45)',
+                                                                    color: 'var(--app-text-faint)',
                                                                     lineHeight: 1.4
                                                                 }}>
                                                                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.7 }}>
@@ -10291,7 +10878,7 @@ export default function ClientPage() {
                                                                 const fullContent = evt.message_text || snippet;
                                                                 return snippet ? (
                                                                     <p
-                                                                        style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.55)', cursor: 'default' }}
+                                                                        style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'var(--app-text-faint)', cursor: 'default' }}
                                                                         onMouseEnter={(e) => {
                                                                             if (fullContent) setActivityReplyPopup({ html: fullContent, isHtml: Boolean(evt.message_text && evt.message_text.includes('<')), x: e.clientX, y: e.clientY });
                                                                         }}
@@ -10312,8 +10899,8 @@ export default function ClientPage() {
                                                                     borderRadius: '4px',
                                                                     fontSize: '0.72rem',
                                                                     fontWeight: 500,
-                                                                    background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(255, 255, 255, 0.06)',
-                                                                    color: evt.reply_category === 'Interested' ? '#4ade80' : 'rgba(255, 255, 255, 0.5)'
+                                                                    background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'var(--app-surface-3)',
+                                                                    color: evt.reply_category === 'Interested' ? '#4ade80' : 'var(--app-text-ghost)'
                                                                 }}>{evt.reply_category}</span>
                                                             )}
                                                         </div>
@@ -10325,14 +10912,14 @@ export default function ClientPage() {
                             </div>
 
                             {/* Advanced / IDs — collapsed by default */}
-                            <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.75rem' }}>
+                            <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: '0.75rem' }}>
                                 <button
                                     onClick={() => setShowLeadAdvanced(!showLeadAdvanced)}
                                     style={{
                                         background: 'none',
                                         border: 'none',
                                         cursor: 'pointer',
-                                        color: 'rgba(255, 255, 255, 0.35)',
+                                        color: 'var(--app-text-ghost)',
                                         fontSize: '0.8rem',
                                         padding: 0,
                                         display: 'flex',
@@ -10356,7 +10943,7 @@ export default function ClientPage() {
                                         fontSize: '0.85rem',
                                         lineHeight: 1.5,
                                         marginTop: '0.5rem',
-                                        color: 'rgba(255, 255, 255, 0.4)'
+                                        color: 'var(--app-text-ghost)'
                                     }}>
                                         <span>Domain ID</span>
                                         <span style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{selectedLead.id}</span>
@@ -10387,7 +10974,7 @@ export default function ClientPage() {
                                         fontWeight: 600,
                                         textTransform: 'uppercase',
                                         letterSpacing: '0.06em',
-                                        color: 'rgba(255, 255, 255, 0.4)'
+                                        color: 'var(--app-text-ghost)'
                                     }}>
                                         Lead Insights
                                     </p>
@@ -10473,7 +11060,7 @@ export default function ClientPage() {
                                         const populatedRows = insightRows.filter((row) => row.value !== null && row.value !== '');
                                         if (!populatedRows.length && !attributeEntries.length) {
                                             return (
-                                                <p style={{ margin: 0, fontSize: '0.86rem', color: 'rgba(255, 255, 255, 0.45)' }}>
+                                                <p style={{ margin: 0, fontSize: '0.86rem', color: 'var(--app-text-faint)' }}>
                                                     No insights available for this lead yet.
                                                 </p>
                                             );
@@ -10491,22 +11078,22 @@ export default function ClientPage() {
                                                     }}>
                                                         {populatedRows.map((row) => (
                                                             <div key={row.label} style={{ display: 'contents' }}>
-                                                                <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>{row.label}</span>
-                                                                <span style={{ color: 'rgba(255, 255, 255, 0.88)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{row.value}</span>
+                                                                <span style={{ color: 'var(--app-text-faint)' }}>{row.label}</span>
+                                                                <span style={{ color: 'var(--app-text-high)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{row.value}</span>
                                                             </div>
                                                         ))}
                                                     </div>
                                                 )}
 
                                                 {attributeEntries.length > 0 && (
-                                                    <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', paddingTop: '0.8rem' }}>
+                                                    <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: '0.8rem' }}>
                                                         <p style={{
                                                             margin: '0 0 0.5rem',
                                                             fontSize: '0.75rem',
                                                             fontWeight: 600,
                                                             textTransform: 'uppercase',
                                                             letterSpacing: '0.06em',
-                                                            color: 'rgba(255, 255, 255, 0.4)'
+                                                            color: 'var(--app-text-ghost)'
                                                         }}>
                                                             Attributes
                                                         </p>
@@ -10519,8 +11106,8 @@ export default function ClientPage() {
                                                         }}>
                                                             {attributeEntries.map(([key, value]) => (
                                                                 <div key={key} style={{ display: 'contents' }}>
-                                                                    <span style={{ color: 'rgba(255, 255, 255, 0.45)' }}>{key}</span>
-                                                                    <span style={{ color: 'rgba(255, 255, 255, 0.88)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{typeof value === 'string' ? value : JSON.stringify(value)}</span>
+                                                                    <span style={{ color: 'var(--app-text-faint)' }}>{key}</span>
+                                                                    <span style={{ color: 'var(--app-text-high)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{typeof value === 'string' ? value : JSON.stringify(value)}</span>
                                                                 </div>
                                                             ))}
                                                         </div>
@@ -10549,12 +11136,12 @@ export default function ClientPage() {
                         maxHeight: '420px',
                         overflowY: 'auto',
                         background: 'rgb(14, 14, 24)',
-                        border: '1px solid rgba(255, 255, 255, 0.15)',
+                        border: '1px solid var(--app-border-mid)',
                         borderRadius: '10px',
                         padding: '0.75rem',
                         boxShadow: '0 8px 32px rgba(0, 0, 0, 0.8)',
                         fontSize: '0.8rem',
-                        color: 'rgba(255, 255, 255, 0.82)',
+                        color: 'var(--app-text-high)',
                         lineHeight: '1.55',
                         wordBreak: 'break-word',
                         pointerEvents: 'none',

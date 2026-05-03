@@ -27,7 +27,7 @@ import * as queries from './db/queries.js';
  * Parse and normalize email status from various sources
  * Maps email finder statuses to database valid values
  */
-function normalizeEmailStatus(rawStatus) {
+export function normalizeEmailStatus(rawStatus) {
     if (!rawStatus) return null;
     const status = String(rawStatus).toLowerCase().trim();
 

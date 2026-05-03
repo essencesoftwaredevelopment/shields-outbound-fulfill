@@ -147,11 +147,11 @@ export default function AccountPage() {
                         </div>
                         
                         {/* Email Verification Provider Selection */}
-                        <div style={{ marginTop: '3rem', paddingTop: '2rem', borderTop: '1px solid var(--border-color, #e5e7eb)' }}>
+                        <div style={{ marginTop: '3rem', paddingTop: '2rem', borderTop: '1px solid var(--app-border-mid)' }}>
                             <h2 style={{ fontSize: '1.5rem', fontWeight: '600', marginBottom: '0.5rem' }}>
                                 Email Verification Provider
                             </h2>
-                            <p style={{ color: 'var(--text-secondary, #6b7280)', marginBottom: '1.5rem' }}>
+                            <p style={{ color: 'var(--app-text-muted)', marginBottom: '1.5rem' }}>
                                 Choose which service to use for email verification during pipeline runs.
                             </p>
                             
@@ -167,7 +167,7 @@ export default function AccountPage() {
                                     />
                                     <div>
                                         <div style={{ fontWeight: '500' }}>TryKitt</div>
-                                        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary, #6b7280)' }}>
+                                        <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
                                             Cloud-based email verification service (requires API key in vault)
                                         </div>
                                     </div>
@@ -184,7 +184,7 @@ export default function AccountPage() {
                                     />
                                     <div>
                                         <div style={{ fontWeight: '500' }}>Self-Hosted Verifier</div>
-                                        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary, #6b7280)' }}>
+                                        <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
                                             Use the self-hosted email verification service (no API key required)
                                         </div>
                                     </div>

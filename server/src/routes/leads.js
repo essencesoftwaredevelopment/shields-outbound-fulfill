@@ -11,12 +11,43 @@
  */
 
 import express from 'express';
+import multer from 'multer';
+import { parse as csvParse } from 'csv-parse';
 import { verifyFirebaseToken } from '../middleware/auth.js';
 import * as leadsService from '../services/leads.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
 import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
 import { normalizeDomain } from '../utils/domain.js';
+
+const uploadVerification = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 20 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+        if (file.mimetype === 'text/csv' || file.mimetype === 'application/vnd.ms-excel' || file.originalname.toLowerCase().endsWith('.csv')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only CSV files are allowed'));
+        }
+    }
+});
+
+function parseCsvBuffer(buffer) {
+    return new Promise((resolve, reject) => {
+        const rows = [];
+        const parser = csvParse({ columns: true, trim: true, skip_empty_lines: true, bom: true });
+        parser.on('readable', () => {
+            let row;
+            while ((row = parser.read()) !== null) {
+                rows.push(row);
+            }
+        });
+        parser.on('end', () => resolve(rows));
+        parser.on('error', reject);
+        parser.write(buffer);
+        parser.end();
+    });
+}
 
 const router = express.Router();
 
@@ -52,6 +83,29 @@ function normalizeOptionalText(value) {
 
 function isEmailLikeSearch(value) {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+// Looks like "example.com" / "shop.co.uk" — no @, no spaces, at least one dot,
+// every label is a valid host label. Used to short-circuit the search bar onto
+// the (client_id, domain_normalized) index when the user pastes a domain.
+function isDomainLikeSearch(value) {
+    const trimmed = String(value || '').trim();
+    if (!trimmed || trimmed.includes('@') || /\s/.test(trimmed)) return false;
+    if (!trimmed.includes('.')) return false;
+    return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(trimmed);
+}
+
+// Classify whatever the user typed in the lead search bar so the SQL planner
+// can route to the most selective index.
+//   - email  -> idx_contacts_client_email_lower
+//   - domain -> idx_companies_client_domain
+//   - text   -> trigram GIN on full_name / email
+function classifyLeadSearch(value) {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return { kind: 'empty', value: '' };
+    if (isEmailLikeSearch(trimmed)) return { kind: 'email', value: trimmed.toLowerCase() };
+    if (isDomainLikeSearch(trimmed)) return { kind: 'domain', value: trimmed.toLowerCase() };
+    return { kind: 'text', value: trimmed.toLowerCase() };
 }
 
 function normalizeOptionalNumber(value) {
@@ -335,13 +389,17 @@ function clientMatchersOverlap(left, right) {
 }
 
 const LEAD_FILTER_FIELDS = [
+    // ── Contact fields ──────────────────────────────────────────────────────
     {
         key: 'full_name',
         label: 'Founder Name',
         type: 'text',
         operators: [
             { key: 'contains', label: 'Contains' },
+            { key: 'not_contains', label: 'Does Not Contain' },
             { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'starts_with', label: 'Starts With' },
             { key: 'is_empty', label: 'Is Empty' },
             { key: 'not_empty', label: 'Is Not Empty' }
         ]
@@ -352,7 +410,10 @@ const LEAD_FILTER_FIELDS = [
         type: 'text',
         operators: [
             { key: 'contains', label: 'Contains' },
+            { key: 'not_contains', label: 'Does Not Contain' },
             { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'starts_with', label: 'Starts With' },
             { key: 'is_empty', label: 'Is Empty' },
             { key: 'not_empty', label: 'Is Not Empty' }
         ]
@@ -363,7 +424,11 @@ const LEAD_FILTER_FIELDS = [
         type: 'enum',
         operators: [
             { key: 'eq', label: 'Equals' },
-            { key: 'is_empty', label: 'Is Empty' }
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
         ],
         options: [
             { value: 'valid', label: 'Valid' },
@@ -378,7 +443,25 @@ const LEAD_FILTER_FIELDS = [
         type: 'text',
         operators: [
             { key: 'contains', label: 'Contains' },
-            { key: 'eq', label: 'Equals' }
+            { key: 'not_contains', label: 'Does Not Contain' },
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'starts_with', label: 'Starts With' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        key: 'role_type',
+        label: 'Role Type',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'not_contains', label: 'Does Not Contain' },
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
         ]
     },
     {
@@ -388,16 +471,32 @@ const LEAD_FILTER_FIELDS = [
         operators: [
             { key: 'contains', label: 'Contains' },
             { key: 'eq', label: 'Equals' },
-            { key: 'is_empty', label: 'Is Empty' }
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
         ]
     },
+    {
+        key: 'first_line',
+        label: 'First Line',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'not_contains', label: 'Does Not Contain' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    // ── Date fields ─────────────────────────────────────────────────────────
     {
         key: 'created_at',
         label: 'Created At',
         type: 'date',
         operators: [
             { key: 'on_or_after', label: 'On Or After' },
-            { key: 'on_or_before', label: 'On Or Before' }
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'between', label: 'Between' },
+            { key: 'older_than_days', label: 'Older Than Days' }
         ]
     },
     {
@@ -407,10 +506,24 @@ const LEAD_FILTER_FIELDS = [
         operators: [
             { key: 'on_or_after', label: 'On Or After' },
             { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'between', label: 'Between' },
             { key: 'older_than_days', label: 'Older Than Days' },
-            { key: 'is_empty', label: 'Is Empty' }
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
         ]
     },
+    {
+        key: 'last_verified_at',
+        label: 'Last Verified',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    // ── Campaign / pipeline fields ───────────────────────────────────────────
     {
         key: 'added_to_campaign_at',
         label: 'Added To Campaign',
@@ -418,7 +531,20 @@ const LEAD_FILTER_FIELDS = [
         operators: [
             { key: 'on_or_after', label: 'On Or After' },
             { key: 'on_or_before', label: 'On Or Before' },
-            { key: 'is_empty', label: 'Is Empty' }
+            { key: 'between', label: 'Between' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        key: 'last_reply_at',
+        label: 'Last Reply',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
         ]
     },
     {
@@ -426,7 +552,10 @@ const LEAD_FILTER_FIELDS = [
         label: 'Instantly Status',
         type: 'enum',
         operators: [
-            { key: 'eq', label: 'Equals' }
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' }
         ],
         options: [
             { value: 'active', label: 'Active' },
@@ -447,15 +576,95 @@ const LEAD_FILTER_FIELDS = [
         ]
     },
     {
+        key: 'has_replied',
+        label: 'Has Replied',
+        type: 'boolean',
+        operators: [
+            { key: 'is_true', label: 'Has Replied' },
+            { key: 'is_false', label: 'Has Not Replied' }
+        ]
+    },
+    {
         key: 'campaign_count_all_time',
-        label: 'Campaign Count',
+        label: 'Campaign Count (All Time)',
         type: 'number',
         operators: [
             { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
             { key: 'gt', label: 'Greater Than' },
             { key: 'gte', label: 'Greater Than Or Equal' },
             { key: 'lt', label: 'Less Than' },
             { key: 'lte', label: 'Less Than Or Equal' }
+        ]
+    },
+    {
+        key: 'campaign_count_active',
+        label: 'Active Campaign Count',
+        type: 'number',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' }
+        ]
+    },
+    // ── Insight fields (contact_insights) ────────────────────────────────────
+    {
+        key: 'uses_klaviyo',
+        label: 'Uses Klaviyo',
+        type: 'boolean',
+        operators: [
+            { key: 'is_true', label: 'Yes' },
+            { key: 'is_false', label: 'No' },
+            { key: 'is_empty', label: 'Not Checked' }
+        ]
+    },
+    {
+        key: 'uses_shopify',
+        label: 'Uses Shopify',
+        type: 'boolean',
+        operators: [
+            { key: 'is_true', label: 'Yes' },
+            { key: 'is_false', label: 'No' },
+            { key: 'is_empty', label: 'Not Checked' }
+        ]
+    },
+    {
+        key: 'discovery_call_held',
+        label: 'Discovery Call Held',
+        type: 'boolean',
+        operators: [
+            { key: 'is_true', label: 'Yes' },
+            { key: 'is_false', label: 'No' },
+            { key: 'is_empty', label: 'Not Checked' }
+        ]
+    },
+    {
+        key: 'annual_revenue_min',
+        label: 'Annual Revenue (Min $)',
+        type: 'number',
+        operators: [
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' },
+            { key: 'is_empty', label: 'Not Set' },
+            { key: 'not_empty', label: 'Is Set' }
+        ]
+    },
+    {
+        key: 'annual_revenue_max',
+        label: 'Annual Revenue (Max $)',
+        type: 'number',
+        operators: [
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' },
+            { key: 'is_empty', label: 'Not Set' },
+            { key: 'not_empty', label: 'Is Set' }
         ]
     }
 ];
@@ -473,7 +682,7 @@ function getLeadFilterFieldsPayload() {
 }
 
 function parseLeadFiltersQuery(rawFilters) {
-    if (typeof rawFilters !== 'string' || !rawFilters.trim()) return [];
+    if (typeof rawFilters !== 'string' || !rawFilters.trim()) return { clauses: [] };
 
     let parsed;
     try {
@@ -484,33 +693,84 @@ function parseLeadFiltersQuery(rawFilters) {
         throw error;
     }
 
-    if (!Array.isArray(parsed)) {
-        const error = new Error('filters must be an array.');
-        error.statusCode = 400;
-        throw error;
+    // Backward compat: accept old flat array format (all AND)
+    if (Array.isArray(parsed)) {
+        return { clauses: parsed.slice(0, 25).map((c) => ({ ...c, joinOp: 'AND' })) };
     }
 
-    return parsed.slice(0, 25);
+    if (parsed && typeof parsed === 'object') {
+        // Old format: { logic, clauses } — spread joinOp from global logic
+        if (parsed.logic) {
+            const logic = String(parsed.logic || 'AND').toUpperCase() === 'OR' ? 'OR' : 'AND';
+            const clauses = Array.isArray(parsed.clauses) ? parsed.clauses.slice(0, 25) : [];
+            return { clauses: clauses.map((c) => ({ ...c, joinOp: logic })) };
+        }
+        // New format: { clauses: [{...clause, joinOp}] }
+        const clauses = Array.isArray(parsed.clauses) ? parsed.clauses.slice(0, 25) : [];
+        return {
+            clauses: clauses.map((c) => ({
+                ...c,
+                joinOp: String(c.joinOp || 'AND').toUpperCase() === 'OR' ? 'OR' : 'AND'
+            }))
+        };
+    }
+
+    const error = new Error('filters must be a JSON object or array.');
+    error.statusCode = 400;
+    throw error;
 }
+
+const CAMPAIGN_STATS_FILTER_FIELDS = new Set([
+    'added_to_campaign_at', 'instantly_status', 'campaign_count_all_time',
+    'campaign_count_active', 'last_reply_at', 'has_replied'
+]);
+
+const INSIGHTS_FILTER_FIELDS = new Set([
+    'uses_klaviyo', 'uses_shopify', 'discovery_call_held',
+    'annual_revenue_min', 'annual_revenue_max'
+]);
 
 function leadFiltersRequireCampaignStats(filters) {
     return filters.some((filter) => {
         const fieldKey = normalizeOptionalText(filter?.field)?.toLowerCase() || '';
-        return fieldKey === 'added_to_campaign_at'
-            || fieldKey === 'instantly_status'
-            || fieldKey === 'campaign_count_all_time';
+        return CAMPAIGN_STATS_FILTER_FIELDS.has(fieldKey);
     });
 }
 
-function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
-    if (operatorKey === 'is_empty' || operatorKey === 'not_empty') return null;
+function leadFiltersRequireInsights(filters) {
+    return filters.some((filter) => {
+        const fieldKey = normalizeOptionalText(filter?.field)?.toLowerCase() || '';
+        return INSIGHTS_FILTER_FIELDS.has(fieldKey);
+    });
+}
 
-    if (fieldKey === 'campaign_count_all_time' || operatorKey === 'older_than_days') {
+const DATE_FILTER_FIELDS = new Set([
+    'created_at', 'last_contacted_at', 'added_to_campaign_at', 'last_verified_at', 'last_reply_at'
+]);
+const NUMERIC_FILTER_FIELDS = new Set([
+    'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max'
+]);
+
+function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
+    // Operators that need no value
+    if (operatorKey === 'is_empty' || operatorKey === 'not_empty'
+        || operatorKey === 'is_true' || operatorKey === 'is_false') return null;
+
+    // Multi-value operators — value is a JSON array string
+    if (operatorKey === 'in' || operatorKey === 'not_in' || operatorKey === 'between') {
+        let arr;
+        try { arr = JSON.parse(rawValue); } catch { return null; }
+        if (!Array.isArray(arr) || arr.length === 0) return null;
+        if (operatorKey === 'between' && arr.length < 2) return null;
+        return arr.map((v) => String(v ?? '').trim()).filter(Boolean);
+    }
+
+    if (NUMERIC_FILTER_FIELDS.has(fieldKey) || operatorKey === 'older_than_days') {
         const parsed = Number(rawValue);
         return Number.isFinite(parsed) ? parsed : null;
     }
 
-    if (fieldKey === 'created_at' || fieldKey === 'last_contacted_at' || fieldKey === 'added_to_campaign_at') {
+    if (DATE_FILTER_FIELDS.has(fieldKey)) {
         const normalized = normalizeOptionalTimestamp(rawValue);
         return normalized || null;
     }
@@ -530,6 +790,36 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     return normalizedText;
 }
 
+/**
+ * Build a WHERE fragment from per-clause joinOp.
+ * Clauses connected by AND are grouped together; OR separates groups.
+ * Result: AND (groupA_clause1 AND groupA_clause2) OR (groupB_clause1) ...
+ * wrapped appropriately so the whole expression is safe to AND into a parent WHERE.
+ */
+function joinDynamicClauses(sqlClauses, rawFilters) {
+    if (sqlClauses.length === 0) return null;
+    // rawFilters[i].joinOp is the connector AFTER clause i
+    const groups = [];
+    let currentGroup = [sqlClauses[0]];
+    for (let i = 0; i < sqlClauses.length - 1; i++) {
+        const joinOp = String(rawFilters[i]?.joinOp || 'AND').toUpperCase() === 'OR' ? 'OR' : 'AND';
+        if (joinOp === 'OR') {
+            groups.push(currentGroup);
+            currentGroup = [sqlClauses[i + 1]];
+        } else {
+            currentGroup.push(sqlClauses[i + 1]);
+        }
+    }
+    groups.push(currentGroup);
+
+    const groupSql = groups
+        .map((g) => g.map((c) => `(${c})`).join(' AND '))
+        .filter(Boolean);
+
+    if (groupSql.length === 1) return groupSql[0];
+    return `(${groupSql.join(' OR ')})`;
+}
+
 function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
     const clauses = [];
     const bindParam = (value) => {
@@ -538,6 +828,11 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
         paramsState.paramIndex += 1;
         return ref;
     };
+
+    // Helper: bind each element of an array and return [ref, ref, ...]
+    const bindArray = (arr) => arr.map((v) => bindParam(v));
+
+    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false']);
 
     for (const rawFilter of rawFilters) {
         if (!rawFilter || typeof rawFilter !== 'object' || Array.isArray(rawFilter)) continue;
@@ -548,18 +843,29 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
 
         const fieldDef = LEAD_FILTER_FIELD_MAP.get(fieldKey);
         if (!fieldDef) continue;
-        if (!fieldDef.operators.some((operator) => operator.key === operatorKey)) continue;
+        if (!fieldDef.operators.some((op) => op.key === operatorKey)) continue;
 
         const normalizedValue = normalizeLeadFilterValue(fieldKey, operatorKey, rawFilter.value);
-        if (operatorKey !== 'is_empty' && operatorKey !== 'not_empty' && normalizedValue === null) continue;
+        if (!NO_VALUE_OPS.has(operatorKey) && normalizedValue === null) continue;
 
+        // ── full_name ──────────────────────────────────────────────────────
         if (fieldKey === 'full_name') {
             if (operatorKey === 'contains') {
+                // Expression intentionally matches idx_contacts_full_name_trgm (LOWER(full_name))
                 const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
-                clauses.push(`LOWER(COALESCE(c.full_name, '')) LIKE ${ref}`);
+                clauses.push(`c.full_name IS NOT NULL AND LOWER(c.full_name) LIKE ${ref}`);
+            } else if (operatorKey === 'not_contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`(c.full_name IS NULL OR LOWER(c.full_name) NOT LIKE ${ref})`);
             } else if (operatorKey === 'eq') {
                 const ref = bindParam(String(normalizedValue).toLowerCase());
                 clauses.push(`LOWER(COALESCE(c.full_name, '')) = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.full_name, '')) <> ${ref}`);
+            } else if (operatorKey === 'starts_with') {
+                const ref = bindParam(`${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`c.full_name IS NOT NULL AND LOWER(c.full_name) LIKE ${ref}`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`(c.full_name IS NULL OR BTRIM(c.full_name) = '')`);
             } else if (operatorKey === 'not_empty') {
@@ -568,13 +874,25 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             continue;
         }
 
+        // ── email ──────────────────────────────────────────────────────────
         if (fieldKey === 'email') {
             if (operatorKey === 'contains') {
+                // Matches idx_contacts_email_trgm (LOWER(email))
                 const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
-                clauses.push(`LOWER(COALESCE(c.email, '')) LIKE ${ref}`);
+                clauses.push(`c.email IS NOT NULL AND LOWER(c.email) LIKE ${ref}`);
+            } else if (operatorKey === 'not_contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`(c.email IS NULL OR LOWER(c.email) NOT LIKE ${ref})`);
             } else if (operatorKey === 'eq') {
+                // Matches idx_contacts_client_email_lower (client_id, LOWER(email))
                 const ref = bindParam(String(normalizedValue).toLowerCase());
-                clauses.push(`LOWER(COALESCE(c.email, '')) = ${ref}`);
+                clauses.push(`c.email IS NOT NULL AND LOWER(c.email) = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`(c.email IS NULL OR LOWER(c.email) <> ${ref})`);
+            } else if (operatorKey === 'starts_with') {
+                const ref = bindParam(`${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`c.email IS NOT NULL AND LOWER(c.email) LIKE ${ref}`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`(c.email IS NULL OR BTRIM(c.email) = '')`);
             } else if (operatorKey === 'not_empty') {
@@ -583,27 +901,77 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             continue;
         }
 
+        // ── email_status ───────────────────────────────────────────────────
         if (fieldKey === 'email_status') {
             if (operatorKey === 'eq') {
                 const ref = bindParam(String(normalizedValue).toLowerCase());
                 clauses.push(`LOWER(COALESCE(c.email_status, '')) = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.email_status, '')) <> ${ref}`);
+            } else if (operatorKey === 'in') {
+                const refs = bindArray(normalizedValue.map((v) => v.toLowerCase()));
+                clauses.push(`LOWER(COALESCE(c.email_status, '')) = ANY(ARRAY[${refs.join(', ')}]::text[])`);
+            } else if (operatorKey === 'not_in') {
+                const refs = bindArray(normalizedValue.map((v) => v.toLowerCase()));
+                clauses.push(`LOWER(COALESCE(c.email_status, '')) <> ALL(ARRAY[${refs.join(', ')}]::text[])`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`(c.email_status IS NULL OR BTRIM(c.email_status) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.email_status IS NOT NULL AND BTRIM(c.email_status) <> '')`);
             }
             continue;
         }
 
+        // ── domain ─────────────────────────────────────────────────────────
         if (fieldKey === 'domain') {
             if (operatorKey === 'contains') {
+                // Matches idx_companies_domain_normalized_trgm
                 const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
-                clauses.push(`LOWER(COALESCE(co.domain_normalized, '')) LIKE ${ref}`);
+                clauses.push(`co.domain_normalized IS NOT NULL AND co.domain_normalized LIKE ${ref}`);
+            } else if (operatorKey === 'not_contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`(co.domain_normalized IS NULL OR co.domain_normalized NOT LIKE ${ref})`);
             } else if (operatorKey === 'eq') {
                 const ref = bindParam(String(normalizedValue).toLowerCase());
-                clauses.push(`LOWER(COALESCE(co.domain_normalized, '')) = ${ref}`);
+                clauses.push(`co.domain_normalized = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`co.domain_normalized <> ${ref}`);
+            } else if (operatorKey === 'starts_with') {
+                const ref = bindParam(`${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`co.domain_normalized IS NOT NULL AND co.domain_normalized LIKE ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(co.domain_normalized IS NULL OR BTRIM(co.domain_normalized) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(co.domain_normalized IS NOT NULL AND BTRIM(co.domain_normalized) <> '')`);
             }
             continue;
         }
 
+        // ── role_type ──────────────────────────────────────────────────────
+        if (fieldKey === 'role_type') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`c.role_type IS NOT NULL AND LOWER(c.role_type) LIKE ${ref}`);
+            } else if (operatorKey === 'not_contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`(c.role_type IS NULL OR LOWER(c.role_type) NOT LIKE ${ref})`);
+            } else if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.role_type, '')) = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`LOWER(COALESCE(c.role_type, '')) <> ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.role_type IS NULL OR BTRIM(c.role_type) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.role_type IS NOT NULL AND BTRIM(c.role_type) <> '')`);
+            }
+            continue;
+        }
+
+        // ── job_id ─────────────────────────────────────────────────────────
         if (fieldKey === 'job_id') {
             if (operatorKey === 'contains') {
                 const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
@@ -611,12 +979,34 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             } else if (operatorKey === 'eq') {
                 const ref = bindParam(String(normalizedValue));
                 clauses.push(`COALESCE(c.job_id, '') = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`COALESCE(c.job_id, '') <> ${ref}`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`(c.job_id IS NULL OR BTRIM(c.job_id) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.job_id IS NOT NULL AND BTRIM(c.job_id) <> '')`);
             }
             continue;
         }
 
+        // ── first_line ─────────────────────────────────────────────────────
+        if (fieldKey === 'first_line') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`c.personalization_first_line IS NOT NULL AND LOWER(c.personalization_first_line) LIKE ${ref}`);
+            } else if (operatorKey === 'not_contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`(c.personalization_first_line IS NULL OR LOWER(c.personalization_first_line) NOT LIKE ${ref})`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.personalization_first_line IS NOT NULL AND BTRIM(c.personalization_first_line) <> '')`);
+            }
+            continue;
+        }
+
+        // ── created_at ─────────────────────────────────────────────────────
         if (fieldKey === 'created_at') {
             if (operatorKey === 'on_or_after') {
                 const ref = bindParam(String(normalizedValue));
@@ -624,10 +1014,18 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             } else if (operatorKey === 'on_or_before') {
                 const ref = bindParam(String(normalizedValue).slice(0, 10));
                 clauses.push(`c.created_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'between') {
+                const refStart = bindParam(normalizedValue[0]);
+                const refEnd = bindParam(normalizedValue[1].slice(0, 10));
+                clauses.push(`c.created_at >= ${refStart}::timestamptz AND c.created_at < (${refEnd}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'older_than_days') {
+                const ref = bindParam(Number(normalizedValue));
+                clauses.push(`c.created_at < NOW() - (${ref}::text || ' days')::interval`);
             }
             continue;
         }
 
+        // ── last_contacted_at ──────────────────────────────────────────────
         if (fieldKey === 'last_contacted_at') {
             if (operatorKey === 'on_or_after') {
                 const ref = bindParam(String(normalizedValue));
@@ -635,15 +1033,38 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             } else if (operatorKey === 'on_or_before') {
                 const ref = bindParam(String(normalizedValue).slice(0, 10));
                 clauses.push(`c.last_contacted_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'between') {
+                const refStart = bindParam(normalizedValue[0]);
+                const refEnd = bindParam(normalizedValue[1].slice(0, 10));
+                clauses.push(`c.last_contacted_at >= ${refStart}::timestamptz AND c.last_contacted_at < (${refEnd}::date + INTERVAL '1 day')`);
             } else if (operatorKey === 'older_than_days') {
                 const ref = bindParam(Number(normalizedValue));
                 clauses.push(`(c.last_contacted_at IS NULL OR c.last_contacted_at < NOW() - (${ref}::text || ' days')::interval)`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`c.last_contacted_at IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`c.last_contacted_at IS NOT NULL`);
             }
             continue;
         }
 
+        // ── last_verified_at ───────────────────────────────────────────────
+        if (fieldKey === 'last_verified_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`c.last_verified_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`c.last_verified_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`c.last_verified_at IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`c.last_verified_at IS NOT NULL`);
+            }
+            continue;
+        }
+
+        // ── added_to_campaign_at ───────────────────────────────────────────
         if (fieldKey === 'added_to_campaign_at') {
             if (operatorKey === 'on_or_after') {
                 const ref = bindParam(String(normalizedValue));
@@ -651,29 +1072,122 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             } else if (operatorKey === 'on_or_before') {
                 const ref = bindParam(String(normalizedValue).slice(0, 10));
                 clauses.push(`cs.last_campaign_added_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'between') {
+                const refStart = bindParam(normalizedValue[0]);
+                const refEnd = bindParam(normalizedValue[1].slice(0, 10));
+                clauses.push(`cs.last_campaign_added_at >= ${refStart}::timestamptz AND cs.last_campaign_added_at < (${refEnd}::date + INTERVAL '1 day')`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`cs.last_campaign_added_at IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`cs.last_campaign_added_at IS NOT NULL`);
             }
             continue;
         }
 
-        if (fieldKey === 'instantly_status' && operatorKey === 'eq') {
-            const ref = bindParam(String(normalizedValue));
-            clauses.push(`(
-                ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
-                OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
-            )`);
+        // ── last_reply_at ──────────────────────────────────────────────────
+        if (fieldKey === 'last_reply_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`cs.last_reply_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`cs.last_reply_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`cs.last_reply_at IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`cs.last_reply_at IS NOT NULL`);
+            }
             continue;
         }
 
+        // ── has_replied ────────────────────────────────────────────────────
+        if (fieldKey === 'has_replied') {
+            if (operatorKey === 'is_true') {
+                clauses.push(`cs.has_replied IS TRUE`);
+            } else if (operatorKey === 'is_false') {
+                clauses.push(`(cs.has_replied IS NULL OR cs.has_replied IS FALSE)`);
+            }
+            continue;
+        }
+
+        // ── instantly_status ───────────────────────────────────────────────
+        if (fieldKey === 'instantly_status') {
+            const buildStatusCheck = (vals) => {
+                const refs = bindArray(vals.map((v) => String(v).toLowerCase()));
+                return refs.map((ref) => `(
+                    ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
+                    OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
+                )`).join(' OR ');
+            };
+            if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`(
+                    ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
+                    OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
+                )`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`(
+                    ${ref} <> ALL(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
+                    AND ${ref} <> ALL(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
+                )`);
+            } else if (operatorKey === 'in') {
+                clauses.push(`(${buildStatusCheck(normalizedValue)})`);
+            } else if (operatorKey === 'not_in') {
+                const refs = bindArray(normalizedValue.map((v) => String(v).toLowerCase()));
+                clauses.push(`NOT (${refs.map((ref) => `(
+                    ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
+                    OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
+                )`).join(' OR ')})`);
+            }
+            continue;
+        }
+
+        // ── campaign_count_all_time ────────────────────────────────────────
         if (fieldKey === 'campaign_count_all_time') {
             const ref = bindParam(Number(normalizedValue));
             const target = 'COALESCE(cs.campaign_count_all_time, 0)';
             if (operatorKey === 'eq') clauses.push(`${target} = ${ref}`);
-            if (operatorKey === 'gt') clauses.push(`${target} > ${ref}`);
-            if (operatorKey === 'gte') clauses.push(`${target} >= ${ref}`);
-            if (operatorKey === 'lt') clauses.push(`${target} < ${ref}`);
-            if (operatorKey === 'lte') clauses.push(`${target} <= ${ref}`);
+            else if (operatorKey === 'neq') clauses.push(`${target} <> ${ref}`);
+            else if (operatorKey === 'gt') clauses.push(`${target} > ${ref}`);
+            else if (operatorKey === 'gte') clauses.push(`${target} >= ${ref}`);
+            else if (operatorKey === 'lt') clauses.push(`${target} < ${ref}`);
+            else if (operatorKey === 'lte') clauses.push(`${target} <= ${ref}`);
+            continue;
+        }
+
+        // ── campaign_count_active ──────────────────────────────────────────
+        if (fieldKey === 'campaign_count_active') {
+            const ref = bindParam(Number(normalizedValue));
+            const target = 'COALESCE(cs.campaign_count_active, 0)';
+            if (operatorKey === 'eq') clauses.push(`${target} = ${ref}`);
+            else if (operatorKey === 'neq') clauses.push(`${target} <> ${ref}`);
+            else if (operatorKey === 'gt') clauses.push(`${target} > ${ref}`);
+            else if (operatorKey === 'gte') clauses.push(`${target} >= ${ref}`);
+            else if (operatorKey === 'lt') clauses.push(`${target} < ${ref}`);
+            else if (operatorKey === 'lte') clauses.push(`${target} <= ${ref}`);
+            continue;
+        }
+
+        // ── boolean insight fields (fi alias = filter_insights CTE) ───────
+        if (fieldKey === 'uses_klaviyo' || fieldKey === 'uses_shopify' || fieldKey === 'discovery_call_held') {
+            const col = `fi.${fieldKey}`;
+            if (operatorKey === 'is_true') clauses.push(`${col} IS TRUE`);
+            else if (operatorKey === 'is_false') clauses.push(`${col} IS FALSE`);
+            else if (operatorKey === 'is_empty') clauses.push(`${col} IS NULL`);
+            continue;
+        }
+
+        // ── numeric insight fields (fi alias) ──────────────────────────────
+        if (fieldKey === 'annual_revenue_min' || fieldKey === 'annual_revenue_max') {
+            const col = `fi.${fieldKey}`;
+            if (operatorKey === 'gt') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} > ${ref}`); }
+            else if (operatorKey === 'gte') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} >= ${ref}`); }
+            else if (operatorKey === 'lt') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} < ${ref}`); }
+            else if (operatorKey === 'lte') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} <= ${ref}`); }
+            else if (operatorKey === 'is_empty') clauses.push(`${col} IS NULL`);
+            else if (operatorKey === 'not_empty') clauses.push(`${col} IS NOT NULL`);
+            continue;
         }
     }
 
@@ -749,10 +1263,22 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         const shouldIncludeTotal = includeTotal === 'true' || includeTotal === '1';
         const isCountOnly = countOnly === 'true' || countOnly === '1';
 
-        const dynamicFilters = parseLeadFiltersQuery(rawFilters);
-        const searchTerm = typeof search === 'string' ? search.toLowerCase().trim() : '';
-        const isEmailSearch = isEmailLikeSearch(searchTerm);
+        const { clauses: dynamicFilters } = parseLeadFiltersQuery(rawFilters);
+        const rawSearchTerm = typeof search === 'string' ? search.trim() : '';
+        const searchClassification = classifyLeadSearch(rawSearchTerm);
+        // Honour an explicit override from the client (?searchField=email|domain|text)
+        // but otherwise trust the classifier above.
+        const explicitSearchField = typeof req.query.searchField === 'string'
+            ? req.query.searchField.trim().toLowerCase()
+            : '';
+        let searchKind = searchClassification.kind;
+        const searchValue = searchClassification.value;
+        if (explicitSearchField === 'email' && searchValue) searchKind = 'email';
+        else if (explicitSearchField === 'domain' && searchValue) searchKind = 'domain';
+        else if (explicitSearchField === 'text' && searchValue) searchKind = 'text';
+        const searchTerm = searchValue;
         const requiresFilterCampaignStats = leadFiltersRequireCampaignStats(dynamicFilters);
+        const requiresFilterInsights = leadFiltersRequireInsights(dynamicFilters);
         const hasAnyLeadFilters = Boolean(
             emailStatus
             || emailStatusMulti
@@ -809,20 +1335,32 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paramsState.paramIndex = paramIndex;
         }
 
-        // General search filter. Email-shaped searches intentionally use the
-        // existing contacts_client_email_unique (client_id, email) index.
+        // General search filter. Routed to the most selective index based on
+        // classifyLeadSearch() above:
+        //   - email  -> (client_id, LOWER(email))      [idx_contacts_client_email_lower]
+        //   - domain -> (client_id, domain_normalized) [idx_companies_client_domain]
+        //   - text   -> trigram GIN on full_name + email
         if (searchTerm) {
-            if (isEmailSearch) {
-                whereClause += ` AND c.email = $${paramIndex}`;
+            if (searchKind === 'email') {
+                whereClause += ` AND LOWER(c.email) = $${paramIndex}`;
+                params.push(searchTerm);
+                paramIndex++;
+            } else if (searchKind === 'domain') {
+                whereClause += ` AND co.domain_normalized = $${paramIndex}`;
+                params.push(searchTerm);
+                paramIndex++;
             } else {
+                // Free-text: use trigram-indexable LIKE on the columns most
+                // likely to contain the token. We intentionally drop the
+                // domain_normalized branch here — domain searches should be
+                // routed via the domain classifier (or ?searchField=domain).
                 whereClause += ` AND (
-                    LOWER(co.domain_normalized) = $${paramIndex}
-                    OR LOWER(c.email) = $${paramIndex}
-                    OR LOWER(c.full_name) = $${paramIndex}
+                    LOWER(c.full_name) LIKE $${paramIndex}
+                    OR LOWER(c.email) LIKE $${paramIndex}
                 )`;
+                params.push(`%${searchTerm}%`);
+                paramIndex++;
             }
-            params.push(searchTerm);
-            paramIndex++;
             paramsState.paramIndex = paramIndex;
         }
 
@@ -929,8 +1467,9 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         }
 
         const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
-        if (dynamicClauses.length > 0) {
-            whereClause += ` AND ${dynamicClauses.map((clause) => `(${clause})`).join(' AND ')}`;
+        const dynamicWhere = joinDynamicClauses(dynamicClauses, dynamicFilters);
+        if (dynamicWhere) {
+            whereClause += ` AND ${dynamicWhere}`;
         }
         paramIndex = paramsState.paramIndex;
 
@@ -980,6 +1519,19 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 GROUP BY cic.contact_id
             )` : ''}
+            ${requiresFilterInsights ? `,
+            filter_insights AS (
+                SELECT
+                    contact_id,
+                    uses_klaviyo,
+                    uses_shopify,
+                    discovery_call_held,
+                    annual_revenue_min,
+                    annual_revenue_max
+                FROM contact_insights
+                WHERE agency_id = $1
+                AND client_id = $2
+            )` : ''}
         `;
         const countQuery = `
             ${baseWithClause}
@@ -987,6 +1539,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             FROM contacts c
             JOIN scoped_companies co ON c.company_id = co.id
             ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
+            ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
             WHERE ${whereClause}
         `;
 
@@ -1046,6 +1599,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 FROM contacts c
                 JOIN scoped_companies co ON c.company_id = co.id
                 ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
+                ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
                 WHERE ${whereClause}
                 ORDER BY ${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC
                 LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
@@ -1832,10 +2386,21 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
         } = queryInput;
 
         let dynamicFilters = [];
-        if (Array.isArray(queryInput?.filters)) {
-            dynamicFilters = queryInput.filters.slice(0, 25);
-        } else if (typeof queryInput?.filters === 'string') {
-            dynamicFilters = parseLeadFiltersQuery(queryInput.filters);
+        const rawFiltersInput = queryInput?.filters;
+        if (Array.isArray(rawFiltersInput)) {
+            dynamicFilters = rawFiltersInput.slice(0, 25).map((c) => ({ ...c, joinOp: 'AND' }));
+        } else if (rawFiltersInput && typeof rawFiltersInput === 'object') {
+            const parsed = rawFiltersInput.clauses
+                ? rawFiltersInput  // already { clauses } format
+                : { clauses: [] };
+            dynamicFilters = Array.isArray(parsed.clauses)
+                ? parsed.clauses.slice(0, 25).map((c) => ({
+                    ...c,
+                    joinOp: String(c.joinOp || parsed.logic || 'AND').toUpperCase() === 'OR' ? 'OR' : 'AND'
+                }))
+                : [];
+        } else if (typeof rawFiltersInput === 'string') {
+            dynamicFilters = parseLeadFiltersQuery(rawFiltersInput).clauses;
         }
 
         let whereClause = 'c.agency_id = $1 AND c.client_id = $2';
@@ -1988,10 +2553,13 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
         }
 
         const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
-        if (dynamicClauses.length > 0) {
-            whereClause += ` AND ${dynamicClauses.map((clause) => `(${clause})`).join(' AND ')}`;
+        const dynamicWhere = joinDynamicClauses(dynamicClauses, dynamicFilters);
+        if (dynamicWhere) {
+            whereClause += ` AND ${dynamicWhere}`;
         }
 
+        const requiresKlaviyoCampaignStats = leadFiltersRequireCampaignStats(dynamicFilters);
+        const requiresKlaviyoInsights = leadFiltersRequireInsights(dynamicFilters);
         const domainResult = await pool.query(
             `WITH scoped_companies AS (
                 SELECT
@@ -2036,10 +2604,24 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 GROUP BY cic.contact_id
             )
+            ${requiresKlaviyoInsights ? `,
+            filter_insights AS (
+                SELECT
+                    contact_id,
+                    uses_klaviyo,
+                    uses_shopify,
+                    discovery_call_held,
+                    annual_revenue_min,
+                    annual_revenue_max
+                FROM contact_insights
+                WHERE agency_id = $1
+                AND client_id = $2
+            )` : ''}
             SELECT DISTINCT co.domain_normalized AS domain
             FROM contacts c
             JOIN scoped_companies co ON c.company_id = co.id
             LEFT JOIN campaign_stats cs ON cs.contact_id = c.id
+            ${requiresKlaviyoInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
             WHERE ${whereClause}`,
             paramsState.params
         );
@@ -2173,6 +2755,140 @@ router.post('/leads/:contactId/insights', verifyFirebaseToken, async (req, res) 
     } catch (error) {
         console.error('Error upserting lead insights:', error);
         res.status(500).json({ error: 'Failed to save lead insights' });
+    }
+});
+
+/**
+ * POST /leads/verification-import/preview
+ *
+ * Parse an uploaded CSV and return its headers + first 5 data rows so the
+ * frontend can let the user map columns before committing the import.
+ *
+ * Body: multipart/form-data  file=<csv>
+ */
+router.post('/leads/verification-import/preview', verifyFirebaseToken, uploadVerification.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'CSV file is required.' });
+        }
+        const rows = await parseCsvBuffer(req.file.buffer);
+        if (rows.length === 0) {
+            return res.status(400).json({ error: 'CSV file is empty or contains no data rows.' });
+        }
+        const headers = Object.keys(rows[0]);
+        const previewRows = rows.slice(0, 5);
+        return res.json({ headers, previewRows, totalRows: rows.length });
+    } catch (error) {
+        console.error('Error parsing CSV for verification preview:', error);
+        return res.status(400).json({ error: error?.message || 'Failed to parse CSV.' });
+    }
+});
+
+/**
+ * POST /leads/verification-import
+ *
+ * Update email_status and last_verified_at for contacts matched by email.
+ * Only updates contacts that belong to the authenticated agency + client.
+ *
+ * Body: multipart/form-data
+ *   file          – CSV file
+ *   clientId      – client slug (required)
+ *   emailColumn   – CSV column name whose value is the email address (required)
+ *   statusColumn  – CSV column name whose value is the email status  (required)
+ *   verifiedAtColumn – CSV column name whose value is an ISO date for last_verified_at (optional)
+ */
+router.post('/leads/verification-import', verifyFirebaseToken, uploadVerification.single('file'), async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = normalizeOptionalText(req.body?.clientId);
+        const emailColumn = normalizeOptionalText(req.body?.emailColumn);
+        const statusColumn = normalizeOptionalText(req.body?.statusColumn);
+        const verifiedAtColumn = normalizeOptionalText(req.body?.verifiedAtColumn) || null;
+
+        if (!clientSlug) return res.status(400).json({ error: 'clientId is required.' });
+        if (!emailColumn) return res.status(400).json({ error: 'emailColumn is required.' });
+        if (!statusColumn) return res.status(400).json({ error: 'statusColumn is required.' });
+        if (!req.file) return res.status(400).json({ error: 'CSV file is required.' });
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const rows = await parseCsvBuffer(req.file.buffer);
+        if (rows.length === 0) {
+            return res.status(400).json({ error: 'CSV file is empty or contains no data rows.' });
+        }
+        if (rows.length > 50000) {
+            return res.status(400).json({ error: 'CSV exceeds 50 000 row limit. Split the file and re-upload.' });
+        }
+
+        const defaultVerifiedAt = new Date().toISOString();
+        let totalRows = rows.length;
+        let matched = 0;
+        let skipped = 0;
+        let notFound = 0;
+
+        const BATCH = 500;
+        for (let i = 0; i < rows.length; i += BATCH) {
+            const batch = rows.slice(i, i + BATCH);
+
+            // Build arrays for a single multi-row UPDATE
+            const emails = [];
+            const statuses = [];
+            const verifiedAts = [];
+
+            for (const row of batch) {
+                const email = String(row[emailColumn] || '').trim().toLowerCase();
+                const rawStatus = String(row[statusColumn] || '').trim();
+                if (!email || !rawStatus) { skipped++; continue; }
+
+                const normalizedStatus = leadsService.normalizeEmailStatus(rawStatus);
+                if (!normalizedStatus) { skipped++; continue; }
+
+                let effectiveVerifiedAt = defaultVerifiedAt;
+                if (verifiedAtColumn && row[verifiedAtColumn]) {
+                    const parsed = normalizeOptionalTimestamp(String(row[verifiedAtColumn]).trim());
+                    if (parsed) effectiveVerifiedAt = parsed;
+                }
+
+                emails.push(email);
+                statuses.push(normalizedStatus);
+                verifiedAts.push(effectiveVerifiedAt);
+            }
+
+            if (emails.length === 0) continue;
+
+            // Bulk UPDATE via unnest
+            const result = await pool.query(
+                `UPDATE contacts AS c
+                 SET
+                     email_status     = v.new_status,
+                     last_verified_at = v.new_verified_at::timestamptz,
+                     updated_at       = NOW()
+                 FROM (
+                     SELECT
+                         UNNEST($1::text[]) AS email_lower,
+                         UNNEST($2::text[]) AS new_status,
+                         UNNEST($3::text[]) AS new_verified_at
+                 ) AS v
+                 WHERE c.agency_id = $4
+                   AND c.client_id = $5
+                   AND c.email IS NOT NULL
+                   AND LOWER(c.email) = v.email_lower`,
+                [emails, statuses, verifiedAts, agencyId, clientId]
+            );
+
+            matched += emails.length;
+            notFound += emails.length - (result.rowCount || 0);
+        }
+
+        return res.json({
+            totalRows,
+            matched,
+            updated: matched - notFound,
+            skipped,
+            notFound,
+        });
+    } catch (error) {
+        console.error('Error running verification import:', error);
+        return res.status(500).json({ error: error?.message || 'Failed to import verification CSV.' });
     }
 });
 

@@ -668,7 +668,7 @@ async function persistSentAutoResponderActivity(db, {
     const eventTimestamp = new Date().toISOString();
     const fingerprint = crypto.createHash('sha256').update(`interested-autoresponder-email-sent|${draftId}`).digest('hex');
     const payload = {
-        event_type: 'email_sent',
+        event_type: 'interested_reply_sent',
         source: 'interested_autoresponder',
         subject: threadSubject || null,
         email_subject: threadSubject || null,
@@ -699,7 +699,7 @@ async function persistSentAutoResponderActivity(db, {
             campaignId,
             instantlyCampaignId || null,
             instantlyLeadId || null,
-            'email_sent',
+            'interested_reply_sent',
             null,
             leadEmail || null,
             eaccount || null,

@@ -342,7 +342,7 @@ export default function ClientsPage() {
                             style={{
                                 position: "fixed",
                                 inset: 0,
-                                background: "rgba(0, 0, 0, 0.3)",
+                                background: "var(--app-bg-overlay-soft)",
                                 zIndex: 40
                             }}
                         />
@@ -431,7 +431,7 @@ export default function ClientsPage() {
                                                     })
                                             ].map(c => {
                                                 const st = Number(c.status ?? 0);
-                                                const tone = st === 1 ? '#16a34a' : st === 2 ? '#2563eb' : st === 0 ? '#a1a1aa' : '#f59e0b';
+                                                const tone = st === 1 ? 'var(--app-status-active)' : st === 2 ? 'var(--app-status-paused)' : st === 0 ? 'var(--app-status-inactive)' : 'var(--app-status-other)';
                                                 const label = st === 1 ? 'Active' : st === 2 ? 'Paused' : st === 0 ? 'Inactive' : `Status ${st}`;
                                                 return (
                                                     <li key={c.id} className="list__item" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
