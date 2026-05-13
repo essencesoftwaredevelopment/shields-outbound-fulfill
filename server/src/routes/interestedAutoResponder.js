@@ -3,6 +3,7 @@ import express from 'express';
 import { pool } from '../config/db.js';
 import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
 import {
+    callPopupFormGenerate,
     fetchAgencyAndClientSettings,
     generateDraftReply,
     getInterestedAutoResponderDraftByToken,
@@ -240,7 +241,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         if (!contact) return res.status(404).json({ error: 'Contact not found.' });
 
         // Fetch thread context in parallel; template vars resolved after we know the eaccount
-        const [{ openaiKey, ntfyTopic }, threadResult] = await Promise.all([
+        const [{ openaiKey, ntfyTopic }, threadResult, essenceAiPreviewUrl] = await Promise.all([
             fetchAgencyAndClientSettings(req.agencyId, req.params.clientId),
             pool.query(
                 `SELECT
@@ -259,7 +260,8 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                  ORDER BY e.event_timestamp DESC NULLS LAST, e.created_at DESC NULLS LAST
                  LIMIT 5`,
                 [contactId, prompt.campaign_id]
-            )
+            ),
+            callPopupFormGenerate(contact.email)
         ]);
 
         // Derive eaccount from most recent thread event that has one
@@ -291,7 +293,8 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             campaignName: prompt.campaign_name,
             leadEmail: contact.email,
             threadSubject,
-            previousLeadMessage
+            previousLeadMessage,
+            essenceAiPreviewUrl
         });
 
         // Create a real pending_review draft so we can send a clickable review link
@@ -327,6 +330,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             model,
             promptVersion: prompt.version,
             reviewUrl,
+            previewUrl: essenceAiPreviewUrl || null,
             debug: {
                 lead: {
                     email: contact.email,

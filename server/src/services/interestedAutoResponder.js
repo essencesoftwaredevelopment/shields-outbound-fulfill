@@ -12,10 +12,15 @@ const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
 
-async function callPopupFormGenerate(leadEmail) {
+export async function callPopupFormGenerate(leadEmail) {
     const atIndex = String(leadEmail || '').indexOf('@');
     const domain = atIndex !== -1 ? String(leadEmail).slice(atIndex + 1).trim() : '';
-    if (!domain) return null;
+    if (!domain) {
+        console.log('[popup-form/generate] skipped — no domain extractable from leadEmail:', leadEmail);
+        return null;
+    }
+    console.log(`[popup-form/generate] calling for domain=${domain}`);
+    const start = Date.now();
     try {
         const response = await fetch(POPUP_FORM_GENERATE_URL, {
             method: 'POST',
@@ -25,9 +30,17 @@ async function callPopupFormGenerate(leadEmail) {
             },
             body: JSON.stringify({ domain })
         });
-        if (!response.ok) return null;
-        return `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
-    } catch {
+        const elapsed = Date.now() - start;
+        if (!response.ok) {
+            console.warn(`[popup-form/generate] non-200 response status=${response.status} domain=${domain} elapsed=${elapsed}ms`);
+            return null;
+        }
+        const previewUrl = `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
+        console.log(`[popup-form/generate] success domain=${domain} elapsed=${elapsed}ms previewUrl=${previewUrl}`);
+        return previewUrl;
+    } catch (err) {
+        const elapsed = Date.now() - start;
+        console.error(`[popup-form/generate] fetch error domain=${domain} elapsed=${elapsed}ms:`, err.message);
         return null;
     }
 }
@@ -242,7 +255,7 @@ export async function fetchAgencyAndClientSettings(agencyId, clientSlug) {
     };
 }
 
-export async function generateDraftReply({ openaiKey, systemPrompt, campaignName, leadEmail, threadSubject, previousLeadMessage }) {
+export async function generateDraftReply({ openaiKey, systemPrompt, campaignName, leadEmail, threadSubject, previousLeadMessage, essenceAiPreviewUrl }) {
     const client = new OpenAI({ apiKey: openaiKey });
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,
@@ -255,15 +268,22 @@ export async function generateDraftReply({ openaiKey, systemPrompt, campaignName
                     `Campaign: ${campaignName || 'Unknown campaign'}`,
                     `Lead email: ${leadEmail || 'Unknown lead'}`,
                     `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
+                    essenceAiPreviewUrl
+                        ? `Essence AI preview URL: ${essenceAiPreviewUrl}`
+                        : '',
                     '',
                     'Write a plain-text reply to the interested lead.',
                     'Do not include a subject line.',
                     'Do not use markdown.',
                     'Preserve the conversational context from the lead message below.',
                     '',
+                    essenceAiPreviewUrl
+                        ? `CTA instruction: An Essence AI preview has already been generated for this prospect's store. Use the Essence AI preview URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
+                        : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`,
+                    '',
                     'Lead message/thread context:',
                     previousLeadMessage || '(no message text available)'
-                ].join('\n')
+                ].filter(Boolean).join('\n')
             }
         ]
     });
@@ -523,17 +543,15 @@ export async function createInterestedAutoResponderDraftFromEvent({
                     emailAccount: eaccount
                 })
             ]);
-            const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, {
-                ...templateVars,
-                essence_ai_preview_url: essenceAiPreviewUrl || ''
-            });
+            const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
             generation = await generateDraftReply({
                 openaiKey: settings.openaiKey,
                 systemPrompt: renderedSystemPrompt,
                 campaignName: promptConfig.campaign_name,
                 leadEmail: normalizedLeadEmail,
                 threadSubject,
-                previousLeadMessage
+                previousLeadMessage,
+                essenceAiPreviewUrl
             });
         } catch (error) {
             const failedDraft = await upsertDraftRow(client, {

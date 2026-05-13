@@ -35,12 +35,12 @@ export default function InterestedAutoResponderReviewPage() {
             setLoading(true);
             setError(null);
             try {
-                const response = await fetch(`${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}`, {
+                const draftResponse = await fetch(`${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}`, {
                     cache: "no-store"
                 });
-                const data = await response.json().catch(() => ({}));
-                if (!response.ok) {
-                    throw new Error(data.error || `Failed to load review draft (${response.status})`);
+                const data = await draftResponse.json().catch(() => ({}));
+                if (!draftResponse.ok) {
+                    throw new Error(data.error || `Failed to load review draft (${draftResponse.status})`);
                 }
                 if (!cancelled) {
                     const initialText = data.draft?.renderedText || "";
