@@ -6,9 +6,31 @@ import { resolveTemplateVars, renderTemplate } from './followUpSender.js';
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.3-chat-latest').trim() || 'gpt-5.3-chat-latest';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const POPUP_FORM_GENERATE_URL = 'https://essence-retention-ai-popup-demo.vercel.app/api/popup-form/generate';
+const POPUP_FORM_API_KEY = 'CNl6iVR6YwmlPU9iw6gOW1LAF4roUxxPNB9YrI2kdIeMmbcfUKh4Rgdl0gdmZBQo';
 const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
+
+async function callPopupFormGenerate(leadEmail) {
+    const atIndex = String(leadEmail || '').indexOf('@');
+    const domain = atIndex !== -1 ? String(leadEmail).slice(atIndex + 1).trim() : '';
+    if (!domain) return null;
+    try {
+        const response = await fetch(POPUP_FORM_GENERATE_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': POPUP_FORM_API_KEY
+            },
+            body: JSON.stringify({ domain })
+        });
+        if (!response.ok) return null;
+        return `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
+    } catch {
+        return null;
+    }
+}
 
 function asTrimmedText(value) {
     if (value === null || value === undefined) return null;
@@ -494,11 +516,17 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
         let generation;
         try {
-            const templateVars = await resolveTemplateVars(client, contactId, campaignId, {
-                clientId,
-                emailAccount: eaccount
+            const [essenceAiPreviewUrl, templateVars] = await Promise.all([
+                callPopupFormGenerate(normalizedLeadEmail),
+                resolveTemplateVars(client, contactId, campaignId, {
+                    clientId,
+                    emailAccount: eaccount
+                })
+            ]);
+            const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, {
+                ...templateVars,
+                essence_ai_preview_url: essenceAiPreviewUrl || ''
             });
-            const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
             generation = await generateDraftReply({
                 openaiKey: settings.openaiKey,
                 systemPrompt: renderedSystemPrompt,
