@@ -1145,6 +1145,21 @@ export default function ClientPage() {
     const previousRecentEventIdsRef = useRef<Set<string> | null>(null);
     const recentEventAnimationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+    type PendingReviewDraft = {
+        id: number;
+        lead_email: string;
+        eaccount: string | null;
+        thread_subject: string | null;
+        rendered_text: string | null;
+        review_token: string | null;
+        campaign_name: string | null;
+        created_at: string;
+        updated_at: string;
+    };
+    const [pendingReviewDrafts, setPendingReviewDrafts] = useState<PendingReviewDraft[]>([]);
+    const [pendingReviewDraftsLoading, setPendingReviewDraftsLoading] = useState(false);
+    const [expandedDraftId, setExpandedDraftId] = useState<number | null>(null);
+
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId) return "";
         return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${user.uid}/${clientId}`;
@@ -3145,6 +3160,25 @@ export default function ClientPage() {
         }
     }, [user, clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
 
+    const fetchPendingReviewDrafts = useCallback(async () => {
+        if (!user || !clientId) return;
+        try {
+            setPendingReviewDraftsLoading(true);
+            const token = await user.getIdToken();
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/drafts/pending-review`,
+                { headers: { Authorization: `Bearer ${token}` } }
+            );
+            const data = await response.json();
+            if (!response.ok) throw new Error(data?.error || `Failed to fetch drafts (${response.status})`);
+            setPendingReviewDrafts(data.drafts || []);
+        } catch (error) {
+            console.error('Error fetching pending review drafts:', error);
+        } finally {
+            setPendingReviewDraftsLoading(false);
+        }
+    }, [user, clientId]);
+
     useEffect(() => {
         if (jobState) {
             setSelectedJobId(jobState.id);
@@ -3157,7 +3191,8 @@ export default function ClientPage() {
         }
 
         fetchInstantlyEventAnalytics(true);
-    }, [activeTab, user, clientId, fetchInstantlyEventAnalytics]);
+        fetchPendingReviewDrafts();
+    }, [activeTab, user, clientId, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
 
     useEffect(() => {
         if (activeTab !== 'follow-ups' || !user || !clientId) return;
@@ -6063,11 +6098,15 @@ export default function ClientPage() {
                                 ))}
                             </div>
 
+                            <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start" }}>
+
                             <div style={{
                                 padding: "1.25rem",
                                 borderRadius: "16px",
                                 background: "var(--app-surface-3)",
-                                border: "1px solid var(--app-border)"
+                                border: "1px solid var(--app-border)",
+                                flex: 1,
+                                minWidth: 0
                             }}>
                                 <p className="eyebrow eyebrow--muted" style={{ paddingBottom: "15px" }}>Recent Events</p>
 
@@ -6364,6 +6403,130 @@ export default function ClientPage() {
                                     );
                                 })()}
                             </div>
+
+                            {/* Pending Review Drafts column */}
+                            <div style={{
+                                width: "340px",
+                                flexShrink: 0,
+                                padding: "1.25rem",
+                                borderRadius: "16px",
+                                background: "var(--app-surface-3)",
+                                border: "1px solid var(--app-border)"
+                            }}>
+                                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingBottom: "15px" }}>
+                                    <p className="eyebrow eyebrow--muted" style={{ margin: 0 }}>Pending Review</p>
+                                    {pendingReviewDrafts.length > 0 && (
+                                        <span style={{
+                                            fontSize: "0.7rem",
+                                            fontWeight: 600,
+                                            color: "var(--app-evtpill-purple)",
+                                            background: "rgba(139,92,246,0.12)",
+                                            border: "1px solid rgba(139,92,246,0.25)",
+                                            borderRadius: "999px",
+                                            padding: "0.1rem 0.5rem",
+                                        }}>
+                                            {pendingReviewDrafts.length}
+                                        </span>
+                                    )}
+                                </div>
+                                {pendingReviewDraftsLoading && pendingReviewDrafts.length === 0 ? (
+                                    <div className="pipeline-panel__empty">
+                                        <svg className="spinner" style={{ width: "24px", height: "24px", color: "#8b5cf6" }} viewBox="0 0 24 24" fill="none">
+                                            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                                            <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                                        </svg>
+                                    </div>
+                                ) : pendingReviewDrafts.length === 0 ? (
+                                    <div className="pipeline-panel__empty">
+                                        <p>No drafts pending review.</p>
+                                    </div>
+                                ) : (
+                                    <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+                                        {pendingReviewDrafts.map((draft, idx) => {
+                                            const isExpanded = expandedDraftId === draft.id;
+                                            const draftDate = new Date(draft.created_at);
+                                            const timeStr = Number.isNaN(draftDate.getTime()) ? "" : draftDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                                            const dateStr = Number.isNaN(draftDate.getTime()) ? "" : draftDate.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+                                            const plainText = draft.rendered_text
+                                                ? draft.rendered_text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+                                                : null;
+                                            const snippet = plainText ? plainText.slice(0, 120) + (plainText.length > 120 ? "…" : "") : null;
+                                            const reviewUrl = draft.review_token
+                                                ? `/interested-autoresponder/${encodeURIComponent(draft.review_token)}`
+                                                : null;
+
+                                            return (
+                                                <div key={draft.id} style={{ borderTop: idx > 0 ? "1px solid var(--app-border)" : "none" }}>
+                                                    <div
+                                                        style={{
+                                                            padding: "0.6rem 0.25rem",
+                                                            cursor: plainText ? "pointer" : "default",
+                                                            display: "flex",
+                                                            flexDirection: "column",
+                                                            gap: "0.2rem",
+                                                        }}
+                                                        onClick={() => plainText && setExpandedDraftId(isExpanded ? null : draft.id)}
+                                                    >
+                                                        <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                                                            <div style={{
+                                                                width: "8px",
+                                                                height: "8px",
+                                                                borderRadius: "50%",
+                                                                background: "#8b5cf6",
+                                                                flexShrink: 0
+                                                            }} />
+                                                            <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "var(--app-text-high)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                                {draft.lead_email}
+                                                            </span>
+                                                            <span style={{ fontSize: "0.7rem", color: "var(--app-text-ghost)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>
+                                                                {dateStr} {timeStr}
+                                                            </span>
+                                                        </div>
+                                                        {draft.campaign_name && (
+                                                            <p style={{ margin: 0, fontSize: "0.72rem", color: "var(--app-text-ghost)", paddingLeft: "16px" }}>
+                                                                {draft.campaign_name}
+                                                            </p>
+                                                        )}
+                                                        {snippet && !isExpanded && (
+                                                            <p style={{ margin: 0, fontSize: "0.76rem", color: "var(--app-text-faint)", lineHeight: 1.45, paddingLeft: "16px", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                                                                {snippet}
+                                                            </p>
+                                                        )}
+                                                        {isExpanded && plainText && (
+                                                            <div style={{ margin: "0.2rem 0 0", fontSize: "0.76rem", color: "var(--app-text-muted)", lineHeight: 1.55, paddingLeft: "16px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                                                {plainText}
+                                                            </div>
+                                                        )}
+                                                        {reviewUrl && (
+                                                            <div style={{ paddingLeft: "16px", marginTop: "0.4rem" }}>
+                                                                <a
+                                                                    href={reviewUrl}
+                                                                    target="_blank"
+                                                                    rel="noopener noreferrer"
+                                                                    onClick={(e) => e.stopPropagation()}
+                                                                    style={{
+                                                                        fontSize: "0.75rem",
+                                                                        fontWeight: 600,
+                                                                        color: "var(--app-evtpill-purple)",
+                                                                        textDecoration: "none",
+                                                                        display: "inline-flex",
+                                                                        alignItems: "center",
+                                                                        gap: "0.2rem",
+                                                                    }}
+                                                                >
+                                                                    Review draft ↗
+                                                                </a>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+
+                            </div>{/* end flex row */}
                                 </>
                             )}
                         </div>

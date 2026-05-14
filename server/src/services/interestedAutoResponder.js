@@ -787,11 +787,13 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
     }
 
     const outgoingText = normalizeOutgoingReplyText(draft.rendered_text);
+    const renderedHtml = String(draft.rendered_text || '').trim();
+    const isHtml = /<\/?[a-z][\s\S]*>/i.test(renderedHtml);
     const replyPayload = {
         reply_to_uuid: replyToUuid,
         eaccount,
         body: {
-            html: plainTextToHtml(outgoingText)
+            html: isHtml ? decodeBasicHtmlEntities(renderedHtml) : plainTextToHtml(outgoingText)
         }
     };
     if (threadSubject) {

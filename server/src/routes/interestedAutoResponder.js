@@ -450,4 +450,29 @@ router.post('/interested-autoresponder/review/:token/send', async (req, res) => 
     }
 });
 
+router.get('/clients/:clientId/interested-autoresponder/drafts/pending-review', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+
+        const result = await pool.query(
+            `SELECT d.id, d.lead_email, d.eaccount, d.thread_subject, d.rendered_text,
+                    d.review_token, d.created_at, d.updated_at,
+                    ic.name AS campaign_name
+             FROM interested_autoresponder_drafts d
+             LEFT JOIN instantly_campaigns ic ON ic.id = d.campaign_id
+             WHERE d.client_id = $1
+               AND d.status = 'pending_review'
+             ORDER BY d.created_at DESC
+             LIMIT 50`,
+            [clientRow.id]
+        );
+        res.json({ drafts: result.rows });
+    } catch (error) {
+        console.error('GET pending-review drafts error:', error);
+        res.status(500).json({ error: 'Failed to fetch pending review drafts.' });
+    }
+});
+
 export default router;

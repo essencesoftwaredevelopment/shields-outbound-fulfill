@@ -28,6 +28,17 @@ export default function InterestedAutoResponderReviewPage() {
     const lastSavedTextRef = useRef<string>("");
     const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+    type LinkPopup = {
+        url: string;
+        anchor: HTMLAnchorElement | null;
+        top: number;
+        left: number;
+        savedRange: Range | null;
+    };
+    const [linkPopup, setLinkPopup] = useState<LinkPopup | null>(null);
+    const linkInputRef = useRef<HTMLInputElement>(null);
+    const linkPopupRef = useRef<HTMLDivElement>(null);
+
     useEffect(() => {
         if (!token) return;
         let cancelled = false;
@@ -105,6 +116,99 @@ export default function InterestedAutoResponderReviewPage() {
         if (editorRef.current) setRenderedText(editorRef.current.innerHTML);
     }, []);
 
+    const openLinkPopup = useCallback(() => {
+        const sel = window.getSelection();
+        if (!sel) return;
+
+        // Find the anchor the cursor is inside (if any)
+        let anchor: HTMLAnchorElement | null = null;
+        const node = sel.anchorNode;
+        let el: Node | null = node instanceof Element ? node : node?.parentElement ?? null;
+        while (el && el !== editorRef.current) {
+            if (el instanceof HTMLAnchorElement) { anchor = el; break; }
+            el = el.parentElement;
+        }
+
+        // Save the current selection range so we can restore it before execCommand
+        const savedRange = sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+
+        // Position the popover near the selection or anchor
+        let rect: DOMRect | null = null;
+        if (anchor) {
+            rect = anchor.getBoundingClientRect();
+        } else if (sel.rangeCount > 0) {
+            rect = sel.getRangeAt(0).getBoundingClientRect();
+        }
+        const top = rect ? rect.bottom + window.scrollY + 8 : 200;
+        const left = rect ? Math.max(8, rect.left + window.scrollX) : 80;
+
+        setLinkPopup({
+            url: anchor?.href ?? "",
+            anchor,
+            top,
+            left,
+            savedRange,
+        });
+        // Focus the input on next tick
+        setTimeout(() => linkInputRef.current?.focus(), 0);
+    }, []);
+
+    const applyLink = useCallback((url: string) => {
+        if (!editorRef.current) return;
+        editorRef.current.focus();
+        const sel = window.getSelection();
+
+        if (linkPopup?.anchor) {
+            // Edit existing link
+            if (url) {
+                linkPopup.anchor.href = url;
+            } else {
+                // Remove link but keep text
+                const parent = linkPopup.anchor.parentNode;
+                if (parent) {
+                    while (linkPopup.anchor.firstChild) {
+                        parent.insertBefore(linkPopup.anchor.firstChild, linkPopup.anchor);
+                    }
+                    parent.removeChild(linkPopup.anchor);
+                }
+            }
+        } else if (linkPopup?.savedRange && sel) {
+            // Restore saved selection before execCommand
+            sel.removeAllRanges();
+            sel.addRange(linkPopup.savedRange);
+            if (url) {
+                document.execCommand("createLink", false, url);
+                // Style newly created links (execCommand doesn't apply class)
+            } else {
+                document.execCommand("unlink", false, undefined);
+            }
+        }
+
+        setLinkPopup(null);
+        if (editorRef.current) {
+            setRenderedText(editorRef.current.innerHTML);
+        }
+    }, [linkPopup]);
+
+    const handleEditorKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+            e.preventDefault();
+            openLinkPopup();
+        }
+    }, [openLinkPopup]);
+
+    // Close popup on outside click
+    useEffect(() => {
+        if (!linkPopup) return;
+        const handler = (e: MouseEvent) => {
+            if (linkPopupRef.current && !linkPopupRef.current.contains(e.target as Node)) {
+                setLinkPopup(null);
+            }
+        };
+        document.addEventListener("mousedown", handler);
+        return () => document.removeEventListener("mousedown", handler);
+    }, [linkPopup]);
+
     const handleSendReply = async () => {
         setSending(true);
         setError(null);
@@ -158,7 +262,71 @@ export default function InterestedAutoResponderReviewPage() {
                     .ar-card { padding: 1.5rem; }
                     main { padding: 2rem 1rem; }
                 }
+                .link-popup {
+                    position: absolute;
+                    z-index: 9999;
+                    background: #1e2538;
+                    border: 1px solid rgba(255,255,255,0.15);
+                    border-radius: 10px;
+                    padding: 0.6rem 0.75rem;
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+                    min-width: 320px;
+                }
+                .link-popup input {
+                    flex: 1;
+                    background: rgba(0,0,0,0.3);
+                    border: 1px solid rgba(255,255,255,0.12);
+                    border-radius: 6px;
+                    padding: 0.35rem 0.6rem;
+                    color: #fff;
+                    font-size: 0.85rem;
+                    outline: none;
+                }
+                .link-popup input:focus {
+                    border-color: rgba(96,165,250,0.6);
+                    box-shadow: 0 0 0 2px rgba(96,165,250,0.2);
+                }
+                .link-popup button {
+                    flex-shrink: 0;
+                    padding: 0.32rem 0.65rem;
+                    border-radius: 6px;
+                    border: none;
+                    font-size: 0.82rem;
+                    font-weight: 600;
+                    cursor: pointer;
+                }
+                .link-popup .btn-apply { background: #2563eb; color: #fff; }
+                .link-popup .btn-apply:hover { background: #1d4ed8; }
+                .link-popup .btn-remove { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+                .link-popup .btn-remove:hover { background: rgba(239,68,68,0.25); }
             `}</style>
+            {linkPopup && (
+                <div
+                    ref={linkPopupRef}
+                    className="link-popup"
+                    style={{ top: linkPopup.top, left: linkPopup.left }}
+                >
+                    <span style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.45)", flexShrink: 0 }}>🔗</span>
+                    <input
+                        ref={linkInputRef}
+                        type="url"
+                        placeholder="https://"
+                        value={linkPopup.url}
+                        onChange={(e) => setLinkPopup(p => p ? { ...p, url: e.target.value } : p)}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter") { e.preventDefault(); applyLink(linkPopup.url); }
+                            if (e.key === "Escape") { e.preventDefault(); setLinkPopup(null); }
+                        }}
+                    />
+                    <button type="button" className="btn-apply" onClick={() => applyLink(linkPopup.url)}>Apply</button>
+                    {linkPopup.anchor && (
+                        <button type="button" className="btn-remove" onClick={() => applyLink("")}>Remove</button>
+                    )}
+                </div>
+            )}
             <div className="ar-card" style={{ maxWidth: "840px", margin: "0 auto", borderRadius: "20px", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)" }}>
                 <p style={{ margin: 0, textTransform: "uppercase", letterSpacing: "0.08em", fontSize: "0.72rem", color: "rgba(255,255,255,0.45)" }}>
                     Interested Lead Auto-Responder
@@ -193,6 +361,7 @@ export default function InterestedAutoResponderReviewPage() {
                                 contentEditable
                                 suppressContentEditableWarning
                                 onInput={handleEditorInput}
+                                onKeyDown={handleEditorKeyDown}
                                 className="reply-editor"
                                 style={{
                                     minHeight: "180px",
@@ -210,7 +379,7 @@ export default function InterestedAutoResponderReviewPage() {
                                 }}
                             />
                             <p style={{ margin: 0, fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
-                                Click to edit — changes are saved automatically.
+                                Click to edit — changes are saved automatically. Press <kbd style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "4px", padding: "0 4px", fontSize: "0.72rem" }}>⌘K</kbd> to edit a link.
                             </p>
                             <button
                                 type="button"
