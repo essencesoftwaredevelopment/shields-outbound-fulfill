@@ -23,6 +23,7 @@ export default function InterestedAutoResponderReviewPage() {
     const [sending, setSending] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [sendSuccess, setSendSuccess] = useState(false);
+    const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
     const editorRef = useRef<HTMLDivElement>(null);
     const lastSavedTextRef = useRef<string>("");
@@ -58,6 +59,12 @@ export default function InterestedAutoResponderReviewPage() {
                     lastSavedTextRef.current = initialText;
                     setDraft(data.draft || null);
                     setRenderedText(initialText);
+                    // console.log("Loaded draft:", data.draft);
+                    const preview = initialText.match(/https:\/\/essence-ai\.app\/preview\?[^\s"'<>]+/)?.[0] || null;
+                    // console.log("Extracted preview URL:", preview);
+                    setPreviewUrl(preview);
+                   
+
                 }
             } catch (err) {
                 if (!cancelled) {
@@ -343,6 +350,7 @@ export default function InterestedAutoResponderReviewPage() {
                         <div style={{ display: "grid", gap: "0.35rem", fontSize: "0.9rem" }}>
                             <div><strong>Lead:</strong> {draft.leadEmail}</div>
                             <div><strong>Campaign:</strong> {draft.campaignName}</div>
+                            <div><strong>Preview Link:</strong> <a style={{ color: "rgb(29, 132, 235)", textDecoration: "underline" }} href={previewUrl??""} target="_blank" rel="noopener noreferrer">{previewUrl}</a></div>
                         </div>
 
                         {/* Reply editor — rendered HTML, contentEditable */}
