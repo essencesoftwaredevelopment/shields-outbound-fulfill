@@ -29,6 +29,7 @@ import {
     getEmailFindQueue,
     getVerifyQueue,
     getPersonalizeQueue,
+    jobHasRemainingPipelineWork,
     enrichJobDomainCohortFlags,
     markJobDomainFounderExcluded,
     listJobDomainsForJob,
@@ -446,6 +447,63 @@ function enrichmentMergeMode(job) {
     return isReprocessExistingDomains(job) ? 'enrichment_b' : 'preserve';
 }
 
+function isStageCompleted(job, stageKey) {
+    return job.stages?.[stageKey]?.status === 'completed';
+}
+
+async function hasRemainingPipelineWork(job) {
+    return jobHasRemainingPipelineWork({
+        agencyId: job.uid,
+        clientId: job.sqlClientId,
+        jobId: job.id,
+        skipVerification: job.skipVerification,
+        personalizeFirstLine: job.personalizeFirstLine,
+        dedupeStrategy: job.dedupeStrategy
+    });
+}
+
+async function stageHasRemainingWork(job, stageKey) {
+    const reprocessInclude = isReprocessExistingDomains(job);
+    const limits = { reprocessInclude, limit: 1 };
+    if (stageKey === 'founders' && !job.skipFounderFinder) {
+        const pending = await listPendingJobDomains(job.id, 1);
+        return pending.length > 0;
+    }
+    if (stageKey === 'emailDiscovery' && !job.skipEmailFinder) {
+        const queue = await getEmailFindQueue(job.uid, job.sqlClientId, job.id, limits);
+        return queue.length > 0;
+    }
+    if (stageKey === 'verification' && !job.skipVerification) {
+        const queue = await getVerifyQueue(job.uid, job.sqlClientId, job.id, limits);
+        return queue.length > 0;
+    }
+    if (stageKey === 'personalization' && job.personalizeFirstLine) {
+        const queue = await getPersonalizeQueue(job.uid, job.sqlClientId, job.id, limits);
+        return queue.length > 0;
+    }
+    return false;
+}
+
+async function runStageIfNeeded(job, stageKey, handler) {
+    if (isStageCompleted(job, stageKey)) {
+        if (!(await stageHasRemainingWork(job, stageKey))) {
+            log(job, `Skipping ${stageKey} (already completed)`);
+            return job.stages[stageKey]?.summary;
+        }
+        log(job, `Re-running ${stageKey} (incomplete work remaining)`);
+    }
+    return runStage(job, stageKey, handler);
+}
+
+async function resolveProcessableCount(job) {
+    const fromStats = job.dedupeStats?.processable ?? job.dedupeStats?.new;
+    if (typeof fromStats === 'number' && fromStats > 0) {
+        return fromStats;
+    }
+    const counts = await countJobDomainsByStatus(job.id);
+    return (counts.done || 0) + (counts.processing || 0) + (counts.pending || 0);
+}
+
 async function upsertFounderBatch(job, rows) {
     if (!rows?.length) return;
     await upsertLeadRowsBatch({
@@ -505,84 +563,107 @@ async function processJob(job) {
         job.__controlGate = gate;
 
         const totalUploaded = (job.domainEntries || []).length;
-        await runStage(job, 'domainPrep', async () => {
-            await gate.checkpoint();
-            const dedupeResult = await filterJobDomainsForDedupe({
-                agencyId: job.uid,
-                clientId: job.sqlClientId,
-                jobId: job.id,
-                dedupeStrategy: job.dedupeStrategy
+        const pendingBeforePrep = await listPendingJobDomains(job.id, 1);
+        const skipDomainPrep =
+            isStageCompleted(job, 'domainPrep')
+            || (pendingBeforePrep.length === 0 && job.dedupeStats?.processable > 0);
+
+        if (skipDomainPrep) {
+            log(job, 'Skipping domain prep (resume — already processed)');
+            if (!job.dedupeStats?.processable) {
+                const restored = await resolveProcessableCount(job);
+                job.dedupeStats = {
+                    ...(job.dedupeStats || {}),
+                    processable: restored,
+                    total: job.dedupeStats?.total ?? restored
+                };
+            }
+        } else {
+            await runStage(job, 'domainPrep', async () => {
+                await gate.checkpoint();
+                const dedupeResult = await filterJobDomainsForDedupe({
+                    agencyId: job.uid,
+                    clientId: job.sqlClientId,
+                    jobId: job.id,
+                    dedupeStrategy: job.dedupeStrategy
+                });
+
+                const domainCheckSkipped = job.skipDomainCheck === true;
+                const dnsStats = domainCheckSkipped
+                    ? { checked: 0, live: 0, dead: 0, unknown: 0, processable: dedupeResult.stats.new }
+                    : await dnsFilterJobDomains(job);
+
+                job.dedupeStats = {
+                    total: totalUploaded,
+                    unique: totalUploaded,
+                    duplicatesRemoved: 0,
+                    skipped: dedupeResult.stats.skipped,
+                    existing: dedupeResult.stats.existing,
+                    new: dedupeResult.stats.new,
+                    dnsChecked: dnsStats.checked,
+                    dnsLive: dnsStats.live,
+                    dnsDead: dnsStats.dead,
+                    dnsUnknown: dnsStats.unknown,
+                    processable: dnsStats.processable,
+                    domainCheckSkipped
+                };
+
+                await upsertDomainsImmediately(job);
+
+                log(
+                    job,
+                    domainCheckSkipped
+                        ? `Domain prep: ${totalUploaded} uploaded, ${job.dedupeStats.skipped} skipped (existing), ${dnsStats.processable} processable`
+                        : `Domain prep: DNS checked ${dnsStats.checked}, ${dnsStats.processable} processable`
+                );
+
+                return {
+                    total: totalUploaded,
+                    normalized: totalUploaded,
+                    deduped: 0,
+                    checked: dnsStats.checked,
+                    live: dnsStats.live,
+                    dead: dnsStats.dead,
+                    unknown: dnsStats.unknown,
+                    processable: dnsStats.processable,
+                    domainCheckSkipped,
+                    skippedExisting: job.dedupeStats.skipped,
+                    new: job.dedupeStats.new
+                };
             });
+        }
 
-            const domainCheckSkipped = job.skipDomainCheck === true;
-            const dnsStats = domainCheckSkipped
-                ? { checked: 0, live: 0, dead: 0, unknown: 0, processable: dedupeResult.stats.new }
-                : await dnsFilterJobDomains(job);
-
-            job.dedupeStats = {
-                total: totalUploaded,
-                unique: totalUploaded,
-                duplicatesRemoved: 0,
-                skipped: dedupeResult.stats.skipped,
-                existing: dedupeResult.stats.existing,
-                new: dedupeResult.stats.new,
-                dnsChecked: dnsStats.checked,
-                dnsLive: dnsStats.live,
-                dnsDead: dnsStats.dead,
-                dnsUnknown: dnsStats.unknown,
-                processable: dnsStats.processable,
-                domainCheckSkipped
-            };
-
-            await upsertDomainsImmediately(job);
-
+        const cohortTotal = await resolveProcessableCount(job);
+        if (!skipDomainPrep) {
+            setActivity(job, `Applying upload column rules to ${cohortTotal.toLocaleString()} domains…`);
+            const cohortStart = Date.now();
+            await enrichJobDomainCohortFlags(job.id, job.columnMapping || {}, async ({ processed, total }) => {
+                if (processed % 500 === 0 || processed === total) {
+                    await gate.checkpoint();
+                    setActivity(
+                        job,
+                        `Applying upload column rules… ${processed.toLocaleString()} / ${total.toLocaleString()}`
+                    );
+                }
+            });
             log(
                 job,
-                domainCheckSkipped
-                    ? `Domain prep: ${totalUploaded} uploaded, ${job.dedupeStats.skipped} skipped (existing), ${dnsStats.processable} processable`
-                    : `Domain prep: DNS checked ${dnsStats.checked}, ${dnsStats.processable} processable`
+                `Upload column rules applied to ${cohortTotal.toLocaleString()} domains (${Date.now() - cohortStart}ms)`
             );
+            job.activity = null;
+            pushState(job, true);
+        }
 
-            return {
-                total: totalUploaded,
-                normalized: totalUploaded,
-                deduped: 0,
-                checked: dnsStats.checked,
-                live: dnsStats.live,
-                dead: dnsStats.dead,
-                unknown: dnsStats.unknown,
-                processable: dnsStats.processable,
-                domainCheckSkipped,
-                skippedExisting: job.dedupeStats.skipped,
-                new: job.dedupeStats.new
-            };
-        });
-
-        const cohortTotal =
-            typeof job.dedupeStats?.processable === 'number'
-                ? job.dedupeStats.processable
-                : (job.domainEntries || []).length;
-        setActivity(job, `Applying upload column rules to ${cohortTotal.toLocaleString()} domains…`);
-        const cohortStart = Date.now();
-        await enrichJobDomainCohortFlags(job.id, job.columnMapping || {}, async ({ processed, total }) => {
-            if (processed % 500 === 0 || processed === total) {
-                await gate.checkpoint();
-                setActivity(
-                    job,
-                    `Applying upload column rules… ${processed.toLocaleString()} / ${total.toLocaleString()}`
-                );
-            }
-        });
-        log(
-            job,
-            `Upload column rules applied to ${cohortTotal.toLocaleString()} domains (${Date.now() - cohortStart}ms)`
-        );
-        job.activity = null;
-        pushState(job, true);
-
-        const processableCount = typeof job.dedupeStats?.processable === 'number'
-            ? job.dedupeStats.processable
-            : (typeof job.dedupeStats?.new === 'number' ? job.dedupeStats.new : 0);
+        let processableCount = await resolveProcessableCount(job);
+        if (processableCount === 0 && await hasRemainingPipelineWork(job)) {
+            const counts = await countJobDomainsByStatus(job.id);
+            processableCount = Math.max(
+                (counts.done || 0) + (counts.processing || 0) + (counts.pending || 0),
+                1
+            );
+            job.dedupeStats = { ...(job.dedupeStats || {}), processable: processableCount };
+            log(job, `Resume: continuing pipeline (${processableCount} domains in job, enrichment work remaining)`);
+        }
         if (processableCount === 0) {
             Object.entries(job.stages).forEach(([stageKey, stage]) => {
                 if (stage.status === 'completed') {
@@ -624,7 +705,7 @@ async function processJob(job) {
         const totalForJob = Object.values(domainCounts).reduce((a, b) => a + b, 0);
 
         if (job.skipFounderFinder) {
-            await runStage(job, 'founders', async () => {
+            await runStageIfNeeded(job, 'founders', async () => {
                 const founderCol = job.columnMapping?.founder || 'founder_name';
                 const pendingStart = Date.now();
                 const pending = await listPendingJobDomains(job.id);
@@ -678,7 +759,7 @@ async function processJob(job) {
             log(job, `Founders skipped (upload included founder). Processed ${job.stages.founders?.summary?.processed ?? 0} domains.`);
         } else {
             setActivity(job, `Starting founder lookup for ${processableCount.toLocaleString()} domains…`);
-            await runStage(job, 'founders', () =>
+            await runStageIfNeeded(job, 'founders', () =>
                 runFounderFinder({
                     listPendingDomains: () => listPendingJobDomains(job.id),
                     loadSerperCache: () => loadSerperCacheMap(job.id),
@@ -700,7 +781,7 @@ async function processJob(job) {
         if (job.cancelled) return await markCancelled(job);
 
         if (job.skipEmailFinder) {
-            await runStage(job, 'emailDiscovery', async () => {
+            await runStageIfNeeded(job, 'emailDiscovery', async () => {
                 const emailCol = job.columnMapping?.email || 'email';
                 const loadStart = Date.now();
                 const jobDomains = await listJobDomainsForJob(job.id, { emailCohortOnly: true });
@@ -753,7 +834,7 @@ async function processJob(job) {
                 domain: r.domain,
                 founder_name: r.founder_name
             }));
-            await runStage(job, 'emailDiscovery', () =>
+            await runStageIfNeeded(job, 'emailDiscovery', () =>
                 runEmailFinder({
                     founders,
                     apiKeys: job.apiKeys,
@@ -783,7 +864,7 @@ async function processJob(job) {
         if (job.cancelled) return await markCancelled(job);
 
         if (job.skipVerification) {
-            await runStage(job, 'verification', async () => {
+            await runStageIfNeeded(job, 'verification', async () => {
                 const verified = await pool.query(
                     `SELECT email_status FROM contacts WHERE job_id = $1 AND email IS NOT NULL`,
                     [job.id]
@@ -808,7 +889,7 @@ async function processJob(job) {
                 email: r.email,
                 lookup_status: r.email_status
             }));
-            await runStage(job, 'verification', () =>
+            await runStageIfNeeded(job, 'verification', () =>
                 runEmailVerifier({
                     candidates,
                     apiKeys: job.apiKeys,
@@ -875,7 +956,7 @@ async function processJob(job) {
                 }
             });
 
-            await runStage(job, 'personalization', () =>
+            await runStageIfNeeded(job, 'personalization', () =>
                 runPersonalization({
                     inputCsv,
                     outputCsv,

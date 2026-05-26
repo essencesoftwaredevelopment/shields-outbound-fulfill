@@ -472,6 +472,34 @@ export async function listJobDomainsForJob(jobId, { emailCohortOnly = false } = 
     return result.rows;
 }
 
+/** True when enrichment stages still have rows to process (resume / recovery). */
+export async function jobHasRemainingPipelineWork({
+    agencyId,
+    clientId,
+    jobId,
+    skipVerification = false,
+    personalizeFirstLine = false,
+    dedupeStrategy = 'skip'
+}) {
+    const reprocessInclude = String(dedupeStrategy || 'skip').toLowerCase() === 'include';
+    const limit = 1;
+    const [emailRows, verifyRows, pending] = await Promise.all([
+        getEmailFindQueue(agencyId, clientId, jobId, { reprocessInclude, limit }),
+        skipVerification
+            ? Promise.resolve([])
+            : getVerifyQueue(agencyId, clientId, jobId, { reprocessInclude, limit }),
+        listPendingJobDomains(jobId, limit)
+    ]);
+    if (emailRows.length || verifyRows.length || pending.length) {
+        return true;
+    }
+    if (personalizeFirstLine) {
+        const personalizeRows = await getPersonalizeQueue(agencyId, clientId, jobId, { reprocessInclude, limit });
+        if (personalizeRows.length) return true;
+    }
+    return false;
+}
+
 export async function getEmailFindQueue(agencyId, clientId, jobId, { reprocessInclude = false, limit = 5000 } = {}) {
     const emailConstraint = reprocessInclude
         ? ''

@@ -11,6 +11,7 @@ import fs from 'fs';
 import {
     buildUnifiedRowsFromDb,
     getJobById,
+    jobHasRemainingPipelineWork,
     jobRowToState,
     setActiveJob,
     updateJobControl,
@@ -670,11 +671,34 @@ router.post('/jobs/:id/resume', async (req, res) => {
         } else if (row.cancelled) {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
         }
-        if (row.status === 'completed') {
+
+        const options = row.options || {};
+        const recoveryResume = row.status === 'completed' && await jobHasRemainingPipelineWork({
+            agencyId: uid,
+            clientId: row.client_id,
+            jobId,
+            skipVerification: !!options.skipVerification,
+            personalizeFirstLine: !!options.personalizeFirstLine,
+            dedupeStrategy: options.dedupeStrategy || 'skip'
+        });
+
+        if (row.status === 'completed' && !recoveryResume) {
             return res.json({ status: 'completed', message: 'Job already completed.' });
         }
-        if (!row.paused) {
+        if (!row.paused && !recoveryResume) {
             return res.json({ status: row.status, message: 'Job is not paused.' });
+        }
+
+        if (recoveryResume) {
+            await pool.query(
+                `UPDATE jobs SET status = 'queued', completed_at = NULL, paused = true, updated_at = NOW() WHERE id = $1`,
+                [jobId]
+            );
+            row.status = 'queued';
+            row.paused = true;
+            if (queueJob) {
+                await setQueueStatus(jobId, 'paused', { error: null });
+            }
         }
 
         const localJob = jobs.get(jobId);
