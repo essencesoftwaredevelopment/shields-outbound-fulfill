@@ -127,6 +127,15 @@ type Lead = {
     };
 };
 
+type LeadStatusChipVariant =
+    | "valid"
+    | "valid-risky"
+    | "invalid"
+    | "not-found"
+    | "not-run"
+    | "skipped"
+    | "default";
+
 type LeadFilterOperator = {
     key: string;
     label: string;
@@ -1919,27 +1928,15 @@ export default function ClientPage() {
         return trimmed;
     };
 
-    /** Email discovery stage (separate from SMTP email_status). */
-    const displayEmailFindState = (
-        email: string | undefined | null,
-        emailFindCompletedAt: string | undefined | null
-    ) => {
+    const hasDiscoveredEmail = (email: string | undefined | null) => {
         const trimmed = String(email ?? '').trim();
-        if (trimmed && !isLegacyNotFoundEmail(trimmed)) return 'Found';
-        if (emailFindCompletedAt) return 'Not found';
-        return 'Not run';
-    };
-
-    const displayEmailStatus = (emailStatus: string | undefined, emailVerifyCompletedAt: string | undefined) => {
-        if (emailStatus && emailStatus.trim() !== '') return emailStatus;
-        if (emailVerifyCompletedAt) return 'Unknown';
-        return 'Not Run';
+        return Boolean(trimmed && !isLegacyNotFoundEmail(trimmed));
     };
 
     const formatLeadStageTimestamp = (value?: string | null) => {
-        if (!value || !String(value).trim()) return 'Not run';
+        if (!value || !String(value).trim()) return null;
         const parsed = new Date(value);
-        if (Number.isNaN(parsed.getTime())) return 'Not run';
+        if (Number.isNaN(parsed.getTime())) return null;
         return parsed.toLocaleString('en-GB', {
             day: 'numeric',
             month: 'short',
@@ -1948,6 +1945,160 @@ export default function ClientPage() {
             minute: '2-digit'
         });
     };
+
+    type EmailStageDisplay = {
+        label: string;
+        detail?: string;
+        variant: LeadStatusChipVariant;
+    };
+
+    const getEmailFindDisplay = (
+        email: string | undefined | null,
+        emailFindCompletedAt: string | undefined | null
+    ): EmailStageDisplay => {
+        if (hasDiscoveredEmail(email)) {
+            const when = formatLeadStageTimestamp(emailFindCompletedAt);
+            return {
+                label: 'Found',
+                detail: when ? `Discovered ${when}` : undefined,
+                variant: 'valid'
+            };
+        }
+        if (emailFindCompletedAt) {
+            const when = formatLeadStageTimestamp(emailFindCompletedAt);
+            return {
+                label: 'No email found',
+                detail: when ? `Searched ${when}` : 'Discovery completed',
+                variant: 'not-found'
+            };
+        }
+        return {
+            label: 'Not searched',
+            detail: 'Email discovery has not run for this lead',
+            variant: 'not-run'
+        };
+    };
+
+    const getEmailVerifyDisplay = (
+        email: string | undefined | null,
+        emailStatus: string | undefined,
+        emailVerifyCompletedAt: string | undefined | null,
+        emailFindCompletedAt: string | undefined | null
+    ): EmailStageDisplay => {
+        if (!hasDiscoveredEmail(email)) {
+            if (emailFindCompletedAt) {
+                return {
+                    label: 'Skipped',
+                    detail: 'Nothing to verify — discovery found no address',
+                    variant: 'skipped'
+                };
+            }
+            return {
+                label: 'Not run',
+                detail: 'Run email discovery first',
+                variant: 'not-run'
+            };
+        }
+
+        const normalized = (emailStatus || '').trim().toLowerCase();
+        const when = formatLeadStageTimestamp(emailVerifyCompletedAt);
+
+        if (!normalized) {
+            if (emailVerifyCompletedAt) {
+                return {
+                    label: 'Unknown',
+                    detail: when ? `Checked ${when}` : 'Verification completed with unknown result',
+                    variant: 'default'
+                };
+            }
+            return {
+                label: 'Pending',
+                detail: 'Address found — SMTP verification not run yet',
+                variant: 'not-run'
+            };
+        }
+        if (normalized === 'valid') {
+            return { label: 'Valid', detail: when ? `Verified ${when}` : undefined, variant: 'valid' };
+        }
+        if (normalized === 'valid-risky' || normalized === 'risky') {
+            return { label: 'Valid (risky)', detail: when ? `Verified ${when}` : undefined, variant: 'valid-risky' };
+        }
+        if (normalized === 'invalid') {
+            return { label: 'Invalid', detail: when ? `Verified ${when}` : undefined, variant: 'invalid' };
+        }
+        if (normalized === 'not_found' || normalized.includes('not found')) {
+            return { label: 'Not found', detail: when ? `Checked ${when}` : undefined, variant: 'not-found' };
+        }
+        if (normalized === 'skipped_no_founder') {
+            return { label: 'Skipped', detail: 'No founder to verify', variant: 'skipped' };
+        }
+
+        return {
+            label: emailStatus || 'Unknown',
+            detail: when ? `Checked ${when}` : undefined,
+            variant: 'default'
+        };
+    };
+
+    /** @deprecated use getEmailFindDisplay().label */
+    const displayEmailFindState = (
+        email: string | undefined | null,
+        emailFindCompletedAt: string | undefined | null
+    ) => getEmailFindDisplay(email, emailFindCompletedAt).label;
+
+    const displayEmailStatus = (
+        emailStatus: string | undefined,
+        emailVerifyCompletedAt: string | undefined,
+        leadEmail?: string | null,
+        emailFindCompletedAt?: string | null
+    ) =>
+        getEmailVerifyDisplay(leadEmail ?? null, emailStatus, emailVerifyCompletedAt, emailFindCompletedAt).label;
+
+    const getLeadEmailHeaderChip = (lead: {
+        email?: string;
+        status?: string;
+        emailFindCompletedAt?: string;
+        emailVerifyCompletedAt?: string;
+    }) => {
+        const find = getEmailFindDisplay(lead.email, lead.emailFindCompletedAt);
+        const verify = getEmailVerifyDisplay(
+            lead.email,
+            lead.status,
+            lead.emailVerifyCompletedAt,
+            lead.emailFindCompletedAt
+        );
+
+        if (verify.variant !== 'not-run' && verify.variant !== 'skipped') {
+            return { label: verify.label, variant: verify.variant };
+        }
+        if (find.variant === 'not-found') {
+            return { label: 'No email', variant: 'not-found' };
+        }
+        if (find.variant === 'valid' && verify.variant === 'not-run') {
+            return { label: 'Unverified', variant: 'not-run' };
+        }
+        if (find.variant === 'not-run') {
+            return { label: 'Not searched', variant: 'not-run' };
+        }
+        return { label: verify.label, variant: verify.variant };
+    };
+
+    const renderEmailStageRow = (title: string, stage: EmailStageDisplay) => (
+        <>
+            <span style={{ color: 'var(--app-text-faint)' }}>{title}</span>
+            <span style={{ color: 'var(--app-text-high)' }}>
+                <span
+                    className={`lead-pastel-chip lead-pastel-chip--status-${stage.variant}`}
+                    style={{ marginRight: stage.detail ? '0.5rem' : 0 }}
+                >
+                    {stage.label}
+                </span>
+                {stage.detail ? (
+                    <span style={{ color: 'var(--app-text-muted)', fontSize: '0.85rem' }}>{stage.detail}</span>
+                ) : null}
+            </span>
+        </>
+    );
 
     const formatInstantlyStateLabel = (value?: string | null) => {
         if (!value || !value.trim()) return '—';
@@ -2304,32 +2455,14 @@ export default function ClientPage() {
         updateLeadFilter
     ]);
 
-    type LeadStatusChipVariant =
-        | "valid"
-        | "valid-risky"
-        | "invalid"
-        | "not-found"
-        | "not-run"
-        | "skipped"
-        | "default";
-
     const getLeadStatusChipMeta = (
         emailStatus: string | undefined,
-        emailVerifyCompletedAt: string | undefined
+        emailVerifyCompletedAt: string | undefined,
+        email?: string | null,
+        emailFindCompletedAt?: string | null
     ): { label: string; variant: LeadStatusChipVariant } => {
-        const normalized = (emailStatus || '').trim().toLowerCase();
-
-        if (!normalized) {
-            if (emailVerifyCompletedAt) return { label: "Unknown", variant: "default" };
-            return { label: "Not Run", variant: "not-run" };
-        }
-        if (normalized === "valid") return { label: "Valid", variant: "valid" };
-        if (normalized === "valid-risky" || normalized === "risky") return { label: "Valid-Risky", variant: "valid-risky" };
-        if (normalized === "invalid") return { label: "Invalid", variant: "invalid" };
-        if (normalized === "not_found" || normalized.includes("not found")) return { label: "Not Found", variant: "not-found" };
-        if (normalized === "skipped_no_founder") return { label: "Skipped", variant: "skipped" };
-
-        return { label: displayEmailStatus(emailStatus, emailVerifyCompletedAt), variant: "default" };
+        const stage = getEmailVerifyDisplay(email, emailStatus, emailVerifyCompletedAt, emailFindCompletedAt);
+        return { label: stage.label, variant: stage.variant };
     };
 
     useEffect(() => {
@@ -6091,7 +6224,7 @@ export default function ClientPage() {
                                                 fontWeight: 600,
                                                 color: 'var(--app-text-high)',
                                                 borderBottom: '1px solid var(--app-border)'
-                                            }}>Email find</th>
+                                            }}>Discovery</th>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
@@ -6102,7 +6235,7 @@ export default function ClientPage() {
                                                 fontWeight: 600,
                                                 color: 'var(--app-text-high)',
                                                 borderBottom: '1px solid var(--app-border)'
-                                            }}>Email Status</th>
+                                            }}>Verification</th>
                                             <th style={{
                                                 position: 'sticky',
                                                 top: 0,
@@ -6171,14 +6304,19 @@ export default function ClientPage() {
                                                     minWidth: '120px',
                                                     color: 'var(--app-text-muted)'
                                                 }}>
-                                                    {displayEmailFindState(lead.email, lead.emailFindCompletedAt)}
+                                                    {getEmailFindDisplay(lead.email, lead.emailFindCompletedAt).label}
                                                 </td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
                                                     minWidth: '140px'
                                                 }}>
                                                     {(() => {
-                                                        const meta = getLeadStatusChipMeta(lead.status, lead.emailVerifyCompletedAt);
+                                                        const meta = getLeadStatusChipMeta(
+                                                            lead.status,
+                                                            lead.emailVerifyCompletedAt,
+                                                            lead.email,
+                                                            lead.emailFindCompletedAt
+                                                        );
                                                         return (
                                                             <span className={`lead-pastel-chip lead-pastel-chip--status-${meta.variant}`}>
                                                                 {meta.label}
@@ -11168,7 +11306,7 @@ export default function ClientPage() {
                                 {/* Status badge row */}
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                                     {(() => {
-                                        const chip = getLeadStatusChipMeta(selectedLead.status, selectedLead.emailVerifyCompletedAt);
+                                        const chip = getLeadEmailHeaderChip(selectedLead);
                                         const colorMap: Record<string, { bg: string; border: string; text: string }> = {
                                             'valid': { bg: 'rgba(34, 197, 94, 0.15)', border: 'rgba(34, 197, 94, 0.4)', text: '#4ade80' },
                                             'valid-risky': { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)', text: '#facc15' },
@@ -11267,22 +11405,19 @@ export default function ClientPage() {
                                     <span style={{ color: 'var(--app-text-high)', wordBreak: 'break-all' }}>
                                         {formatRawEmailValue(selectedLead.email)}
                                     </span>
-                                    <span style={{ color: 'var(--app-text-faint)' }}>Email find</span>
-                                    <span style={{ color: 'var(--app-text-high)' }}>
-                                        {displayEmailFindState(selectedLead.email, selectedLead.emailFindCompletedAt)}
-                                    </span>
-                                    <span style={{ color: 'var(--app-text-faint)' }}>Email status (SMTP)</span>
-                                    <span style={{ color: 'var(--app-text-high)' }}>
-                                        {displayEmailStatus(selectedLead.status, selectedLead.emailVerifyCompletedAt)}
-                                    </span>
-                                    <span style={{ color: 'var(--app-text-faint)' }}>Email find completed</span>
-                                    <span style={{ color: 'var(--app-text-high)' }}>
-                                        {formatLeadStageTimestamp(selectedLead.emailFindCompletedAt)}
-                                    </span>
-                                    <span style={{ color: 'var(--app-text-faint)' }}>Email verify completed</span>
-                                    <span style={{ color: 'var(--app-text-high)' }}>
-                                        {formatLeadStageTimestamp(selectedLead.emailVerifyCompletedAt)}
-                                    </span>
+                                    {renderEmailStageRow(
+                                        'Email discovery',
+                                        getEmailFindDisplay(selectedLead.email, selectedLead.emailFindCompletedAt)
+                                    )}
+                                    {renderEmailStageRow(
+                                        'Email verification',
+                                        getEmailVerifyDisplay(
+                                            selectedLead.email,
+                                            selectedLead.status,
+                                            selectedLead.emailVerifyCompletedAt,
+                                            selectedLead.emailFindCompletedAt
+                                        )
+                                    )}
                                     {selectedLead.createdAt && (
                                         <>
                                             <span style={{ color: 'var(--app-text-faint)' }}>Created</span>

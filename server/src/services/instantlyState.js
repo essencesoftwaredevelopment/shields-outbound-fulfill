@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { pool } from '../config/db.js';
-import { getOrCreateClient, listClientsWithInstantlyKey } from './db/queries.js';
+import { getOrCreateClient, getClientRowBySlug, listClientsWithInstantlyKey } from './db/queries.js';
 import { createInterestedAutoResponderDraftFromEvent } from './interestedAutoResponder.js';
 
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
@@ -780,13 +780,15 @@ async function publishInstantlySyncProgress(runId, patch = {}) {
 }
 
 async function resolveClientState(agencyId, clientSlug) {
-    const cacheKey = `${agencyId}::${clientSlug}`;
+    const normalizedSlug = String(clientSlug || '').trim();
+    const cacheKey = `${agencyId}::${normalizedSlug}`;
     const cached = clientStateCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < CLIENT_STATE_CACHE_TTL_MS) {
         return cached.value;
     }
 
-    const clientId = await getOrCreateClient(agencyId, clientSlug);
+    const bySlug = normalizedSlug ? await getClientRowBySlug(agencyId, normalizedSlug) : null;
+    const clientId = bySlug?.id ?? (await getOrCreateClient(agencyId, normalizedSlug || clientSlug));
     const result = await pool.query(
         `SELECT id, name, instantly_workspace_id, instantly_webhook_id, instantly_webhook_secret,
                 instantly_webhook_url, instantly_webhook_status, instantly_sync_enabled,
@@ -1251,13 +1253,7 @@ async function ensureInstantlyContact(db, {
     return contactId;
 }
 
-async function upsertCampaignSnapshots(db, rows) {
-    if (!rows.length) return;
-    await db.query(
-        `WITH input AS (
-            SELECT *
-            FROM jsonb_to_recordset($1::jsonb) AS x(
-                contact_id BIGINT,
+const CAMPAIGN_SNAPSHOT_RECORDSET = `contact_id BIGINT,
                 campaign_id BIGINT,
                 upload_source TEXT,
                 instantly_lead_id TEXT,
@@ -1288,29 +1284,10 @@ async function upsertCampaignSnapshots(db, rows) {
                 last_event_type TEXT,
                 last_bounce_at TIMESTAMPTZ,
                 last_unsubscribe_at TIMESTAMPTZ,
-                last_synced_at TIMESTAMPTZ
-            )
-        )
-        INSERT INTO contact_instantly_campaigns (
-            contact_id, campaign_id, upload_source, instantly_lead_id, added_at, active, last_seen_at, removed_at,
-            lead_status, lead_status_label, interest_status, interest_status_label, verification_status,
-            email_open_count, email_reply_count, email_click_count,
-            timestamp_last_contact, timestamp_last_open, timestamp_last_reply, timestamp_last_interest_change, timestamp_last_click,
-            last_contacted_from, last_step_from, last_step_id, last_step_timestamp_executed,
-            status_summary, status_summary_subseq, raw_lead_payload,
-            last_reply_category, last_event_type, last_bounce_at, last_unsubscribe_at, last_synced_at
-        )
-        SELECT
-            contact_id, campaign_id, upload_source, instantly_lead_id, added_at, active, last_seen_at, NULL,
-            lead_status, lead_status_label, interest_status, interest_status_label, verification_status,
-            email_open_count, email_reply_count, email_click_count,
-            timestamp_last_contact, timestamp_last_open, timestamp_last_reply, timestamp_last_interest_change, timestamp_last_click,
-            last_contacted_from, last_step_from, last_step_id, last_step_timestamp_executed,
-            status_summary, status_summary_subseq, raw_lead_payload,
-            last_reply_category, last_event_type, last_bounce_at, last_unsubscribe_at, last_synced_at
-        FROM input
-        ON CONFLICT (contact_id, campaign_id)
-        DO UPDATE SET
+                last_synced_at TIMESTAMPTZ`;
+
+const CAMPAIGN_SNAPSHOT_UPSERT_SET = `
+            upload_source = EXCLUDED.upload_source,
             instantly_lead_id = COALESCE(EXCLUDED.instantly_lead_id, contact_instantly_campaigns.instantly_lead_id),
             added_at = COALESCE(EXCLUDED.added_at, contact_instantly_campaigns.added_at),
             active = TRUE,
@@ -1349,8 +1326,98 @@ async function upsertCampaignSnapshots(db, rows) {
             last_event_type = COALESCE(EXCLUDED.last_event_type, contact_instantly_campaigns.last_event_type),
             last_bounce_at = COALESCE(EXCLUDED.last_bounce_at, contact_instantly_campaigns.last_bounce_at),
             last_unsubscribe_at = COALESCE(EXCLUDED.last_unsubscribe_at, contact_instantly_campaigns.last_unsubscribe_at),
-            last_synced_at = COALESCE(EXCLUDED.last_synced_at, contact_instantly_campaigns.last_synced_at)`,
+            last_synced_at = COALESCE(EXCLUDED.last_synced_at, contact_instantly_campaigns.last_synced_at)`;
+
+/** One row per Instantly lead and per (contact_id, campaign_id) in a batch. */
+function dedupeCampaignSnapshotRows(rows) {
+    const byLead = new Map();
+    const withoutLead = [];
+    for (const row of rows) {
+        const leadId = asNullableText(row.instantly_lead_id);
+        if (leadId) {
+            byLead.set(`${row.campaign_id}::${leadId}`, row);
+        } else {
+            withoutLead.push(row);
+        }
+    }
+    const merged = [...byLead.values(), ...withoutLead];
+    const byContactCampaign = new Map();
+    for (const row of merged) {
+        byContactCampaign.set(`${row.contact_id}::${row.campaign_id}`, row);
+    }
+    return [...byContactCampaign.values()];
+}
+
+/** Drop prior contact row for this Instantly lead before inserting the resolved contact (avoids PK + lead unique clashes). */
+async function deleteCampaignMembershipsByInstantlyLead(db, rows) {
+    const payload = rows
+        .map((row) => ({
+            campaign_id: row.campaign_id,
+            instantly_lead_id: asNullableText(row.instantly_lead_id)
+        }))
+        .filter((row) => row.instantly_lead_id);
+    if (!payload.length) return;
+
+    await db.query(
+        `WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS x(
+                campaign_id BIGINT,
+                instantly_lead_id TEXT
+            )
+        )
+        DELETE FROM contact_instantly_campaigns cic
+        USING input i
+        WHERE cic.campaign_id = i.campaign_id
+          AND cic.instantly_lead_id = i.instantly_lead_id`,
+        [JSON.stringify(payload)]
+    );
+}
+
+async function upsertCampaignSnapshotBatch(db, rows, onConflictClause) {
+    if (!rows.length) return;
+    await db.query(
+        `WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS x(${CAMPAIGN_SNAPSHOT_RECORDSET})
+        )
+        INSERT INTO contact_instantly_campaigns (
+            contact_id, campaign_id, upload_source, instantly_lead_id, added_at, active, last_seen_at, removed_at,
+            lead_status, lead_status_label, interest_status, interest_status_label, verification_status,
+            email_open_count, email_reply_count, email_click_count,
+            timestamp_last_contact, timestamp_last_open, timestamp_last_reply, timestamp_last_interest_change, timestamp_last_click,
+            last_contacted_from, last_step_from, last_step_id, last_step_timestamp_executed,
+            status_summary, status_summary_subseq, raw_lead_payload,
+            last_reply_category, last_event_type, last_bounce_at, last_unsubscribe_at, last_synced_at
+        )
+        SELECT
+            contact_id, campaign_id, upload_source, instantly_lead_id, added_at, active, last_seen_at, NULL,
+            lead_status, lead_status_label, interest_status, interest_status_label, verification_status,
+            email_open_count, email_reply_count, email_click_count,
+            timestamp_last_contact, timestamp_last_open, timestamp_last_reply, timestamp_last_interest_change, timestamp_last_click,
+            last_contacted_from, last_step_from, last_step_id, last_step_timestamp_executed,
+            status_summary, status_summary_subseq, raw_lead_payload,
+            last_reply_category, last_event_type, last_bounce_at, last_unsubscribe_at, last_synced_at
+        FROM input
+        ${onConflictClause}`,
         [JSON.stringify(rows)]
+    );
+}
+
+async function upsertCampaignSnapshots(db, rows) {
+    if (!rows.length) return;
+    const deduped = dedupeCampaignSnapshotRows(rows);
+    const withLead = deduped.filter((row) => asNullableText(row.instantly_lead_id));
+
+    if (withLead.length) {
+        await deleteCampaignMembershipsByInstantlyLead(db, withLead);
+    }
+
+    await upsertCampaignSnapshotBatch(
+        db,
+        deduped,
+        `ON CONFLICT (contact_id, campaign_id)
+        DO UPDATE SET ${CAMPAIGN_SNAPSHOT_UPSERT_SET}`
     );
 }
 
@@ -1982,6 +2049,12 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
         }
 
         if (contactId && sqlCampaignId) {
+            const instantlyLeadId = asNullableText(event?.lead_id || event?.instantly_lead_id);
+            if (instantlyLeadId) {
+                await deleteCampaignMembershipsByInstantlyLead(client, [
+                    { campaign_id: sqlCampaignId, instantly_lead_id: instantlyLeadId }
+                ]);
+            }
             await client.query(
                 `INSERT INTO contact_instantly_campaigns (
                     contact_id, campaign_id, upload_source, instantly_lead_id, active, last_seen_at, removed_at,

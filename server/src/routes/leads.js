@@ -388,6 +388,29 @@ function clientMatchersOverlap(left, right) {
         || setsIntersect(left.sets.compact, right.sets.compact);
 }
 
+/** Matches UI email-discovery state (hasDiscoveredEmail / email_find_completed_at). */
+function sqlEmailHasDiscovered(alias = 'c') {
+    return `(
+        ${alias}.email IS NOT NULL
+        AND BTRIM(${alias}.email) <> ''
+        AND LOWER(${alias}.email) NOT LIKE '%not found%'
+        AND LOWER(${alias}.email) != 'not_found'
+    )`;
+}
+
+function sqlEmailFindStateClause(state) {
+    switch (state) {
+        case 'found':
+            return sqlEmailHasDiscovered();
+        case 'not_found':
+            return `(c.email_find_completed_at IS NOT NULL AND NOT ${sqlEmailHasDiscovered()})`;
+        case 'not_run':
+            return `(c.email_find_completed_at IS NULL AND NOT ${sqlEmailHasDiscovered()})`;
+        default:
+            return null;
+    }
+}
+
 const LEAD_FILTER_FIELDS = [
     // ── Contact fields ──────────────────────────────────────────────────────
     {
@@ -435,6 +458,22 @@ const LEAD_FILTER_FIELDS = [
             { value: 'risky', label: 'Valid-Risky' },
             { value: 'invalid', label: 'Invalid' },
             { value: 'unknown', label: 'Unknown' }
+        ]
+    },
+    {
+        key: 'email_find_state',
+        label: 'Email Discovery',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' }
+        ],
+        options: [
+            { value: 'found', label: 'Found' },
+            { value: 'not_found', label: 'No Email Found' },
+            { value: 'not_run', label: 'Not Searched' }
         ]
     },
     {
@@ -792,6 +831,10 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     if (fieldKey === 'email_status') {
         const lowered = normalizedText.toLowerCase();
         return lowered === 'valid-risky' ? 'risky' : lowered;
+    }
+
+    if (fieldKey === 'email_find_state') {
+        return normalizedText.toLowerCase();
     }
 
     if (fieldKey === 'instantly_status') {
