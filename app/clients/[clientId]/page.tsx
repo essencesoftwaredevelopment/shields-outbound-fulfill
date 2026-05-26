@@ -890,6 +890,14 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
     const progress = stage?.progress;
     const summary = stage?.summary as Record<string, unknown> | null;
     const stats = progress?.stats as Record<string, unknown> | undefined;
+    // Once a stage is completed, `summary` is canonical. `progress` can still
+    // hold stale or sub-step values written before completion (e.g. founders
+    // briefly using batch counters), so prefer summary in that case to avoid
+    // displaying numbers that were never the user-facing totals.
+    const preferSummary = stage?.status === "completed" || stage?.status === "error";
+    const progressTotal = typeof progress?.total === "number" && Number.isFinite(progress.total) ? progress.total : null;
+    const summaryTotal = extractNumberFrom(summary, ["total", "queued", "attempted"]);
+    const statsTotal = extractNumberFrom(stats, ["total", "queued", "attempted"]);
 
     // if it's the founders stage, or email find stage, use found
     // if it's the verification stage, use verified/valid
@@ -898,9 +906,13 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
             extractNumberFrom(summary, ["processable", "live"])
             ?? extractNumberFrom(stats, ["processable", "live"])
             : stageName === "founders" || stageName === "emailDiscovery" ?
-            extractNumberFrom(stats, ["Found", "found"])
-            ?? (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
-            ?? extractNumberFrom(summary, ["Found", "found", "processed", "completed", "personalized"])
+            (preferSummary
+                ? (extractNumberFrom(summary, ["Found", "found"])
+                    ?? extractNumberFrom(stats, ["Found", "found"])
+                    ?? (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null))
+                : (extractNumberFrom(stats, ["Found", "found"])
+                    ?? (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
+                    ?? extractNumberFrom(summary, ["Found", "found", "processed", "completed", "personalized"])))
             : stageName === "verification" ?
                 extractNumberFrom(summary, ["Valid", "valid"])
                 ?? extractNumberFrom(stats, ["valid"])
@@ -911,10 +923,9 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
                         : null)
                     ?? extractNumberFrom(summary, ["personalized", "Personalized"]) : null;
 
-    const total =
-        (typeof progress?.total === "number" && Number.isFinite(progress.total) ? progress.total : null)
-        ?? extractNumberFrom(stats, ["total", "queued", "attempted"])
-        ?? extractNumberFrom(summary, ["total", "queued", "attempted"]);
+    const total = preferSummary
+        ? (summaryTotal ?? statsTotal ?? progressTotal)
+        : (progressTotal ?? statsTotal ?? summaryTotal);
 
     return { throughputNum, total };
 };
