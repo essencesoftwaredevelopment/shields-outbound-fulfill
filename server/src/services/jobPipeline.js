@@ -36,7 +36,7 @@ import {
     insertJob
 } from './db/jobs.js';
 import { pool } from '../config/db.js';
-import { applyJobControlFileToJob, ensureJobControl } from './jobControl.js';
+import { applyJobControlFileToJob, ensureJobControl, writeJobControl } from './jobControl.js';
 import { createJobControlGate } from './jobControlGate.js';
 
 export const jobs = new Map();
@@ -223,6 +223,7 @@ async function markCancelled(job, reason = 'Cancelled by user') {
 
 async function markPaused(job, reason = 'Paused by user') {
     job.paused = true;
+    writeJobControl(job.id, { paused: true, cancelled: false });
     await updateJobControl(job.id, { paused: true });
     job.status = 'running';  // Paused jobs keep running status (can be resumed)
     job.pausedAt = new Date().toISOString();
@@ -233,6 +234,7 @@ async function markPaused(job, reason = 'Paused by user') {
 
 async function markResumed(job) {
     job.paused = false;
+    writeJobControl(job.id, { paused: false, cancelled: false });
     await updateJobControl(job.id, { paused: false });
     job.status = 'running';
     job.resumedAt = new Date().toISOString();

@@ -59,8 +59,8 @@ export function readJobControl(jobId) {
 export function applyJobControlFileToJob(job) {
     if (!job?.id) return { paused: false, cancelled: false };
     const file = readJobControl(job.id);
-    if (file.paused) job.paused = true;
-    if (file.cancelled) job.cancelled = true;
+    job.paused = file.paused;
+    job.cancelled = file.cancelled;
     return file;
 }
 

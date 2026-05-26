@@ -683,6 +683,7 @@ router.post('/jobs/:id/resume', async (req, res) => {
             await markResumed(localJob);
         }
 
+        writeJobControl(jobId, { paused: false, cancelled: false });
         await updateJobControl(jobId, { paused: false, cancelled: false });
         if (queueJob) {
             await updateQueueControl(jobId, { paused: false, cancelled: false });
