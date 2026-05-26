@@ -500,12 +500,12 @@ export async function jobHasRemainingPipelineWork({
     return false;
 }
 
-/** Shared cohort for email discovery counts (must match getEmailFindQueue scope). */
+/** Shared cohort for email discovery (scoped by this job's domains, not contacts.job_id). */
 const EMAIL_DISCOVERY_COHORT_SQL = `
     FROM contacts c
     JOIN companies co ON co.id = c.company_id
     JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
-    WHERE c.agency_id = $1 AND c.client_id = $2 AND c.job_id = $3
+    WHERE c.agency_id = $1 AND c.client_id = $2
       AND c.role_type = 'founder'
       AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
       AND LOWER(BTRIM(c.full_name)) <> 'not found'
@@ -544,7 +544,7 @@ export async function getEmailFindQueue(agencyId, clientId, jobId, { reprocessIn
          FROM contacts c
          JOIN companies co ON co.id = c.company_id
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
-         WHERE c.agency_id = $1 AND c.client_id = $2 AND c.job_id = $3
+         WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            ${emailConstraint}
            AND (c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '' AND LOWER(BTRIM(c.full_name)) <> 'not found')

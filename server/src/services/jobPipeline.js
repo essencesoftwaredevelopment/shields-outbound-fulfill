@@ -857,8 +857,15 @@ async function processJob(job) {
                     typeof foundersStageTotal === 'number' ? foundersStageTotal : 0,
                     queueRows.length
                 );
-                // Derive from cohort size − queue so "done" + "remaining" never double-count.
-                const progressOffset = Math.max(0, progressTotal - queueRows.length);
+                const derivedOffset = Math.max(0, progressTotal - queueRows.length);
+                const persistedDone = job.stages?.emailDiscovery?.progress?.processed;
+                const progressOffset = Math.min(
+                    progressTotal,
+                    Math.max(
+                        derivedOffset,
+                        typeof persistedDone === 'number' ? persistedDone : 0
+                    )
+                );
 
                 log(
                     job,
