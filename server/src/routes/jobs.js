@@ -616,7 +616,7 @@ router.post('/jobs/:id/pause', async (req, res) => {
         if (!row) return res.status(404).json({ error: 'Job not found.' });
 
         writeJobControl(jobId, { paused: true, cancelled: false });
-        await updateJobControl(jobId, { paused: true });
+        await updateJobControl(jobId, { paused: true, cancelled: false });
         const queueJob = await getQueueJob(jobId);
         if (queueJob) {
             await updateQueueControl(jobId, { paused: true });
@@ -646,7 +646,28 @@ router.post('/jobs/:id/resume', async (req, res) => {
         if (!row || row.client_slug !== clientId) {
             return res.status(404).json({ error: 'Job not found.' });
         }
-        if (row.cancelled) {
+        const queueJob = await getQueueJob(jobId);
+        const stages = row.stages && typeof row.stages === 'object' ? row.stages : {};
+        const emailDiscoveryIncomplete = stages.emailDiscovery?.status !== 'completed';
+        const pipelineHadStarted = ['domainPrep', 'founders', 'emailDiscovery'].some(
+            (key) => stages[key]?.status === 'completed' || stages[key]?.status === 'running' || stages[key]?.status === 'error'
+        );
+        const recoverablePauseCancel = row.cancelled && emailDiscoveryIncomplete && pipelineHadStarted
+            && (row.paused || queueJob?.status === 'paused' || queueJob?.status === 'cancelled');
+
+        // Recover jobs that were paused but incorrectly marked cancelled (pre-fix email finder stop)
+        if (recoverablePauseCancel) {
+            writeJobControl(jobId, { paused: true, cancelled: false });
+            await updateJobControl(jobId, { paused: true, cancelled: false });
+            if (queueJob) {
+                await updateQueueControl(jobId, { paused: true, cancelled: false });
+                if (queueJob.status === 'cancelled' || queueJob.status === 'failed') {
+                    await setQueueStatus(jobId, 'paused', { error: null });
+                }
+            }
+            row.cancelled = false;
+            row.paused = true;
+        } else if (row.cancelled) {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
         }
         if (row.status === 'completed') {
@@ -657,7 +678,6 @@ router.post('/jobs/:id/resume', async (req, res) => {
         }
 
         const localJob = jobs.get(jobId);
-        const queueJob = await getQueueJob(jobId);
 
         if (localJob) {
             await markResumed(localJob);

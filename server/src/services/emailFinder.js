@@ -4,6 +4,7 @@ import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
 import http from 'http';
+import { throwIfJobStopped } from './jobControlGate.js';
 
 dotenv.config();
 
@@ -399,8 +400,25 @@ export async function runEmailFinder({
         try {
             await flushPromise;
         } catch (err) {
+            if (controller.signal.aborted) {
+                log(`Emails: batch upsert after stop (${err?.message || err})`);
+                return;
+            }
             controller.abort();
             throw new Error(`Email batch upsert failed: ${err?.message || err}`);
+        }
+    };
+
+    const flushAllPending = async () => {
+        try {
+            await flushBatch(true);
+            await flushPromise;
+        } catch (err) {
+            if (controller.signal.aborted) {
+                log(`Emails: final flush after stop (${err?.message || err})`);
+                return;
+            }
+            throw err;
         }
     };
 
@@ -546,7 +564,7 @@ export async function runEmailFinder({
                     checkPaused();
                 }
                 if (checkPaused && checkPaused() && !controller.signal.aborted) {
-                    const reason = job?.cancelled ? 'cancelled' : 'paused';
+                    const reason = job?.cancelled ? 'cancelled' : (job?.paused ? 'paused' : 'stopped');
                     log(`Emails: aborting (${reason}) at ${completedEligible}/${eligibleTotal}`);
                     controller.abort();
                 }
@@ -555,32 +573,29 @@ export async function runEmailFinder({
 
         try {
             await Promise.all(tasks);
-            await flushBatch(true);
-            await flushPromise;
+            await flushAllPending();
             if (controller.signal.aborted) {
-                await flushBatch(true);
-                await flushPromise;
-                if (refreshControl) await refreshControl();
-                if (job?.cancelled || (checkPaused && checkPaused())) {
-                    const err = new Error('Job cancelled during email discovery');
-                    err.code = 'JOB_CANCELLED';
-                    throw err;
-                }
-                const err = new Error('Job paused during email discovery');
-                err.code = 'JOB_PAUSED';
-                throw err;
+                await flushAllPending();
+                await throwIfJobStopped(job, refreshControl, {
+                    cancelledMessage: 'Job cancelled during email discovery',
+                    pausedMessage: 'Job paused during email discovery'
+                });
             }
         } catch (error) {
+            if (controller.signal.aborted) {
+                await flushAllPending();
+                await throwIfJobStopped(job, refreshControl, {
+                    cancelledMessage: 'Job cancelled during email discovery',
+                    pausedMessage: 'Job paused during email discovery'
+                });
+            }
             if (error?.code === 'JOB_PAUSED' || error?.code === 'JOB_CANCELLED') {
-                await flushBatch(true);
-                await flushPromise;
+                await flushAllPending();
             }
             // If credit exhausted, write partial results and re-throw
             if (error.code === 'CREDIT_EXHAUSTED') {
                 console.log(`[EMAIL_FINDER] Writing partial results before pausing...`);
-                await flushBatch(true);
-                await flushPromise;
-                
+                await flushAllPending();
                 throw error; // Re-throw to propagate to runStage
             }
             throw error; // Re-throw other errors

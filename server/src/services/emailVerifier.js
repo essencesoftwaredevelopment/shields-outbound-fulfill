@@ -4,6 +4,7 @@ import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
 import http from 'http';
+import { throwIfJobStopped } from './jobControlGate.js';
 
 dotenv.config();
 
@@ -284,7 +285,7 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candidatesInput = null, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkpoint = null, checkPaused = null, onBatch = null, pricing = null } = {}) {
+export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candidatesInput = null, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkpoint = null, checkPaused = null, refreshControl = null, onBatch = null, pricing = null } = {}) {
     const API_KEY = apiKeys.kitt;
     const requestCost = Number(pricing?.request_cost) || 0;
 
@@ -322,7 +323,29 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
         const batch = pendingBatch.splice(0, pendingBatch.length);
         if (batch.length === 0) return;
         flushPromise = flushPromise.then(() => onBatch(batch));
-        await flushPromise;
+        try {
+            await flushPromise;
+        } catch (err) {
+            if (controller.signal.aborted) {
+                log(`Verify: batch upsert after stop (${err?.message || err})`);
+                return;
+            }
+            controller.abort();
+            throw err;
+        }
+    };
+
+    const flushAllPending = async () => {
+        try {
+            await flushBatch(true);
+            await flushPromise;
+        } catch (err) {
+            if (controller.signal.aborted) {
+                log(`Verify: final flush after stop (${err?.message || err})`);
+                return;
+            }
+            throw err;
+        }
     };
 
     log(`Verify: ${candidates.length} rows loaded | ${toVerify.length} eligible emails.`);
@@ -426,29 +449,30 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
 
     try {
         await Promise.all(tasks);
+        await flushAllPending();
         if (controller.signal.aborted) {
-            await flushBatch(true);
-            await flushPromise;
-            if (job?.cancelled || (checkPaused && checkPaused())) {
-                const err = new Error('Job cancelled during verification');
-                err.code = 'JOB_CANCELLED';
-                throw err;
-            }
-            const err = new Error('Job paused during verification');
-            err.code = 'JOB_PAUSED';
-            throw err;
+            await flushAllPending();
+            await throwIfJobStopped(job, refreshControl, {
+                cancelledMessage: 'Job cancelled during verification',
+                pausedMessage: 'Job paused during verification'
+            });
         }
     } catch (error) {
+        if (controller.signal.aborted) {
+            await flushAllPending();
+            await throwIfJobStopped(job, refreshControl, {
+                cancelledMessage: 'Job cancelled during verification',
+                pausedMessage: 'Job paused during verification'
+            });
+        }
         if (error?.code === 'JOB_PAUSED' || error?.code === 'JOB_CANCELLED') {
-            await flushBatch(true);
-            await flushPromise;
+            await flushAllPending();
         }
         throw error;
     } finally {
         clearInterval(pauseCheckInterval);
-        if (onBatch) {
-            await flushBatch(true);
-            await flushPromise;
+        if (onBatch && !controller.signal.aborted) {
+            await flushAllPending();
         }
     }
 

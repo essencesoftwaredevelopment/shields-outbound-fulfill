@@ -14,6 +14,27 @@ export function createJobPausedError(message = 'Job paused') {
 }
 
 /**
+ * After cooperative stop (pause/cancel), throw the correct control error.
+ * Must run after refresh/sync — do not use checkPaused() alone (it is true for both pause and cancel).
+ */
+export async function throwIfJobStopped(job, refresh, {
+    cancelledMessage = 'Job cancelled',
+    pausedMessage = 'Job paused'
+} = {}) {
+    if (typeof refresh === 'function') {
+        await refresh();
+    } else {
+        applyJobControlFileToJob(job);
+    }
+    if (job?.cancelled) {
+        throw createJobCancelledError(cancelledMessage);
+    }
+    if (job?.paused) {
+        throw createJobPausedError(pausedMessage);
+    }
+}
+
+/**
  * Cooperative pause/cancel checkpoints for pipeline stages.
  */
 export function createJobControlGate(job, { dbSyncEvery = 5 } = {}) {

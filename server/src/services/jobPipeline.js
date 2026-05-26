@@ -816,6 +816,7 @@ async function processJob(job) {
                     job,
                     checkpoint: () => gate.checkpoint(),
                     checkPaused: () => gate.checkPaused(),
+                    refreshControl: () => gate.refresh(),
                     onBatch: async (rows) => {
                         await upsertLeadRowsBatch({
                             agencyId: job.uid,
