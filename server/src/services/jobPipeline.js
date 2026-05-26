@@ -28,6 +28,7 @@ import {
     updateJobControl,
     getEmailFindQueue,
     countEmailDiscoveryEligibleForJob,
+    countEmailFindCompletedForJob,
     getVerifyQueue,
     getPersonalizeQueue,
     jobHasRemainingPipelineWork,
@@ -846,23 +847,21 @@ async function processJob(job) {
                         resumed: true
                     };
                 }
-                const eligibleTotal = await countEmailDiscoveryEligibleForJob(
-                    job.uid,
-                    job.sqlClientId,
-                    job.id
-                );
+                const [eligibleTotal, emailFindDone] = await Promise.all([
+                    countEmailDiscoveryEligibleForJob(job.uid, job.sqlClientId, job.id),
+                    countEmailFindCompletedForJob(job.uid, job.sqlClientId, job.id)
+                ]);
                 const foundersStageTotal = job.stages?.founders?.summary?.processed;
                 const progressTotal = Math.max(
                     eligibleTotal,
                     typeof foundersStageTotal === 'number' ? foundersStageTotal : 0,
-                    queueRows.length
+                    emailFindDone + queueRows.length
                 );
-                const derivedOffset = Math.max(0, progressTotal - queueRows.length);
                 const persistedDone = job.stages?.emailDiscovery?.progress?.processed;
                 const progressOffset = Math.min(
                     progressTotal,
                     Math.max(
-                        derivedOffset,
+                        emailFindDone,
                         typeof persistedDone === 'number' ? persistedDone : 0
                     )
                 );
@@ -991,14 +990,7 @@ async function processJob(job) {
             await new Promise((resolve) => writer.on('finish', resolve));
 
             const personalizeTotal = personalizeCandidates.length;
-            log(job, `Starting personalization for ${personalizeTotal} leads…`, {
-                progress: {
-                    stage: 'personalization',
-                    processed: 0,
-                    total: personalizeTotal,
-                    stats: { personalized: 0 }
-                }
-            });
+            log(job, `Starting personalization for ${personalizeTotal} leads…`);
 
             await runStageIfNeeded(job, 'personalization', () =>
                 runPersonalization({

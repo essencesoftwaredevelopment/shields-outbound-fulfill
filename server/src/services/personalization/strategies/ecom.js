@@ -35,7 +35,14 @@ function reportPersonalizationProgress(log, processed, total, stats = {}) {
         progress.cost = stats.cost;
         progress.stats.Cost = `$${stats.cost.toFixed(2)}`;
     }
-    log?.(`Personalization progress: ${done}/${safeTotal}`, { progress });
+    const phase = stats.phase;
+    const label =
+        phase === 'shopify_detection'
+            ? 'Shopify detection'
+            : phase === 'generating'
+                ? 'Generating first lines'
+                : 'Personalization';
+    log?.(`${label}: ${done}/${safeTotal}`, { progress });
 }
 
 function normalizeHostname(urlOrDomain) {
@@ -674,12 +681,14 @@ async function personalizeWithNewPromptFromShopify({
     }
 
     const estimatedCost = (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
-    reportPersonalizationProgress(log, processed, rows.length, {
-        phase: 'generating',
-        productsFetched,
-        failed,
-        cost: Number(estimatedCost.toFixed(6))
-    });
+    if (processed < rows.length) {
+        reportPersonalizationProgress(log, processed, rows.length, {
+            phase: 'generating',
+            productsFetched,
+            failed,
+            cost: Number(estimatedCost.toFixed(6))
+        });
+    }
 
     log?.(`New prompt personalization complete: ${processed} rows. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
 

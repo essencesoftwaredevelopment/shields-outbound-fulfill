@@ -1170,6 +1170,7 @@ export default function ClientPage() {
     const [isDeletingClient, setIsDeletingClient] = useState(false);
     const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
     const [pausingJob, setPausingJob] = useState(false);
+    const pendingPauseControlRef = useRef<'pause' | 'resume' | null>(null);
     const [stoppingJob, setStoppingJob] = useState(false);
     const [pipelineVisible, setPipelineVisible] = useState(true);
     const [expandedErrorJobId, setExpandedErrorJobId] = useState<string | null>(null);
@@ -2743,6 +2744,9 @@ export default function ClientPage() {
                     new: Number.isFinite(newVal) ? newVal : 0,
                 }
                 : null,
+            paused: data.paused === true,
+            queueStatus: typeof data.queueStatus === 'string' ? data.queueStatus : null,
+            workerActive: data.workerActive === true,
         };
     }, [normalizeStages]);
 
@@ -3501,7 +3505,11 @@ export default function ClientPage() {
         // Running pipeline progress is driven by Supabase job realtime while watched.
         if (realtimeJobId) {
             const liveStatus = uploadStatus || pipelineStatus;
-            if (liveStatus === "running" || liveStatus === "queued") {
+            if (
+                liveStatus === "running"
+                || liveStatus === "queued"
+                || jobState?.paused
+            ) {
                 return false;
             }
         }
@@ -3522,7 +3530,8 @@ export default function ClientPage() {
         clientId,
         realtimeJobId,
         activeJobStatus,
-        jobState?.status
+        jobState?.status,
+        jobState?.paused
     ]);
 
     useEffect(() => {
@@ -4579,12 +4588,55 @@ export default function ClientPage() {
         }
     };
 
+    const waitForGracefulPause = useCallback(
+        async (jobId: string) => {
+            const deadline = Date.now() + 120_000;
+            while (Date.now() < deadline) {
+                const idToken = await getAccessToken();
+                if (!idToken) return null;
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/jobs/${jobId}?clientId=${encodeURIComponent(clientId)}`,
+                    {
+                        cache: 'no-store',
+                        headers: { Authorization: `Bearer ${idToken}` },
+                    }
+                );
+                if (!response.ok) {
+                    await new Promise((resolve) => setTimeout(resolve, 500));
+                    continue;
+                }
+                const payload = await response.json();
+                const raw = payload?.job as Record<string, unknown> | undefined;
+                if (!raw?.id) {
+                    await new Promise((resolve) => setTimeout(resolve, 500));
+                    continue;
+                }
+                const snapshot = mapApiJobToJob(raw);
+                setJobState((prev) => mergeJobState(prev, snapshot));
+                const pauseSettled =
+                    snapshot.queueStatus === 'paused'
+                    || (
+                        snapshot.paused === true
+                        && snapshot.workerActive !== true
+                        && snapshot.queueStatus !== 'running'
+                    );
+                if (pauseSettled) {
+                    return snapshot;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+            return null;
+        },
+        [clientId, mapApiJobToJob, mergeJobState]
+    );
+
     const handlePauseResumeJob = async () => {
         if (!user || !jobState?.id || !clientId) return;
-        
+
         const isPaused = jobState.paused === true;
         const endpoint = isPaused ? 'resume' : 'pause';
-        
+
+        pendingPauseControlRef.current = isPaused ? 'resume' : 'pause';
         setPausingJob(true);
         try {
             const idToken = await getAccessToken();
@@ -4592,18 +4644,37 @@ export default function ClientPage() {
             const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ idToken, clientId })
+                body: JSON.stringify({ idToken, clientId }),
             });
             if (!resp.ok) {
                 const data = await resp.json().catch(() => ({}));
                 throw new Error(data.error || `Failed to ${endpoint} job (${resp.status})`);
             }
-            setJobState((prev) => prev ? { ...prev, paused: !isPaused } : prev);
-            setJobStatusMessage(isPaused ? 'Job resumed.' : 'Job paused.');
+
+            if (isPaused) {
+                setJobState((prev) => (prev ? { ...prev, paused: false } : prev));
+                setJobStatusMessage('Job resumed.');
+            } else {
+                const snapshot = await waitForGracefulPause(jobState.id);
+                setJobState((prev) =>
+                    prev
+                        ? {
+                              ...prev,
+                              paused: true,
+                              queueStatus: snapshot?.queueStatus ?? 'paused',
+                              workerActive: false,
+                          }
+                        : prev
+                );
+                setJobStatusMessage(
+                    snapshot ? 'Job paused.' : 'Pause requested; worker may still be stopping.'
+                );
+            }
         } catch (error) {
             setToastMessage(error instanceof Error ? error.message : `Failed to ${endpoint} job`);
             setToastVisible(true);
         } finally {
+            pendingPauseControlRef.current = null;
             setPausingJob(false);
         }
     };
@@ -7277,7 +7348,9 @@ export default function ClientPage() {
                                                                 }}
                                                             >
                                                                 {pausingJob ? (
-                                                                    jobState.paused ? 'Resuming...' : 'Pausing...'
+                                                                    pendingPauseControlRef.current === 'resume'
+                                                                        ? 'Resuming...'
+                                                                        : 'Pausing...'
                                                                 ) : (
                                                                     <>
                                                                         {jobState.paused ? (

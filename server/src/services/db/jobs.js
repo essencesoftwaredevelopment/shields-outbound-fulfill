@@ -563,12 +563,16 @@ export async function getVerifyQueue(agencyId, clientId, jobId, { reprocessInclu
         : `AND c.email_verify_completed_at IS NULL`;
 
     const result = await pool.query(
-        `SELECT c.id AS contact_id, co.domain_normalized AS domain, c.full_name AS founder_name,
-                c.email, c.email_status
+        `SELECT DISTINCT ON (c.id)
+                c.id AS contact_id,
+                co.domain_normalized AS domain,
+                c.full_name AS founder_name,
+                c.email,
+                c.email_status
          FROM contacts c
          JOIN companies co ON co.id = c.company_id
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
-         WHERE c.agency_id = $1 AND c.client_id = $2 AND c.job_id = $3
+         WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
@@ -597,12 +601,17 @@ export async function getPersonalizeQueue(
         : '';
 
     const result = await pool.query(
-        `SELECT c.id AS contact_id, co.domain_normalized AS domain, c.full_name AS founder_name,
-                c.email, c.email_status, c.personalization_first_line
+        `SELECT DISTINCT ON (c.id)
+                c.id AS contact_id,
+                co.domain_normalized AS domain,
+                c.full_name AS founder_name,
+                c.email,
+                c.email_status,
+                c.personalization_first_line
          FROM contacts c
          JOIN companies co ON co.id = c.company_id
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
-         WHERE c.agency_id = $1 AND c.client_id = $2 AND c.job_id = $3
+         WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'

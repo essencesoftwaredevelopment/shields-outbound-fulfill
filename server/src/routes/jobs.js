@@ -32,7 +32,21 @@ import { getOrCreateClient, getClientRowBySlug, resolveClientRow } from '../serv
 import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
-import { deleteQueueJob, enqueuePipelineJob, getQueueJob, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
+import { deleteQueueJob, enqueuePipelineJob, getQueueJob, getRunnerRecord, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
+
+async function enrichJobWithQueueRuntime(jobState, jobId) {
+    if (!jobState || !jobId) return jobState;
+    const row = await getRunnerRecord(jobId);
+    if (!row) {
+        return { ...jobState, queueStatus: null, workerActive: false };
+    }
+    const workerActive = row.runner_pid != null && row.status === 'running';
+    return {
+        ...jobState,
+        queueStatus: row.status,
+        workerActive
+    };
+}
 import { forceTerminateRunner } from '../services/jobRunner.js';
 import { normalizeDomain } from '../utils/domain.js';
 import OpenAI from 'openai';
@@ -467,7 +481,8 @@ router.get('/jobs/:id', async (req, res) => {
         const jobId = req.params.id;
         const memoryJob = jobs.get(jobId);
         if (memoryJob) {
-            return res.json({ job: serializeJob(memoryJob) });
+            const job = await enrichJobWithQueueRuntime(serializeJob(memoryJob), jobId);
+            return res.json({ job });
         }
 
         const agencyId = await agencyFromRequest(req);
@@ -475,7 +490,8 @@ router.get('/jobs/:id', async (req, res) => {
         if (!row) {
             return res.status(404).json({ error: 'Job not found' });
         }
-        return res.json({ job: jobRowToState(row) });
+        const job = await enrichJobWithQueueRuntime(jobRowToState(row), jobId);
+        return res.json({ job });
     } catch (error) {
         console.error('GET job error:', error);
         res.status(500).json({ error: 'Failed to load job' });

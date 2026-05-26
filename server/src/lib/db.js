@@ -391,11 +391,13 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                             role_type = $2,
                             full_name = COALESCE($3, full_name),
                             email_status = COALESCE($4, email_status),
-                            confidence = COALESCE($5, confidence),
-                            personalization_first_line = COALESCE($6, personalization_first_line),
-                            job_id = COALESCE($7, job_id),
+                            email_find_completed_at = COALESCE($5::timestamptz, email_find_completed_at),
+                            email_verify_completed_at = COALESCE($6::timestamptz, email_verify_completed_at),
+                            confidence = COALESCE($7, confidence),
+                            personalization_first_line = COALESCE($8, personalization_first_line),
+                            job_id = COALESCE($9, job_id),
                             updated_at = now()
-                        WHERE client_id = $8 AND email = $9
+                        WHERE client_id = $10 AND email = $11
                         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
                                   email_find_completed_at, email_verify_completed_at,
                                   last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
@@ -404,7 +406,8 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                         await txClient.query('SAVEPOINT contacts_email_owner_update');
                         const updateResult = await txClient.query(updateQuery, [
                             row.company_id, row.role_type, row.full_name,
-                            row.email_status, row.confidence, row.personalization_first_line, row.job_id,
+                            row.email_status, row.email_find_completed_at, row.email_verify_completed_at,
+                            row.confidence, row.personalization_first_line, row.job_id,
                             clientId, row.email
                         ]);
                         await txClient.query('RELEASE SAVEPOINT contacts_email_owner_update');

@@ -52,6 +52,10 @@ export interface PipelineJob {
     uploadedAt?: string | null;
     discarded?: boolean;
     paused?: boolean;
+    /** job_queue.status — `paused` means the worker child has finished shutting down. */
+    queueStatus?: string | null;
+    /** True while a child process is still running this job. */
+    workerActive?: boolean;
     activityMessage?: string | null;
     activityUpdatedAt?: string | null;
 }

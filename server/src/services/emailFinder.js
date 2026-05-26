@@ -383,7 +383,8 @@ export async function runEmailFinder({
     const jobTotal = Number.isFinite(progressTotal) && progressTotal > 0
         ? progressTotal
         : progressOffset + eligibleTotal;
-    const displayProcessed = (n) => Math.min(progressOffset + n, jobTotal);
+    const displayProcessed = (n) => progressOffset + n;
+    const displayProcessedCapped = (n) => Math.min(displayProcessed(n), jobTotal);
 
     log(
         progressOffset > 0
@@ -529,10 +530,12 @@ export async function runEmailFinder({
             completedEligible += 1;
             const costNumber = Number(stageCost.toFixed(6));
             const processedJobWide = displayProcessed(completedEligible);
+            const processedForUi = displayProcessedCapped(completedEligible);
+            const segmentDone = completedEligible >= eligibleTotal;
             const progressPayload = {
                 progress: {
                     stage: 'emailDiscovery',
-                    processed: processedJobWide,
+                    processed: processedForUi,
                     total: jobTotal,
                     found: stats['Found'],
                     cost: costNumber,
@@ -542,9 +545,14 @@ export async function runEmailFinder({
                     }
                 }
             };
-            if (completedEligible % 10 === 0 || completedEligible <= 5 || completedEligible === eligibleTotal) {
-                log(`Emails: processed ${processedJobWide}/${jobTotal} eligible founders`, progressPayload);
-            } else {
+            const shouldLogLine =
+                completedEligible % 10 === 0
+                || completedEligible <= 5
+                || segmentDone;
+            const cappedBeforeDone = processedForUi >= jobTotal && !segmentDone;
+            if (shouldLogLine && !cappedBeforeDone) {
+                log(`Emails: processed ${processedForUi}/${jobTotal} eligible founders`, progressPayload);
+            } else if (!cappedBeforeDone) {
                 log(null, progressPayload);
             }
 
