@@ -3103,16 +3103,8 @@ export default function ClientPage() {
             if (!response.ok || response.status === 304) return;
             const payload = await response.json();
             if (payload?.job) {
-                const raw = payload.job as Record<string, unknown> & { id: string };
-                setJobState((prev) =>
-                    mergeJobState(prev, {
-                        ...(raw as PipelineJob),
-                        activityMessage:
-                            typeof raw.activityMessage === "string" ? raw.activityMessage : null,
-                        activityUpdatedAt:
-                            typeof raw.activityUpdatedAt === "string" ? raw.activityUpdatedAt : null,
-                    })
-                );
+                const raw = payload.job as Record<string, unknown>;
+                setJobState((prev) => mergeJobState(prev, mapApiJobToJob(raw)));
             }
         } catch (error: any) {
             console.error('❌ [JOB SNAPSHOT ERROR]:', {
@@ -3129,7 +3121,7 @@ export default function ClientPage() {
         } finally {
             isFetchingRef.current = false;
         }
-    }, [user, clientId, mergeJobState]);
+    }, [user, clientId, mergeJobState, mapApiJobToJob]);
 
     const startJobWatch = useCallback(
         (jobId: string) => {
