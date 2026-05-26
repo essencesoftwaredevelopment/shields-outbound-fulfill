@@ -557,7 +557,9 @@ export async function getPersonalizeQueue(
         ? ''
         : `AND (c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')`;
     const emailStatusFilter = requireValidEmail
-        ? `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid', 'valid-risky')`
+        // `contacts.email_status` is normalized to `risky` (see normalizeEmailStatus in `services/leads.js`),
+        // but allow both labels defensively.
+        ? `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid', 'valid-risky', 'risky')`
         : '';
 
     const result = await pool.query(
@@ -583,7 +585,9 @@ export async function getPersonalizeQueue(
 export async function buildUnifiedRowsFromDb(jobId, scope = 'valid') {
     let statusFilter = '';
     if (scope === 'valid') {
-        statusFilter = `AND c.email_status IN ('valid', 'risky')`;
+        // Treat "valid-risky" as export-eligible alongside "valid".
+        // Keep legacy "risky" for backwards compatibility with older rows.
+        statusFilter = `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid', 'valid-risky', 'risky')`;
     } else if (scope === 'complete') {
         statusFilter = `AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
             AND c.personalization_first_line IS NOT NULL AND BTRIM(c.personalization_first_line) <> ''`;
