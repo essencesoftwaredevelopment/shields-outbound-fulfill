@@ -27,7 +27,6 @@ import {
     syncJobControlFromDb,
     updateJobControl,
     getEmailFindQueue,
-    countEmailFindCompletedForJob,
     getVerifyQueue,
     getPersonalizeQueue,
     jobHasRemainingPipelineWork,
@@ -861,21 +860,12 @@ async function processJob(job) {
                           ? processableCount
                           : queueRows.length;
                 const progressTotal = jobEmailTotal;
-                const emailFindDone = await countEmailFindCompletedForJob(
-                    job.uid,
-                    job.sqlClientId,
-                    job.id
-                );
-                const persistedDone = job.stages?.emailDiscovery?.progress?.processed;
+                // queueRows.length reflects what's left to do (queue filter excludes
+                // already-completed rows in skip mode; in reprocess/include mode the
+                // queue contains every founder for the upload). Either way, the
+                // derived offset is the correct "done so far" count for THIS run.
                 const derivedOffset = Math.max(0, jobEmailTotal - queueRows.length);
-                const progressOffset = Math.min(
-                    jobEmailTotal,
-                    Math.max(
-                        derivedOffset,
-                        emailFindDone,
-                        typeof persistedDone === 'number' ? persistedDone : 0
-                    )
-                );
+                const progressOffset = Math.min(jobEmailTotal, derivedOffset);
 
                 log(
                     job,

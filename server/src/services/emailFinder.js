@@ -574,10 +574,9 @@ export async function runEmailFinder({
                 completedEligible % 10 === 0
                 || completedEligible <= 5
                 || segmentDone;
-            const cappedBeforeDone = processedForUi >= jobTotal && !segmentDone;
-            if (shouldLogLine && !cappedBeforeDone) {
+            if (shouldLogLine) {
                 log(`Emails: processed ${processedForUi}/${jobTotal} eligible founders`, progressPayload);
-            } else if (!cappedBeforeDone) {
+            } else {
                 log(null, progressPayload);
             }
 
