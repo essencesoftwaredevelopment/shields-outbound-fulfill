@@ -353,6 +353,10 @@ const DEFAULT_LEAD_EXPORT_FIELD_KEYS = LEAD_EXPORT_FIELDS
     .filter((field) => field.defaultSelected)
     .map((field) => field.key);
 
+const LEAD_EXPORT_ROW_LIMIT_PRESETS = [100, 500, 1000, 5000] as const;
+const DEFAULT_LEAD_EXPORT_MAX_ROWS = 1000;
+const LEAD_EXPORT_MAX_ROWS_CAP = 1_000_000;
+
 function createLeadFilterId() {
     return `lead-filter-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -1602,6 +1606,7 @@ export default function ClientPage() {
     const [stats, setStats] = useState<{ total: number | null; verified: number; unverified: number }>(() => ({ total: null, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
+    const [emailCopied, setEmailCopied] = useState(false);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
     const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
@@ -1621,10 +1626,13 @@ export default function ClientPage() {
     const [exportingCsv, setExportingCsv] = useState(false);
     const [leadExportModalOpen, setLeadExportModalOpen] = useState(false);
     const [selectedLeadExportFields, setSelectedLeadExportFields] = useState<string[]>(DEFAULT_LEAD_EXPORT_FIELD_KEYS);
+    const [leadExportLimitEnabled, setLeadExportLimitEnabled] = useState(false);
+    const [leadExportMaxRows, setLeadExportMaxRows] = useState(DEFAULT_LEAD_EXPORT_MAX_ROWS);
 
     useEffect(() => {
         setLeadModalTab('detail');
         setShowLeadAdvanced(false);
+        setEmailCopied(false);
     }, [selectedLead?.id]);
 
     useEffect(() => {
@@ -2029,7 +2037,7 @@ export default function ClientPage() {
             return { label: 'Valid', detail: when ? `Verified ${when}` : undefined, variant: 'valid' };
         }
         if (normalized === 'valid-risky' || normalized === 'risky') {
-            return { label: 'Valid (risky)', detail: when ? `Verified ${when}` : undefined, variant: 'valid-risky' };
+            return { label: 'Valid-Risky', detail: when ? `Verified ${when}` : undefined, variant: 'valid-risky' };
         }
         if (normalized === 'invalid') {
             return { label: 'Invalid', detail: when ? `Verified ${when}` : undefined, variant: 'invalid' };
@@ -5995,6 +6003,9 @@ export default function ClientPage() {
             const includeLatestEvent = selectedLeadExportFields.some((fieldKey) => (
                 LEAD_EXPORT_FIELDS.find((field) => field.key === fieldKey)?.group === 'Events'
             ));
+            const maxRows = leadExportLimitEnabled
+                ? Math.max(1, Math.min(LEAD_EXPORT_MAX_ROWS_CAP, Math.floor(leadExportMaxRows) || 1))
+                : null;
             const params = buildLeadQueryParams({ limit: 5000, includeLatestEvent });
 
             const collected: Lead[] = [];
@@ -6022,18 +6033,24 @@ export default function ClientPage() {
                 offset += mapped.length;
                 hasMore = more && mapped.length > 0;
 
-                if (collected.length >= 1000000) {
-                    console.warn('Reached max export limit of 1,000,000 leads');
+                if (maxRows !== null && collected.length >= maxRows) {
+                    break;
+                }
+
+                if (collected.length >= LEAD_EXPORT_MAX_ROWS_CAP) {
+                    console.warn(`Reached max export limit of ${LEAD_EXPORT_MAX_ROWS_CAP.toLocaleString()} leads`);
                     break;
                 }
             }
+
+            const rowsToExport = maxRows !== null ? collected.slice(0, maxRows) : collected;
 
             const orderedFields = LEAD_EXPORT_FIELDS.filter((field) => selectedLeadExportFields.includes(field.key));
             const csvRows = [
                 orderedFields.map((field) => csvEscape(field.label)).join(',')
             ];
 
-            collected.forEach((lead) => {
+            rowsToExport.forEach((lead) => {
                 csvRows.push(orderedFields.map((field) => csvEscape(getLeadExportValue(lead, field.key))).join(','));
             });
 
@@ -6047,6 +6064,8 @@ export default function ClientPage() {
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
+            setToastMessage(`Exported ${rowsToExport.length.toLocaleString()} lead${rowsToExport.length === 1 ? '' : 's'}`);
+            setToastVisible(true);
         } catch (error) {
             console.error('CSV export failed:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to export CSV');
@@ -6054,7 +6073,7 @@ export default function ClientPage() {
         } finally {
             setExportingCsv(false);
         }
-    }, [buildLeadQueryParams, clientName, mapApiLeadRow, selectedLeadExportFields, user]);
+    }, [buildLeadQueryParams, clientName, leadExportLimitEnabled, leadExportMaxRows, mapApiLeadRow, selectedLeadExportFields, user]);
 
     const uploadDisabled = !selectedFile || uploading;
 
@@ -6429,7 +6448,7 @@ export default function ClientPage() {
                                                         }}>
                                                             {formatRawEmailValue(lead.email)}
                                                         </span>
-                                                        {renderEmailFindChip(lead.email, lead.emailFindCompletedAt)}
+                                                        {!lead.email && renderEmailFindChip(lead.email, lead.emailFindCompletedAt)}
                                                     </div>
                                                 </td>
                                                 <td style={{
@@ -7322,8 +7341,58 @@ export default function ClientPage() {
                                             </p>
                                         )}
                                         {jobState && (
-                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem' }}>
-                                                Valid leads: {validLeadsCompleted.toLocaleString()} · Job ID: {jobState.id}
+                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                                                <span>Valid leads: {validLeadsCompleted.toLocaleString()} · Job ID: {jobState.id}</span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        const currentJobId = jobState.id;
+                                                        if (!currentJobId) return;
+                                                        const clause = {
+                                                            field: 'job_id',
+                                                            op: 'contains',
+                                                            value: currentJobId,
+                                                            joinOp: 'AND' as const
+                                                        };
+                                                        setLeadFilters([{ id: createLeadFilterId(), ...clause }]);
+                                                        setAppliedLeadFilters([clause]);
+                                                        setLeadSearch("");
+                                                        setCampaignFilterId("");
+                                                        setActiveTab("leads");
+                                                    }}
+                                                    title="View leads for this job"
+                                                    aria-label="View leads for this job"
+                                                    style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        gap: '0.35rem',
+                                                        padding: '0.2rem 0.6rem',
+                                                        fontSize: '0.75rem',
+                                                        fontWeight: 500,
+                                                        lineHeight: 1.2,
+                                                        color: 'var(--app-text-muted)',
+                                                        background: 'var(--app-surface-2)',
+                                                        border: '1px solid var(--app-border)',
+                                                        borderRadius: '6px',
+                                                        cursor: 'pointer',
+                                                        transition: 'all 0.15s ease'
+                                                    }}
+                                                    onMouseEnter={(e) => {
+                                                        e.currentTarget.style.background = 'var(--app-surface-hover)';
+                                                        e.currentTarget.style.borderColor = 'var(--app-border-mid)';
+                                                        e.currentTarget.style.color = 'var(--app-text)';
+                                                    }}
+                                                    onMouseLeave={(e) => {
+                                                        e.currentTarget.style.background = 'var(--app-surface-2)';
+                                                        e.currentTarget.style.borderColor = 'var(--app-border)';
+                                                        e.currentTarget.style.color = 'var(--app-text-muted)';
+                                                    }}
+                                                >
+                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                                        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+                                                    </svg>
+                                                    View leads
+                                                </button>
                                             </p>
                                         )}
                                         {jobState && (
@@ -10839,12 +10908,102 @@ export default function ClientPage() {
                             <div>
                                 <h2 className="modal__title">Export lead CSV</h2>
                                 <p className="modal__description">
-                                    Choose which fields to include. Event fields use the latest Instantly event per contact.
+                                    Choose which fields to include and how many rows to export. Event fields use the latest Instantly event per contact.
                                 </p>
                             </div>
                         </div>
 
                         <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '65vh', overflowY: 'auto' }}>
+                            <div
+                                style={{
+                                    border: '1px solid var(--app-border)',
+                                    borderRadius: '12px',
+                                    background: 'var(--app-surface-3)',
+                                    padding: '1rem',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '0.85rem'
+                                }}
+                            >
+                                <div style={{ fontWeight: 600, color: 'var(--app-text-high)' }}>Row limit</div>
+                                <label
+                                    style={{
+                                        display: 'flex',
+                                        gap: '0.6rem',
+                                        alignItems: 'flex-start',
+                                        cursor: exportingCsv ? 'default' : 'pointer'
+                                    }}
+                                >
+                                    <input
+                                        type="radio"
+                                        name="lead-export-row-limit"
+                                        checked={!leadExportLimitEnabled}
+                                        onChange={() => setLeadExportLimitEnabled(false)}
+                                        disabled={exportingCsv}
+                                        style={{ marginTop: '0.2rem' }}
+                                    />
+                                    <span style={{ color: 'var(--app-text)', fontSize: '0.94rem' }}>
+                                        All matching leads
+                                        {displayedLeadTotal !== null ? ` (${displayedLeadTotal.toLocaleString()})` : ''}
+                                    </span>
+                                </label>
+                                <label
+                                    style={{
+                                        display: 'flex',
+                                        gap: '0.6rem',
+                                        alignItems: 'flex-start',
+                                        cursor: exportingCsv ? 'default' : 'pointer'
+                                    }}
+                                >
+                                    <input
+                                        type="radio"
+                                        name="lead-export-row-limit"
+                                        checked={leadExportLimitEnabled}
+                                        onChange={() => setLeadExportLimitEnabled(true)}
+                                        disabled={exportingCsv}
+                                        style={{ marginTop: '0.2rem' }}
+                                    />
+                                    <span style={{ color: 'var(--app-text)', fontSize: '0.94rem' }}>
+                                        Limit to first N rows (current sort and filters)
+                                    </span>
+                                </label>
+                                {leadExportLimitEnabled && (
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', paddingLeft: '1.5rem' }}>
+                                        <label className="settings-field" style={{ maxWidth: '200px' }}>
+                                            <span className="settings-field__label">Max rows</span>
+                                            <input
+                                                type="number"
+                                                min={1}
+                                                max={LEAD_EXPORT_MAX_ROWS_CAP}
+                                                value={leadExportMaxRows}
+                                                onChange={(event) => {
+                                                    const parsed = Number.parseInt(event.target.value, 10);
+                                                    setLeadExportMaxRows(Number.isFinite(parsed) && parsed > 0 ? parsed : 1);
+                                                }}
+                                                disabled={exportingCsv}
+                                            />
+                                        </label>
+                                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                            {LEAD_EXPORT_ROW_LIMIT_PRESETS.map((preset) => (
+                                                <button
+                                                    key={preset}
+                                                    type="button"
+                                                    className={
+                                                        leadExportMaxRows === preset
+                                                            ? 'secondary-button secondary-button--active'
+                                                            : 'secondary-button'
+                                                    }
+                                                    onClick={() => setLeadExportMaxRows(preset)}
+                                                    disabled={exportingCsv}
+                                                >
+                                                    {preset.toLocaleString()}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
                             <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
                                 <button
                                     type="button"
@@ -10924,7 +11083,11 @@ export default function ClientPage() {
                                 onClick={handleExportLeadsCsv}
                                 disabled={exportingCsv || selectedLeadExportFields.length === 0}
                             >
-                                {exportingCsv ? 'Exporting...' : `Export CSV (${selectedLeadExportFields.length} fields)`}
+                                {exportingCsv
+                                    ? 'Exporting...'
+                                    : leadExportLimitEnabled
+                                        ? `Export CSV (${selectedLeadExportFields.length} fields, up to ${Math.max(1, Math.floor(leadExportMaxRows) || 1).toLocaleString()} rows)`
+                                        : `Export CSV (${selectedLeadExportFields.length} fields, all matching)`}
                             </button>
                         </div>
                     </div>
@@ -11394,7 +11557,7 @@ export default function ClientPage() {
             `}</style>
 
                         {/* Header: Name + Domain + Status badge */}
-                        <div className="modal__header" style={{ paddingBottom: '0.75rem' }}>
+                        <div className="modal__header" style={{ paddingBottom: '0.35rem' }}>
                             <div style={{ flex: '1 1 auto', minWidth: 0 }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
                                     {selectedLead.domain && (
@@ -11431,61 +11594,70 @@ export default function ClientPage() {
                                         )}
                                     </div>
                                 </div>
-                                {/* Status badge row */}
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-                                    {(() => {
-                                        const chip = getLeadEmailHeaderChip(selectedLead);
-                                        const colorMap: Record<string, { bg: string; border: string; text: string }> = {
-                                            'valid': { bg: 'rgba(34, 197, 94, 0.15)', border: 'rgba(34, 197, 94, 0.4)', text: '#4ade80' },
-                                            'valid-risky': { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)', text: '#facc15' },
-                                            'invalid': { bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.4)', text: '#f87171' },
-                                            'not-found': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-ghost)' },
-                                            'not-run': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-ghost)' },
-                                            'skipped': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-ghost)' },
-                                            'default': { bg: 'var(--app-surface-3)', border: 'var(--app-border-mid)', text: 'var(--app-text-muted)' },
-                                        };
-                                        const colors = colorMap[chip.variant] || colorMap['default'];
-                                        return (
-                                            <span style={{
-                                                display: 'inline-flex',
-                                                alignItems: 'center',
-                                                padding: '0.25rem 0.6rem',
-                                                borderRadius: '999px',
-                                                background: colors.bg,
-                                                border: `1px solid ${colors.border}`,
-                                                color: colors.text,
-                                                fontSize: '0.8rem',
-                                                fontWeight: 600,
-                                                letterSpacing: '0.02em',
-                                                textTransform: 'uppercase'
-                                            }}>
-                                                {chip.label}
-                                            </span>
-                                        );
-                                    })()}
-                                    {selectedLead.roleType && (
-                                        <span style={{
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            padding: '0.25rem 0.6rem',
-                                            borderRadius: '999px',
-                                            background: 'rgba(139, 92, 246, 0.12)',
-                                            border: '1px solid rgba(139, 92, 246, 0.3)',
-                                            color: 'var(--app-evtpill-purple)',
-                                            fontSize: '0.8rem',
-                                            fontWeight: 500
-                                        }}>
-                                            {selectedLead.roleType === 'founder' ? 'Founder'
-                                                : selectedLead.roleType === 'dm' ? 'Decision Maker'
-                                                    : selectedLead.roleType === 'instantly_lead' ? 'Instantly Lead'
-                                                        : selectedLead.roleType}
-                                        </span>
-                                    )}
-                                </div>
                             </div>
                         </div>
 
                         <div className="modal__body" style={{ paddingTop: 0 }}>
+                            {/* Email — above tabs */}
+                            {(selectedLead.email || selectedLead.emailFindCompletedAt) && (
+                                <div style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    flexWrap: 'wrap',
+                                    margin: '-0.25rem 0 1rem'
+                                }}>
+                                    <button
+                                        type="button"
+                                        title={emailCopied ? 'Copied!' : 'Copy email'}
+                                        onClick={() => {
+                                            if (!selectedLead.email) return;
+                                            navigator.clipboard.writeText(selectedLead.email);
+                                            setEmailCopied(true);
+                                            setTimeout(() => setEmailCopied(false), 2000);
+                                        }}
+                                        style={{
+                                            background: 'none',
+                                            border: 'none',
+                                            padding: 0,
+                                            cursor: selectedLead.email ? 'pointer' : 'default',
+                                            color: emailCopied ? '#4ade80' : 'var(--app-text-ghost)',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            flexShrink: 0,
+                                            transition: 'color 0.15s ease'
+                                        }}
+                                    >
+                                        {emailCopied ? (
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                                <polyline points="20 6 9 17 4 12"/>
+                                            </svg>
+                                        ) : (
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                            </svg>
+                                        )}
+                                    </button>
+                                    <span style={{
+                                        fontSize: '1.05rem',
+                                        fontWeight: 500,
+                                        color: selectedLead.email ? 'var(--app-text-high)' : 'var(--app-text-ghost)',
+                                        wordBreak: 'break-all'
+                                    }}>
+                                        {selectedLead.email || 'No email found'}
+                                    </span>
+                                    {(() => {
+                                        const v = getEmailVerifyDisplay(selectedLead.email, selectedLead.status, selectedLead.emailVerifyCompletedAt, selectedLead.emailFindCompletedAt);
+                                        return (
+                                            <span className={`lead-pastel-chip lead-pastel-chip--status-${v.variant}`} style={{ fontSize: '0.7rem', padding: '0.1rem 0.45rem', flexShrink: 0 }}>
+                                                {v.label}
+                                            </span>
+                                        );
+                                    })()}
+                                </div>
+                            )}
+
                             <div className="tab-nav" style={{ marginTop: 0, marginBottom: '1rem' }}>
                                 {([
                                     { key: 'detail', label: 'Detail' },
@@ -11529,35 +11701,6 @@ export default function ClientPage() {
                                             <span style={{ color: 'var(--app-text-high)' }}>{selectedLead.founderName}</span>
                                         </>
                                     )}
-                                    <span style={{ color: 'var(--app-text-faint)' }}>Email</span>
-                                    <span style={{
-                                        color: 'var(--app-text-high)',
-                                        wordBreak: 'break-all',
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        gap: '0.5rem',
-                                        flexWrap: 'wrap'
-                                    }}>
-                                        {formatRawEmailValue(selectedLead.email)}
-                                        {renderEmailFindChip(selectedLead.email, selectedLead.emailFindCompletedAt)}
-                                    </span>
-                                    {(() => {
-                                        const find = getEmailFindDisplay(
-                                            selectedLead.email,
-                                            selectedLead.emailFindCompletedAt
-                                        );
-                                        if (!find.detail) return null;
-                                        return renderEmailStageRow('Email discovery', find, { showChip: false });
-                                    })()}
-                                    {renderEmailStageRow(
-                                        'Email verification',
-                                        getEmailVerifyDisplay(
-                                            selectedLead.email,
-                                            selectedLead.status,
-                                            selectedLead.emailVerifyCompletedAt,
-                                            selectedLead.emailFindCompletedAt
-                                        )
-                                    )}
                                     {selectedLead.createdAt && (
                                         <>
                                             <span style={{ color: 'var(--app-text-faint)' }}>Created</span>
@@ -11576,6 +11719,28 @@ export default function ClientPage() {
                                     )}
                                 </div>
                             </div>
+
+
+                            {/* First Line */}
+                            {selectedLead.firstLine && (
+                                <div style={{ marginBottom: '1.25rem' }}>
+                                    <p style={{
+                                        margin: '0 0 0.4rem',
+                                        fontSize: '0.75rem',
+                                        fontWeight: 600,
+                                        textTransform: 'uppercase',
+                                        letterSpacing: '0.06em',
+                                        color: 'var(--app-text-ghost)'
+                                    }}>First Line</p>
+                                    <p style={{
+                                        margin: 0,
+                                        fontSize: '0.9rem',
+                                        color: 'var(--app-text)',
+                                        lineHeight: 1.6,
+                                        fontStyle: 'italic'
+                                    }}>{selectedLead.firstLine}</p>
+                                </div>
+                            )}
 
                             {/* Campaign Outcomes — signal, not logs */}
                             {selectedLead.campaignsData && selectedLead.campaignsData.length > 0 && (
@@ -11698,6 +11863,45 @@ export default function ClientPage() {
                                         };
 
                                         const syntheticEvents: TimelineItem[] = [];
+
+                                        // Email find event
+                                        if (selectedLead.emailFindCompletedAt) {
+                                            syntheticEvents.push({
+                                                id: 'syn-email-find',
+                                                event_type: selectedLead.email ? 'email_found' : 'email_not_found',
+                                                displayLabel: selectedLead.email ? 'Email discovered' : 'Email not found',
+                                                event_timestamp: selectedLead.emailFindCompletedAt,
+                                                campaign_name: null,
+                                                lead_email: selectedLead.email || null,
+                                                message_text: null,
+                                                reply_text_snippet: null,
+                                                reply_category: null,
+                                                synthetic: true,
+                                            });
+                                        }
+
+                                        // Email verify event
+                                        if (selectedLead.emailVerifyCompletedAt) {
+                                            const verifyDisplay = getEmailVerifyDisplay(
+                                                selectedLead.email,
+                                                selectedLead.status,
+                                                selectedLead.emailVerifyCompletedAt,
+                                                selectedLead.emailFindCompletedAt
+                                            );
+                                            syntheticEvents.push({
+                                                id: 'syn-email-verify',
+                                                event_type: 'email_verified',
+                                                displayLabel: `Email verified — ${verifyDisplay.label}`,
+                                                event_timestamp: selectedLead.emailVerifyCompletedAt,
+                                                campaign_name: null,
+                                                lead_email: selectedLead.email || null,
+                                                message_text: null,
+                                                reply_text_snippet: null,
+                                                reply_category: null,
+                                                synthetic: true,
+                                            });
+                                        }
+
                                         for (const campaign of (selectedLead.campaignsData || [])) {
                                             const leadStatusNorm = (campaign.leadStatus || '').toLowerCase().replace(/[_ ]+/g, ' ').trim();
                                             const interestNorm = (campaign.interestStatus || '').toLowerCase().replace(/[_ ]+/g, ' ').trim();
@@ -11770,9 +11974,15 @@ export default function ClientPage() {
                                                     const isDayN = /^day \d+$/.test(labelNorm);
                                                     const dotColor = evt.event_type === 'added_to_campaign'
                                                         ? '#f59e0b'
-                                                        : isDayN
+                                                        : evt.event_type === 'email_found'
                                                             ? '#22c55e'
-                                                            : getInstantlyActivityColor(evt.event_type, evt.displayLabel);
+                                                            : evt.event_type === 'email_not_found'
+                                                                ? 'var(--app-text-ghost)'
+                                                                : evt.event_type === 'email_verified'
+                                                                    ? '#3b82f6'
+                                                                    : isDayN
+                                                                        ? '#22c55e'
+                                                                        : getInstantlyActivityColor(evt.event_type, evt.displayLabel);
 
                                                     const evtDate = new Date(evt.event_timestamp);
                                                     const now = new Date();

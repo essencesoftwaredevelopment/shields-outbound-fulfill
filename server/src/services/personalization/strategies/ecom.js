@@ -7,6 +7,7 @@ import path from 'path';
 import { parse as csvParse } from 'csv-parse';
 import { stringify as csvStringify } from 'csv-stringify';
 import OpenAI from 'openai';
+import pLimit from 'p-limit';
 
 const dnsResolve4 = promisify(dns.resolve4);
 const dnsResolveCname = promisify(dns.resolveCname);
@@ -39,9 +40,11 @@ function reportPersonalizationProgress(log, processed, total, stats = {}) {
     const label =
         phase === 'shopify_detection'
             ? 'Shopify detection'
-            : phase === 'generating'
-                ? 'Generating first lines'
-                : 'Personalization';
+            : phase === 'fetching_products'
+                ? 'Fetching products'
+                : phase === 'generating'
+                    ? 'Generating first lines'
+                    : 'Personalization';
     log?.(`${label}: ${done}/${safeTotal}`, { progress });
 }
 
@@ -173,7 +176,7 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
     return { total: rows.length, shopifyStores: shopifyCount };
 }
 
-function fetchUrl(url, timeout = 4000) {
+function fetchUrl(url, timeout = 3000) {
     return new Promise((resolve, reject) => {
         const protocol = url.startsWith('https') ? https : http;
         const timeoutId = setTimeout(() => {
@@ -421,7 +424,8 @@ async function personalizeWithNewPromptFromShopify({
     apiKeys,
     log,
     productPromptProducts = 3,
-    concurrency = 12,
+    concurrency = 100,
+    fetchConcurrency = 200,
     model = NEW_PROMPT_MODEL,
     removeB2B = true,
     onBatch = null,
@@ -449,8 +453,6 @@ async function personalizeWithNewPromptFromShopify({
         fs.writeFileSync(outputCsv, 'domain,url,title,description,date,first_line\n');
         return { personalized: 0, productsFetched: 0, failed: 0 };
     }
-
-    reportPersonalizationProgress(log, 0, rows.length, { phase: 'generating' });
 
     const writeStream = fs.createWriteStream(outputCsv);
     const stringifier = csvStringify({
@@ -481,14 +483,25 @@ async function personalizeWithNewPromptFromShopify({
         await flushPromise;
     };
 
-    const fetchProductsForDomain = async (domain, retries = 2, attempts = 0) => {
+    const isPermanentFetchError = (err) => {
+        const message = String(err?.message || '');
+        // 3xx redirects, 4xx client errors — deterministic, won't change on retry
+        if (/^HTTP [34]\d\d$/.test(message)) return true;
+        // SSL/TLS issues — won't recover within seconds
+        if (/certificate/i.test(message)) return true;
+        // DNS — domain doesn't resolve, won't change
+        if (/ENOTFOUND/i.test(message)) return true;
+        return false;
+    };
+
+    const fetchProductsForDomain = async (domain, retries = 1, attempts = 0) => {
         const url = `https://${domain}/products.json?limit=${productPromptProducts}`;
         try {
             const data = await fetchUrl(url);
             const products = Array.isArray(data?.products) ? data.products : [];
             return products.slice(0, productPromptProducts);
         } catch (err) {
-            if (attempts < retries) {
+            if (attempts < retries && !isPermanentFetchError(err)) {
                 await new Promise((resolve) => setTimeout(resolve, 700 * (attempts + 1)));
                 return fetchProductsForDomain(domain, retries, attempts + 1);
             }
@@ -555,16 +568,68 @@ async function personalizeWithNewPromptFromShopify({
         }
     };
 
+    // ===== Phase 1: Fetch products in parallel =====
+    log?.(`Fetching products for ${rows.length} Shopify stores (concurrency ${fetchConcurrency})...`);
+    reportPersonalizationProgress(log, 0, rows.length, { phase: 'fetching_products' });
+
+    // domain -> { products: Product[] } | { fetchError: string } | { empty: true }
+    const productCache = new Map();
+    const fetchLimit = pLimit(fetchConcurrency);
+    let fetchProcessed = 0;
+    let fetchFailed = 0;
+
+    await Promise.all(rows.map((row) => fetchLimit(async () => {
+        if (checkpoint) await checkpoint();
+        const domain = normalizeHostname(row.domain || '');
+        if (!domain) {
+            fetchProcessed += 1;
+            return;
+        }
+        try {
+            let products = await fetchProductsForDomain(domain);
+            if (removeB2B) {
+                products = products.filter((p) => {
+                    const combined = `${p.title || ''} ${stripHtml(p.body_html || '')} ${Array.isArray(p.tags) ? p.tags.join(', ') : (p.tags || '')}`;
+                    return !isB2B(combined);
+                });
+            }
+            if (!products.length) {
+                productCache.set(domain, { empty: true });
+            } else {
+                productCache.set(domain, { products });
+                productsFetched += products.length;
+            }
+        } catch (err) {
+            fetchFailed += 1;
+            productCache.set(domain, { fetchError: err.message });
+            log?.(`Product fetch failed for ${domain}: ${err.message}`);
+        }
+
+        fetchProcessed += 1;
+        if (fetchProcessed % 50 === 0 || fetchProcessed === rows.length) {
+            reportPersonalizationProgress(log, fetchProcessed, rows.length, {
+                phase: 'fetching_products',
+                productsFetched,
+                fetchFailed
+            });
+        }
+    })));
+
+    log?.(`Product fetch complete: ${productsFetched} products from ${rows.length - fetchFailed}/${rows.length} stores${fetchFailed ? ` (${fetchFailed} failed)` : ''}`);
+
+    // ===== Phase 2: Generate first lines in parallel =====
+    log?.(`Generating first lines with OpenAI (concurrency ${concurrency})...`);
+    reportPersonalizationProgress(log, 0, rows.length, { phase: 'generating', productsFetched });
+
+    const llmLimit = pLimit(concurrency);
+
     const runRow = async (row) => {
         if (checkpoint) await checkpoint();
         const domain = normalizeHostname(row.domain || '');
         if (!domain) return null;
 
-        let products;
-        try {
-            products = await fetchProductsForDomain(domain);
-        } catch (err) {
-            log?.(`New prompt fetch failed for ${domain}: ${err.message}`);
+        const cached = productCache.get(domain);
+        if (!cached) {
             return {
                 domain,
                 url: `https://${domain}`,
@@ -574,15 +639,17 @@ async function personalizeWithNewPromptFromShopify({
                 first_line: '[Generation failed]'
             };
         }
-
-        if (removeB2B) {
-            products = products.filter((p) => {
-                const combined = `${p.title || ''} ${stripHtml(p.body_html || '')} ${Array.isArray(p.tags) ? p.tags.join(', ') : (p.tags || '')}`;
-                return !isB2B(combined);
-            });
+        if (cached.fetchError) {
+            return {
+                domain,
+                url: `https://${domain}`,
+                title: '',
+                description: '',
+                date: '',
+                first_line: '[Generation failed]'
+            };
         }
-
-        if (!products.length) {
+        if (cached.empty || !cached.products?.length) {
             return {
                 domain,
                 url: `https://${domain}`,
@@ -592,9 +659,8 @@ async function personalizeWithNewPromptFromShopify({
                 first_line: 'invalid'
             };
         }
-        productsFetched += products.length;
 
-        const productList = formatProductsForNewPrompt(products);
+        const productList = formatProductsForNewPrompt(cached.products);
         const prompt = buildNewPrompt({ domain, productList });
 
         const completion = await createCompletionWithRetry({
@@ -641,36 +707,40 @@ async function personalizeWithNewPromptFromShopify({
         };
     };
 
-    for (let i = 0; i < rows.length; i += concurrency) {
-        if (checkpoint) await checkpoint();
-        const batch = rows.slice(i, i + concurrency);
-        const results = await Promise.allSettled(batch.map((row) => runRow(row)));
-        for (const result of results) {
-            if (result.status === 'fulfilled' && result.value) {
-                processed += 1;
-                stringifier.write(result.value);
-                // Queue incremental upsert
-                if (onBatch && result.value.first_line && result.value.first_line !== '[Generation failed]' && result.value.first_line !== 'invalid') {
-                    pendingBatch.push({
-                        domain: result.value.domain,
-                        personalization_first_line: result.value.first_line
-                    });
+    await Promise.all(rows.map((row) => llmLimit(async () => {
+        let result = null;
+        try {
+            result = await runRow(row);
+        } catch (err) {
+            failed += 1;
+            log?.(`New prompt row failed: ${err?.message || err || 'Unknown error'}`);
+        }
+
+        if (result) {
+            processed += 1;
+            stringifier.write(result);
+            if (onBatch && result.first_line && result.first_line !== '[Generation failed]' && result.first_line !== 'invalid') {
+                pendingBatch.push({
+                    domain: result.domain,
+                    personalization_first_line: result.first_line
+                });
+                if (pendingBatch.length >= BATCH_SIZE) {
+                    await flushBatch(false);
                 }
-            } else if (result.status === 'rejected') {
-                failed += 1;
-                log?.(`New prompt row failed: ${result.reason?.message || result.reason || 'Unknown error'}`);
             }
         }
-        await flushBatch(false);
-        const runningCost =
-            (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
-        reportPersonalizationProgress(log, Math.min(i + batch.length, rows.length), rows.length, {
-            phase: 'generating',
-            productsFetched,
-            failed,
-            cost: Number(runningCost.toFixed(6))
-        });
-    }
+
+        if (processed % 25 === 0 || processed === rows.length) {
+            const runningCost =
+                (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
+            reportPersonalizationProgress(log, processed, rows.length, {
+                phase: 'generating',
+                productsFetched,
+                failed,
+                cost: Number(runningCost.toFixed(6))
+            });
+        }
+    })));
 
     stringifier.end();
     await new Promise((resolve) => writeStream.on('finish', resolve));
@@ -681,14 +751,12 @@ async function personalizeWithNewPromptFromShopify({
     }
 
     const estimatedCost = (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
-    if (processed < rows.length) {
-        reportPersonalizationProgress(log, processed, rows.length, {
-            phase: 'generating',
-            productsFetched,
-            failed,
-            cost: Number(estimatedCost.toFixed(6))
-        });
-    }
+    reportPersonalizationProgress(log, processed, rows.length, {
+        phase: 'generating',
+        productsFetched,
+        failed,
+        cost: Number(estimatedCost.toFixed(6))
+    });
 
     log?.(`New prompt personalization complete: ${processed} rows. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
 
@@ -1012,7 +1080,7 @@ export async function runPersonalization({
     const useNewPrompt = String(productPromptVersion || '').toLowerCase() === 'new_gpt5mini';
     const personalizationConcurrency = Number.isFinite(concurrency)
         ? Math.max(1, concurrency)
-        : 15;
+        : (useNewPrompt ? 100 : 15);
     if (useNewPrompt) {
         const newPromptProducts = Number.isFinite(productPromptProducts)
             ? Math.max(1, Math.min(productPromptProducts, 5))

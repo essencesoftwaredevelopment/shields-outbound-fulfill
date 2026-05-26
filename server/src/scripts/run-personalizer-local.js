@@ -1,10 +1,24 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 import { parse as csvParse } from 'csv-parse';
 import { stringify as csvStringify } from 'csv-stringify';
 import '../config/env.js';
 import { runPersonalization } from '../services/personalization/strategies/ecom.js';
 import { TMP_ROOT } from '../config/paths.js';
+
+// Additionally load workspace-root env files so local runs can reuse
+// OPENAI_API_KEY (and others) from the repo's .env.local.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const WORKSPACE_ROOT = path.resolve(__dirname, '../../..');
+for (const rel of ['.env.local', '.env']) {
+    const candidate = path.join(WORKSPACE_ROOT, rel);
+    if (fs.existsSync(candidate)) {
+        dotenv.config({ path: candidate, override: false });
+    }
+}
 
 function printUsage() {
     console.log(`Usage:
@@ -163,6 +177,59 @@ async function main() {
     console.log(`Working dir: ${runDir}`);
     console.log(`Output: ${outputCsv}`);
     console.log(`Strategy: ecom.js (${args.productPromptVersion})`);
+    if (Number.isFinite(args.concurrency)) {
+        console.log(`Concurrency override: ${args.concurrency}`);
+    }
+
+    const runStartMs = Date.now();
+    const phaseStarts = new Map();
+    const phaseDurations = new Map();
+
+    const formatDuration = (ms) => {
+        if (ms < 1000) return `${ms}ms`;
+        const seconds = ms / 1000;
+        if (seconds < 60) return `${seconds.toFixed(2)}s`;
+        const minutes = Math.floor(seconds / 60);
+        const rem = (seconds - minutes * 60).toFixed(1);
+        return `${minutes}m ${rem}s`;
+    };
+
+    const stampedLog = (message) => {
+        if (!message) return;
+        const elapsedMs = Date.now() - runStartMs;
+        console.log(`[+${formatDuration(elapsedMs).padStart(7, ' ')}] ${message}`);
+
+        // Track phase boundaries based on log strings emitted by ecom.js
+        if (typeof message === 'string') {
+            if (message.startsWith('Starting Shopify detection')) {
+                phaseStarts.set('shopify_detection', Date.now());
+            } else if (message.startsWith('Shopify detection complete')) {
+                const start = phaseStarts.get('shopify_detection');
+                if (start) phaseDurations.set('Shopify detection', Date.now() - start);
+            } else if (message.startsWith('Fetching products for')) {
+                phaseStarts.set('fetching_products', Date.now());
+            } else if (message.startsWith('Product fetch complete')) {
+                const start = phaseStarts.get('fetching_products');
+                if (start) phaseDurations.set('Product fetch', Date.now() - start);
+            } else if (message.startsWith('Generating first lines with OpenAI')) {
+                phaseStarts.set('generating', Date.now());
+            } else if (message.startsWith('New prompt personalization complete')) {
+                const start = phaseStarts.get('generating');
+                if (start) phaseDurations.set('OpenAI generation', Date.now() - start);
+            } else if (message.startsWith('Cleaning product data')) {
+                phaseStarts.set('cleaning', Date.now());
+            } else if (message.startsWith('Personalization complete:')) {
+                const start = phaseStarts.get('generating_old');
+                if (start) phaseDurations.set('OpenAI generation', Date.now() - start);
+            } else if (message.startsWith('Generating personalized first lines with OpenAI')) {
+                phaseStarts.set('generating_old', Date.now());
+            } else if (message.startsWith('Fetching product samples')) {
+                phaseStarts.set('fetching_products_old', Date.now());
+            } else if (/^Product fetch progress:.*\(\d+ fetched/.test(message)) {
+                // no-op, just progress
+            }
+        }
+    };
 
     const result = await runPersonalization({
         inputCsv: normalizedInputCsv,
@@ -170,15 +237,28 @@ async function main() {
         apiKeys: {
             openai: args.openaiKey
         },
-        log: (message) => {
-            if (message) console.log(message);
-        },
+        log: stampedLog,
         concurrency: args.concurrency,
         removeB2B: args.removeB2B,
         productPromptVersion: args.productPromptVersion,
         productPromptProducts: args.productPromptProducts
     });
 
+    const totalMs = Date.now() - runStartMs;
+    const totalRows = (result?.['Shopify Stores'] ?? result?.processed ?? 0);
+    const personalized = result?.['Personalized'] ?? result?.processed ?? 0;
+    const rowsPerSecond = totalMs > 0 ? (personalized / (totalMs / 1000)).toFixed(2) : '0';
+
+    console.log('');
+    console.log('===== Timing =====');
+    for (const [label, ms] of phaseDurations.entries()) {
+        console.log(`  ${label.padEnd(22, ' ')} ${formatDuration(ms)}`);
+    }
+    console.log(`  ${'Total'.padEnd(22, ' ')} ${formatDuration(totalMs)}`);
+    if (personalized > 0) {
+        console.log(`  ${'Throughput'.padEnd(22, ' ')} ${rowsPerSecond} personalized/sec (${personalized} total)`);
+    }
+    console.log('');
     console.log('Done.');
     console.log(JSON.stringify({ outputCsv, result }, null, 2));
 }

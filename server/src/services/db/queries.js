@@ -149,13 +149,25 @@ export async function getOrCreateClient(agencyId, clientName) {
             return clientId;
         }
 
-        // Create new client if not found
+        // Create new client if not found. Callers historically pass a slug-shaped
+        // identifier here (e.g. "essence-retention"), not a human display name, so
+        // we populate both `name` and `slug` from the same input. Leaving `slug`
+        // NULL produces phantom rows that the periodic Instantly sync keeps
+        // touching forever.
+        const slugCandidate = normalizedClientName
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '');
         const insertQuery = `
-            INSERT INTO clients (agency_id, name)
-            VALUES ($1, $2)
+            INSERT INTO clients (agency_id, name, slug)
+            VALUES ($1, $2, $3)
             RETURNING id
         `;
-        const insertResult = await pool.query(insertQuery, [agencyId, normalizedClientName]);
+        const insertResult = await pool.query(insertQuery, [
+            agencyId,
+            normalizedClientName,
+            slugCandidate || normalizedClientName
+        ]);
         const clientId = insertResult.rows[0].id;
         clientIdCache.set(cacheKey, clientId);
         return clientId;
