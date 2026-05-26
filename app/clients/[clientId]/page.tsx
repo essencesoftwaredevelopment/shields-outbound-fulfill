@@ -953,6 +953,23 @@ const stageCostFromStage = (stage?: PipelineStageState): number | null => {
     return null;
 };
 
+/** Stages that participate in the per-stage ETA estimator. Domain prep is excluded
+ *  (it completes too quickly and has no meaningful per-item rate). */
+const ETA_STAGES: PipelineStageKey[] = ["founders", "emailDiscovery", "verification", "personalization"];
+/** Max number of (timestamp, processed) samples retained per stage. */
+const STAGE_ETA_WINDOW = 50;
+
+const formatEtaShort = (ms: number): string => {
+    if (!Number.isFinite(ms) || ms <= 0) return "";
+    const totalSeconds = Math.round(ms / 1000);
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const totalMinutes = Math.round(totalSeconds / 60);
+    if (totalMinutes < 60) return `${totalMinutes}m`;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+};
+
 const deriveDedupedDomainBaseline = (job?: PipelineJob | null) => {
     const dedupe = job?.dedupeStats as (Record<string, unknown> | null | undefined);
     if (!dedupe) return null;
@@ -1164,6 +1181,11 @@ export default function ClientPage() {
     const lastFetchTimeRef = useRef<number>(0);
     const isFetchingRef = useRef<boolean>(false);
     const currentJobStatusRef = useRef<string | null>(null);
+    /** Per-job, per-stage rolling buffer of (timestamp, processed) samples for the ETA estimator. */
+    const stageEtaSamplesRef = useRef<{
+        jobId: string | null;
+        buffers: Partial<Record<PipelineStageKey, Array<{ t: number; processed: number }>>>;
+    }>({ jobId: null, buffers: {} });
     const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
     const [realtimeJobId, setRealtimeJobId] = useState<string | null>(null);
     const [activeJobStatus, setActiveJobStatus] = useState<string | null>(null);
@@ -1764,6 +1786,55 @@ export default function ClientPage() {
             if (stageCost !== null) sum += stageCost;
         }
         return sum > 0 ? sum : null;
+    }, [jobState]);
+
+    /** Per-stage "time to finish" estimate, derived from the rolling window of
+     *  (timestamp, processed) samples in `stageEtaSamplesRef`. Only computed for
+     *  stages currently running; skipped for `domainPrep` (too fast/lumpy to be
+     *  useful). Returns an empty string when not enough data is available. */
+    const stageEtas = useMemo(() => {
+        const result: Partial<Record<PipelineStageKey, string>> = {};
+        if (!jobState) return result;
+
+        const store = stageEtaSamplesRef.current;
+        if (store.jobId !== jobState.id) {
+            store.jobId = jobState.id;
+            store.buffers = {};
+        }
+
+        const now = Date.now();
+        for (const stageKey of ETA_STAGES) {
+            const stage = jobState.stages[stageKey];
+            const processed = typeof stage?.progress?.processed === "number" ? stage.progress.processed : null;
+            const total = typeof stage?.progress?.total === "number" ? stage.progress.total : null;
+
+            // Reset the buffer outside the active window so a fresh run gets a fresh ETA.
+            if (!stage || stage.status !== "running" || processed === null || total === null || total <= 0) {
+                store.buffers[stageKey] = [];
+                continue;
+            }
+
+            const buf = store.buffers[stageKey] ?? [];
+            const last = buf[buf.length - 1];
+            if (!last || last.processed !== processed) {
+                buf.push({ t: now, processed });
+                if (buf.length > STAGE_ETA_WINDOW) buf.splice(0, buf.length - STAGE_ETA_WINDOW);
+                store.buffers[stageKey] = buf;
+            }
+
+            if (buf.length < 2) continue;
+            const first = buf[0];
+            const latest = buf[buf.length - 1];
+            const dProcessed = latest.processed - first.processed;
+            const dt = latest.t - first.t;
+            if (dProcessed <= 0 || dt <= 0) continue;
+            const remaining = total - latest.processed;
+            if (remaining <= 0) continue;
+            const etaMs = remaining * (dt / dProcessed);
+            const formatted = formatEtaShort(etaMs);
+            if (formatted) result[stageKey] = formatted;
+        }
+        return result;
     }, [jobState]);
 
     const stageCompletionPercent = useMemo(() => {
@@ -7755,6 +7826,11 @@ export default function ClientPage() {
                                                                 <div style={{ fontSize: '0.875rem', marginTop: '0.5rem', opacity: 0.65 }}>
                                                                     {subtext}
                                                                 </div>
+                                                                {stageEtas[stageKey] && (
+                                                                    <div style={{ fontSize: '0.75rem', marginTop: '0.35rem', opacity: 0.5, fontVariantNumeric: 'tabular-nums' }}>
+                                                                        ~{stageEtas[stageKey]} remaining
+                                                                    </div>
+                                                                )}
                                                             </div>
                                                             {costFooter && (
                                                                 <div style={{ fontSize: '0.75rem', marginTop: '0.75rem', opacity: 0.5 }}>

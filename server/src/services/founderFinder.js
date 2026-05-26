@@ -519,9 +519,10 @@ export async function runFounderFinder({
             }
 
             if ((batchIdx + 1) % 10 === 0 || batchIdx + 1 === chunks.length) {
-                log(`Founders: Serper ${batchIdx + 1} / ${chunks.length}`, {
-                    progress: { stage: 'founders', processed: batchIdx + 1, total: chunks.length }
-                });
+                // Log-only: do NOT write progress.processed/total here — those keys
+                // represent domain-level progress (consumed by the UI hero stats).
+                // Serper batches are an internal sub-step, not the user-facing total.
+                log(`Founders: Serper ${batchIdx + 1} / ${chunks.length}`);
             }
 
             for (let k = 0; k < chunk.items.length; k++) {
@@ -600,6 +601,9 @@ export async function runFounderFinder({
                     const progressPayload = {
                         progress: {
                             stage: 'founders',
+                            processed,
+                            total: totalDomains,
+                            found: foundCount,
                             cost: costNumber,
                             stats: {
                                 'Total': totalDomains,
