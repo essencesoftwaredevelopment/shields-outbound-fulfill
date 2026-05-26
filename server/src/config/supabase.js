@@ -13,8 +13,8 @@ export function getSupabaseAdmin() {
     }
     adminClient = createClient(url, key, {
         auth: { autoRefreshToken: false, persistSession: false },
-        // Node 20 has no global WebSocket; supabase-js Realtime init requires one for createClient.
-        global: { WebSocket: ws }
+        // Node < 22: RealtimeClient needs ws via transport (global.WebSocket is not used).
+        realtime: { transport: ws }
     });
     return adminClient;
 }
