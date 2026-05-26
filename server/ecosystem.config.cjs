@@ -1,15 +1,37 @@
+const path = require('path');
+const fs = require('fs');
+
+// Load server/.secrets/.env then server/.env so PM2 sees the same DB creds as `npm run db:ping`.
+// Do not pass empty PG* into PM2 env — that blocks dotenv in the app from filling them in.
+for (const rel of ['.secrets/.env', '.env']) {
+  const envPath = path.join(__dirname, rel);
+  if (fs.existsSync(envPath)) {
+    require('dotenv').config({ path: envPath });
+    break;
+  }
+}
+
+function envOrUnset(key) {
+  const v = process.env[key];
+  return v !== undefined && v !== '' ? v : undefined;
+}
+
 const baseEnv = {
   NODE_ENV: process.env.NODE_ENV || 'production',
   PORT: process.env.PORT || 4000,
-  PGHOST: process.env.PGHOST || '',
-  PGPORT: process.env.PGPORT || 5432,
-  PGDATABASE: process.env.PGDATABASE || '',
-  PGUSER: process.env.PGUSER || '',
-  PGPASSWORD: process.env.PGPASSWORD || '',
+  ...(envOrUnset('DATABASE_URL') ? { DATABASE_URL: process.env.DATABASE_URL } : {}),
+  ...(envOrUnset('PGHOST') ? { PGHOST: process.env.PGHOST } : {}),
+  PGPORT: Number(process.env.PGPORT || 5432),
+  ...(envOrUnset('PGDATABASE') ? { PGDATABASE: process.env.PGDATABASE } : {}),
+  ...(envOrUnset('PGUSER') ? { PGUSER: process.env.PGUSER } : {}),
+  ...(envOrUnset('PGPASSWORD') ? { PGPASSWORD: process.env.PGPASSWORD } : {}),
   PGSSLMODE: process.env.PGSSLMODE || 'require',
-  PGSSLROOTCERT: process.env.PGSSLROOTCERT || '',
+  ...(envOrUnset('PGSSLROOTCERT') ? { PGSSLROOTCERT: process.env.PGSSLROOTCERT } : {}),
   PGPOOL_MAX: process.env.PGPOOL_MAX || 5,
   DB_WRITE_FREEZE: process.env.DB_WRITE_FREEZE || 'false',
+  ...(envOrUnset('SUPABASE_URL') ? { SUPABASE_URL: process.env.SUPABASE_URL } : {}),
+  ...(envOrUnset('SUPABASE_SERVICE_ROLE_KEY') ? { SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY } : {}),
+  ...(envOrUnset('SUPABASE_ANON_KEY') ? { SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY } : {}),
   INSTANTLY_SYNC_INTERVAL_MS: process.env.INSTANTLY_SYNC_INTERVAL_MS || 900000,
   INSTANTLY_SYNC_CONCURRENCY: process.env.INSTANTLY_SYNC_CONCURRENCY || 2,
   INSTANTLY_REQUEST_TIMEOUT_MS: process.env.INSTANTLY_REQUEST_TIMEOUT_MS || 20000,
