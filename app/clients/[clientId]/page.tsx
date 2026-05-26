@@ -957,17 +957,18 @@ const stageCostFromStage = (stage?: PipelineStageState): number | null => {
  *  (it completes too quickly and has no meaningful per-item rate). */
 const ETA_STAGES: PipelineStageKey[] = ["founders", "emailDiscovery", "verification", "personalization"];
 /** Max number of (timestamp, processed) samples retained per stage. */
-const STAGE_ETA_WINDOW = 50;
+const STAGE_ETA_WINDOW = 300;
 
 const formatEtaShort = (ms: number): string => {
     if (!Number.isFinite(ms) || ms <= 0) return "";
     const totalSeconds = Math.round(ms / 1000);
-    if (totalSeconds < 60) return `${totalSeconds}s`;
-    const totalMinutes = Math.round(totalSeconds / 60);
-    if (totalMinutes < 60) return `${totalMinutes}m`;
-    const hours = Math.floor(totalMinutes / 60);
+    const seconds = totalSeconds % 60;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    if (totalMinutes < 1) return `${seconds}s`;
     const minutes = totalMinutes % 60;
-    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+    const hours = Math.floor(totalMinutes / 60);
+    if (hours < 1) return `${minutes}m ${seconds}s`;
+    return `${hours}h ${minutes}m ${seconds}s`;
 };
 
 const deriveDedupedDomainBaseline = (job?: PipelineJob | null) => {
