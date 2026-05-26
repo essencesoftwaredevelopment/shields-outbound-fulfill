@@ -2083,16 +2083,37 @@ export default function ClientPage() {
         return { label: verify.label, variant: verify.variant };
     };
 
-    const renderEmailStageRow = (title: string, stage: EmailStageDisplay) => (
+    const renderEmailFindChip = (
+        email: string | undefined | null,
+        emailFindCompletedAt: string | undefined | null
+    ) => {
+        const find = getEmailFindDisplay(email, emailFindCompletedAt);
+        return (
+            <span
+                className={`lead-pastel-chip lead-pastel-chip--status-${find.variant}`}
+                style={{ flexShrink: 0 }}
+            >
+                {find.label}
+            </span>
+        );
+    };
+
+    const renderEmailStageRow = (
+        title: string,
+        stage: EmailStageDisplay,
+        options?: { showChip?: boolean }
+    ) => (
         <>
             <span style={{ color: 'var(--app-text-faint)' }}>{title}</span>
             <span style={{ color: 'var(--app-text-high)' }}>
-                <span
-                    className={`lead-pastel-chip lead-pastel-chip--status-${stage.variant}`}
-                    style={{ marginRight: stage.detail ? '0.5rem' : 0 }}
-                >
-                    {stage.label}
-                </span>
+                {options?.showChip !== false ? (
+                    <span
+                        className={`lead-pastel-chip lead-pastel-chip--status-${stage.variant}`}
+                        style={{ marginRight: stage.detail ? '0.5rem' : 0 }}
+                    >
+                        {stage.label}
+                    </span>
+                ) : null}
                 {stage.detail ? (
                     <span style={{ color: 'var(--app-text-muted)', fontSize: '0.85rem' }}>{stage.detail}</span>
                 ) : null}
@@ -6224,17 +6245,6 @@ export default function ClientPage() {
                                                 fontWeight: 600,
                                                 color: 'var(--app-text-high)',
                                                 borderBottom: '1px solid var(--app-border)'
-                                            }}>Discovery</th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
                                             }}>Verification</th>
                                             <th style={{
                                                 position: 'sticky',
@@ -6294,17 +6304,26 @@ export default function ClientPage() {
                                                 }}>{lead.founderName || '—'}</td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
-                                                    maxWidth: '250px',
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap'
-                                                }}>{formatRawEmailValue(lead.email)}</td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    minWidth: '120px',
-                                                    color: 'var(--app-text-muted)'
+                                                    maxWidth: '320px'
                                                 }}>
-                                                    {getEmailFindDisplay(lead.email, lead.emailFindCompletedAt).label}
+                                                    <div style={{
+                                                        display: 'flex',
+                                                        alignItems: 'center',
+                                                        gap: '0.5rem',
+                                                        flexWrap: 'wrap',
+                                                        minWidth: 0
+                                                    }}>
+                                                        <span style={{
+                                                            overflow: 'hidden',
+                                                            textOverflow: 'ellipsis',
+                                                            whiteSpace: 'nowrap',
+                                                            minWidth: 0,
+                                                            flex: '1 1 auto'
+                                                        }}>
+                                                            {formatRawEmailValue(lead.email)}
+                                                        </span>
+                                                        {renderEmailFindChip(lead.email, lead.emailFindCompletedAt)}
+                                                    </div>
                                                 </td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
@@ -11402,13 +11421,25 @@ export default function ClientPage() {
                                         </>
                                     )}
                                     <span style={{ color: 'var(--app-text-faint)' }}>Email</span>
-                                    <span style={{ color: 'var(--app-text-high)', wordBreak: 'break-all' }}>
+                                    <span style={{
+                                        color: 'var(--app-text-high)',
+                                        wordBreak: 'break-all',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '0.5rem',
+                                        flexWrap: 'wrap'
+                                    }}>
                                         {formatRawEmailValue(selectedLead.email)}
+                                        {renderEmailFindChip(selectedLead.email, selectedLead.emailFindCompletedAt)}
                                     </span>
-                                    {renderEmailStageRow(
-                                        'Email discovery',
-                                        getEmailFindDisplay(selectedLead.email, selectedLead.emailFindCompletedAt)
-                                    )}
+                                    {(() => {
+                                        const find = getEmailFindDisplay(
+                                            selectedLead.email,
+                                            selectedLead.emailFindCompletedAt
+                                        );
+                                        if (!find.detail) return null;
+                                        return renderEmailStageRow('Email discovery', find, { showChip: false });
+                                    })()}
                                     {renderEmailStageRow(
                                         'Email verification',
                                         getEmailVerifyDisplay(

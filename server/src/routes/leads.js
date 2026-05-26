@@ -977,6 +977,33 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             continue;
         }
 
+        // ── email_find_state ───────────────────────────────────────────────
+        if (fieldKey === 'email_find_state') {
+            const rawStates = operatorKey === 'in' || operatorKey === 'not_in'
+                ? (Array.isArray(normalizedValue) ? normalizedValue : [])
+                : [String(normalizedValue)];
+            const states = rawStates
+                .map((value) => String(value).toLowerCase())
+                .filter((value) => ['found', 'not_found', 'not_run'].includes(value));
+            if (!states.length) continue;
+
+            const stateClauses = states
+                .map((state) => sqlEmailFindStateClause(state))
+                .filter(Boolean);
+            if (!stateClauses.length) continue;
+
+            if (operatorKey === 'eq') {
+                clauses.push(stateClauses[0]);
+            } else if (operatorKey === 'neq') {
+                clauses.push(`NOT (${stateClauses[0]})`);
+            } else if (operatorKey === 'in') {
+                clauses.push(`(${stateClauses.join(' OR ')})`);
+            } else if (operatorKey === 'not_in') {
+                clauses.push(`NOT (${stateClauses.join(' OR ')})`);
+            }
+            continue;
+        }
+
         // ── domain ─────────────────────────────────────────────────────────
         if (fieldKey === 'domain') {
             if (operatorKey === 'contains') {
@@ -1451,12 +1478,15 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         }
 
         // Filter by email discovery (not SMTP status)
-        if (emailFilter === 'exists') {
-            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND c.email IS NOT NULL AND BTRIM(c.email) <> '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+        if (emailFilter === 'exists' || emailFilter === 'found') {
+            const findClause = sqlEmailFindStateClause('found');
+            if (findClause) whereClause += ` AND ${findClause}`;
         } else if (emailFilter === 'not_found') {
-            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
+            const findClause = sqlEmailFindStateClause('not_found');
+            if (findClause) whereClause += ` AND ${findClause}`;
         } else if (emailFilter === 'not_run') {
-            whereClause += ` AND c.email_find_completed_at IS NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
+            const findClause = sqlEmailFindStateClause('not_run');
+            if (findClause) whereClause += ` AND ${findClause}`;
         }
 
         if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
@@ -2536,12 +2566,15 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
             whereClause += ` AND (c.full_name IS NULL OR c.full_name = '' OR LOWER(c.full_name) LIKE '%not found%' OR LOWER(c.full_name) = 'not_found')`;
         }
 
-        if (emailFilter === 'exists') {
-            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND c.email IS NOT NULL AND BTRIM(c.email) <> '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+        if (emailFilter === 'exists' || emailFilter === 'found') {
+            const findClause = sqlEmailFindStateClause('found');
+            if (findClause) whereClause += ` AND ${findClause}`;
         } else if (emailFilter === 'not_found') {
-            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
+            const findClause = sqlEmailFindStateClause('not_found');
+            if (findClause) whereClause += ` AND ${findClause}`;
         } else if (emailFilter === 'not_run') {
-            whereClause += ` AND c.email_find_completed_at IS NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
+            const findClause = sqlEmailFindStateClause('not_run');
+            if (findClause) whereClause += ` AND ${findClause}`;
         }
 
         if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
