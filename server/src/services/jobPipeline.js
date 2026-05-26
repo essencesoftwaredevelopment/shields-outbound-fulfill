@@ -465,13 +465,14 @@ async function hasRemainingPipelineWork(job) {
         jobId: job.id,
         skipVerification: job.skipVerification,
         personalizeFirstLine: job.personalizeFirstLine,
-        dedupeStrategy: job.dedupeStrategy
+        dedupeStrategy: job.dedupeStrategy,
+        jobStartedAt: job.createdAt
     });
 }
 
 async function stageHasRemainingWork(job, stageKey) {
     const reprocessInclude = isReprocessExistingDomains(job);
-    const limits = { reprocessInclude, limit: 1 };
+    const limits = { reprocessInclude, limit: 1, jobStartedAt: job.createdAt };
     if (stageKey === 'founders' && !job.skipFounderFinder) {
         const pending = await listPendingJobDomains(job.id, 1);
         return pending.length > 0;
@@ -840,7 +841,7 @@ async function processJob(job) {
                     job.uid,
                     job.sqlClientId,
                     job.id,
-                    { reprocessInclude, limit: queueLimit }
+                    { reprocessInclude, limit: queueLimit, jobStartedAt: job.createdAt }
                 );
                 if (!queueRows.length) {
                     const prior = job.stages?.emailDiscovery?.summary || {};
@@ -929,7 +930,11 @@ async function processJob(job) {
             const reprocessInclude = isReprocessExistingDomains(job);
             const queueLimit = Math.max(totalForJob, processableCount, 5000);
             const candidates = (
-                await getVerifyQueue(job.uid, job.sqlClientId, job.id, { reprocessInclude, limit: queueLimit })
+                await getVerifyQueue(job.uid, job.sqlClientId, job.id, {
+                    reprocessInclude,
+                    limit: queueLimit,
+                    jobStartedAt: job.createdAt
+                })
             ).map((r) => ({
                 domain: r.domain,
                 founder_name: r.founder_name,

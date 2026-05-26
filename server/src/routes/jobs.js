@@ -695,7 +695,8 @@ router.post('/jobs/:id/resume', async (req, res) => {
             jobId,
             skipVerification: !!options.skipVerification,
             personalizeFirstLine: !!options.personalizeFirstLine,
-            dedupeStrategy: options.dedupeStrategy || 'skip'
+            dedupeStrategy: options.dedupeStrategy || 'skip',
+            jobStartedAt: row.created_at ? new Date(row.created_at).toISOString() : null
         });
 
         if (row.status === 'completed' && !recoveryResume) {

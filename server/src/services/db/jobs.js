@@ -479,22 +479,24 @@ export async function jobHasRemainingPipelineWork({
     jobId,
     skipVerification = false,
     personalizeFirstLine = false,
-    dedupeStrategy = 'skip'
+    dedupeStrategy = 'skip',
+    jobStartedAt = null
 }) {
     const reprocessInclude = String(dedupeStrategy || 'skip').toLowerCase() === 'include';
     const limit = 1;
+    const opts = { reprocessInclude, limit, jobStartedAt };
     const [emailRows, verifyRows, pending] = await Promise.all([
-        getEmailFindQueue(agencyId, clientId, jobId, { reprocessInclude, limit }),
+        getEmailFindQueue(agencyId, clientId, jobId, opts),
         skipVerification
             ? Promise.resolve([])
-            : getVerifyQueue(agencyId, clientId, jobId, { reprocessInclude, limit }),
+            : getVerifyQueue(agencyId, clientId, jobId, opts),
         listPendingJobDomains(jobId, limit)
     ]);
     if (emailRows.length || verifyRows.length || pending.length) {
         return true;
     }
     if (personalizeFirstLine) {
-        const personalizeRows = await getPersonalizeQueue(agencyId, clientId, jobId, { reprocessInclude, limit });
+        const personalizeRows = await getPersonalizeQueue(agencyId, clientId, jobId, opts);
         if (personalizeRows.length) return true;
     }
     return false;
@@ -531,10 +533,34 @@ export async function countEmailFindCompletedForJob(agencyId, clientId, jobId) {
     return result.rows[0]?.count ?? 0;
 }
 
-export async function getEmailFindQueue(agencyId, clientId, jobId, { reprocessInclude = false, limit = 5000 } = {}) {
-    const emailConstraint = reprocessInclude
-        ? ''
-        : `AND (c.email IS NULL OR BTRIM(c.email) = '') AND c.email_find_completed_at IS NULL`;
+/**
+ * Queue email-finder work for a job.
+ *
+ * - In skip mode (`reprocessInclude=false`): exclude any contact already completed.
+ * - In reprocess mode (`reprocessInclude=true`):
+ *   - If `jobStartedAt` is given, exclude rows whose `email_find_completed_at` is at or
+ *     after that timestamp (i.e. processed during THIS run). Stale completions from
+ *     prior jobs (or NULL) are queued for refresh.
+ *   - If no `jobStartedAt` is given, return everything (legacy behavior, full reprocess).
+ */
+export async function getEmailFindQueue(
+    agencyId,
+    clientId,
+    jobId,
+    { reprocessInclude = false, limit = 5000, jobStartedAt = null } = {}
+) {
+    const params = [agencyId, clientId, jobId, limit];
+    let emailConstraint;
+    if (reprocessInclude) {
+        if (jobStartedAt) {
+            params.push(jobStartedAt);
+            emailConstraint = `AND (c.email_find_completed_at IS NULL OR c.email_find_completed_at < $5::timestamptz)`;
+        } else {
+            emailConstraint = '';
+        }
+    } else {
+        emailConstraint = `AND (c.email IS NULL OR BTRIM(c.email) = '') AND c.email_find_completed_at IS NULL`;
+    }
 
     const result = await pool.query(
         `SELECT DISTINCT ON (c.id)
@@ -552,15 +578,30 @@ export async function getEmailFindQueue(agencyId, clientId, jobId, { reprocessIn
            ${COHORT_ELIGIBLE_SQL}
          ORDER BY c.id ASC
          LIMIT $4`,
-        [agencyId, clientId, jobId, limit]
+        params
     );
     return result.rows;
 }
 
-export async function getVerifyQueue(agencyId, clientId, jobId, { reprocessInclude = false, limit = 5000 } = {}) {
-    const freshnessConstraint = reprocessInclude
-        ? ''
-        : `AND c.email_verify_completed_at IS NULL`;
+/** Same job-scoped resume semantics as `getEmailFindQueue` for verification. */
+export async function getVerifyQueue(
+    agencyId,
+    clientId,
+    jobId,
+    { reprocessInclude = false, limit = 5000, jobStartedAt = null } = {}
+) {
+    const params = [agencyId, clientId, jobId, limit];
+    let freshnessConstraint;
+    if (reprocessInclude) {
+        if (jobStartedAt) {
+            params.push(jobStartedAt);
+            freshnessConstraint = `AND (c.email_verify_completed_at IS NULL OR c.email_verify_completed_at < $5::timestamptz)`;
+        } else {
+            freshnessConstraint = '';
+        }
+    } else {
+        freshnessConstraint = `AND c.email_verify_completed_at IS NULL`;
+    }
 
     const result = await pool.query(
         `SELECT DISTINCT ON (c.id)
@@ -580,7 +621,7 @@ export async function getVerifyQueue(agencyId, clientId, jobId, { reprocessInclu
            ${COHORT_ELIGIBLE_SQL}
          ORDER BY c.id ASC
          LIMIT $4`,
-        [agencyId, clientId, jobId, limit]
+        params
     );
     return result.rows;
 }
@@ -589,8 +630,11 @@ export async function getPersonalizeQueue(
     agencyId,
     clientId,
     jobId,
-    { reprocessInclude = false, requireValidEmail = false, limit = 5000 } = {}
+    { reprocessInclude = false, requireValidEmail = false, limit = 5000, jobStartedAt = null } = {}
 ) {
+    // personalization_first_line has no completion timestamp; resume relies on the
+    // text being populated. `jobStartedAt` is unused here but accepted for symmetry.
+    void jobStartedAt;
     const personalizationFilter = reprocessInclude
         ? ''
         : `AND (c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')`;
