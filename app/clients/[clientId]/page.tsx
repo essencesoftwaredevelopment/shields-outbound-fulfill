@@ -22,6 +22,10 @@ import {
     PipelineStageStatus,
 } from "@/lib/pipeline/types";
 
+/** HTTP fallback for upload / discovery — not for live pipeline progress (useJobRealtime). */
+const ACTIVE_JOB_POLL_MS = 10_000;
+const ACTIVE_JOB_POLL_MIN_GAP_MS = 5_000;
+
 // Helper function to retry fetch on connection errors
 async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
     const startTime = Date.now();
@@ -1150,6 +1154,8 @@ export default function ClientPage() {
     const lastUploadErrorRef = useRef<string | null>(null);
     const lastActiveJobSnapshotRef = useRef<string | null>(null);
     const activeJobPollInFlightRef = useRef(false);
+    const lastActiveJobPollAtRef = useRef(0);
+    const pollActiveJobRef = useRef<((force?: boolean) => Promise<void>) | null>(null);
     const jobStateRef = useRef<PipelineJob | null>(null);
     const lastFetchTimeRef = useRef<number>(0);
     const isFetchingRef = useRef<boolean>(false);
@@ -3457,8 +3463,13 @@ export default function ClientPage() {
         }
     }, [stopJobWatch, fetchJobSnapshot, startJobWatch]);
 
-    const pollActiveJob = useCallback(async () => {
+    const pollActiveJob = useCallback(async (force = false) => {
         if (!clientId || activeJobPollInFlightRef.current) return;
+        const now = Date.now();
+        if (!force && now - lastActiveJobPollAtRef.current < ACTIVE_JOB_POLL_MIN_GAP_MS) {
+            return;
+        }
+        lastActiveJobPollAtRef.current = now;
         activeJobPollInFlightRef.current = true;
         try {
             const payload = await apiJson<{
@@ -3479,44 +3490,51 @@ export default function ClientPage() {
         }
     }, [clientId, applyActiveJobPayload]);
 
+    pollActiveJobRef.current = pollActiveJob;
+
     const needsActiveJobPoll = useMemo(() => {
         if (!user?.id || !clientId) return false;
+
         const uploadStatus = activeJobStatus || currentJobStatusRef.current;
-        if (uploadStatus === "running" || uploadStatus === "queued" || uploadStatus === "pending-upload") {
+        const pipelineStatus = jobState?.status;
+
+        // Running pipeline progress is driven by Supabase job realtime while watched.
+        if (realtimeJobId) {
+            const liveStatus = uploadStatus || pipelineStatus;
+            if (liveStatus === "running" || liveStatus === "queued") {
+                return false;
+            }
+        }
+
+        if (uploadStatus === "pending-upload") {
             return true;
         }
-        if (jobState?.status === "running" || jobState?.status === "queued") {
+        if (uploadStatus === "running" || uploadStatus === "queued") {
             return true;
         }
-        const personalizerStatus = personalizerJobState?.status;
-        if (
-            personalizerJobId &&
-            personalizerStatus &&
-            personalizerStatus !== "completed" &&
-            personalizerStatus !== "failed"
-        ) {
+        if (pipelineStatus === "running" || pipelineStatus === "queued") {
             return true;
         }
+
         return false;
     }, [
         user?.id,
         clientId,
+        realtimeJobId,
         activeJobStatus,
-        jobState?.status,
-        personalizerJobId,
-        personalizerJobState?.status
+        jobState?.status
     ]);
 
     useEffect(() => {
         if (!user?.id || !clientId) return;
-        void pollActiveJob();
-    }, [user?.id, clientId, pollActiveJob]);
+        void pollActiveJobRef.current?.(true);
+    }, [user?.id, clientId]);
 
     useIntervalWhenVisible(
         () => {
-            void pollActiveJob();
+            void pollActiveJobRef.current?.();
         },
-        3000,
+        ACTIVE_JOB_POLL_MS,
         needsActiveJobPoll
     );
 
