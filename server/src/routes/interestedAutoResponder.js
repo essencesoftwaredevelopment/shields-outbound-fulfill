@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import express from 'express';
 import { pool } from '../config/db.js';
 import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
+import { resolveClientRow } from '../services/db/queries.js';
 import {
     callPopupFormGenerate,
     fetchAgencyAndClientSettings,
@@ -18,18 +19,6 @@ function setNoStoreHeaders(res) {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
-}
-
-async function resolveClientRow(agencyId, clientSlug) {
-    const result = await pool.query(
-        `SELECT id, name
-         FROM clients
-         WHERE agency_id = $1
-           AND name = $2
-         LIMIT 1`,
-        [agencyId, clientSlug]
-    );
-    return result.rows[0] || null;
 }
 
 async function resolveCampaignRow(clientId, campaignId) {

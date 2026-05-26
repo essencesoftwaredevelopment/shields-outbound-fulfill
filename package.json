@@ -6,15 +6,16 @@
     "dev": "next dev",
     "dev:app": "next dev",
     "dev:server": "npm --prefix server run dev",
-    "dev:all": "bash -c \"npm run dev:server & npm run dev:app; wait\"",
+    "dev:all": "bash -c \"npm run dev:server & npm --prefix server run worker & npm run dev:app; wait\"",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.6.1",
+    "@supabase/supabase-js": "^2.106.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "firebase": "^12.6.0",
     "lucide-react": "^1.7.0",
     "next": "16.0.10",
     "ngrok": "5.0.0-beta.2",

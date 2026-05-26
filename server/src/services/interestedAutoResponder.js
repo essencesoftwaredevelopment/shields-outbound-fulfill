@@ -1,7 +1,8 @@
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
-import { firestore } from '../config/firebase.js';
+import { getAgencySettings } from './db/agencySettings.js';
+import { getClientRowById, resolveClientRow } from './db/queries.js';
 import { resolveTemplateVars, renderTemplate } from './followUpSender.js';
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.3-chat-latest').trim() || 'gpt-5.3-chat-latest';
@@ -244,15 +245,23 @@ async function fetchLatestThreadMetadata(db, contactId, campaignId) {
     return result.rows[0] || {};
 }
 
-export async function fetchAgencyAndClientSettings(agencyId, clientSlug) {
-    const [agencySnap, clientSnap] = await Promise.all([
-        firestore.collection('users').doc(agencyId).get(),
-        firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug).get()
+export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
+    const [agencySettings, clientRow] = await Promise.all([
+        getAgencySettings(agencyId),
+        resolveClientRow(agencyId, clientIdOrSlug)
     ]);
     return {
-        openaiKey: asTrimmedText(agencySnap.data()?.openai_key),
-        ntfyTopic: asTrimmedText(clientSnap.data()?.ntfy_topic)
+        openaiKey: asTrimmedText(agencySettings?.openai_key),
+        ntfyTopic: asTrimmedText(clientRow?.ntfy_topic),
+        instantlyKey: asTrimmedText(clientRow?.instantly_key)
     };
+}
+
+async function resolveClientInstantlyKey(agencyId, clientId, cachedKey = null) {
+    const fromDraft = asTrimmedText(cachedKey);
+    if (fromDraft) return fromDraft;
+    const clientRow = await getClientRowById(agencyId, clientId);
+    return asTrimmedText(clientRow?.instantly_key);
 }
 
 export async function generateDraftReply({ openaiKey, systemPrompt, campaignName, leadEmail, threadSubject, previousLeadMessage, essenceAiPreviewUrl }) {
@@ -462,7 +471,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
             fetchSourceEventDetails(client, sourceEventId),
             fetchLatestThreadMetadata(client, contactId, campaignId),
             fetchOpenDraft(client, contactId, campaignId),
-            fetchAgencyAndClientSettings(agencyId, clientSlug)
+            fetchAgencyAndClientSettings(agencyId, clientId)
         ]);
 
         if (!promptConfig) {
@@ -627,10 +636,14 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
 async function loadPendingReviewDraft(token) {
     const result = await pool.query(
-        `SELECT d.*, ic.name AS campaign_name, ic.instantly_campaign_id, c.name AS client_slug
+        `SELECT d.*,
+                ic.name AS campaign_name,
+                ic.instantly_campaign_id,
+                c.slug AS client_slug,
+                c.instantly_key AS client_instantly_key
          FROM interested_autoresponder_drafts d
          JOIN instantly_campaigns ic ON ic.id = d.campaign_id
-         JOIN clients c ON c.id = d.client_id
+         JOIN clients c ON c.id = d.client_id AND c.agency_id = d.agency_id
          WHERE d.review_token = $1
          LIMIT 1`,
         [token]
@@ -774,14 +787,13 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         throw error;
     }
 
-    const [agencySnap, clientSnap] = await Promise.all([
-        firestore.collection('users').doc(draft.agency_id).get(),
-        firestore.collection('users').doc(draft.agency_id).collection('clients').doc(draft.client_slug).get()
-    ]);
-    const instantlyKey = asTrimmedText(agencySnap?.data()?.instantly_key);
-    const clientInstantlyKey = asTrimmedText(clientSnap?.data()?.instantly_key);
-    if (!clientInstantlyKey && !instantlyKey) {
-        const error = new Error('Missing Instantly API key for client.');
+    const clientInstantlyKey = await resolveClientInstantlyKey(
+        draft.agency_id,
+        draft.client_id,
+        draft.client_instantly_key
+    );
+    if (!clientInstantlyKey) {
+        const error = new Error('Missing Instantly API key for this client. Add it under client settings.');
         error.statusCode = 500;
         throw error;
     }
@@ -800,7 +812,7 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         replyPayload.subject = threadSubject;
     }
 
-    const replyResult = await sendInstantlyReplyDirect(clientInstantlyKey || instantlyKey, replyPayload);
+    const replyResult = await sendInstantlyReplyDirect(clientInstantlyKey, replyPayload);
     const client = await pool.connect();
     try {
         await client.query('BEGIN');

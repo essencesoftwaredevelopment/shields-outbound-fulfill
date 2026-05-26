@@ -173,8 +173,6 @@ async function reconstructJob() {
                 progress: null
             }
         },
-        logs: [],
-        streams: [],
         dedupeStats: null,
         __persistedOnce: true
     };

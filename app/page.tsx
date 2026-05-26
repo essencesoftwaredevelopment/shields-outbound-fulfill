@@ -3,15 +3,12 @@
 import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { createPortal } from "react-dom";
-import { doc, getDoc, serverTimestamp, setDoc, collection, getDocs, onSnapshot } from "firebase/firestore";
-import { getIdToken, signOut } from "firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
-import { firestore } from "@/lib/firebase/firestore";
-import { createPipelineJob, getJobResultUrl, getJobStreamUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { getAccessToken } from "@/lib/supabase/session";
+import { createClient as createClientApi, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import {
   PipelineJob,
-  PipelineServerEvent,
   PipelineStageKey,
   PipelineStageState,
   PipelineStageStatus,
@@ -81,10 +78,14 @@ async function createFingerprintMap(keys: ApiKeyState): Promise<ApiKeyState> {
   }, createEmptyKeys());
 }
 
-const readKeysFromSnapshot = (data: Record<string, unknown> | undefined): ApiKeyState => ({
-  openai: typeof data?.[FIRESTORE_FIELD_MAP.openai] === "string" ? (data[FIRESTORE_FIELD_MAP.openai] as string) : "",
-  serper: typeof data?.[FIRESTORE_FIELD_MAP.serper] === "string" ? (data[FIRESTORE_FIELD_MAP.serper] as string) : "",
-  kitt: typeof data?.[FIRESTORE_FIELD_MAP.kitt] === "string" ? (data[FIRESTORE_FIELD_MAP.kitt] as string) : "",
+const readKeysFromAgencySettings = (data: {
+  openai_key?: string;
+  serper_key?: string;
+  trykitt_key?: string;
+} | null | undefined): ApiKeyState => ({
+  openai: data?.openai_key || "",
+  serper: data?.serper_key || "",
+  kitt: data?.trykitt_key || "",
 });
 
 function HomeContent() {
@@ -92,6 +93,7 @@ function HomeContent() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const { user, loading } = useAuth();
+  const agencyId = user?.id ?? "";
   const [apiKeys, setApiKeys] = useState<ApiKeyState>(() => createEmptyKeys());
   const [lastSavedKeys, setLastSavedKeys] = useState<ApiKeyState>(() => createEmptyKeys());
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
@@ -164,138 +166,65 @@ function HomeContent() {
     }
   }, [loading, user, router]);
 
-  // Fetch SQL company counts per client slug
+  const clientIdsKey = useMemo(
+    () => clients.map((c) => c.id).filter(Boolean).sort().join(","),
+    [clients]
+  );
+
+  // One batched request for all client company counts (not N parallel calls).
   useEffect(() => {
-    if (!user || clients.length === 0) {
+    if (!user?.id || !clientIdsKey) {
       setCompanyCountsByClient({});
       setCompanyCountsLoadingByClient({});
       return;
     }
 
     let cancelled = false;
+    const clientIds = clientIdsKey.split(",");
+
+    const loadingByClient = clientIds.reduce<Record<string, boolean>>((acc, id) => {
+      acc[id] = true;
+      return acc;
+    }, {});
+    setCompanyCountsLoadingByClient(loadingByClient);
 
     (async () => {
       try {
-        const idToken = await getIdToken(user);
-        if (!idToken || cancelled) return;
+        const token = await getAccessToken();
+        if (!token || cancelled) return;
 
-        const clientRows = clients.filter((client) => client.id);
-        if (clientRows.length === 0) {
-          if (!cancelled) {
-            setCompanyCountsByClient({});
-            setCompanyCountsLoadingByClient({});
+        const params = new URLSearchParams({ clientIds: clientIdsKey });
+        const response = await fetch(
+          `${getPipelineBaseUrl()}/api/stats/companies-counts?${params}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
           }
-          return;
-        }
-
-        if (!cancelled) {
-          const loadingByClient = clientRows.reduce<Record<string, boolean>>((acc, client) => {
-            acc[client.id] = true;
-            return acc;
-          }, {});
-          setCompanyCountsByClient({});
-          setCompanyCountsLoadingByClient(loadingByClient);
-        }
-
-        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-        const readJsonSafely = async (response: Response) => {
-          try {
-            return await response.json();
-          } catch {
-            return null;
-          }
-        };
-
-        const entries = await Promise.all(
-          clientRows.map(async (client) => {
-            let authToken = idToken;
-            const params = new URLSearchParams({
-              clientId: client.id,
-              clientName: client.name,
-            }).toString();
-            const url = `${getPipelineBaseUrl()}/api/stats/companies-count?${params}`;
-
-            for (let attempt = 1; attempt <= 3; attempt += 1) {
-              try {
-                console.log("[home-company-counts] requesting", {
-                  clientId: client.id,
-                  clientName: client.name,
-                  attempt,
-                  uid: user.uid,
-                });
-
-                const response = await fetch(url, {
-                  headers: {
-                    Authorization: `Bearer ${authToken}`,
-                    "Content-Type": "application/json",
-                  },
-                  cache: "no-store",
-                });
-                const payload = await readJsonSafely(response);
-
-                console.log("[home-company-counts] response", {
-                  clientId: client.id,
-                  status: response.status,
-                  ok: response.ok,
-                  payload,
-                });
-
-                if (response.ok) {
-                  return [client.id, Number((payload as { count?: number } | null)?.count) || 0] as const;
-                }
-
-                if (response.status === 401 && attempt < 3) {
-                  authToken = await getIdToken(user, true);
-                  continue;
-                }
-
-                if (attempt < 3) {
-                  await delay(400 * attempt);
-                  continue;
-                }
-              } catch (error) {
-                console.error("[home-company-counts] request error", {
-                  clientId: client.id,
-                  attempt,
-                  error,
-                });
-
-                if (attempt < 3) {
-                  await delay(400 * attempt);
-                  continue;
-                }
-              }
-            }
-
-            return [client.id, 0] as const;
-          }),
         );
+        const payload = response.ok
+          ? ((await response.json()) as { counts?: Record<string, number> })
+          : null;
 
-        if (!cancelled) {
-          const counts = entries.reduce<Record<string, number>>((acc, [clientId, count]) => {
-            acc[clientId] = count;
-            return acc;
-          }, {});
-          const loadingByClient = clientRows.reduce<Record<string, boolean>>((acc, client) => {
-            acc[client.id] = false;
-            return acc;
-          }, {});
-          console.log("[home-company-counts] final counts", {
-            uid: user.uid,
-            counts,
-          });
-          setCompanyCountsByClient(counts);
-          setCompanyCountsLoadingByClient(loadingByClient);
-        }
+        if (cancelled) return;
+
+        const counts = payload?.counts || {};
+        const loadingDone = clientIds.reduce<Record<string, boolean>>((acc, id) => {
+          acc[id] = false;
+          return acc;
+        }, {});
+        setCompanyCountsByClient(counts);
+        setCompanyCountsLoadingByClient(loadingDone);
       } catch (error) {
         console.error("Failed to fetch company counts:", error);
         if (!cancelled) {
-          const loadingByClient = clients.reduce<Record<string, boolean>>((acc, client) => {
-            acc[client.id] = false;
+          const loadingDone = clientIds.reduce<Record<string, boolean>>((acc, id) => {
+            acc[id] = false;
             return acc;
           }, {});
           setCompanyCountsByClient({});
-          setCompanyCountsLoadingByClient(loadingByClient);
+          setCompanyCountsLoadingByClient(loadingDone);
         }
       }
     })();
@@ -303,7 +232,7 @@ function HomeContent() {
     return () => {
       cancelled = true;
     };
-  }, [clients, user]);
+  }, [user?.id, clientIdsKey]);
 
   // Resolve client name for current job by looking up clients list or fetching the doc
   useEffect(() => {
@@ -313,26 +242,7 @@ function HomeContent() {
       return;
     }
     const local = clients.find((c) => c.id === clientId)?.name;
-    if (local) {
-      setJobClientName(local);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        const clientRef = doc(firestore, "users", user.uid, "clients", clientId);
-        const snap = await getDoc(clientRef);
-        if (!cancelled) {
-          const name = (snap.data()?.name as string) || clientId;
-          setJobClientName(name);
-        }
-      } catch {
-        if (!cancelled) setJobClientName(clientId);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    setJobClientName(local || clientId);
   }, [jobClientId, clients, user]);
 
   useEffect(() => {
@@ -351,24 +261,24 @@ function HomeContent() {
 
     const loadVaultKeys = async () => {
       try {
-        const vaultRef = doc(firestore, "users", user.uid);
-        const snapshot = await getDoc(vaultRef);
-        if (!snapshot.exists()) {
+        const token = await getAccessToken();
+        if (!token) {
           if (!cancelled) {
             setApiKeys(createEmptyKeys());
             setLastSavedKeys(createEmptyKeys());
           }
           return;
         }
-
-        const storedKeys = readKeysFromSnapshot(snapshot.data());
-        const fingerprints = await createFingerprintMap(storedKeys);
-
+        const response = await fetch(`${getPipelineBaseUrl()}/api/agency/settings`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const payload = response.ok ? await response.json() : null;
+        const storedKeys = readKeysFromAgencySettings(payload);
         if (!cancelled) {
           setApiKeys(storedKeys);
           setLastSavedKeys(storedKeys);
         }
-      } catch (error) {
+      } catch {
         if (!cancelled) {
           setVaultMessage({
             tone: "error",
@@ -382,39 +292,36 @@ function HomeContent() {
       }
     };
 
-    void loadVaultKeys();
-
     const loadClients = async () => {
       try {
-        const colRef = collection(firestore, "users", user.uid, "clients");
-        const snap = await getDocs(colRef);
-        const rows = snap.docs.map((d) => ({
-          id: d.id,
-          name: (d.data().name as string) || d.id,
-        }));
+        const token = await getAccessToken();
+        if (!token) {
+          if (!cancelled) setClients([]);
+          return;
+        }
+        const response = await fetch(`${getPipelineBaseUrl()}/api/clients`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const payload = response.ok ? await response.json() : null;
+        const rows = Array.isArray(payload?.clients)
+          ? payload.clients.map((c: { id: string; name?: string }) => ({
+              id: c.id,
+              name: c.name || c.id,
+            }))
+          : [];
         if (!cancelled) setClients(rows);
       } catch {
         if (!cancelled) setClients([]);
       }
     };
 
-    const colRef = collection(firestore, "users", user.uid, "clients");
-    const unsubscribeClients = onSnapshot(colRef, (snap) => {
-      if (cancelled) return;
-      const rows = snap.docs.map((d) => ({
-        id: d.id,
-        name: (d.data().name as string) || d.id,
-      }));
-      setClients(rows);
-    }, () => {
-      if (!cancelled) setClients([]);
-    });
+    void loadVaultKeys();
+    void loadClients();
 
     return () => {
       cancelled = true;
-      try { unsubscribeClients(); } catch { }
     };
-  }, [user]);
+  }, [user?.id]);
 
   const handleVaultSave = async () => {
     if (!user) {
@@ -431,23 +338,27 @@ function HomeContent() {
         return acc;
       }, createEmptyKeys());
 
-      const fingerprints = await createFingerprintMap(sanitizedKeys);
+      const token = await getAccessToken();
+      if (!token) {
+        throw new Error("You must be signed in to save keys.");
+      }
 
-      const firestorePayload = API_KEY_FIELDS.reduce<Record<string, string>>((acc, key) => {
-        acc[FIRESTORE_FIELD_MAP[key]] = sanitizedKeys[key];
-        return acc;
-      }, {});
-
-      const vaultRef = doc(firestore, "users", user.uid);
-
-      await setDoc(
-        vaultRef,
-        {
-          ...firestorePayload,
-          vaultUpdatedAt: serverTimestamp(),
+      const response = await fetch(`${getPipelineBaseUrl()}/api/agency/settings`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
         },
-        { merge: true },
-      );
+        body: JSON.stringify({
+          openai_key: sanitizedKeys.openai,
+          serper_key: sanitizedKeys.serper,
+          trykitt_key: sanitizedKeys.kitt,
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error((payload?.error as string) || "Unable to save API keys.");
+      }
 
       setApiKeys(sanitizedKeys);
       setLastSavedKeys(sanitizedKeys);
@@ -479,32 +390,23 @@ function HomeContent() {
     setClientSaving(true);
     setClientMessage({ tone: "idle", text: "" });
     try {
-      const clientId = newClientName.trim().toLowerCase().replace(/\s+/g, "-").slice(0, 60);
-      const clientRef = doc(firestore, "users", user.uid, "clients", clientId);
-      await setDoc(
-        clientRef,
-        {
-          id: clientId,
-          name: newClientName.trim(),
-          industry: newClientIndustry,
-          instantly_key: newClientInstantlyKey.trim(),
-          createdAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
+      const token = await getAccessToken();
+      if (!token) {
+        throw new Error("You must be signed in.");
+      }
+      const created = await createClientApi({
+        idToken: token,
+        name: newClientName.trim(),
+        industry: newClientIndustry as "ecom" | "saas" | "agency" | "local",
+        instantly_key: newClientInstantlyKey.trim(),
+      });
+      setClients((prev) => {
+        const next = prev.filter((c) => c.id !== created.id);
+        next.push({ id: created.id, name: newClientName.trim() });
+        return next.sort((a, b) => a.name.localeCompare(b.name));
+      });
       setClientMessage({ tone: "success", text: "Client saved." });
-      setClientSaving(false);
       setClientModalOpen(false);
-      // Refresh client list
-      try {
-        const colRef = collection(firestore, "users", user.uid, "clients");
-        const snap = await getDocs(colRef);
-        setClients(snap.docs.map((d) => ({
-          id: d.id,
-          name: (d.data().name as string) || d.id,
-        })));
-      } catch { }
-
     } catch (error) {
       setClientSaving(false);
       setClientMessage({ tone: "error", text: error instanceof Error ? error.message : "Unable to save client." });
@@ -533,7 +435,7 @@ function HomeContent() {
         <div className="hero-panel__layout">
           <div className="hero-panel__content">
             <p className="eyebrow">Good evening</p>
-            <h1 className="hero-panel__title">{user?.uid === 'Z7pPTvd8FDWlNEsSrlayVM2Md3G3' ? 'Shields Outbound' : 'ESSENCE Outbound'}</h1>
+            <h1 className="hero-panel__title">ESSENCE Outbound</h1>
             <p className="hero-panel__description">
               Kick off a fresh outbound motion.
               Pick a niche preset, drop your CSV, and we&apos;ll do the rest.

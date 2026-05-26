@@ -284,8 +284,9 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkPaused = null, onBatch = null } = {}) {
+export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candidatesInput = null, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkpoint = null, checkPaused = null, onBatch = null, pricing = null } = {}) {
     const API_KEY = apiKeys.kitt;
+    const requestCost = Number(pricing?.request_cost) || 0;
 
     // Validate based on provider
     if (provider === PROVIDERS.TRYKITT && !API_KEY) {
@@ -293,7 +294,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
     }
 
     log(`Using email verification provider: ${provider}`);
-    const candidates = await readEmailCandidates(inputCsv);
+    const candidates = candidatesInput || (inputCsv ? await readEmailCandidates(inputCsv) : []);
 
     const rows = candidates.map(row => ({
         ...row,
@@ -307,6 +308,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
     const limit = pLimit(Math.min(CONCURRENCY, Math.max(1, toVerify.length)));
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
+    let stageCost = 0;
     const controller = new AbortController();
 
     // In-flight batch for incremental upserts
@@ -345,7 +347,17 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
                 return;
             }
             // Check if paused and abort if so
-            if (checkPaused && checkPaused()) {
+            if (checkpoint) {
+                try {
+                    await checkpoint();
+                } catch (err) {
+                    if (err?.code === 'JOB_PAUSED' || err?.code === 'JOB_CANCELLED') {
+                        controller.abort();
+                        return;
+                    }
+                    throw err;
+                }
+            } else if (checkPaused && checkPaused()) {
                 log(`Verify: paused by user at ${completed}/${toVerify.length}`);
                 controller.abort();
                 return;
@@ -367,6 +379,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
                 stats.unknown += 1;
             }
 
+            stageCost += requestCost;
             completed += 1;
 
             // Queue incremental upsert batch
@@ -382,12 +395,17 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
             }
 
             const percent = toVerify.length ? ((completed / toVerify.length) * 100).toFixed(1) : '0.0';
+            const costNumber = Number(stageCost.toFixed(6));
             const progressPayload = {
                 progress: {
                     stage: 'verification',
                     processed: completed,
                     total: toVerify.length,
-                    stats
+                    cost: costNumber,
+                    stats: {
+                        ...stats,
+                        Cost: `$${costNumber.toFixed(2)}`
+                    }
                 }
             };
             if (completed % 10 === 0 || completed <= 5 || completed === toVerify.length) {
@@ -408,31 +426,53 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
 
     try {
         await Promise.all(tasks);
+        if (controller.signal.aborted) {
+            await flushBatch(true);
+            await flushPromise;
+            if (job?.cancelled || (checkPaused && checkPaused())) {
+                const err = new Error('Job cancelled during verification');
+                err.code = 'JOB_CANCELLED';
+                throw err;
+            }
+            const err = new Error('Job paused during verification');
+            err.code = 'JOB_PAUSED';
+            throw err;
+        }
+    } catch (error) {
+        if (error?.code === 'JOB_PAUSED' || error?.code === 'JOB_CANCELLED') {
+            await flushBatch(true);
+            await flushPromise;
+        }
+        throw error;
     } finally {
         clearInterval(pauseCheckInterval);
-        // Flush any remaining batch
         if (onBatch) {
             await flushBatch(true);
+            await flushPromise;
         }
     }
 
-    const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
-    writer.write('domain,founder_name,email,email_status\n');
-    rows.forEach(row => {
-        writer.write(
-            [
-                toCsvValue(row.domain),
-                toCsvValue(row.founder_name),
-                toCsvValue(row.email),
-                toCsvValue(row.email_status)
-            ].join(',') + '\n'
-        );
-    });
-    writer.end();
-    await new Promise(res => writer.on('finish', res));
+    if (outputCsv) {
+        const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
+        writer.write('domain,founder_name,email,email_status\n');
+        rows.forEach(row => {
+            writer.write(
+                [
+                    toCsvValue(row.domain),
+                    toCsvValue(row.founder_name),
+                    toCsvValue(row.email),
+                    toCsvValue(row.email_status)
+                ].join(',') + '\n'
+            );
+        });
+        writer.end();
+        await new Promise(res => writer.on('finish', res));
+        log(`Verify: verification complete. Results written to ${outputCsv}`);
+    } else {
+        log('Verify: verification complete.');
+    }
 
-    log(`Verify: verification complete. Results written to ${outputCsv}`);
-
+    const cost = Number(stageCost.toFixed(6));
     return {
         'Total Rows': rows.length,
         'Eligible': toVerify.length,
@@ -441,6 +481,9 @@ export async function runEmailVerifier({ inputCsv, outputCsv, apiKeys, provider 
         'Invalid': stats.invalid,
         'Valid-Risky': stats['valid-risky'],
         'Unknown': stats.unknown,
+        valid: stats.valid,
+        invalid: stats.invalid,
+        cost
     };
 }
 

@@ -263,8 +263,9 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
             updated_at = now()
-        RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                  last_verified_at, last_contacted_at, confidence, job_id, created_at, updated_at
+        RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
+                  email_find_completed_at, email_verify_completed_at,
+                  last_contacted_at, confidence, job_id, created_at, updated_at
     `;
     
     try {
@@ -297,8 +298,9 @@ export async function upsertContact(agencyId, companyId, roleType, data = {}) {
                     job_id = COALESCE($6, job_id),
                     updated_at = now()
                 WHERE agency_id = $7 AND email = $8
-                RETURNING id, agency_id, company_id, role_type, full_name, email, email_status, 
-                          last_verified_at, last_contacted_at, confidence, job_id, created_at, updated_at
+                RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
+                          email_find_completed_at, email_verify_completed_at,
+                          last_contacted_at, confidence, job_id, created_at, updated_at
             `;
             const updateResult = await pool.query(updateQuery, [
                 companyId,
@@ -346,7 +348,8 @@ export async function getContactsByAgency(agencyId, filters = {}) {
             c.full_name,
             c.email,
             c.email_status,
-            c.last_verified_at,
+            c.email_find_completed_at,
+            c.email_verify_completed_at,
             c.last_contacted_at,
             c.confidence,
             c.created_at,
@@ -479,6 +482,189 @@ export async function deleteAgencyData(agencyId) {
     return results;
 }
 
+export async function listClientsForAgency(agencyId) {
+    const result = await pool.query(
+        `SELECT id, agency_id, name, slug, industry, instantly_key, ntfy_topic, display_name, created_at, updated_at
+         FROM clients
+         WHERE agency_id = $1
+         ORDER BY name ASC`,
+        [agencyId]
+    );
+    return result.rows;
+}
+
+export async function getClientRowBySlug(agencyId, slug) {
+    const result = await pool.query(
+        `SELECT * FROM clients WHERE agency_id = $1 AND slug = $2 LIMIT 1`,
+        [agencyId, slug]
+    );
+    return result.rows[0] || null;
+}
+
+export async function getClientRowById(agencyId, clientId) {
+    if (!agencyId || clientId === null || clientId === undefined) return null;
+    const result = await pool.query(
+        `SELECT * FROM clients WHERE agency_id = $1 AND id = $2 LIMIT 1`,
+        [agencyId, clientId]
+    );
+    return result.rows[0] || null;
+}
+
+/** Resolve client by numeric SQL id or slug string. */
+export async function resolveClientRow(agencyId, clientIdOrSlug) {
+    const raw = String(clientIdOrSlug || '').trim();
+    if (!raw) return null;
+    if (/^\d+$/.test(raw)) {
+        const result = await pool.query(
+            `SELECT * FROM clients WHERE agency_id = $1 AND id = $2 LIMIT 1`,
+            [agencyId, Number(raw)]
+        );
+        return result.rows[0] || null;
+    }
+    return getClientRowBySlug(agencyId, raw);
+}
+
+export async function deleteClientForAgency(agencyId, clientIdOrSlug) {
+    const row = await resolveClientRow(agencyId, clientIdOrSlug);
+    if (!row) return false;
+    await pool.query(`DELETE FROM clients WHERE agency_id = $1 AND id = $2`, [agencyId, row.id]);
+    return true;
+}
+
+export async function upsertClientBySlug(agencyId, { slug, name, industry, instantly_key, ntfy_topic }) {
+    const existing = await getClientRowBySlug(agencyId, slug);
+    if (existing) {
+        const updated = await pool.query(
+            `UPDATE clients SET name = $3, industry = $4, instantly_key = $5,
+                ntfy_topic = COALESCE($6, ntfy_topic), updated_at = NOW()
+             WHERE agency_id = $1 AND slug = $2 RETURNING id`,
+            [agencyId, slug, name, industry || null, instantly_key || null, ntfy_topic ?? null]
+        );
+        return updated.rows[0]?.id || existing.id;
+    }
+    const inserted = await pool.query(
+        `INSERT INTO clients (agency_id, name, slug, industry, instantly_key, ntfy_topic)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [agencyId, name, slug, industry || null, instantly_key || null, ntfy_topic ?? null]
+    );
+    return inserted.rows[0]?.id;
+}
+
+export function clientRowToApi(row) {
+    if (!row) return null;
+    return {
+        id: row.slug,
+        sqlId: row.id,
+        slug: row.slug,
+        name: row.name || row.slug,
+        industry: row.industry || null,
+        instantly_key: row.instantly_key || '',
+        ntfy_topic: row.ntfy_topic || '',
+        instantlyWebhookId: row.instantly_webhook_id || null,
+        instantlyWebhookStatus: row.instantly_webhook_status ?? null,
+        instantlyWebhookUrl: row.instantly_webhook_url || null,
+        instantlyWebhookUpdatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null
+    };
+}
+
+export async function patchClientRow(agencyId, clientIdOrSlug, patch = {}) {
+    const row = await resolveClientRow(agencyId, clientIdOrSlug);
+    if (!row) return null;
+
+    const sets = ['updated_at = NOW()'];
+    const params = [agencyId, row.id];
+    let idx = 3;
+
+    if (patch.name !== undefined) {
+        sets.push(`name = $${idx++}`);
+        params.push(patch.name);
+    }
+    if (patch.industry !== undefined) {
+        sets.push(`industry = $${idx++}`);
+        params.push(patch.industry);
+    }
+    if (patch.instantly_key !== undefined) {
+        sets.push(`instantly_key = $${idx++}`);
+        params.push(patch.instantly_key);
+    }
+    if (patch.ntfy_topic !== undefined) {
+        sets.push(`ntfy_topic = $${idx++}`);
+        params.push(patch.ntfy_topic);
+    }
+
+    await pool.query(
+        `UPDATE clients SET ${sets.join(', ')} WHERE agency_id = $1 AND id = $2`,
+        params
+    );
+    return resolveClientRow(agencyId, row.id);
+}
+
+export async function listClientSegments(agencyId, sqlClientId) {
+    const result = await pool.query(
+        `SELECT id, name, filters, created_at, updated_at
+         FROM client_segments
+         WHERE agency_id = $1 AND client_id = $2
+         ORDER BY updated_at DESC`,
+        [agencyId, sqlClientId]
+    );
+    return result.rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: '',
+        filters: r.filters || {},
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : '',
+        updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : ''
+    }));
+}
+
+export async function upsertClientSegment(agencyId, sqlClientId, { id, name, filters }) {
+    const segmentId = String(id || Date.now());
+    await pool.query(
+        `INSERT INTO client_segments (id, agency_id, client_id, name, filters, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, NOW(), NOW())
+         ON CONFLICT (agency_id, client_id, id) DO UPDATE SET
+            name = EXCLUDED.name,
+            filters = EXCLUDED.filters,
+            updated_at = NOW()`,
+        [segmentId, agencyId, sqlClientId, name, JSON.stringify(filters || {})]
+    );
+    return segmentId;
+}
+
+export async function deleteClientSegment(agencyId, sqlClientId, segmentId) {
+    const result = await pool.query(
+        `DELETE FROM client_segments WHERE agency_id = $1 AND client_id = $2 AND id = $3`,
+        [agencyId, sqlClientId, segmentId]
+    );
+    return result.rowCount > 0;
+}
+
+export async function listClientsWithInstantlyKey({ agencyId = null, clientSlug = null } = {}) {
+    let sql = `
+        SELECT agency_id, COALESCE(slug, REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g')) AS client_slug,
+               instantly_key
+        FROM clients
+        WHERE instantly_key IS NOT NULL AND BTRIM(instantly_key) <> ''
+    `;
+    const params = [];
+    if (agencyId) {
+        params.push(agencyId);
+        sql += ` AND agency_id = $${params.length}`;
+    }
+    if (clientSlug) {
+        params.push(clientSlug);
+        sql += ` AND slug = $${params.length}`;
+    }
+    const result = await pool.query(sql, params);
+    return result.rows
+        .filter((r) => r.instantly_key?.trim())
+        .map((r) => ({
+            agencyId: r.agency_id,
+            clientSlug: r.client_slug,
+            instantlyKey: r.instantly_key.trim()
+        }));
+}
+
 export default {
     upsertCompany,
     getCompaniesByAgency,
@@ -490,5 +676,16 @@ export default {
     updateCheckpoint,
     getJobCheckpoints,
     deleteAgencyData,
+    listClientsForAgency,
+    getClientRowBySlug,
+    resolveClientRow,
+    deleteClientForAgency,
+    clientRowToApi,
+    patchClientRow,
+    listClientSegments,
+    upsertClientSegment,
+    deleteClientSegment,
+    upsertClientBySlug,
+    listClientsWithInstantlyKey,
     pool
 };

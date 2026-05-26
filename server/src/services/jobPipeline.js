@@ -1,35 +1,49 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { promises as dns } from 'dns';
-import { admin, firestore } from '../config/firebase.js';
-import { TMP_ROOT } from '../config/paths.js';
-import { DEFAULT_PRICING, loadPricing, computeJobCost } from '../utils/pricing.js';
-import { buildFoundersCsvFromInput, buildEmailsCsvFromInput, buildUnifiedRows, writeUploadCsv } from '../utils/csv.js';
-import { filterAndWriteProcessedDomains, upsertLeadsFromCsv, upsertLeadRowsBatch } from './leads.js';
+import { env } from '../config/env.js';
+import { DEFAULT_PRICING, loadPricing, computeJobCost, normalizeStageSummary } from '../utils/pricing.js';
+import { filterJobDomainsForDedupe, upsertLeadRowsBatch } from './leads.js';
+import { isNotFoundValue } from './enrichmentCohort.js';
 import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
 import { runEmailVerifier } from './emailVerifier.js';
 import { runPersonalization } from './personalization/index.js';
-import { ensureJobControl, readJobControl, writeJobControl } from './jobControl.js';
 import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
-import { parse as csvParse } from 'csv-parse';
 import { normalizeDomain } from '../utils/domain.js';
+import {
+    parseDomainsFromBuffer,
+    bulkInsertJobDomains,
+    listPendingJobDomains,
+    countJobDomainsByStatus,
+    markJobDomainsDone,
+    markJobDomainsFounderExcluded,
+    loadSerperCacheMap,
+    upsertSerperCacheBatch,
+    persistJobState as persistJobStateSql,
+    setActiveJob,
+    updateActiveJobStatus,
+    syncJobControlFromDb,
+    updateJobControl,
+    getEmailFindQueue,
+    getVerifyQueue,
+    getPersonalizeQueue,
+    enrichJobDomainCohortFlags,
+    markJobDomainFounderExcluded,
+    listJobDomainsForJob,
+    buildUnifiedRowsFromDb,
+    insertJob
+} from './db/jobs.js';
+import { pool } from '../config/db.js';
+import { applyJobControlFileToJob, ensureJobControl } from './jobControl.js';
+import { createJobControlGate } from './jobControlGate.js';
 
 export const jobs = new Map();
 
-// ============================================================================
-// FIRESTORE WRITE THROTTLING
-// ============================================================================
-// To reduce Firestore costs and improve performance, we throttle persistence:
-// - SSE broadcasts happen on EVERY update for real-time UI
-// - Firestore writes happen every N leads (default: 5) or 2+ seconds apart
-// - Status changes (completed, error, stage transitions) ALWAYS trigger writes
-// - This reduces 10,000 writes/job → ~2,000 writes/job for large datasets
-// ============================================================================
-
-const FIRESTORE_UPDATE_INTERVAL = 5; // Update every N processed items
-const FIRESTORE_MIN_INTERVAL_MS = 2000; // Minimum 2 seconds between updates
-const REALTIME_STAGE_MIN_INTERVAL_MS = 500; // Faster updates for realtime stages (emailDiscovery, verification)
+const SQL_UPDATE_INTERVAL = 5;
+const SQL_MIN_INTERVAL_MS = 2000;
+const REALTIME_STAGE_MIN_INTERVAL_MS = 500;
 const DNS_QUERY_TIMEOUT_MS = 2500;
 const DNS_CHECK_CONCURRENCY = 25;
 const PLACEHOLDER_CONTACT_MAX_DOMAINS = Math.max(
@@ -37,38 +51,29 @@ const PLACEHOLDER_CONTACT_MAX_DOMAINS = Math.max(
     parseInt(process.env.PLACEHOLDER_CONTACT_MAX_DOMAINS || '5000', 10)
 );
 
-function shouldUpdateFirestore(job) {
-    // Always update on status changes or completion
+function shouldUpdateSql(job) {
     if (job.__lastStatus !== job.status || job.status === 'completed' || job.status === 'failed') {
         job.__lastStatus = job.status;
-        job.__lastFirestoreUpdate = Date.now();
+        job.__lastSqlUpdate = Date.now();
         return true;
     }
-    
-    // For realtime stages (emailDiscovery, verification), use faster update interval
-    const activeStage = Object.keys(job.stages).find(
-        key => job.stages[key]?.status === 'running'
-    );
-    const isRealtimeStage = activeStage === 'emailDiscovery' || activeStage === 'verification';
-    const minInterval = isRealtimeStage ? REALTIME_STAGE_MIN_INTERVAL_MS : FIRESTORE_MIN_INTERVAL_MS;
-    
-    // Throttle progress updates
+    const activeStage = Object.keys(job.stages).find((key) => job.stages[key]?.status === 'running');
+    const isRealtimeStage =
+        activeStage === 'domainPrep'
+        || activeStage === 'founders'
+        || activeStage === 'emailDiscovery'
+        || activeStage === 'verification'
+        || activeStage === 'personalization';
+    const minInterval = isRealtimeStage ? REALTIME_STAGE_MIN_INTERVAL_MS : SQL_MIN_INTERVAL_MS;
     const now = Date.now();
-    const timeSinceLastUpdate = now - (job.__lastFirestoreUpdate || 0);
-    
-    // Ensure minimum time interval
-    if (timeSinceLastUpdate < minInterval) {
-        return false;
-    }
-    
-    // Check if we've processed enough items
+    const timeSinceLastUpdate = now - (job.__lastSqlUpdate || 0);
+    if (timeSinceLastUpdate < minInterval) return false;
     const currentCount = job.__updateCounter || 0;
-    if (currentCount >= FIRESTORE_UPDATE_INTERVAL) {
+    if (currentCount >= SQL_UPDATE_INTERVAL) {
         job.__updateCounter = 0;
-        job.__lastFirestoreUpdate = now;
+        job.__lastSqlUpdate = now;
         return true;
     }
-    
     return false;
 }
 
@@ -81,28 +86,7 @@ const initialStageState = () => ({
     progress: null
 });
 
-function broadcast(job, payload) {
-    job.streams.forEach(stream => {
-        try {
-            stream.write(`data: ${JSON.stringify(payload)}\n\n`);
-        } catch (err) {
-            console.error('SSE stream error', err);
-        }
-    });
-}
-
-function closeStreams(job) {
-    job.streams.forEach(stream => {
-        try {
-            stream.end();
-        } catch {
-            /* noop */
-        }
-    });
-    job.streams = [];
-}
-
-function pushState(job, forceFirestoreUpdate = false) {
+function pushState(job, forceSqlUpdate = false) {
     const state = {
         id: job.id,
         status: job.status,
@@ -119,27 +103,23 @@ function pushState(job, forceFirestoreUpdate = false) {
         cost: typeof job.cost === 'number' ? job.cost : 0,
         fileName: job.fileName
     };
-    
-    // Always broadcast to SSE streams for real-time updates
-    broadcast(job, { type: 'state', state });
-    
-    // Throttle Firestore updates unless forced or criteria met
-    if (forceFirestoreUpdate || shouldUpdateFirestore(job)) {
-        persistJobState(job).catch(() => {
-            /* already handled */
-        });
+
+    computeJobCost(job);
+
+    if (forceSqlUpdate || shouldUpdateSql(job)) {
+        persistJobState(job).catch(() => {});
     }
+}
+
+function setActivity(job, message) {
+    if (!message) return;
+    job.activity = { message, updatedAt: new Date().toISOString() };
+    pushState(job, true);
 }
 
 function log(job, message = null, meta = {}) {
     if (message) {
-        const entry = { message, meta, timestamp: new Date().toISOString() };
-        job.logs.push(entry);
-        if (job.logs.length > 500) {
-            job.logs.shift();
-        }
         console.log(`[${job.id}] ${message}`);
-        broadcast(job, { type: 'log', log: entry });
     }
 
     const progress = meta?.progress;
@@ -156,10 +136,8 @@ function log(job, message = null, meta = {}) {
         
         // Increment update counter for throttling
         job.__updateCounter = (job.__updateCounter || 0) + 1;
-        
-        pushState(job);
-    } else if (message) {
-        pushState(job);
+
+        pushState(job, true);
     }
 }
 
@@ -173,83 +151,48 @@ function updateStage(job, stageKey, updates) {
     pushState(job, forceUpdate);
 }
 
-function syncJobControl(job) {
+async function syncJobControl(job) {
     if (!job?.id) return null;
-    const control = readJobControl(job.id);
-    if (control) {
-        job.paused = !!control.paused;
-        job.cancelled = !!control.cancelled;
-    }
-    return control;
+    return syncJobControlFromDb(job);
 }
 
 async function persistJobState(job) {
-    if (!job?.uid || !job?.clientId) {
-        console.error(`[${job?.id || 'unknown'}] Cannot persist: missing uid or clientId`, { uid: job?.uid, clientId: job?.clientId });
-        return;
-    }
+    if (!job?.id) return;
     try {
-        console.log(`[${job.id}] Persisting job state to Firestore...`);
-        const jobRef = firestore
-            .collection('users').doc(job.uid)
-            .collection('clients').doc(job.clientId)
-            .collection('jobs').doc(job.id);
-
-        const payload = {
-            ...serializeJob(job),
-            logs: Array.isArray(job.logs) ? job.logs.slice(-200) : [],
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-
-        if (!job.__persistedOnce) {
-            await jobRef.set({
-                ...payload,
-                createdAtServer: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-            job.__persistedOnce = true;
-            console.log(`[${job.id}] Job persisted to Firestore (first time)`);
-        } else {
-            await jobRef.set(payload, { merge: true });
-            console.log(`[${job.id}] Job updated in Firestore`);
-        }
+        await persistJobStateSql(job);
+        job.__persistedOnce = true;
     } catch (error) {
         console.error(`[${job?.id || 'unknown'}] Job persistence error:`, error?.message || error);
     }
 }
 
 async function updateActiveJob(job, status, additionalData = {}) {
-    if (!job?.uid || !job?.clientId) {
-        console.warn(`[${job?.id || 'unknown'}] Cannot update activeJob: missing uid (${job?.uid}) or clientId (${job?.clientId})`);
-        return;
-    }
+    if (!job?.id) return;
     try {
-        const activeJobRef = firestore
-            .collection('users').doc(job.uid)
-            .collection('clients').doc(job.clientId)
-            .collection('activeJob').doc('current');
-
-        console.log(`[${job.id}] Setting activeJob: users/${job.uid}/clients/${job.clientId}/activeJob/current`, { jobId: job.id, status, ...additionalData });
-        await activeJobRef.set({
-            jobId: job.id,
-            status,
-            ...additionalData,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        console.log(`[${job.id}] ActiveJob document updated successfully`);
+        await updateActiveJobStatus(job.id, status, {
+            uploadError: additionalData.uploadError ?? null,
+            uploadMetrics: additionalData.uploadMetrics ?? null,
+            status: job.status
+        });
+        if (status === 'running' || status === 'queued') {
+            await setActiveJob(job.id, job.uid, job.sqlClientId);
+        }
     } catch (error) {
         console.error(`[${job?.id || 'unknown'}] Active job update error:`, error?.message || error);
     }
 }
 
 async function runStage(job, stageKey, handler) {
+    job.activity = null;
     updateStage(job, stageKey, { status: 'running', startedAt: new Date().toISOString(), error: null });
     try {
         const summary = await handler();
-        const safeSummary = summary || {};
+        const safeSummary = normalizeStageSummary(summary || {});
         updateStage(job, stageKey, { status: 'completed', completedAt: new Date().toISOString(), summary: safeSummary });
+        computeJobCost(job);
         return summary;
     } catch (err) {
-        if (err?.code === 'JOB_PAUSED') {
+        if (err?.code === 'JOB_PAUSED' || err?.code === 'JOB_CANCELLED') {
             throw err;
         }
 
@@ -269,19 +212,18 @@ async function runStage(job, stageKey, handler) {
     }
 }
 
-function markCancelled(job, reason = 'Cancelled by user') {
+async function markCancelled(job, reason = 'Cancelled by user') {
     job.cancelled = true;
-    writeJobControl(job.id, { cancelled: true, paused: false });
+    await updateJobControl(job.id, { cancelled: true, paused: false });
     job.status = 'failed';  // Cancelled jobs are treated as failed in primary status
     job.error = reason;
     job.completedAt = job.completedAt || new Date().toISOString();
     pushState(job);
-    closeStreams(job);
 }
 
-function markPaused(job, reason = 'Paused by user') {
+async function markPaused(job, reason = 'Paused by user') {
     job.paused = true;
-    writeJobControl(job.id, { paused: true });
+    await updateJobControl(job.id, { paused: true });
     job.status = 'running';  // Paused jobs keep running status (can be resumed)
     job.pausedAt = new Date().toISOString();
     console.log(`[${job.id}] Job paused. paused=${job.paused}, status=${job.status}`);
@@ -289,9 +231,9 @@ function markPaused(job, reason = 'Paused by user') {
     pushState(job);
 }
 
-function markResumed(job) {
+async function markResumed(job) {
     job.paused = false;
-    writeJobControl(job.id, { paused: false });
+    await updateJobControl(job.id, { paused: false });
     job.status = 'running';
     job.resumedAt = new Date().toISOString();
     log(job, 'Job resumed.');
@@ -304,6 +246,30 @@ function createJobPausedError(message = 'Job paused') {
     return pauseError;
 }
 
+function createJobCancelledError(message = 'Job cancelled') {
+    const err = new Error(message);
+    err.code = 'JOB_CANCELLED';
+    return err;
+}
+
+/** Pause/cancel from DB + control.json (stop button / other process / post-watch-restart). */
+async function refreshJobControl(job) {
+    if (!job?.id) return;
+    applyJobControlFileToJob(job);
+    try {
+        await syncJobControlFromDb(job);
+    } catch {
+        /* noop */
+    }
+}
+
+function makeCheckPaused(job) {
+    return () => {
+        applyJobControlFileToJob(job);
+        return !!(job.paused || job.cancelled);
+    };
+}
+
 async function pauseJobWithError(job, reason, errorMessage = null) {
     const resolvedReason = reason || 'Paused due to pipeline error';
     const resolvedError = errorMessage || resolvedReason;
@@ -311,7 +277,7 @@ async function pauseJobWithError(job, reason, errorMessage = null) {
     job.error = resolvedError;
 
     if (!job.paused) {
-        markPaused(job, resolvedReason);
+        await markPaused(job, resolvedReason);
     } else {
         log(job, resolvedReason);
         pushState(job, true);
@@ -320,31 +286,59 @@ async function pauseJobWithError(job, reason, errorMessage = null) {
     await updateActiveJob(job, 'paused', {
         error: resolvedError,
         uploadError: resolvedError,
-        uploadMetrics: null,
-        pausedAt: admin.firestore.FieldValue.serverTimestamp()
+        uploadMetrics: null
     });
 }
 
 function resolveJobPaths(jobId) {
     const job = jobs.get(jobId);
-    const jobDir = job?.paths?.dir || path.join(TMP_ROOT, jobId);
-    return {
-        job,
-        jobDir,
-        finalPath: job?.paths?.final || path.join(jobDir, 'final.csv'),
-        personalizedPath: job?.paths?.personalized || path.join(jobDir, 'personalized.csv'),
-        uploadPath: job?.paths?.upload || path.join(jobDir, 'upload.csv')
-    };
+    return { job, jobDir: null, finalPath: null, personalizedPath: null, uploadPath: null };
 }
 
-function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip', options = {}) {
+async function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip', options = {}) {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const domainColumn = options.columnMapping?.domain || 'domain';
+    const domainEntries = parseDomainsFromBuffer(fileBuffer, domainColumn);
 
-    const dir = path.join(TMP_ROOT, id);
-    fs.mkdirSync(dir, { recursive: true });
+    const stages = {
+        domainPrep: initialStageState(),
+        founders: initialStageState(),
+        emailDiscovery: initialStageState(),
+        verification: initialStageState(),
+        personalization: initialStageState()
+    };
 
-    const inputPath = path.join(dir, 'domains.csv');
-    fs.writeFileSync(inputPath, fileBuffer);
+    const jobOptions = {
+        dedupeStrategy,
+        skipFounderFinder: !!options.skipFounderFinder,
+        skipEmailFinder: !!options.skipEmailFinder,
+        skipVerification: !!options.skipVerification,
+        skipDomainCheck: options.skipDomainCheck === true,
+        findFounder: options.findFounder !== false,
+        industry: options.industry || options.nicheId || null,
+        nicheId: options.nicheId || null,
+        nicheLabel: options.nicheLabel || null,
+        personalizeFirstLine: options.personalizeFirstLine === true,
+        productPromptVersion: options.productPromptVersion || 'old',
+        productPromptProducts: Number.isFinite(options.productPromptProducts) ? options.productPromptProducts : 3,
+        emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
+        columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
+        initialStages: stages
+    };
+
+    await insertJob({
+        id,
+        agencyId: uid,
+        clientId: options.sqlClientId,
+        clientSlug: clientId,
+        fileName: originalName,
+        options: jobOptions,
+        status: 'queued'
+    });
+
+    if (domainEntries.length) {
+        await bulkInsertJobDomains(id, uid, domainEntries);
+    }
 
     const job = {
         id,
@@ -374,36 +368,115 @@ function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedup
         emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
         columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
         cost: 0,
-        stages: {
-            domainPrep: initialStageState(),
-            founders: initialStageState(),
-            emailDiscovery: initialStageState(),
-            verification: initialStageState(),
-            personalization: initialStageState()
-        },
-        logs: [],
-        streams: [],
-        paths: {
-            dir,
-            tmpDir: dir,
-            domains: inputPath,
-            founders: path.join(dir, 'founders.csv'),
-            emails: path.join(dir, 'emails.csv'),
-            final: path.join(dir, 'final.csv'),
-            personalized: path.join(dir, 'personalized.csv'),
-            upload: path.join(dir, 'upload.csv')
-        }
+        stages,
+        paths: {},
+        domainEntries
     };
 
-    ensureJobControl(id, { paused: false, cancelled: false });
     jobs.set(id, job);
+    ensureJobControl(id, { paused: false, cancelled: false });
     return job;
 }
 
+async function dnsFilterJobDomains(job) {
+    const pending = await listPendingJobDomains(job.id);
+    const uniqueDomains = pending.map((r) => r.domain_normalized);
+    if (!uniqueDomains.length) {
+        return { checked: 0, live: 0, dead: 0, unknown: 0, processable: 0 };
+    }
+
+    const total = uniqueDomains.length;
+    const reportEvery = Math.max(50, Math.floor(total / 40));
+    let completed = 0;
+    setActivity(job, `Checking DNS for ${total.toLocaleString()} domains…`);
+
+    const gate = job.__controlGate;
+    const checks = await mapWithConcurrency(uniqueDomains, DNS_CHECK_CONCURRENCY, async (domain) => {
+        if (gate) await gate.checkpoint().catch((err) => { throw err; });
+        const result = await checkDomainDns(domain);
+        completed += 1;
+        if (completed % reportEvery === 0 || completed === total) {
+            log(job, `Domain prep: DNS ${completed.toLocaleString()} / ${total.toLocaleString()}`, {
+                progress: { stage: 'domainPrep', processed: completed, total }
+            });
+        }
+        return result;
+    });
+    let live = 0;
+    let dead = 0;
+    let unknown = 0;
+    const deadDomains = [];
+
+    for (const result of checks) {
+        if (result?.status === 'live') {
+            live += 1;
+        } else if (result?.status === 'dead') {
+            dead += 1;
+            if (result.domain) deadDomains.push(result.domain);
+        } else {
+            unknown += 1;
+        }
+    }
+
+    if (deadDomains.length) {
+        await pool.query(
+            `UPDATE job_domains SET status = 'skipped', updated_at = NOW()
+             WHERE job_id = $1 AND domain_normalized = ANY($2::text[])`,
+            [job.id, deadDomains]
+        );
+    }
+
+    const counts = await countJobDomainsByStatus(job.id);
+    return {
+        checked: uniqueDomains.length,
+        live,
+        dead,
+        unknown,
+        processable: counts.pending || 0
+    };
+}
+
+function isReprocessExistingDomains(job) {
+    return String(job.dedupeStrategy || 'skip').toLowerCase() === 'include';
+}
+
+function enrichmentMergeMode(job) {
+    return isReprocessExistingDomains(job) ? 'enrichment_b' : 'preserve';
+}
+
+async function upsertFounderBatch(job, rows) {
+    if (!rows?.length) return;
+    await upsertLeadRowsBatch({
+        agencyId: job.uid,
+        clientId: job.sqlClientId,
+        rows,
+        type: 'founders',
+        jobId: job.id,
+        mergeMode: enrichmentMergeMode(job)
+    });
+}
+
+async function handleFounderBatch(job, rows) {
+    if (!rows?.length) return;
+    const toUpsert = [];
+    const excludedDomains = [];
+    for (const row of rows) {
+        if (isNotFoundValue(row.founder_name)) {
+            excludedDomains.push(row.domain);
+            continue;
+        }
+        toUpsert.push(row);
+    }
+    if (excludedDomains.length) {
+        await markJobDomainsFounderExcluded(job.id, excludedDomains);
+    }
+    await upsertFounderBatch(job, toUpsert);
+}
+
 async function processJob(job) {
-    syncJobControl(job);
+    await syncJobControl(job);
     if (job.cancelled) {
-        markCancelled(job, 'Cancelled before start');
+        await markCancelled(job, 'Cancelled before start');
         return;
     }
 
@@ -420,67 +493,37 @@ async function processJob(job) {
         // Load pricing configuration
         job.pricing = await loadPricing(job.uid);
 
-        syncJobControl(job);
+        await syncJobControl(job);
         if (job.cancelled) {
-            markCancelled(job, 'Cancelled before start');
+            await markCancelled(job, 'Cancelled before start');
             return;
         }
 
-        // Stage 1: normalize/remove www, dedupe, and optionally DNS-check domains.
-        let filteredDomainsPath = job.paths.filtered;
-        let preparedDomainsPath = filteredDomainsPath;
-        await runStage(job, 'domainPrep', async () => {
-            if (!preparedDomainsPath) {
-                const { filtered, stats: dedupeStats } = await filterAndWriteProcessedDomains({
-                    agencyId: job.uid,
-                    clientId: job.sqlClientId,
-                    jobId: job.id,
-                    domainsCsvPath: job.paths.domains,
-                    dedupeStrategy: job.dedupeStrategy,
-                    domainColumn: job.columnMapping?.domain || 'domain'
-                });
-                preparedDomainsPath = filtered;
-                job.dedupeStats = dedupeStats;
-            }
+        const gate = createJobControlGate(job);
+        job.__controlGate = gate;
 
-            const { path: dedupedPath, removedDuplicates, totalRows, uniqueRows } = await dedupeDomainsCsv(
-                preparedDomainsPath,
-                job.columnMapping?.domain || 'domain'
-            );
-            preparedDomainsPath = dedupedPath;
+        const totalUploaded = (job.domainEntries || []).length;
+        await runStage(job, 'domainPrep', async () => {
+            await gate.checkpoint();
+            const dedupeResult = await filterJobDomainsForDedupe({
+                agencyId: job.uid,
+                clientId: job.sqlClientId,
+                jobId: job.id,
+                dedupeStrategy: job.dedupeStrategy
+            });
 
             const domainCheckSkipped = job.skipDomainCheck === true;
             const dnsStats = domainCheckSkipped
-                ? {
-                    path: preparedDomainsPath,
-                    checked: 0,
-                    live: 0,
-                    dead: 0,
-                    unknown: 0,
-                    processable: uniqueRows
-                }
-                : await dnsFilterDomainsCsv(
-                    preparedDomainsPath,
-                    job.columnMapping?.domain || 'domain'
-                );
-
-            if (!domainCheckSkipped) {
-                preparedDomainsPath = dnsStats.path;
-            }
-
-            const normalized = typeof job.dedupeStats?.unique === 'number'
-                ? job.dedupeStats.unique
-                : totalRows;
-            const duplicatesRemoved = (typeof job.dedupeStats?.duplicatesRemoved === 'number'
-                ? job.dedupeStats.duplicatesRemoved
-                : 0) + removedDuplicates;
+                ? { checked: 0, live: 0, dead: 0, unknown: 0, processable: dedupeResult.stats.new }
+                : await dnsFilterJobDomains(job);
 
             job.dedupeStats = {
-                ...(job.dedupeStats || {}),
-                totalRows,
-                unique: normalized,
-                duplicateRows: removedDuplicates,
-                duplicatesRemoved,
+                total: totalUploaded,
+                unique: totalUploaded,
+                duplicatesRemoved: 0,
+                skipped: dedupeResult.stats.skipped,
+                existing: dedupeResult.stats.existing,
+                new: dedupeResult.stats.new,
                 dnsChecked: dnsStats.checked,
                 dnsLive: dnsStats.live,
                 dnsDead: dnsStats.dead,
@@ -489,48 +532,56 @@ async function processJob(job) {
                 domainCheckSkipped
             };
 
-            if (domainCheckSkipped) {
-                log(
-                    job,
-                    `Domain prep: normalized ${normalized}, deduped ${duplicatesRemoved}, domain check skipped, ${dnsStats.processable} processable`
-                );
-            } else {
-                log(
-                    job,
-                    `Domain prep: normalized ${normalized}, deduped ${duplicatesRemoved}, DNS checked ${dnsStats.checked} (${dnsStats.live} live, ${dnsStats.dead} dead, ${dnsStats.unknown} unknown), ${dnsStats.processable} processable`
-                );
-            }
+            await upsertDomainsImmediately(job);
 
-            // Keep this work inside Domain Prep so the next stage does not appear "stuck pending"
-            // while we bulk-upsert domains/placeholders for large uploads.
-            await upsertDomainsImmediately(job, preparedDomainsPath);
+            log(
+                job,
+                domainCheckSkipped
+                    ? `Domain prep: ${totalUploaded} uploaded, ${job.dedupeStats.skipped} skipped (existing), ${dnsStats.processable} processable`
+                    : `Domain prep: DNS checked ${dnsStats.checked}, ${dnsStats.processable} processable`
+            );
 
             return {
-                total: typeof job.dedupeStats?.total === 'number' ? job.dedupeStats.total : totalRows,
-                normalized,
-                deduped: duplicatesRemoved,
+                total: totalUploaded,
+                normalized: totalUploaded,
+                deduped: 0,
                 checked: dnsStats.checked,
                 live: dnsStats.live,
                 dead: dnsStats.dead,
                 unknown: dnsStats.unknown,
                 processable: dnsStats.processable,
                 domainCheckSkipped,
-                skippedExisting: typeof job.dedupeStats?.skipped === 'number' ? job.dedupeStats.skipped : 0,
-                new: typeof job.dedupeStats?.new === 'number' ? job.dedupeStats.new : dnsStats.processable
+                skippedExisting: job.dedupeStats.skipped,
+                new: job.dedupeStats.new
             };
         });
-        filteredDomainsPath = preparedDomainsPath;
-        job.paths.prepared = filteredDomainsPath;
 
-        // If no domains are left after domain prep, complete early.
+        const cohortTotal =
+            typeof job.dedupeStats?.processable === 'number'
+                ? job.dedupeStats.processable
+                : (job.domainEntries || []).length;
+        setActivity(job, `Applying upload column rules to ${cohortTotal.toLocaleString()} domains…`);
+        const cohortStart = Date.now();
+        await enrichJobDomainCohortFlags(job.id, job.columnMapping || {}, async ({ processed, total }) => {
+            if (processed % 500 === 0 || processed === total) {
+                await gate.checkpoint();
+                setActivity(
+                    job,
+                    `Applying upload column rules… ${processed.toLocaleString()} / ${total.toLocaleString()}`
+                );
+            }
+        });
+        log(
+            job,
+            `Upload column rules applied to ${cohortTotal.toLocaleString()} domains (${Date.now() - cohortStart}ms)`
+        );
+        job.activity = null;
+        pushState(job, true);
+
         const processableCount = typeof job.dedupeStats?.processable === 'number'
             ? job.dedupeStats.processable
             : (typeof job.dedupeStats?.new === 'number' ? job.dedupeStats.new : 0);
         if (processableCount === 0) {
-            fs.writeFileSync(job.paths.final, 'domain,email,email_status,founder_name\n');
-            fs.writeFileSync(job.paths.personalized, 'domain,url,title,description,date,first_line\n');
-            fs.writeFileSync(job.paths.upload, 'domain,founder_name,email,email_status,first_name,last_name,personalization\n');
-
             Object.entries(job.stages).forEach(([stageKey, stage]) => {
                 if (stage.status === 'completed') {
                     return;
@@ -561,225 +612,218 @@ async function processJob(job) {
             return;
         }
 
-        syncJobControl(job);
+        await syncJobControl(job);
         if (job.cancelled) {
-            markCancelled(job);
+            await markCancelled(job);
             return;
         }
 
+        const domainCounts = await countJobDomainsByStatus(job.id);
+        const totalForJob = Object.values(domainCounts).reduce((a, b) => a + b, 0);
+
         if (job.skipFounderFinder) {
-            try {
-                await buildFoundersCsvFromInput({
-                    filteredDomainsPath,
-                    originalInputPath: job.paths.domains,
-                    outputPath: job.paths.founders,
-                    columnMapping: job.columnMapping
-                });
-                const processed = (typeof job.dedupeStats?.processable === 'number' ? job.dedupeStats.processable : null)
-                    ?? job.dedupeStats?.new
-                    ?? job.dedupeStats?.unique
-                    ?? job.dedupeStats?.total
-                    ?? 0;
-                updateStage(job, 'founders', {
-                    status: 'completed',
-                    completedAt: new Date().toISOString(),
-                    startedAt: job.stages.founders.startedAt || new Date().toISOString(),
-                    summary: { processed, cost: 0, skipped: 0 },
-                    progress: {
-                        stage: 'founders',
-                        processed,
-                        total: processed,
-                        stats: { processed, total: processed, cost: 0 }
+            await runStage(job, 'founders', async () => {
+                const founderCol = job.columnMapping?.founder || 'founder_name';
+                const pendingStart = Date.now();
+                const pending = await listPendingJobDomains(job.id);
+                const total = pending.length;
+                log(job, `Founders from CSV: loaded ${total.toLocaleString()} pending domains (${Date.now() - pendingStart}ms)`);
+
+                const founderRows = [];
+                const excludedDomains = [];
+                const doneDomains = [];
+                const progressEvery = 500;
+
+                for (let i = 0; i < pending.length; i += 1) {
+                    if (i % 100 === 0) await gate.checkpoint();
+                    const row = pending[i];
+                    const raw = row.raw_row || {};
+                    const founder = String(raw[founderCol] || raw.founder_name || '').trim();
+                    if (isNotFoundValue(founder)) {
+                        excludedDomains.push(row.domain_normalized);
+                        doneDomains.push(row.domain_normalized);
+                        continue;
                     }
-                });
-                log(job, `Founders skipped (CSV included founder_name). Processed ${processed} domains.`);
-            } catch (err) {
-                console.error(`[${job.id}] Failed to build founders CSV from input:`, err?.message || err);
-                throw err;
-            }
+                    if (founder) {
+                        founderRows.push({ domain: row.domain_normalized, founder_name: founder });
+                        doneDomains.push(row.domain_normalized);
+                    }
+                    const processed = i + 1;
+                    if (processed % progressEvery === 0 || processed === total) {
+                        log(job, `Founders from CSV: ${processed.toLocaleString()} / ${total.toLocaleString()}`, {
+                            progress: { stage: 'founders', processed, total }
+                        });
+                    }
+                }
+
+                if (excludedDomains.length) {
+                    await markJobDomainsFounderExcluded(job.id, excludedDomains);
+                }
+                if (doneDomains.length) {
+                    await markJobDomainsDone(job.id, doneDomains);
+                }
+                if (founderRows.length) {
+                    await upsertFounderBatch(job, founderRows);
+                }
+
+                log(job, `Founders from CSV: upserted ${founderRows.length.toLocaleString()} founders`);
+                return {
+                    processed: founderRows.length,
+                    excluded: excludedDomains.length,
+                    cost: 0
+                };
+            });
+            log(job, `Founders skipped (upload included founder). Processed ${job.stages.founders?.summary?.processed ?? 0} domains.`);
         } else {
+            setActivity(job, `Starting founder lookup for ${processableCount.toLocaleString()} domains…`);
             await runStage(job, 'founders', () =>
                 runFounderFinder({
-                    inputCsv: filteredDomainsPath,
-                    outputCsv: job.paths.founders,
+                    listPendingDomains: () => listPendingJobDomains(job.id),
+                    loadSerperCache: () => loadSerperCacheMap(job.id),
+                    saveSerperCache: (entries) => upsertSerperCacheBatch(job.id, entries),
+                    markDomainsDone: (domains) => markJobDomainsDone(job.id, domains),
+                    checkpoint: () => gate.checkpoint(),
+                    checkPaused: () => gate.checkPaused(),
+                    totalDomainCount: totalForJob,
                     apiKeys: job.apiKeys,
                     pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
                     log: (message, meta) => log(job, message, meta),
-                    checkpointDir: job.tmpDir,
-                    onBatch: async (rows) => {
-                        await upsertLeadRowsBatch({
-                            agencyId: job.uid,
-                            clientId: job.sqlClientId,
-                            rows,
-                            type: 'founders',
-                            jobId: job.id
-                        });
-                    }
+                    onBatch: async (rows) => handleFounderBatch(job, rows)
                 })
             );
         }
         computeJobCost(job);
 
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
-
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
+        await syncJobControl(job);
+        if (job.cancelled) return await markCancelled(job);
 
         if (job.skipEmailFinder) {
-            try {
-                await buildEmailsCsvFromInput({
-                    filteredDomainsPath,
-                    originalInputPath: job.paths.domains,
-                    outputPath: job.paths.emails,
-                    columnMapping: job.columnMapping
-                });
-                const emailsContent = fs.readFileSync(job.paths.emails, 'utf-8');
-                const lines = emailsContent.split('\n').filter(line => line.trim());
-                const processed = Math.max(0, lines.length - 1);
-                
-                updateStage(job, 'emailDiscovery', {
-                    status: 'completed',
-                    completedAt: new Date().toISOString(),
-                    startedAt: job.stages.emailDiscovery.startedAt || new Date().toISOString(),
-                    summary: { processed, cost: 0, skipped: processed },
-                    progress: {
-                        stage: 'emailDiscovery',
-                        processed,
-                        total: processed,
-                        stats: { processed, total: processed, cost: 0 }
+            await runStage(job, 'emailDiscovery', async () => {
+                const emailCol = job.columnMapping?.email || 'email';
+                const loadStart = Date.now();
+                const jobDomains = await listJobDomainsForJob(job.id, { emailCohortOnly: true });
+                const total = jobDomains.length;
+                log(job, `Email from CSV: loaded ${total.toLocaleString()} domains (${Date.now() - loadStart}ms)`);
+
+                const batch = [];
+                const progressEvery = 500;
+                for (let i = 0; i < jobDomains.length; i += 1) {
+                    if (i % 100 === 0) await gate.checkpoint();
+                    const jd = jobDomains[i];
+                    const raw = jd.raw_row || {};
+                    const email = String(raw[emailCol] || raw.email || '').trim();
+                    if (!isNotFoundValue(email)) {
+                        batch.push({
+                            domain: jd.domain_normalized,
+                            founder_name:
+                                String(raw[job.columnMapping?.founder || 'founder_name'] || raw.founder_name || '').trim()
+                                || null,
+                            email,
+                            lookup_status: 'found'
+                        });
                     }
-                });
-                log(job, `Email discovery skipped (CSV included email). Processed ${processed} rows.`);
-            } catch (err) {
-                console.error(`[${job.id}] Failed to build emails CSV from input:`, err?.message || err);
-                throw err;
-            }
+                    const processed = i + 1;
+                    if (processed % progressEvery === 0 || processed === total) {
+                        log(job, `Email from CSV: ${processed.toLocaleString()} / ${total.toLocaleString()}`, {
+                            progress: { stage: 'emailDiscovery', processed, total }
+                        });
+                    }
+                }
+                if (batch.length) {
+                    await upsertLeadRowsBatch({
+                        agencyId: job.uid,
+                        clientId: job.sqlClientId,
+                        rows: batch,
+                        type: 'emails',
+                        jobId: job.id,
+                        mergeMode: enrichmentMergeMode(job)
+                    });
+                }
+                return { processed: batch.length, cost: 0 };
+            });
+            log(job, `Email discovery skipped (upload included email). Processed ${job.stages.emailDiscovery?.summary?.processed ?? 0} rows.`);
         } else {
+            const reprocessInclude = isReprocessExistingDomains(job);
+            const queueLimit = Math.max(totalForJob, processableCount, 5000);
+            const founders = (
+                await getEmailFindQueue(job.uid, job.sqlClientId, job.id, { reprocessInclude, limit: queueLimit })
+            ).map((r) => ({
+                domain: r.domain,
+                founder_name: r.founder_name
+            }));
             await runStage(job, 'emailDiscovery', () =>
                 runEmailFinder({
-                    inputCsv: job.paths.founders,
-                    outputCsv: job.paths.emails,
+                    founders,
                     apiKeys: job.apiKeys,
                     provider: job.emailVerificationProvider,
+                    pricing: job.pricing?.stages?.emailDiscovery || DEFAULT_PRICING.stages.emailDiscovery,
                     log: (message, meta) => log(job, message, meta),
                     job,
-                    checkPaused: () => {
-                        syncJobControl(job);
-                        return job.paused || job.cancelled;
-                    },
+                    checkpoint: () => gate.checkpoint(),
+                    checkPaused: () => gate.checkPaused(),
+                    refreshControl: () => gate.refresh(),
                     onBatch: async (rows) => {
                         await upsertLeadRowsBatch({
                             agencyId: job.uid,
                             clientId: job.sqlClientId,
                             rows,
                             type: 'emails',
-                            jobId: job.id
+                            jobId: job.id,
+                            mergeMode: enrichmentMergeMode(job)
                         });
                     }
                 })
             );
-            // Upsert leads with email lookup results (only when actually found)
-            await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.emails, type: 'emails', jobId: job.id });
         }
         computeJobCost(job);
 
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
-
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
+        await syncJobControl(job);
+        if (job.cancelled) return await markCancelled(job);
 
         if (job.skipVerification) {
-            try {
-                // Copy emails.csv to final.csv without verification
-                const emailsContent = fs.readFileSync(job.paths.emails, 'utf-8');
-                fs.writeFileSync(job.paths.final, emailsContent);
-                
-                const lines = emailsContent.split('\n').filter(line => line.trim());
-                const processed = Math.max(0, lines.length - 1); // Subtract header
-                
-                // Count email statuses from self-hosted finding (already verified)
-                let valid = 0;
-                let invalid = 0;
-                let validRisky = 0;
-                let unknown = 0;
-                
-                const rows = emailsContent.split('\n').slice(1); // Skip header
-                for (const row of rows) {
-                    if (!row.trim()) continue;
-                    const parts = row.split(',');
-                    // Status is in the last column (lookup_status or email_status)
-                    const status = parts[parts.length - 1]?.replace(/^"|"$/g, '').trim().toLowerCase();
-                    
-                    if (status === 'valid') {
-                        valid++;
-                    } else if (status === 'invalid') {
-                        invalid++;
-                    } else if (status === 'valid-risky') {
-                        validRisky++;
-                    } else if (status && status !== 'not_found' && status !== 'not_processed') {
-                        unknown++;
-                    }
+            await runStage(job, 'verification', async () => {
+                const verified = await pool.query(
+                    `SELECT email_status FROM contacts WHERE job_id = $1 AND email IS NOT NULL`,
+                    [job.id]
+                );
+                const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
+                for (const row of verified.rows) {
+                    const s = String(row.email_status || 'unknown').toLowerCase();
+                    if (stats[s] !== undefined) stats[s] += 1;
+                    else stats.unknown += 1;
                 }
-                
-                updateStage(job, 'verification', {
-                    status: 'completed',
-                    completedAt: new Date().toISOString(),
-                    startedAt: job.stages.verification.startedAt || new Date().toISOString(),
-                    summary: { 
-                        processed, 
-                        cost: 0, 
-                        skipped: processed,
-                        valid,
-                        invalid,
-                        'valid-risky': validRisky,
-                        unknown
-                    },
-                    progress: {
-                        stage: 'verification',
-                        processed,
-                        total: processed,
-                        stats: { processed, total: processed, cost: 0, valid, invalid, 'valid-risky': validRisky, unknown }
-                    }
-                });
-                log(job, `Verification skipped (self-hosted already verified). ${valid} valid, ${validRisky} valid-risky, ${invalid} invalid.`);
-            } catch (err) {
-                console.error(`[${job.id}] Failed to skip verification:`, err?.message || err);
-                throw err;
-            }
+                return { processed: verified.rows.length, cost: 0, ...stats };
+            });
+            log(job, 'Verification skipped (pre-verified in upload).');
         } else {
+            const reprocessInclude = isReprocessExistingDomains(job);
+            const queueLimit = Math.max(totalForJob, processableCount, 5000);
+            const candidates = (
+                await getVerifyQueue(job.uid, job.sqlClientId, job.id, { reprocessInclude, limit: queueLimit })
+            ).map((r) => ({
+                domain: r.domain,
+                founder_name: r.founder_name,
+                email: r.email,
+                lookup_status: r.email_status
+            }));
             await runStage(job, 'verification', () =>
                 runEmailVerifier({
-                    inputCsv: job.paths.emails,
-                    outputCsv: job.paths.final,
+                    candidates,
                     apiKeys: job.apiKeys,
                     provider: job.emailVerificationProvider,
+                    pricing: job.pricing?.stages?.verification || DEFAULT_PRICING.stages.verification,
                     log: (message, meta) => log(job, message, meta),
                     job,
-                    checkPaused: () => {
-                        syncJobControl(job);
-                        return job.paused || job.cancelled;
-                    },
+                    checkpoint: () => gate.checkpoint(),
+                    checkPaused: () => gate.checkPaused(),
                     onBatch: async (rows) => {
                         await upsertLeadRowsBatch({
                             agencyId: job.uid,
                             clientId: job.sqlClientId,
                             rows,
                             type: 'verification',
-                            jobId: job.id
+                            jobId: job.id,
+                            mergeMode: enrichmentMergeMode(job)
                         });
                     }
                 })
@@ -787,116 +831,131 @@ async function processJob(job) {
         }
         computeJobCost(job);
 
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
+        await syncJobControl(job);
+        if (job.cancelled) return await markCancelled(job);
 
-        // Upsert leads with verification status
-        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.final, type: 'verification', jobId: job.id });
+        if (job.personalizeFirstLine) {
+            const reprocessInclude = isReprocessExistingDomains(job);
+            const queueLimit = Math.max(totalForJob, processableCount, 5000);
+            const personalizeCandidates = (
+                await getPersonalizeQueue(job.uid, job.sqlClientId, job.id, {
+                    reprocessInclude,
+                    requireValidEmail: reprocessInclude,
+                    limit: queueLimit
+                })
+            ).map((r) => ({
+                domain: r.domain,
+                founder_name: r.founder_name,
+                email: r.email,
+                email_status: r.email_status
+            }));
 
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `personalize-${job.id}-`));
+            const inputCsv = path.join(tmpDir, 'final.csv');
+            const outputCsv = path.join(tmpDir, 'personalized.csv');
+            const writer = fs.createWriteStream(inputCsv);
+            writer.write('domain,founder_name,email,email_status\n');
+            for (const row of personalizeCandidates) {
+                const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+                writer.write(`${esc(row.domain)},${esc(row.founder_name)},${esc(row.email)},${esc(row.email_status)}\n`);
+            }
+            writer.end();
+            await new Promise((resolve) => writer.on('finish', resolve));
 
-        await runStage(job, 'personalization', () =>
-            runPersonalization({
-                inputCsv: job.paths.final,
-                outputCsv: job.paths.personalized,
-                apiKeys: job.apiKeys,
-                log: (message, meta) => log(job, message, meta),
-                removeB2B: false, // Disabled B2B filtering
-                industry: job.industry || job.nicheId || null,
-                nicheId: job.nicheId || null,
-                nicheLabel: job.nicheLabel || null,
-                personalizeFirstLine: job.personalizeFirstLine,
-                productPromptVersion: job.productPromptVersion || 'old',
-                productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
-                onBatch: async (rows) => {
-                    await upsertLeadRowsBatch({
-                        agencyId: job.uid,
-                        clientId: job.sqlClientId,
-                        rows,
-                        type: 'personalization',
-                        jobId: job.id
-                    });
+            const personalizeTotal = personalizeCandidates.length;
+            log(job, `Starting personalization for ${personalizeTotal} leads…`, {
+                progress: {
+                    stage: 'personalization',
+                    processed: 0,
+                    total: personalizeTotal,
+                    stats: { personalized: 0 }
                 }
-            })
-        );
+            });
+
+            await runStage(job, 'personalization', () =>
+                runPersonalization({
+                    inputCsv,
+                    outputCsv,
+                    apiKeys: job.apiKeys,
+                    log: (message, meta) => log(job, message, meta),
+                    removeB2B: false,
+                    industry: job.industry || job.nicheId || null,
+                    nicheId: job.nicheId || null,
+                    nicheLabel: job.nicheLabel || null,
+                    personalizeFirstLine: job.personalizeFirstLine,
+                    productPromptVersion: job.productPromptVersion || 'old',
+                    productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
+                    checkpoint: () => gate.checkpoint(),
+                    onBatch: async (rows) => {
+                        await upsertLeadRowsBatch({
+                            agencyId: job.uid,
+                            clientId: job.sqlClientId,
+                            rows,
+                            type: 'personalization',
+                            jobId: job.id,
+                            mergeMode: enrichmentMergeMode(job)
+                        });
+                    }
+                })
+            );
+        } else {
+            updateStage(job, 'personalization', {
+                status: 'completed',
+                completedAt: new Date().toISOString(),
+                summary: { skipped: true, personalized: 0 },
+                progress: { stage: 'personalization', processed: 0, total: 0 }
+            });
+            log(job, 'Personalization skipped (not enabled for this job).');
+        }
         computeJobCost(job);
 
-        syncJobControl(job);
-        if (job.cancelled) {
-            markCancelled(job);
-            return;
-        }
+        await syncJobControl(job);
+        if (job.cancelled) return await markCancelled(job);
 
-        // Upsert leads with personalization data
-        await upsertLeadsFromCsv({ agencyId: job.uid, clientId: job.sqlClientId, csvPath: job.paths.personalized, type: 'personalization', jobId: job.id });
-
-        // Build upload-ready CSV (complete leads with founder, email, and personalization)
-        const uploadRows = await buildUnifiedRows({ jobId: job.id, scope: 'complete', resolveJobPaths });
-        await writeUploadCsv(job.paths.upload, uploadRows);
-        log(job, `Upload CSV ready at ${job.paths.upload} (${uploadRows.length} rows)`);
+        setActivity(job, 'Finalizing job results…');
+        const uploadRows = await buildUnifiedRowsFromDb(job.id, 'complete');
+        job.activity = null;
+        log(job, `Job complete: ${uploadRows.length} leads ready for export`);
 
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
-        pushState(job);
-        console.log(`[${job.id}] Updating activeJob to completed...`);
+        pushState(job, true);
         await updateActiveJob(job, 'completed', { uploadError: null, uploadMetrics: null });
-        console.log(`[${job.id}] ActiveJob updated successfully`);
-        log(job, `Job completed. Final CSV ready at ${job.paths.final}`);
+        log(job, 'Job completed.');
     } catch (err) {
-        if (job.cancelled) {
-            markCancelled(job, 'Cancelled during processing');
+        await refreshJobControl(job);
+        if (job.cancelled || err?.code === 'JOB_CANCELLED') {
+            await markCancelled(job, 'Cancelled during processing');
             return;
         }
         // Handle paused jobs gracefully (e.g., credit exhaustion)
         if (err?.code === 'JOB_PAUSED') {
             console.log(`[${job.id}] Job paused gracefully`);
-            closeStreams(job);
+            if (!job.paused) {
+                await markPaused(job, 'Paused during processing');
+            }
+            pushState(job, true);
             return;
         }
         console.error(`[${job.id}] Pipeline error, pausing job:`, err?.message || err);
         await pauseJobWithError(job, 'Paused due to pipeline error', err?.message || 'Unexpected pipeline error');
-        closeStreams(job);
     }
 
 }
 
-async function upsertDomainsImmediately(job, domainsPath) {
+async function upsertDomainsImmediately(job) {
     if (!job?.sqlClientId) {
         console.warn(`[${job?.id || 'unknown'}] Skipping domain upsert: missing sqlClientId`);
         return;
     }
-    if (!domainsPath || !fs.existsSync(domainsPath)) {
-        console.warn(`[${job?.id || 'unknown'}] Skipping domain upsert: domains file missing at ${domainsPath}`);
+
+    const pending = await listPendingJobDomains(job.id);
+    const uniqueDomains = pending.map((r) => r.domain_normalized).filter(Boolean);
+
+    if (!uniqueDomains.length) {
+        log(job, 'Domain upsert skipped: no pending domains');
         return;
     }
-
-    const domainColumn = job.columnMapping?.domain || 'domain';
-    const domains = [];
-
-    await new Promise((resolve, reject) => {
-        fs.createReadStream(domainsPath)
-            .pipe(csvParse({ columns: true, trim: true, skip_empty_lines: true }))
-            .on('data', (row) => {
-                const domain = normalizeDomain(row[domainColumn] || row.domain);
-                if (domain) domains.push(domain);
-            })
-            .on('end', resolve)
-            .on('error', reject);
-    });
-
-    if (!domains.length) {
-        log(job, 'Domain upsert skipped: no domains found after parsing');
-        return;
-    }
-
-    const uniqueDomains = Array.from(new Set(domains));
 
     try {
         const start = Date.now();
@@ -910,7 +969,8 @@ async function upsertDomainsImmediately(job, domainsPath) {
             if (uniqueDomains.length <= PLACEHOLDER_CONTACT_MAX_DOMAINS) {
                 const contactPayloads = Array.from(domainMap.values()).map((companyId) => ({
                     company_id: companyId,
-                    role_type: 'founder'
+                    role_type: 'founder',
+                    job_id: job.id
                 }));
                 if (contactPayloads.length) {
                     await batchUpsertContacts(client, job.uid, job.sqlClientId, contactPayloads);
@@ -1137,6 +1197,9 @@ function serializeJob(job) {
         completedAt: job.completedAt,
         stages: job.stages,
         dedupeStats: job.dedupeStats || null,
+        cost: typeof job.cost === 'number' ? job.cost : 0,
+        activityMessage: job.activity?.message || null,
+        activityUpdatedAt: job.activity?.updatedAt || null,
         dedupeStrategy: job.dedupeStrategy || 'skip',
         sqlClientId: job.sqlClientId || null,
         skipFounderFinder: !!job.skipFounderFinder,
@@ -1153,9 +1216,36 @@ function serializeJob(job) {
         personalizeFirstLine: !!job.personalizeFirstLine,
         productPromptVersion: job.productPromptVersion || 'old',
         productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
-        skipDomainCheck: !!job.skipDomainCheck,
-        cost: typeof job.cost === 'number' ? job.cost : 0
+        skipDomainCheck: !!job.skipDomainCheck
     };
 }
 
-export { createJobRecord, resolveJobPaths, processJob, serializeJob, markCancelled, markPaused, markResumed, closeStreams, log as logJob };
+/**
+ * Signal in-flight inline jobs to stop (SIGINT / server shutdown).
+ */
+export function requestJobsShutdown(reason = 'Server shutting down') {
+    let count = 0;
+    for (const job of jobs.values()) {
+        if (job.status === 'running' || job.status === 'queued') {
+            job.cancelled = true;
+            count += 1;
+            console.log(`[${job.id}] Shutdown requested: ${reason}`);
+        }
+    }
+    return count;
+}
+
+export async function cancelActiveJobsOnShutdown(reason = 'Server shutting down') {
+    const active = [...jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued');
+    for (const job of active) {
+        job.cancelled = true;
+        try {
+            await markCancelled(job, reason);
+        } catch (err) {
+            console.error(`[${job?.id || 'unknown'}] Shutdown cancel error:`, err?.message || err);
+        }
+    }
+    return active.length;
+}
+
+export { createJobRecord, resolveJobPaths, processJob, serializeJob, markCancelled, markPaused, markResumed, log as logJob };

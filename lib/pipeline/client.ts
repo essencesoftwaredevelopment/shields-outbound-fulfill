@@ -81,10 +81,6 @@ export function getPipelineBaseUrl() {
     return pipelineBaseUrl;
 }
 
-export function getJobStreamUrl(jobId: string) {
-    return `${pipelineBaseUrl}/api/jobs/${jobId}/stream`;
-}
-
 export function getJobResultUrl(jobId: string, scope: 'all' | 'valid' = 'all') {
     const query = scope === 'valid' ? '?scope=valid' : '';
     return `${pipelineBaseUrl}/api/jobs/${jobId}/result${query}`;
@@ -174,6 +170,9 @@ export async function createPipelineJob({
 
     const response = await fetchWithRetry(`${pipelineBaseUrl}/api/jobs`, {
         method: "POST",
+        headers: {
+            Authorization: `Bearer ${idToken}`,
+        },
         body: formData,
         signal,
     });
@@ -190,8 +189,11 @@ export async function createPipelineJob({
 export async function createClient({ idToken, name, industry, instantly_key }: { idToken: string; name: string; industry: 'ecom' | 'saas' | 'agency' | 'local'; instantly_key: string; }) {
     const response = await fetchWithRetry(`${pipelineBaseUrl}/api/clients`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ idToken, name, industry, instantly_key }),
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ name, industry, instantly_key }),
     });
     const payload = await readJsonSafely(response);
     if (!response.ok) {

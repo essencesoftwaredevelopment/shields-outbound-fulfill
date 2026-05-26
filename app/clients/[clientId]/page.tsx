@@ -2,15 +2,21 @@
 
 import { ChangeEvent, FormEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { doc, serverTimestamp, setDoc, collection, onSnapshot, query, orderBy, getDocs, limit, startAfter, where, startAt, endAt, DocumentSnapshot, deleteDoc, updateDoc } from "firebase/firestore";
-import { getIdToken } from "firebase/auth";
+import { getAccessToken } from "@/lib/supabase/session";
+import {
+    useJobRealtime,
+    useClientJobsRealtime,
+    debounceFn,
+    type JobRealtimeState,
+} from "@/lib/hooks/useJobRealtime";
+import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAuth } from "@/hooks/use-auth";
-import { firestore } from "@/lib/firebase/firestore";
-import { createPipelineJob, getJobResultUrl, getJobStreamUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { useAgencyId } from "@/lib/hooks/useAgencyId";
+import { apiFetch, apiJson } from "@/lib/api/http";
+import { createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import {
     PipelineJob,
-    PipelineServerEvent,
     PipelineStageKey,
     PipelineStageState,
     PipelineStageStatus,
@@ -78,7 +84,8 @@ type Lead = {
     personalizationTitle?: string;
     updatedAt?: string;
     createdAt?: string;
-    lastVerifiedAt?: string;
+    emailFindCompletedAt?: string;
+    emailVerifyCompletedAt?: string;
     lastContactedAt?: string;
     jobId?: string;
     campaignCountAllTime?: number | null;
@@ -297,7 +304,8 @@ const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
     { key: 'first_line', label: 'First Line', group: 'Lead', defaultSelected: true },
     { key: 'created_at', label: 'Created At', group: 'Lead' },
     { key: 'updated_at', label: 'Updated At', group: 'Lead', defaultSelected: true },
-    { key: 'last_verified_at', label: 'Last Verified At', group: 'Lead' },
+    { key: 'email_find_completed_at', label: 'Email Find Completed', group: 'Lead' },
+    { key: 'email_verify_completed_at', label: 'Email Verify Completed', group: 'Lead' },
     { key: 'last_contacted_at', label: 'Last Contacted At', group: 'Lead' },
     { key: 'role_type', label: 'Role Type', group: 'Lead' },
     { key: 'job_id', label: 'Job ID', group: 'Lead' },
@@ -560,8 +568,10 @@ function getLeadExportValue(lead: Lead, key: string): unknown {
         return lead.createdAt || '';
     case 'updated_at':
         return lead.updatedAt || '';
-    case 'last_verified_at':
-        return lead.lastVerifiedAt || '';
+    case 'email_find_completed_at':
+        return lead.emailFindCompletedAt || '';
+    case 'email_verify_completed_at':
+        return lead.emailVerifyCompletedAt || '';
     case 'last_contacted_at':
         return lead.lastContactedAt || '';
     case 'role_type':
@@ -789,7 +799,8 @@ const describeStageProgress = (stage?: PipelineStageState) => {
     const total = typeof stage.progress?.total === "number" ? stage.progress.total : null;
 
     if (processed !== null && total) {
-        return `${processed.toLocaleString()} / ${total.toLocaleString()} processed`;
+        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+        return `${processed.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`;
     }
 
     const stats = stage.progress?.stats;
@@ -869,15 +880,18 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
             extractNumberFrom(summary, ["processable", "live"])
             ?? extractNumberFrom(stats, ["processable", "live"])
             : stageName === "founders" || stageName === "emailDiscovery" ?
-            (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
-            ?? extractNumberFrom(stats, ["Found", "processed", "completed", "personalized"])
-            ?? extractNumberFrom(summary, ["Found", "processed", "completed", "personalized"])
+            extractNumberFrom(stats, ["Found", "found"])
+            ?? (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
+            ?? extractNumberFrom(summary, ["Found", "found", "processed", "completed", "personalized"])
             : stageName === "verification" ?
                 extractNumberFrom(summary, ["Valid", "valid"])
                 ?? extractNumberFrom(stats, ["valid"])
                 : stageName === "personalization" ?
-                    extractNumberFrom(summary, ["personalized", "Personalized"])
-                    ?? (typeof progress?.stats?.['personalized'] === "number" && Number.isFinite(progress.stats?.personalized) ? progress.stats.personalized : null) : null;
+                    extractNumberFrom(stats, ["personalized", "Personalized"])
+                    ?? (typeof progress?.processed === "number" && Number.isFinite(progress.processed)
+                        ? progress.processed
+                        : null)
+                    ?? extractNumberFrom(summary, ["personalized", "Personalized"]) : null;
 
     const total =
         (typeof progress?.total === "number" && Number.isFinite(progress.total) ? progress.total : null)
@@ -885,6 +899,40 @@ const deriveStageTotals = (stage?: PipelineStageState) => {
         ?? extractNumberFrom(summary, ["total", "queued", "attempted"]);
 
     return { throughputNum, total };
+};
+
+const parseCostValue = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === "string") {
+        const parsed = parseFloat(value.replace(/[^0-9.-]/g, ""));
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+};
+
+/** Stage cost from summary and/or in-flight progress (Realtime while running). */
+const stageCostFromStage = (stage?: PipelineStageState): number | null => {
+    if (!stage) return null;
+    const summary = stage.summary as Record<string, unknown> | null | undefined;
+    const progress = stage.progress;
+    const stats = progress?.stats as Record<string, unknown> | undefined;
+    const candidates = [
+        summary?.cost,
+        progress?.cost,
+        summary?.["Estimated Cost"],
+        progress?.["Estimated Cost"],
+        summary?.Cost,
+        progress?.Cost,
+        stats?.cost,
+        stats?.Cost,
+    ];
+    for (const value of candidates) {
+        const parsed = parseCostValue(value);
+        if (parsed !== null && parsed >= 0) return parsed;
+    }
+    return null;
 };
 
 const deriveDedupedDomainBaseline = (job?: PipelineJob | null) => {
@@ -907,23 +955,38 @@ const deriveDedupedDomainBaseline = (job?: PipelineJob | null) => {
 };
 
 const calculateJobProgress = (job: PipelineJob): { processed: number; total: number; percent: number } => {
-    // Find the currently active or last completed stage to get the most accurate progress
-    let processed = 0;
     const dedupedTotal = deriveDedupedDomainBaseline(job);
+    let processed = 0;
     let total = dedupedTotal ?? 0;
-    
-    // Check stages in order for progress
-    for (const stageKey of STAGE_ORDER) {
-        const stage = job.stages?.[stageKey];
-        if (stage && (stage.status === 'running' || stage.status === 'completed')) {
-            const stageTotals = deriveStageTotals(stage);
-            if (stageTotals.total) {
-                total = stageTotals.total;
-                processed = stage.progress?.processed || 0;
-            }
+
+    // Prefer the active stage; otherwise the last stage with progress in pipeline order.
+    const activeKey =
+        STAGE_ORDER.find((key) => job.stages?.[key]?.status === "running")
+        ?? [...STAGE_ORDER].reverse().find((key) => {
+            const stage = job.stages?.[key];
+            return (
+                stage
+                && (stage.status === "completed" || stage.status === "running")
+                && (
+                    typeof stage.progress?.total === "number"
+                    || deriveStageTotals(stage).total
+                )
+            );
+        });
+
+    if (activeKey) {
+        const stage = job.stages[activeKey];
+        const stageTotals = deriveStageTotals(stage);
+        if (stageTotals.total) {
+            total = stageTotals.total;
+        } else if (typeof stage.progress?.total === "number" && stage.progress.total > 0) {
+            total = stage.progress.total;
+        }
+        if (typeof stage.progress?.processed === "number") {
+            processed = stage.progress.processed;
         }
     }
-    
+
     const percent = total > 0 ? Math.round((processed / total) * 100) : 0;
     return { processed, total, percent };
 };
@@ -934,6 +997,7 @@ export default function ClientPage() {
     const searchParams = useSearchParams();
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
+    const { agencyId } = useAgencyId();
     const allowedTabs = ["analytics", "info", "campaigns", "leads", "personalizer", "follow-ups"] as const;
     type ClientTab = typeof allowedTabs[number];
     const initialTab = searchParams?.get("tab");
@@ -945,6 +1009,7 @@ export default function ClientPage() {
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
     const [clientInstantlyKey, setClientInstantlyKey] = useState<string>("");
     const [clientNtfyTopic, setClientNtfyTopic] = useState<string>("");
+    const [clientSqlId, setClientSqlId] = useState<number | null>(null);
     const [emailProvider, setEmailProvider] = useState<'trykitt' | 'self_hosted'>('trykitt');
 
     // Personalizer state
@@ -1069,20 +1134,20 @@ export default function ClientPage() {
     const [jobState, setJobState] = useState<PipelineJob | null>(null);
     const [jobHistory, setJobHistory] = useState<PipelineJob[]>([]);
     const [jobStatusMessage, setJobStatusMessage] = useState("");
-    const [jobStreamConnected, setJobStreamConnected] = useState(false);
-    const jobStreamRef = useRef<EventSource | null>(null);
-    const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const reconnectAttemptsRef = useRef(0);
-    const lastStreamingJobIdRef = useRef<string | null>(null);
+    const lastWatchedJobIdRef = useRef<string | null>(null);
     const lastActiveStatusRef = useRef<string | null>(null);
     const previousJobIdRef = useRef<string | null>(null);
     const lastUploadErrorRef = useRef<string | null>(null);
+    const lastActiveJobSnapshotRef = useRef<string | null>(null);
+    const activeJobPollInFlightRef = useRef(false);
     const jobStateRef = useRef<PipelineJob | null>(null);
     const lastFetchTimeRef = useRef<number>(0);
     const isFetchingRef = useRef<boolean>(false);
     const currentJobStatusRef = useRef<string | null>(null);
     const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+    const [realtimeJobId, setRealtimeJobId] = useState<string | null>(null);
     const [activeJobStatus, setActiveJobStatus] = useState<string | null>(null);
+
     const [uploadMetrics, setUploadMetrics] = useState<{ count: number; total: number } | null>(null);
     const [instantlyUploadError, setInstantlyUploadError] = useState<string | null>(null);
     const [isSavingClient, setIsSavingClient] = useState(false);
@@ -1161,9 +1226,9 @@ export default function ClientPage() {
     const [expandedDraftId, setExpandedDraftId] = useState<number | null>(null);
 
     const instantlyWebhookUrl = useMemo(() => {
-        if (!user || !clientId) return "";
-        return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${user.uid}/${clientId}`;
-    }, [user, clientId]);
+        if (!user || !clientId || !agencyId) return "";
+        return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${agencyId}/${clientId}`;
+    }, [user, clientId, agencyId]);
     const [copiedWebhook, setCopiedWebhook] = useState(false);
 
     const createEmptyStageState = useCallback((): PipelineStageState => ({
@@ -1199,6 +1264,216 @@ export default function ClientPage() {
         });
         return stages;
     }, [createEmptyStageState]);
+
+    /** Forward pipeline rank: pending < running < completed | error */
+    const stageLifecycleRank = (status?: string) => {
+        switch (status) {
+            case "completed":
+            case "error":
+                return 3;
+            case "running":
+                return 2;
+            default:
+                return 1;
+        }
+    };
+
+    const pickStageStatus = (
+        a?: PipelineStageState["status"],
+        b?: PipelineStageState["status"],
+    ): PipelineStageState["status"] => {
+        const rankA = stageLifecycleRank(a);
+        const rankB = stageLifecycleRank(b);
+        if (rankA >= rankB) {
+            return a || b || "pending";
+        }
+        return b || a || "pending";
+    };
+
+    const mergeStageProgress = (
+        key: PipelineStageKey,
+        prior?: PipelineStageState,
+        next?: PipelineStageState,
+    ): PipelineStageState["progress"] => {
+        const priorProgress = prior?.progress;
+        const nextProgress = next?.progress;
+        if (!priorProgress && !nextProgress) {
+            return null;
+        }
+
+        const maxCounter = (a: number | null, b: number | null): number | null => {
+            if (a === null && b === null) return null;
+            return Math.max(a ?? 0, b ?? 0);
+        };
+
+        // Incoming Realtime row last; then lift monotonic counters so stale prior cannot rewind.
+        const merged: NonNullable<PipelineStageState["progress"]> = {
+            ...(priorProgress || {}),
+            ...(nextProgress || {}),
+            stage: key,
+        };
+
+        const priorProcessed =
+            typeof priorProgress?.processed === "number" ? priorProgress.processed : null;
+        const nextProcessed =
+            typeof nextProgress?.processed === "number" ? nextProgress.processed : null;
+        const mergedProcessed = maxCounter(priorProcessed, nextProcessed);
+        if (mergedProcessed !== null) {
+            merged.processed = mergedProcessed;
+        }
+
+        const priorFound =
+            typeof priorProgress?.found === "number" ? priorProgress.found : null;
+        const nextFound = typeof nextProgress?.found === "number" ? nextProgress.found : null;
+        const mergedFound = maxCounter(priorFound, nextFound);
+        if (mergedFound !== null) {
+            merged.found = mergedFound;
+        }
+
+        const priorTotal = typeof priorProgress?.total === "number" ? priorProgress.total : null;
+        const nextTotal = typeof nextProgress?.total === "number" ? nextProgress.total : null;
+        const mergedTotal = maxCounter(priorTotal, nextTotal);
+        if (mergedTotal !== null && mergedTotal > 0) {
+            merged.total = mergedTotal;
+        }
+
+        const priorCost = typeof priorProgress?.cost === "number" ? priorProgress.cost : null;
+        const nextCost = typeof nextProgress?.cost === "number" ? nextProgress.cost : null;
+        const mergedCost = maxCounter(priorCost, nextCost);
+        if (mergedCost !== null) {
+            merged.cost = mergedCost;
+        }
+
+        const priorStats = (priorProgress?.stats || {}) as Record<string, unknown>;
+        const nextStats = (nextProgress?.stats || {}) as Record<string, unknown>;
+        const mergedStats: Record<string, unknown> = { ...priorStats, ...nextStats };
+        for (const statKey of new Set([...Object.keys(priorStats), ...Object.keys(nextStats)])) {
+            const p = priorStats[statKey];
+            const n = nextStats[statKey];
+            if (typeof p === "number" && typeof n === "number") {
+                mergedStats[statKey] = Math.max(p, n);
+            } else if (typeof p === "number" || typeof n === "number") {
+                mergedStats[statKey] = Math.max(
+                    typeof p === "number" ? p : 0,
+                    typeof n === "number" ? n : 0,
+                );
+            }
+        }
+        if (Object.keys(mergedStats).length > 0) {
+            merged.stats = mergedStats as Record<string, number>;
+        }
+
+        return merged;
+    };
+
+    const pipelineStatusRank = (status?: string) => {
+        switch (status) {
+            case "completed":
+            case "failed":
+            case "cancelled":
+                return 4;
+            case "running":
+            case "paused":
+                return 3;
+            case "queued":
+                return 2;
+            default:
+                return 1;
+        }
+    };
+
+    /** Realtime can deliver out-of-order rows; keep furthest lifecycle + highest progress. */
+    const mergeJobState = useCallback(
+        (prev: PipelineJob | null, incoming: Partial<PipelineJob> & { id: string }): PipelineJob => {
+            const stages = normalizeStages(incoming.stages ?? prev?.stages);
+            if (prev?.stages) {
+                for (const key of STAGE_ORDER) {
+                    const prior = prev.stages[key];
+                    const next = stages[key];
+                    const status = pickStageStatus(prior?.status, next?.status);
+                    const nextSummary =
+                        next?.summary && Object.keys(next.summary).length > 0
+                            ? next.summary
+                            : null;
+                    const priorSummary =
+                        prior?.summary && Object.keys(prior.summary).length > 0
+                            ? prior.summary
+                            : null;
+                    stages[key] = {
+                        ...next,
+                        status,
+                        startedAt: prior?.startedAt ?? next.startedAt,
+                        completedAt:
+                            status === "completed" || status === "error"
+                                ? next?.completedAt ?? prior?.completedAt
+                                : next?.completedAt ?? prior?.completedAt ?? null,
+                        summary: nextSummary ?? priorSummary,
+                        error: next?.error ?? prior?.error ?? null,
+                        progress: mergeStageProgress(key, prior, next),
+                    };
+                }
+            }
+
+            const runningWithProgress = STAGE_ORDER.find((key) => {
+                const stage = stages[key];
+                return (
+                    stage?.status === "running"
+                    && typeof stage.progress?.processed === "number"
+                    && typeof stage.progress?.total === "number"
+                    && stage.progress.total > 0
+                );
+            });
+
+            let activityMessage =
+                incoming.activityMessage !== undefined
+                    ? incoming.activityMessage
+                    : prev?.activityMessage ?? null;
+            if (runningWithProgress) {
+                activityMessage = null;
+            }
+
+            const incomingStatus = (incoming.status as PipelineJob["status"]) || prev?.status || "queued";
+            const prevStatus = prev?.status || "queued";
+            const mergedStatus =
+                pipelineStatusRank(incoming.status as string) >= pipelineStatusRank(prev?.status)
+                    ? incomingStatus
+                    : prevStatus;
+
+            return {
+                ...(prev || {}),
+                ...incoming,
+                id: incoming.id,
+                status: mergedStatus,
+                stages,
+                cost:
+                    typeof incoming.cost === "number" && Number.isFinite(incoming.cost) && incoming.cost > 0
+                        ? incoming.cost
+                        : typeof prev?.cost === "number" && prev.cost > 0
+                          ? prev.cost
+                          : incoming.cost ?? prev?.cost,
+                activityMessage,
+                activityUpdatedAt:
+                    incoming.activityUpdatedAt !== undefined
+                        ? incoming.activityUpdatedAt
+                        : prev?.activityUpdatedAt ?? null,
+            } as PipelineJob;
+        },
+        [normalizeStages]
+    );
+
+    const onJobRealtimeUpdate = useCallback(
+        (state: JobRealtimeState) => {
+            setJobState((prev) => {
+                if (prev?.id && state.id && prev.id !== state.id) {
+                    return prev;
+                }
+                return mergeJobState(prev, state as Partial<PipelineJob> & { id: string });
+            });
+        },
+        [mergeJobState],
+    );
+
+    useJobRealtime(realtimeJobId, onJobRealtimeUpdate);
 
     const formatJobDate = useCallback((value: string | null | undefined) => {
         if (!value) {
@@ -1344,7 +1619,8 @@ export default function ClientPage() {
         (async () => {
             setLeadEventsLoading(true);
             try {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/${selectedLead.id}/events?limit=50`, {
                     headers: { Authorization: `Bearer ${idToken}` }
                 });
@@ -1395,7 +1671,8 @@ export default function ClientPage() {
         (async () => {
             setLeadFilterFieldsLoading(true);
             try {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/filter-fields`, {
                     headers: { Authorization: `Bearer ${idToken}` }
                 });
@@ -1421,7 +1698,7 @@ export default function ClientPage() {
         return () => {
             cancelled = true;
         };
-    }, [user]);
+    }, [user?.id]);
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -1451,10 +1728,39 @@ export default function ClientPage() {
     const [downloadingSegmentId, setDownloadingSegmentId] = useState<string | null>(null);
 
     // Computed values for pipeline panel
+    const displayJobCost = useMemo(() => {
+        if (!jobState) return null;
+        if (typeof jobState.cost === "number" && jobState.cost > 0) {
+            return jobState.cost;
+        }
+        let sum = 0;
+        for (const key of STAGE_ORDER) {
+            const stageCost = stageCostFromStage(jobState.stages[key]);
+            if (stageCost !== null) sum += stageCost;
+        }
+        return sum > 0 ? sum : null;
+    }, [jobState]);
+
     const stageCompletionPercent = useMemo(() => {
         if (!jobState) return 0;
-        const completedStages = STAGE_ORDER.filter(k => jobState.stages[k]?.status === 'completed').length;
-        return Math.round((completedStages / STAGE_ORDER.length) * 100);
+        const stageWeight = 100 / STAGE_ORDER.length;
+        let percent = 0;
+        for (const key of STAGE_ORDER) {
+            const stage = jobState.stages[key];
+            if (stage?.status === "completed" || stage?.status === "error") {
+                percent += stageWeight;
+                continue;
+            }
+            if (stage?.status === "running") {
+                const total = typeof stage.progress?.total === "number" ? stage.progress.total : null;
+                const processed =
+                    typeof stage.progress?.processed === "number" ? stage.progress.processed : null;
+                if (total && total > 0 && processed !== null) {
+                    percent += stageWeight * Math.min(1, processed / total);
+                }
+            }
+        }
+        return Math.min(100, Math.round(percent));
     }, [jobState]);
 
     const validLeadsCompleted = useMemo(() => {
@@ -1467,14 +1773,40 @@ export default function ClientPage() {
     const activeStatusLabel = useMemo(() => {
         if (!jobState) return null;
         if (jobState.paused) return 'Job paused';
-        if (jobState.status === 'running') {
+        if (jobState.status === 'running' || jobState.status === 'queued') {
             const runningStage = STAGE_ORDER.find(k => jobState.stages[k]?.status === 'running');
             if (runningStage) {
-                return `Running ${STAGE_METADATA[runningStage]?.title || runningStage}...`;
+                const stage = jobState.stages[runningStage];
+                const processed = stage?.progress?.processed;
+                const total = stage?.progress?.total;
+                const title = STAGE_METADATA[runningStage]?.title || runningStage;
+                if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
+                    return `${title}: ${processed.toLocaleString()} / ${total.toLocaleString()}`;
+                }
+                return `Running ${title}…`;
+            }
+            if (jobState.activityMessage) {
+                return jobState.activityMessage;
+            }
+            const nextPending = STAGE_ORDER.find(k => jobState.stages[k]?.status === 'pending');
+            if (nextPending) {
+                return `Preparing ${STAGE_METADATA[nextPending]?.title || nextPending}…`;
             }
         }
         return null;
     }, [jobState]);
+
+    const recentJobLogLines = useMemo(() => {
+        if (!jobState?.activityMessage) return [];
+        const headline = activeStatusLabel?.replace(/\s+/g, " ").trim().toLowerCase();
+        const line = jobState.activityMessage.replace(/\s+/g, " ").trim();
+        if (!line) return [];
+        const norm = line.toLowerCase();
+        if (headline && (norm === headline || headline.includes(norm) || norm.includes(headline))) {
+            return [];
+        }
+        return [line];
+    }, [jobState?.activityMessage, activeStatusLabel]);
 
     const canUploadToInstantly = useMemo(() => {
         return jobState?.status === 'completed' && activeJobStatus !== 'uploaded';
@@ -1533,17 +1865,34 @@ export default function ClientPage() {
     );
 
     useEffect(() => {
-        if (user?.uid) {
-            const userDocRef = doc(firestore, "users", user.uid);
-            const unsubscribe = onSnapshot(userDocRef, (snapshot) => {
-                if (snapshot.exists()) {
-                    const data = snapshot.data();
-                    setEmailProvider(data?.email_verification_provider || "trykitt");
-                }
-            });
-            return () => unsubscribe();
+        if (!user) {
+            return;
         }
-    }, [user]);
+        let cancelled = false;
+        (async () => {
+            try {
+                const token = await getAccessToken();
+                if (!token || cancelled) {
+                    return;
+                }
+                const response = await fetch(`${getPipelineBaseUrl()}/api/agency/settings`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                if (!response.ok || cancelled) {
+                    return;
+                }
+                const data = (await response.json()) as { email_verification_provider?: string };
+                setEmailProvider(
+                    data.email_verification_provider === "self_hosted" ? "self_hosted" : "trykitt",
+                );
+            } catch {
+                /* keep default */
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [user?.id]);
 
     // Auto-disable verification when using self-hosted (emails are already verified during finding)
     useEffect(() => {
@@ -1558,25 +1907,46 @@ export default function ClientPage() {
         }
     }, [loading, user, router]);
 
-    // Helper function to display email
-    const displayEmail = (email: string | undefined, emailStatus: string | undefined) => {
-        // If email exists, show it (even if from Instantly backfill without status)
-        if (email && email.trim() !== '') {
-            const emailLower = email.toLowerCase().trim();
-            if (emailLower === 'not found' || emailLower === 'not_found' || emailLower.includes('not found')) return 'Not Found';
-            return email;
-        }
-        // If email_status exists but no email, it was not found
-        if (emailStatus && emailStatus.trim() !== '') return 'Not Found';
-        // No email and no status means email finder hasn't run yet
+    const isLegacyNotFoundEmail = (email: string) => {
+        const emailLower = email.toLowerCase().trim();
+        return emailLower === 'not found' || emailLower === 'not_found' || emailLower.includes('not found');
+    };
+
+    /** Raw contacts.email value for table/detail — null/empty stays empty (—). */
+    const formatRawEmailValue = (email: string | undefined | null) => {
+        const trimmed = String(email ?? '').trim();
+        if (!trimmed || isLegacyNotFoundEmail(trimmed)) return '—';
+        return trimmed;
+    };
+
+    /** Email discovery stage (separate from SMTP email_status). */
+    const displayEmailFindState = (
+        email: string | undefined | null,
+        emailFindCompletedAt: string | undefined | null
+    ) => {
+        const trimmed = String(email ?? '').trim();
+        if (trimmed && !isLegacyNotFoundEmail(trimmed)) return 'Found';
+        if (emailFindCompletedAt) return 'Not found';
+        return 'Not run';
+    };
+
+    const displayEmailStatus = (emailStatus: string | undefined, emailVerifyCompletedAt: string | undefined) => {
+        if (emailStatus && emailStatus.trim() !== '') return emailStatus;
+        if (emailVerifyCompletedAt) return 'Unknown';
         return 'Not Run';
     };
 
-    // Helper function to display email status
-    const displayEmailStatus = (emailStatus: string | undefined) => {
-        // If email_status is empty, the email finder hasn't run yet
-        if (!emailStatus || emailStatus.trim() === '') return 'Not Run';
-        return emailStatus;
+    const formatLeadStageTimestamp = (value?: string | null) => {
+        if (!value || !String(value).trim()) return 'Not run';
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return 'Not run';
+        return parsed.toLocaleString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
     };
 
     const formatInstantlyStateLabel = (value?: string | null) => {
@@ -1943,100 +2313,100 @@ export default function ClientPage() {
         | "skipped"
         | "default";
 
-    const getLeadStatusChipMeta = (emailStatus: string | undefined): { label: string; variant: LeadStatusChipVariant } => {
+    const getLeadStatusChipMeta = (
+        emailStatus: string | undefined,
+        emailVerifyCompletedAt: string | undefined
+    ): { label: string; variant: LeadStatusChipVariant } => {
         const normalized = (emailStatus || '').trim().toLowerCase();
 
-        if (!normalized) return { label: "Not Run", variant: "not-run" };
+        if (!normalized) {
+            if (emailVerifyCompletedAt) return { label: "Unknown", variant: "default" };
+            return { label: "Not Run", variant: "not-run" };
+        }
         if (normalized === "valid") return { label: "Valid", variant: "valid" };
         if (normalized === "valid-risky" || normalized === "risky") return { label: "Valid-Risky", variant: "valid-risky" };
         if (normalized === "invalid") return { label: "Invalid", variant: "invalid" };
         if (normalized === "not_found" || normalized.includes("not found")) return { label: "Not Found", variant: "not-found" };
         if (normalized === "skipped_no_founder") return { label: "Skipped", variant: "skipped" };
 
-        return { label: displayEmailStatus(emailStatus), variant: "default" };
+        return { label: displayEmailStatus(emailStatus, emailVerifyCompletedAt), variant: "default" };
     };
 
     useEffect(() => {
-        if (!user || !clientId) return;
+        if (!user || !clientId || !agencyId) return;
         let cancelled = false;
 
-        // Subscribe to client data
-        const clientRef = doc(firestore, "users", user.uid, "clients", clientId);
-        const unsubClient = onSnapshot(clientRef, (snap) => {
-            if (cancelled) return;
-            if (snap.exists()) {
-                const data = snap.data();
-                setClientName((data.name as string) || clientId);
-                setClientIndustry((data.industry as Niche["id"]) || "ecom");
-                setClientInstantlyKey((data.instantly_key as string) || "");
-                setClientNtfyTopic((data.ntfy_topic as string) || "");
-                setClientTotalLeads((data.totalLeads as number) || 0);
-                setClientInstantlyWebhookStatus(typeof data.instantlyWebhookStatus === 'number' ? data.instantlyWebhookStatus : null);
-                setClientInstantlyWebhookUpdatedAt(data.instantlyWebhookUpdatedAt?.toDate ? data.instantlyWebhookUpdatedAt.toDate().toLocaleString() : null);
-            }
-        }, () => {
-            if (!cancelled) {
-                setClientName(clientId);
-                setClientIndustry("ecom");
-                setClientInstantlyKey("");
-                setClientNtfyTopic("");
-                setClientTotalLeads(0);
-                setClientInstantlyWebhookStatus(null);
-                setClientInstantlyWebhookUpdatedAt(null);
-            }
-        });
+        (async () => {
+            try {
+                const clientPayload = await apiJson<{
+                    client: {
+                        sqlId?: number;
+                        name?: string;
+                        industry?: string;
+                        instantly_key?: string;
+                        ntfy_topic?: string;
+                        instantlyWebhookStatus?: number | null;
+                        instantlyWebhookUpdatedAt?: string | null;
+                    };
+                }>(`/api/clients/${encodeURIComponent(clientId)}`);
 
-        // Subscribe to campaigns subcollection
-        const campaignsCol = collection(firestore, "users", user.uid, "clients", clientId, "campaigns");
-        const unsubCampaigns = onSnapshot(campaignsCol, (snap) => {
-            if (cancelled) return;
-            const rows = snap.docs.map((d) => {
-                const data = d.data();
-                return {
-                    id: d.id,
-                    name: (data.name as string) || d.id,
-                    status: (data.status as number) || 0,
-                    createdAt: data.createdAt?.toDate ? new Date(data.createdAt.toDate()).toLocaleString() : "",
-                    totalLeads: (data.totalLeads as number) || 0,
-                } as Campaign;
-            });
-            setCampaigns(rows);
-        }, () => {
-            if (!cancelled) {
-                setCampaigns([]);
-            }
-        });
+                const campaignsPayload = await apiFetch(
+                    `/api/clients/${encodeURIComponent(clientId)}/campaigns/list?agencyId=${encodeURIComponent(agencyId)}`
+                ).then((r) => r.json());
 
-        // Subscribe to segments subcollection
-        const segmentsCol = collection(firestore, "users", user.uid, "clients", clientId, "segments");
-        const unsubSegments = onSnapshot(segmentsCol, (snap) => {
-            if (cancelled) return;
-            const rows = snap.docs.map((d) => {
-                const data = d.data();
-                return {
-                    id: d.id,
-                    name: (data.name as string) || d.id,
-                    description: (data.description as string) || "",
-                    filters: data.filters || {},
-                    createdAt: data.createdAt?.toDate ? new Date(data.createdAt.toDate()).toLocaleString() : "",
-                    updatedAt: data.updatedAt?.toDate ? new Date(data.updatedAt.toDate()).toLocaleString() : "",
-                } as Segment;
-            });
-            setSegments(rows.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')));
-        }, () => {
-            if (!cancelled) {
-                setSegments([]);
+                const segmentsPayload = await apiJson<{ segments: Segment[] }>(
+                    `/api/clients/${encodeURIComponent(clientId)}/segments`
+                );
+
+                if (cancelled) return;
+
+                const c = clientPayload.client;
+                setClientSqlId(c.sqlId ?? null);
+                setClientName(c.name || clientId);
+                setClientIndustry((c.industry as Niche["id"]) || "ecom");
+                setClientInstantlyKey(c.instantly_key || "");
+                setClientNtfyTopic(c.ntfy_topic || "");
+                setClientInstantlyWebhookStatus(
+                    typeof c.instantlyWebhookStatus === "number" ? c.instantlyWebhookStatus : null
+                );
+                setClientInstantlyWebhookUpdatedAt(
+                    c.instantlyWebhookUpdatedAt
+                        ? new Date(c.instantlyWebhookUpdatedAt).toLocaleString()
+                        : null
+                );
+
+                const campaignRows = (campaignsPayload.campaigns || []).map((row: { id: string | number; name: string; status?: number }) => ({
+                    id: String(row.id),
+                    name: row.name || String(row.id),
+                    status: Number(row.status ?? 0),
+                    createdAt: "",
+                    totalLeads: 0,
+                })) as Campaign[];
+                setCampaigns(campaignRows);
+
+                setSegments(
+                    (segmentsPayload.segments || []).sort((a, b) =>
+                        (b.updatedAt || "").localeCompare(a.updatedAt || "")
+                    )
+                );
+            } catch {
+                if (!cancelled) {
+                    setClientName(clientId);
+                    setClientIndustry("ecom");
+                    setClientInstantlyKey("");
+                    setClientNtfyTopic("");
+                    setClientSqlId(null);
+                    setCampaigns([]);
+                    setSegments([]);
+                }
             }
-        });
+        })();
 
         return () => {
             cancelled = true;
             stopInstantlySyncPolling();
-            try { unsubClient(); } catch { }
-            try { unsubCampaigns(); } catch { }
-            try { unsubSegments(); } catch { }
         };
-    }, [user, clientId, stopInstantlySyncPolling]);
+    }, [user?.id, clientId, agencyId, stopInstantlySyncPolling]);
 
     useEffect(() => {
         if (!user || !clientId) return;
@@ -2053,7 +2423,7 @@ export default function ClientPage() {
             fetchLeadTotal();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters]);
+    }, [user?.id, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -2062,7 +2432,8 @@ export default function ClientPage() {
         const fetchInstantlyCampaigns = async () => {
             setInstantlyCampaignsLoading(true);
             try {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const params = new URLSearchParams();
                 params.append('clientId', clientId);
 
@@ -2109,7 +2480,8 @@ export default function ClientPage() {
         if (!user || !clientId || segments.length === 0) return;
 
         const fetchSegmentCounts = async () => {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const counts: Record<string, number> = {};
 
             await Promise.all(
@@ -2161,15 +2533,9 @@ export default function ClientPage() {
         }
     }, [toastVisible]);
 
-    const closeJobStream = useCallback(() => {
-        if (reconnectTimeoutRef.current) {
-            clearTimeout(reconnectTimeoutRef.current);
-            reconnectTimeoutRef.current = null;
-        }
-        reconnectAttemptsRef.current = 0;
-        jobStreamRef.current?.close();
-        jobStreamRef.current = null;
-        setJobStreamConnected(false);
+    const stopJobWatch = useCallback(() => {
+        lastWatchedJobIdRef.current = null;
+        setRealtimeJobId(null);
     }, []);
 
     const campaignIdToName = useMemo(() => {
@@ -2188,24 +2554,12 @@ export default function ClientPage() {
         return lead.campaigns.map((id) => campaignIdToName.get(id) || id);
     }, [campaignIdToName]);
 
-    const mapJobDocToJob = useCallback((docSnap: DocumentSnapshot): PipelineJob => {
-        const data = (docSnap.data() as Record<string, unknown> | undefined) || {};
-        const id = (data.id as string) || docSnap.id;
-        const createdAtRaw = data.createdAt;
-        const completedAtRaw = data.completedAt;
-
+    const mapApiJobToJob = useCallback((data: Record<string, unknown>): PipelineJob => {
+        const id = String(data.id || "");
         const toIso = (value: unknown) => {
             if (typeof value === "string" && value) return value;
-            if (value && typeof (value as any).toDate === "function") {
-                try {
-                    return (value as any).toDate().toISOString();
-                } catch {
-                    return new Date().toISOString();
-                }
-            }
             return new Date().toISOString();
         };
-
         const dedupe = data.dedupeStats as { total?: number; skipped?: number; new?: number } | undefined;
         const totalVal = Number(dedupe?.total ?? 0);
         const skippedVal = Number(dedupe?.skipped ?? 0);
@@ -2215,10 +2569,12 @@ export default function ClientPage() {
             id,
             status: (data.status as PipelineJob["status"]) || "queued",
             error: (data.error as string) || null,
-            fileName: (data.fileName as string) || id,
-            createdAt: toIso(createdAtRaw),
-            completedAt: typeof completedAtRaw === "undefined" || completedAtRaw === null ? null : toIso(completedAtRaw),
+            fileName: (data.fileName as string) || String(data.file_name || id),
+            createdAt: toIso(data.createdAt),
+            completedAt: data.completedAt == null ? null : toIso(data.completedAt),
             stages: normalizeStages(data.stages),
+            activityMessage: typeof data.activityMessage === 'string' ? data.activityMessage : null,
+            activityUpdatedAt: typeof data.activityUpdatedAt === 'string' ? data.activityUpdatedAt : null,
             dedupeStats: dedupe
                 ? {
                     total: Number.isFinite(totalVal) ? totalVal : 0,
@@ -2228,6 +2584,46 @@ export default function ClientPage() {
                 : null,
         };
     }, [normalizeStages]);
+
+    const refreshJobHistory = useCallback(async () => {
+        if (!clientId) return;
+        try {
+            const data = await apiJson<{ jobs: Array<Record<string, unknown>> }>(
+                `/api/jobs?clientId=${encodeURIComponent(clientId)}`
+            );
+            const rows = (data.jobs || []).map(mapApiJobToJob);
+            setJobHistory(rows);
+        } catch (error) {
+            console.error("Job history fetch error:", error);
+            setJobHistory([]);
+        }
+    }, [clientId, mapApiJobToJob]);
+
+    /** Stable key so list refetches are not tied to every Realtime stage tick. */
+    const jobHistoryIdsKey = useMemo(
+        () => jobHistory.map((job) => job.id).filter(Boolean).sort().join("|"),
+        [jobHistory]
+    );
+
+    const refreshJobHistoryRef = useRef(refreshJobHistory);
+    refreshJobHistoryRef.current = refreshJobHistory;
+
+    const debouncedRefreshJobHistory = useMemo(
+        () =>
+            debounceFn(() => {
+                void refreshJobHistoryRef.current();
+            }, 1500),
+        []
+    );
+
+    const realtimeJobIdRef = useRef(realtimeJobId);
+    realtimeJobIdRef.current = realtimeJobId;
+
+    const onClientJobsTableChange = useCallback(() => {
+        // Live job panel uses useJobRealtime; skip hammering GET /jobs on every persist tick.
+        if (realtimeJobIdRef.current) return;
+        debouncedRefreshJobHistory();
+    }, [debouncedRefreshJobHistory]);
 
     const buildLeadQueryParams = useCallback(({ limit, offset, includeTotal, countOnly, includeLatestEvent }: { limit: number; offset?: number; includeTotal?: boolean; countOnly?: boolean; includeLatestEvent?: boolean }) => {
         const params = new URLSearchParams();
@@ -2278,7 +2674,8 @@ export default function ClientPage() {
         personalizationTitle: row.personalizationTitle || "",
         updatedAt: row.updatedAt || "",
         createdAt: row.createdAt || "",
-        lastVerifiedAt: row.lastVerifiedAt || "",
+        emailFindCompletedAt: row.emailFindCompletedAt || "",
+        emailVerifyCompletedAt: row.emailVerifyCompletedAt || "",
         lastContactedAt: row.lastContactedAt || "",
         jobId: row.jobId || "",
         campaignCountAllTime: typeof row.campaignCountAllTime === "number" ? row.campaignCountAllTime : null,
@@ -2293,7 +2690,8 @@ export default function ClientPage() {
     const fetchLeadTotal = useCallback(async () => {
         if (!user || !clientId) return;
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const params = buildLeadQueryParams({
                 limit: 1,
                 includeTotal: true,
@@ -2338,7 +2736,8 @@ export default function ClientPage() {
         setLeadsLoading(true);
         try {
             // Get Firebase ID token for authentication
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             
             // Build query parameters
             const params = buildLeadQueryParams({
@@ -2430,7 +2829,8 @@ export default function ClientPage() {
         (async () => {
             setFollowUpPreviewSearching(true);
             try {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const params = new URLSearchParams();
                 params.append('clientId', clientId);
                 params.append('limit', '12');
@@ -2477,7 +2877,8 @@ export default function ClientPage() {
         (async () => {
             setAutoResponderTestLeadSearching(true);
             try {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const params = new URLSearchParams();
                 params.append('clientId', clientId);
                 params.append('limit', '12');
@@ -2505,7 +2906,8 @@ export default function ClientPage() {
 
         setCheckingKlaviyo(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
 
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/insights/klaviyo/query`, {
                 method: 'POST',
@@ -2552,7 +2954,8 @@ export default function ClientPage() {
 
     const fetchInstantlySyncRun = useCallback(async (runId: number) => {
         if (!user || !clientId || !runId) return null;
-        const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+                if (!idToken) return;
         const response = await fetchWithRetry(
             `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/${runId}`,
             {
@@ -2576,7 +2979,8 @@ export default function ClientPage() {
 
     const fetchLatestInstantlySyncRun = useCallback(async () => {
         if (!user || !clientId) return null;
-        const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+                if (!idToken) return;
         const response = await fetchWithRetry(
             `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/latest`,
             {
@@ -2603,7 +3007,7 @@ export default function ClientPage() {
         fetchLatestInstantlySyncRun().catch((error) => {
             console.error('Failed to fetch latest Instantly sync run:', error);
         });
-    }, [user, clientId, fetchLatestInstantlySyncRun]);
+    }, [user?.id, clientId, fetchLatestInstantlySyncRun]);
 
     useEffect(() => {
         const runId = instantlySyncRun?.id;
@@ -2659,9 +3063,9 @@ export default function ClientPage() {
 
     useEffect(() => {
         return () => {
-            closeJobStream();
+            stopJobWatch();
         };
-    }, [closeJobStream]);
+    }, [stopJobWatch]);
 
     useEffect(() => {
         jobStateRef.current = jobState;
@@ -2688,16 +3092,27 @@ export default function ClientPage() {
         lastFetchTimeRef.current = now;
         
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobId}?clientId=${clientId}`, {
+                cache: "no-store",
                 headers: {
                     'Authorization': `Bearer ${idToken}`
                 }
             });
-            if (!response.ok) return;
+            if (!response.ok || response.status === 304) return;
             const payload = await response.json();
             if (payload?.job) {
-                setJobState(payload.job);
+                const raw = payload.job as Record<string, unknown> & { id: string };
+                setJobState((prev) =>
+                    mergeJobState(prev, {
+                        ...(raw as PipelineJob),
+                        activityMessage:
+                            typeof raw.activityMessage === "string" ? raw.activityMessage : null,
+                        activityUpdatedAt:
+                            typeof raw.activityUpdatedAt === "string" ? raw.activityUpdatedAt : null,
+                    })
+                );
             }
         } catch (error: any) {
             console.error('❌ [JOB SNAPSHOT ERROR]:', {
@@ -2714,290 +3129,245 @@ export default function ClientPage() {
         } finally {
             isFetchingRef.current = false;
         }
-    }, [user, clientId]);
+    }, [user, clientId, mergeJobState]);
 
-    const handleServerEvent = useCallback((payload: PipelineServerEvent) => {
-        if (payload.type === "state" && payload.state) {
-            setJobState(payload.state);
-        } else if (payload.type === "error" && payload.error) {
-            setJobStatusMessage(payload.error);
-        }
-    }, []);
+    const startJobWatch = useCallback(
+        (jobId: string) => {
+            if (!jobId) return;
+            if (lastWatchedJobIdRef.current === jobId) return;
 
-    const openJobStream = useCallback(
-        (jobId: string, isReconnect = false) => {
-            if (!jobId) {
-                return;
-            }
-            
-            // Don't open stream if job isn't running/queued
-            const currentStatus = currentJobStatusRef.current;
-            if (currentStatus && currentStatus !== 'running' && currentStatus !== 'queued') {
-                console.log(`⏭️ [GUARD] Not opening stream - job status is "${currentStatus}", not running/queued`);
-                return;
-            }
-            
-            // Prevent opening multiple streams for the same job
-            if (jobStreamRef.current && lastStreamingJobIdRef.current === jobId) {
-                console.log(`⏭️ [GUARD] Stream already open for job ${jobId}`);
-                return;
-            }
-            
-            closeJobStream();
-            if (!isReconnect) {
-                reconnectAttemptsRef.current = 0;
+            if (lastWatchedJobIdRef.current) {
+                stopJobWatch();
             }
             setSelectedJobId(jobId);
-            lastStreamingJobIdRef.current = jobId;
-            setJobStatusMessage(isReconnect ? "Reconnecting to pipeline..." : "Connecting to pipeline...");
-            // Only fetch snapshot on initial open, not reconnects
-            if (!isReconnect) {
-                fetchJobSnapshot(jobId, true);
-            }
-
-            const stream = new EventSource(getJobStreamUrl(jobId));
-            jobStreamRef.current = stream;
-
-            stream.onopen = () => {
-                setJobStreamConnected(true);
-                setJobStatusMessage("Live updates streaming.");
-                reconnectAttemptsRef.current = 0;
-            };
-
-            stream.onmessage = (event) => {
-                if (!event.data) {
-                    return;
-                }
-                try {
-                    const parsed = JSON.parse(event.data) as PipelineServerEvent;
-                    handleServerEvent(parsed);
-                } catch (error) {
-                    console.warn("Unable to parse pipeline event", error);
-                }
-            };
-
-            stream.onerror = (event) => {
-                console.warn('⚠️ EventSource error:', {
-                    jobId,
-                    readyState: stream.readyState,
-                    attempt: reconnectAttemptsRef.current,
-                    status: currentJobStatusRef.current
-                });
-                
-                setJobStreamConnected(false);
-                stream.close();
-                jobStreamRef.current = null;
-                
-                // Check if job status still requires streaming before reconnecting
-                const currentStatus = currentJobStatusRef.current;
-                if (currentStatus && currentStatus !== 'running' && currentStatus !== 'queued') {
-                    console.log(`⏹️ Stopping stream reconnection - job status is "${currentStatus}"`);
-                    setJobStatusMessage("");
-                    return;
-                }
-                
-                setJobStatusMessage("Lost connection to pipeline stream, retrying...");
-
-                const MAX_RETRIES = 5;
-                if (reconnectAttemptsRef.current >= MAX_RETRIES) {
-                    setJobStatusMessage("Unable to reconnect to pipeline stream.");
-                    // Fetch one final time after giving up
-                    fetchJobSnapshot(jobId, true);
-                    return;
-                }
-
-                const attempt = reconnectAttemptsRef.current;
-                reconnectAttemptsRef.current = attempt + 1;
-                const delay = Math.min(10000, 1000 * Math.pow(2, attempt));
-                console.log(`⏳ Reconnecting in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-                reconnectTimeoutRef.current = setTimeout(() => {
-                    openJobStream(jobId, true);
-                }, delay);
-            };
+            lastWatchedJobIdRef.current = jobId;
+            setRealtimeJobId(jobId);
+            void fetchJobSnapshot(jobId, true);
         },
-        [closeJobStream, handleServerEvent, fetchJobSnapshot],
+        [stopJobWatch, fetchJobSnapshot],
     );
 
-    // Check for active job on mount (after openJobStream is defined)
-    useEffect(() => {
-        if (!user || !clientId) {
+    const serializeActiveJobSnapshot = (active: {
+        jobId?: string;
+        status?: string;
+        upload_status?: string | null;
+        upload_error?: string | null;
+        upload_metrics?: { count?: number; total?: number } | null;
+        error?: string | null;
+    } | null) => {
+        if (!active?.jobId) return "none";
+        const status = active.upload_status || active.status || "";
+        const metrics = active.upload_metrics;
+        return [
+            active.jobId,
+            status,
+            active.upload_error || "",
+            metrics?.count ?? "",
+            metrics?.total ?? "",
+            active.error || ""
+        ].join("|");
+    };
+
+    const applyActiveJobPayload = useCallback((active: {
+        jobId?: string;
+        status?: string;
+        upload_status?: string | null;
+        upload_error?: string | null;
+        upload_metrics?: { count?: number; total?: number } | null;
+        error?: string | null;
+    } | null) => {
+        const snapshot = serializeActiveJobSnapshot(active);
+        if (snapshot === lastActiveJobSnapshotRef.current) {
+            return;
+        }
+        lastActiveJobSnapshotRef.current = snapshot;
+
+        if (!active?.jobId) {
+            setActiveJobStatus(null);
+            setJobPendingUpload(null);
+            setUploadMetrics(null);
+            setJobStatusMessage("");
+            setInstantlyUploadError(null);
+            lastActiveStatusRef.current = null;
+            previousJobIdRef.current = null;
+            lastUploadErrorRef.current = null;
             return;
         }
 
-        const activeJobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-        const unsubscribe = onSnapshot(activeJobRef, (snap) => {
-            if (!snap.exists()) {
-                setActiveJobStatus(null);
-                setJobPendingUpload(null);
-                setUploadMetrics(null);
-                setJobStatusMessage("");
-                setInstantlyUploadError(null);
-                lastActiveStatusRef.current = null;
-                previousJobIdRef.current = null;
-                lastUploadErrorRef.current = null;
-                return;
+        const jobId = active.jobId;
+        const status = (active.status || active.upload_status || null) as string | null;
+        const uploadErrorMessage = active.upload_error || null;
+        const errorMessage = active.error || uploadErrorMessage;
+        const metricsRaw = active.upload_metrics || undefined;
+        const parsedMetrics = metricsRaw
+            ? {
+                count: Number.isFinite(metricsRaw.count) ? Number(metricsRaw.count) : 0,
+                total: Number.isFinite(metricsRaw.total ?? metricsRaw.count)
+                    ? Number(metricsRaw.total ?? metricsRaw.count)
+                    : 0,
             }
+            : null;
 
-            const data = snap.data() as Record<string, unknown>;
-            const jobId = typeof data.jobId === "string" ? data.jobId : null;
-            const status = typeof data.status === "string" ? data.status : null;
-            const uploadErrorMessage = typeof data.uploadError === "string" ? data.uploadError : null;
-            const errorMessage = typeof data.error === "string" ? data.error : uploadErrorMessage;
-            const metricsRaw = data.uploadMetrics as Record<string, unknown> | undefined;
+        setActiveJobStatus(status);
+        setUploadMetrics(parsedMetrics);
+        setInstantlyUploadError(uploadErrorMessage);
+        currentJobStatusRef.current = status;
 
-            const parsedMetrics = metricsRaw
-                ? {
-                    count: (() => {
-                        const value = metricsRaw.count;
-                        return typeof value === "number" && Number.isFinite(value) ? value : 0;
-                    })(),
-                    total: (() => {
-                        const value = metricsRaw.total ?? metricsRaw.count;
-                        return typeof value === "number" && Number.isFinite(value) ? value : 0;
-                    })(),
-                }
-                : null;
-
-            setActiveJobStatus(status);
-            setUploadMetrics(parsedMetrics);
-            setInstantlyUploadError(uploadErrorMessage);
-            
-            // Store current status in ref for stream error handler to check
-            currentJobStatusRef.current = status;
-
-            if (status === "pending-upload") {
-                if (uploadErrorMessage && uploadErrorMessage !== lastUploadErrorRef.current) {
-                    setToastMessage(uploadErrorMessage);
-                    setToastVisible(true);
-                }
-                lastUploadErrorRef.current = uploadErrorMessage;
-            } else {
-                lastUploadErrorRef.current = null;
+        if (status === "pending-upload") {
+            if (uploadErrorMessage && uploadErrorMessage !== lastUploadErrorRef.current) {
+                setToastMessage(uploadErrorMessage);
+                setToastVisible(true);
             }
-
-            if (status === "pending-upload" && jobId) {
-                setJobPendingUpload(jobId);
-            } else if (status && status !== "pending-upload") {
-                setJobPendingUpload(null);
-            }
-
-            const shouldRestoreActiveJob = Boolean(
-                jobId && (status === "running" || status === "queued" || status === "pending-upload")
-            );
-
-            if (jobId && shouldRestoreActiveJob) {
-                setSelectedJobId(jobId);
-                const compositeKey = `${jobId}:${status ?? ""}`;
-                if (previousJobIdRef.current !== compositeKey) {
-                    previousJobIdRef.current = compositeKey;
-                    // Use force=false to respect debouncing
-                    fetchJobSnapshot(jobId, false);
-                }
-            } else {
-                previousJobIdRef.current = null;
-            }
-
-            const shouldStream = status === "running" || status === "queued";
-            const isStreaming = jobId && lastStreamingJobIdRef.current === jobId && Boolean(jobStreamRef.current);
-            if (jobId && shouldStream) {
-                if (!isStreaming) {
-                    openJobStream(jobId);
-                }
-            } else if (isStreaming && (!status || status === "completed" || status === "uploaded" || status === "failed" || status === "discarded")) {
-                closeJobStream();
-            }
-
-            if (status && status !== lastActiveStatusRef.current) {
-                if (status === "completed") {
-                    const message = "Pipeline finished.";
-                    setJobStatusMessage(message);
-                    setToastMessage(message);
-                    setToastVisible(true);
-                } else if (status === "uploaded") {
-                    const uploadedCount = parsedMetrics?.count ?? 0;
-                    const uploadedTotal = parsedMetrics?.total ?? 0;
-                    const detail = uploadedTotal
-                        ? `Uploaded ${uploadedCount.toLocaleString()} of ${uploadedTotal.toLocaleString()} leads to Instantly.`
-                        : `Uploaded ${uploadedCount.toLocaleString()} leads to Instantly.`;
-                    setJobStatusMessage(detail);
-                    setToastMessage(detail);
-                    setToastVisible(true);
-                    setUploadModalOpen(false);
-                } else if (status === "discarded") {
-                    const message = "Job discarded.";
-                    setJobStatusMessage(message);
-                    setToastMessage(message);
-                    setToastVisible(true);
-                    setUploadModalOpen(false);
-                    setJobState(null);
-                } else if (status === "failed") {
-                    const message = errorMessage || "Pipeline failed.";
-                    setJobStatusMessage(message);
-                    setToastMessage(message);
-                    setToastVisible(true);
-                } else if (status === "queued") {
-                    setJobStatusMessage("Pipeline queued.");
-                } else if (status === "running") {
-                    setJobStatusMessage("Pipeline running.");
-                }
-                lastActiveStatusRef.current = status;
-            }
-        }, (error) => {
-            console.error("Active job subscription error:", error);
-        });
-
-        return () => {
-            unsubscribe();
-        };
-    }, [user, clientId, fetchJobSnapshot, openJobStream, closeJobStream]);
-
-    useEffect(() => {
-        if (!user || !clientId) {
-            return;
-        }
-        const jobsRef = collection(firestore, "users", user.uid, "clients", clientId, "jobs");
-        const jobsQuery = query(jobsRef, orderBy("createdAt", "desc"));
-        const unsubscribe = onSnapshot(jobsQuery, (snap) => {
-            console.log(`[Job History] Received ${snap.docs.length} jobs from Firestore`);
-            const rows = snap.docs.map(mapJobDocToJob);
-            console.log(`[Job History] Parsed jobs:`, rows.map(j => ({ id: j.id, status: j.status, fileName: j.fileName })));
-            setJobHistory(rows);
-        }, (error) => {
-            console.error('Job history subscription error:', error);
-            setJobHistory([]);
-        });
-
-        return () => unsubscribe();
-    }, [user, clientId, mapJobDocToJob]);
-
-    useEffect(() => {
-        if (!user || !clientId || !selectedJobId) {
-            return;
+            lastUploadErrorRef.current = uploadErrorMessage;
+        } else {
+            lastUploadErrorRef.current = null;
         }
 
-        const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "jobs", selectedJobId);
-        // Subscribe with explicit listener for realtime updates
-        const unsubscribe = onSnapshot(jobRef, { includeMetadataChanges: false }, (snap) => {
-            if (!snap.exists()) {
-                return;
-            }
-            const jobObj = mapJobDocToJob(snap);
-            // Only update from Firestore if NOT currently streaming via SSE
-            // SSE has fresher data for running jobs
-            const isStreaming = lastStreamingJobIdRef.current === selectedJobId;
-            if (!isStreaming || jobObj.status !== "running") {
-                setJobState(jobObj);
-            }
-        }, (error) => {
-            console.error("Job subscription error:", error);
-        });
+        if (status === "pending-upload" && jobId) {
+            setJobPendingUpload(jobId);
+        } else if (status && status !== "pending-upload") {
+            setJobPendingUpload(null);
+        }
 
-        return () => unsubscribe();
-    }, [user, clientId, selectedJobId, mapJobDocToJob]);
+        const shouldRestoreActiveJob = Boolean(
+            jobId && (status === "running" || status === "queued" || status === "pending-upload")
+        );
+
+        if (jobId && shouldRestoreActiveJob) {
+            setSelectedJobId(jobId);
+            const compositeKey = `${jobId}:${status ?? ""}`;
+            if (previousJobIdRef.current !== compositeKey) {
+                previousJobIdRef.current = compositeKey;
+                fetchJobSnapshot(jobId, false);
+            }
+        } else {
+            previousJobIdRef.current = null;
+        }
+
+        const shouldWatch = status === "running" || status === "queued";
+        const isWatching = jobId && lastWatchedJobIdRef.current === jobId;
+        if (jobId && shouldWatch) {
+            if (!isWatching) {
+                startJobWatch(jobId);
+            }
+        } else if (
+            isWatching
+            && (!status || status === "completed" || status === "uploaded" || status === "failed" || status === "discarded")
+        ) {
+            stopJobWatch();
+        }
+
+        if (status && status !== lastActiveStatusRef.current) {
+            if (status === "completed") {
+                const message = "Pipeline finished.";
+                setJobStatusMessage(message);
+                setToastMessage(message);
+                setToastVisible(true);
+            } else if (status === "uploaded") {
+                const uploadedCount = parsedMetrics?.count ?? 0;
+                const uploadedTotal = parsedMetrics?.total ?? 0;
+                const detail = uploadedTotal
+                    ? `Uploaded ${uploadedCount.toLocaleString()} of ${uploadedTotal.toLocaleString()} leads to Instantly.`
+                    : `Uploaded ${uploadedCount.toLocaleString()} leads to Instantly.`;
+                setJobStatusMessage(detail);
+                setToastMessage(detail);
+                setToastVisible(true);
+                setUploadModalOpen(false);
+            } else if (status === "discarded") {
+                const message = "Job discarded.";
+                setJobStatusMessage(message);
+                setToastVisible(true);
+                setUploadModalOpen(false);
+                setJobState(null);
+            } else if (status === "failed") {
+                const message = errorMessage || "Pipeline failed.";
+                setJobStatusMessage(message);
+                setToastMessage(message);
+                setToastVisible(true);
+            } else if (status === "queued") {
+                setJobStatusMessage("Pipeline queued.");
+            } else if (status === "running") {
+                setJobStatusMessage("Pipeline running.");
+            }
+            lastActiveStatusRef.current = status;
+        }
+    }, [stopJobWatch, fetchJobSnapshot, startJobWatch]);
+
+    const pollActiveJob = useCallback(async () => {
+        if (!clientId || activeJobPollInFlightRef.current) return;
+        activeJobPollInFlightRef.current = true;
+        try {
+            const payload = await apiJson<{
+                activeJob: {
+                    jobId?: string;
+                    status?: string;
+                    upload_status?: string | null;
+                    upload_error?: string | null;
+                    upload_metrics?: { count?: number; total?: number } | null;
+                    error?: string | null;
+                } | null;
+            }>(`/api/clients/${encodeURIComponent(clientId)}/active-job`);
+            applyActiveJobPayload(payload.activeJob || null);
+        } catch (error) {
+            console.error("Active job poll error:", error);
+        } finally {
+            activeJobPollInFlightRef.current = false;
+        }
+    }, [clientId, applyActiveJobPayload]);
+
+    const needsActiveJobPoll = useMemo(() => {
+        if (!user?.id || !clientId) return false;
+        const uploadStatus = activeJobStatus || currentJobStatusRef.current;
+        if (uploadStatus === "running" || uploadStatus === "queued" || uploadStatus === "pending-upload") {
+            return true;
+        }
+        if (jobState?.status === "running" || jobState?.status === "queued") {
+            return true;
+        }
+        const personalizerStatus = personalizerJobState?.status;
+        if (
+            personalizerJobId &&
+            personalizerStatus &&
+            personalizerStatus !== "completed" &&
+            personalizerStatus !== "failed"
+        ) {
+            return true;
+        }
+        return false;
+    }, [
+        user?.id,
+        clientId,
+        activeJobStatus,
+        jobState?.status,
+        personalizerJobId,
+        personalizerJobState?.status
+    ]);
 
     useEffect(() => {
+        if (!user?.id || !clientId) return;
+        void pollActiveJob();
+    }, [user?.id, clientId, pollActiveJob]);
+
+    useIntervalWhenVisible(
+        () => {
+            void pollActiveJob();
+        },
+        3000,
+        needsActiveJobPoll
+    );
+
+    useEffect(() => {
+        if (!user || !clientId) return;
+        refreshJobHistory();
+    }, [user?.id, clientId, refreshJobHistory]);
+
+    useClientJobsRealtime(clientSqlId, onClientJobsTableChange);
+
+    useEffect(() => {
+        const liveJob = jobStateRef.current;
+
         if (!jobHistory.length) {
-            if (!jobState) {
+            if (!liveJob) {
                 setSelectedJobId(null);
             }
             return;
@@ -3007,92 +3377,74 @@ export default function ClientPage() {
             ? jobHistory.find((job) => job.id === selectedJobId) || null
             : null;
 
-        const streamingSelected = (jobStreamConnected || jobState?.status === "running") && jobState && selectedJobId === jobState.id;
-
-        // If we have an active job from the activeJob document that's not in history yet,
-        // keep showing that instead of switching to history
-        if (jobState && !jobHistory.find(j => j.id === jobState.id)) {
-            // Active job exists but isn't in Firestore history yet - keep using it
+        // Supabase Realtime + snapshot own jobState while a live job is watched.
+        if (realtimeJobId && realtimeJobId === selectedJobId) {
             return;
         }
 
-        if (selectedFromHistory && streamingSelected) {
-            const statusChanged = jobState?.status !== selectedFromHistory.status;
-            const completedChanged = jobState?.completedAt !== selectedFromHistory.completedAt;
-            const errorChanged = jobState?.error !== selectedFromHistory.error;
-            if (statusChanged || completedChanged || errorChanged) {
-                setJobState((prev) => prev && prev.id === selectedFromHistory.id
-                    ? { ...prev, ...selectedFromHistory, stages: selectedFromHistory.stages || prev.stages }
-                    : selectedFromHistory);
-            }
+        // Active job not in history yet (e.g. just uploaded) — keep current panel state.
+        if (liveJob && !jobHistory.find((j) => j.id === liveJob.id)) {
+            return;
         }
 
-        // If a job is selected and not streaming, keep it in sync with history
-        if (selectedFromHistory && !streamingSelected) {
+        // Selected job from history only (completed / not live-watched).
+        if (selectedFromHistory) {
             setJobState((prev) => {
-                const sameId = prev?.id === selectedFromHistory.id;
-                const sameStatus = prev?.status === selectedFromHistory.status;
-                const sameCompleted = prev?.completedAt === selectedFromHistory.completedAt;
-                const sameError = prev?.error === selectedFromHistory.error;
-                const prevStages = prev?.stages ? JSON.stringify(prev.stages) : null;
-                const nextStages = selectedFromHistory.stages ? JSON.stringify(selectedFromHistory.stages) : null;
-                const sameStages = prevStages === nextStages;
-                if (sameId && sameStatus && sameCompleted && sameError && sameStages) {
-                    return prev;
+                if (prev?.id === selectedFromHistory.id) {
+                    if (
+                        pipelineStatusRank(selectedFromHistory.status)
+                        < pipelineStatusRank(prev.status)
+                    ) {
+                        return prev;
+                    }
+                    const merged = mergeJobState(prev, selectedFromHistory);
+                    if (
+                        merged.status === prev.status
+                        && merged.error === prev.error
+                        && merged.paused === prev.paused
+                    ) {
+                        return prev;
+                    }
+                    return merged;
                 }
-                return { ...selectedFromHistory, stages: selectedFromHistory.stages || prev?.stages };
+                return selectedFromHistory;
             });
             return;
         }
 
-        // Keep the default state unselected until the user picks a job or an active job is restored.
         if (!selectedJobId) {
             return;
         }
 
-        // If the previously selected job disappeared, clear the selection.
-        if (!selectedFromHistory && !streamingSelected) {
+        if (!selectedFromHistory) {
             setSelectedJobId(null);
             setJobState(null);
         }
-    }, [jobHistory, jobState, jobStreamConnected, selectedJobId]);
+    }, [jobHistory, realtimeJobId, selectedJobId, mergeJobState]);
 
-    // Fetch upload status for all jobs in a single batch request
+    // Instantly upload badges on history cards (not pipeline progress — do not poll during runs).
     const fetchJobsUploadStatus = useCallback(async () => {
-        if (!user || !clientId || jobHistory.length === 0) {
+        if (!user || !clientId || !agencyId) return;
+
+        const jobIds = jobHistoryIdsKey ? jobHistoryIdsKey.split("|").filter(Boolean) : [];
+        if (jobIds.length === 0) {
+            setJobUploadStatus({});
             return;
         }
 
         try {
-            const token = await user.getIdToken();
-            const jobIds = jobHistory.map(job => job.id);
-            
-            const response = await fetch(
-                `${getPipelineBaseUrl()}/api/jobs/batch/upload-status`,
+            const data = await apiJson<{ statusMap?: Record<string, unknown[]> }>(
+                `/api/jobs/batch/upload-status`,
                 {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${token}`
-                    },
-                    body: JSON.stringify({
-                        jobIds,
-                        clientId,
-                        agencyId: user.uid
-                    })
+                    method: "POST",
+                    body: JSON.stringify({ jobIds, clientId }),
                 }
             );
-            
-            if (!response.ok) {
-                throw new Error(`Failed to fetch upload status: ${response.status}`);
-            }
-            
-            const data = await response.json();
             setJobUploadStatus(data.statusMap || {});
         } catch (error) {
-            console.error('Error fetching upload status:', error);
+            console.error("Error fetching upload status:", error);
         }
-    }, [user, clientId, jobHistory]);
+    }, [user?.id, clientId, agencyId, jobHistoryIdsKey]);
 
     const fetchInstantlyEventAnalytics = useCallback(async (showLoading = true) => {
         if (!user || !clientId) return;
@@ -3103,7 +3455,8 @@ export default function ClientPage() {
             }
             setInstantlyEventAnalyticsError(null);
 
-            const token = await user.getIdToken();
+            const token = await getAccessToken();
+            if (!token) return;
             const params = new URLSearchParams({
                 period: instantlyEventAnalyticsPeriod,
                 eventType: instantlyEventAnalyticsEventType
@@ -3164,7 +3517,8 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         try {
             setPendingReviewDraftsLoading(true);
-            const token = await user.getIdToken();
+            const token = await getAccessToken();
+            if (!token) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/drafts/pending-review`,
                 { headers: { Authorization: `Bearer ${token}` } }
@@ -3201,7 +3555,8 @@ export default function ClientPage() {
         setInterestedAutoResponderPromptsLoading(true);
         (async () => {
             try {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const [scriptsResponse, prompts, campaignOptions] = await Promise.all([
                     fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts`, {
                         headers: { Authorization: `Bearer ${idToken}` }
@@ -3215,8 +3570,8 @@ export default function ClientPage() {
                     if (Array.isArray(scriptData.send_days) && scriptData.send_days.length > 0) {
                         setFollowUpSendDays(scriptData.send_days);
                     }
-                    setInterestedAutoResponderPrompts(prompts);
-                    setAutoResponderCampaigns(campaignOptions);
+                    setInterestedAutoResponderPrompts(prompts || []);
+                    setAutoResponderCampaigns(campaignOptions || []);
                 }
             } catch (err) {
                 console.error('Failed to fetch follow-up scripts:', err);
@@ -3446,92 +3801,110 @@ export default function ClientPage() {
         };
     }, [activeTab, instantlyEventAnalytics, instantlyEventAnalyticsLoading, fetchInstantlyEventAnalytics]);
 
-    // Fetch upload status when job history changes
+    // Instantly upload status: when job list membership changes, not on every pipeline UPDATE.
     useEffect(() => {
-        fetchJobsUploadStatus();
-    }, [fetchJobsUploadStatus]);
-
-    // Track personalizer job status
-    useEffect(() => {
-        if (!user || !clientId || !personalizerJobId) {
+        if (!jobHistoryIdsKey) {
+            setJobUploadStatus({});
             return;
         }
+        if (jobState?.status === "running" || jobState?.status === "queued") {
+            return;
+        }
+        void fetchJobsUploadStatus();
+    }, [jobHistoryIdsKey, jobState?.status, fetchJobsUploadStatus]);
 
-        const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "jobs", personalizerJobId);
-        const unsubscribe = onSnapshot(jobRef, (snap) => {
-            if (!snap.exists()) {
-                return;
+    const prevPipelineStatusRef = useRef<string | null>(null);
+    useEffect(() => {
+        const status = jobState?.status ?? null;
+        const prev = prevPipelineStatusRef.current;
+        if (
+            prev === "running"
+            && (status === "completed" || status === "failed")
+        ) {
+            void refreshJobHistory();
+            void fetchJobsUploadStatus();
+        }
+        prevPipelineStatusRef.current = status;
+    }, [jobState?.status, refreshJobHistory, fetchJobsUploadStatus]);
+
+    useEffect(() => {
+        if (!personalizerJobId) return;
+
+        let cancelled = false;
+        let toastShown = false;
+
+        const poll = async () => {
+            try {
+                const payload = await apiJson<{ job: Record<string, unknown> }>(
+                    `/api/jobs/personalizer/${encodeURIComponent(personalizerJobId)}/status`
+                );
+                if (cancelled) return;
+                const jobData = payload.job || {};
+                setPersonalizerJobState(jobData);
+
+                if (jobData.status === "completed" && !toastShown) {
+                    toastShown = true;
+                    const personalized = (jobData.result as { personalized?: number })?.personalized || 0;
+                    setToastMessage(`Personalizer complete! ${personalized} leads personalized`);
+                    setToastVisible(true);
+                } else if (jobData.status === "failed" && !toastShown) {
+                    toastShown = true;
+                    setToastMessage(`Personalizer failed: ${String(jobData.error || "Unknown error")}`);
+                    setToastVisible(true);
+                }
+            } catch (error) {
+                console.error("Personalizer status poll error:", error);
             }
-            const jobData = snap.data();
-            setPersonalizerJobState(jobData);
+        };
 
-            // Show toast on completion
-            if (jobData.status === 'completed' && !jobData.__toastShown) {
-                setToastMessage(`Personalizer complete! ${jobData.result?.personalized || 0} leads personalized`);
-                setToastVisible(true);
-                // Mark that we showed the toast
-                updateDoc(jobRef, { __toastShown: true }).catch(() => {});
-            } else if (jobData.status === 'failed') {
-                setToastMessage(`Personalizer failed: ${jobData.error || 'Unknown error'}`);
-                setToastVisible(true);
+        poll();
+        const timer = window.setInterval(() => {
+            if (document.visibilityState === "visible") {
+                void poll();
             }
-        }, (error) => {
-            console.error("Personalizer job subscription error:", error);
-        });
-
-        return () => unsubscribe();
-    }, [user, clientId, personalizerJobId]);
+        }, 2000);
+        const onVisibility = () => {
+            if (document.visibilityState === "visible") {
+                void poll();
+            }
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+            document.removeEventListener("visibilitychange", onVisibility);
+        };
+    }, [personalizerJobId]);
 
     useEffect(() => {
         if (!jobState || !user || !clientId) {
             return;
         }
 
-        const isLiveJob = lastStreamingJobIdRef.current === jobState.id;
+        const isWatchedJob = lastWatchedJobIdRef.current === jobState.id;
         if (jobState.status === "completed") {
-            if (!isLiveJob) {
+            if (!isWatchedJob) {
                 return;
             }
             setJobStatusMessage("Pipeline finished.");
-            closeJobStream();
+            stopJobWatch();
             setJobPendingUpload(jobState.id);
-
-            // Update job status to pending-upload in Firestore
-            (async () => {
-                try {
-                    const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-                    await setDoc(jobRef, { status: 'pending-upload', uploadError: null, uploadMetrics: null }, { merge: true });
-                } catch (error) {
-                    console.error('Failed to update job status:', error);
-                }
-            })();
-            lastStreamingJobIdRef.current = null;
         } else if (jobState.status === "failed") {
-            if (!isLiveJob) {
+            if (!isWatchedJob) {
                 return;
             }
             setJobStatusMessage(jobState.error || "Pipeline failed.");
-            closeJobStream();
-
-            // Update job status in Firestore
-            (async () => {
-                try {
-                    const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-                    await setDoc(jobRef, { status: 'error', error: jobState.error, uploadMetrics: null }, { merge: true });
-                } catch (error) {
-                    console.error('Failed to update job status:', error);
-                }
-            })();
-            lastStreamingJobIdRef.current = null;
+            stopJobWatch();
         }
-    }, [jobState, closeJobStream, user, clientId]);
+    }, [jobState, stopJobWatch, user, clientId]);
 
     const handleRefreshCampaigns = useCallback(async () => {
         if (!user || !clientId) return;
         setSyncingCampaigns(true);
         setCampaignSyncMessage("");
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(clientId)}/campaigns`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -3595,7 +3968,7 @@ export default function ClientPage() {
                 
                 // Extract domains from CSV and check against database
                 const domainColumnIndex = columns.indexOf(detectedDomain);
-                if (domainColumnIndex >= 0 && user && clientId) {
+                if (domainColumnIndex >= 0 && user && clientId && agencyId) {
                     setCheckingDomains(true);
                     
                     try {
@@ -3608,7 +3981,8 @@ export default function ClientPage() {
                             .filter(Boolean);
 
                         // Check domains against database
-                        const token = await user.getIdToken();
+                        const token = await getAccessToken();
+            if (!token) return;
                         const response = await fetch(
                             `${getPipelineBaseUrl()}/api/jobs/check-domains`,
                             {
@@ -3620,7 +3994,6 @@ export default function ClientPage() {
                                 body: JSON.stringify({
                                     domains,
                                     clientId,
-                                    agencyId: user.uid
                                 })
                             }
                         );
@@ -3666,14 +4039,13 @@ export default function ClientPage() {
         setSelectedJobId(job.id);
 
         if (job.status === "running" || job.status === "queued") {
-            openJobStream(job.id);
+            startJobWatch(job.id);
         } else {
-            lastStreamingJobIdRef.current = null;
-            closeJobStream();
+            stopJobWatch();
         }
 
-        fetchJobSnapshot(job.id);
-    }, [closeJobStream, openJobStream, fetchJobSnapshot]);
+        void fetchJobSnapshot(job.id);
+    }, [stopJobWatch, startJobWatch, fetchJobSnapshot]);
 
     const handleUploadClick = async () => {
         if (!selectedFile || !user) {
@@ -3682,7 +4054,8 @@ export default function ClientPage() {
         setUploadError("");
         setUploading(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const activeNiche = niches.find(n => n.id === clientIndustry);
             const selectedProductPromptVersion: 'old' | 'new_gpt5mini' | undefined =
                 clientIndustry === 'ecom' && personalizeFirstLine
@@ -3717,6 +4090,10 @@ export default function ClientPage() {
 
             const freshJob = response.job;
             setJobState(freshJob);
+            setJobHistory((prev) => {
+                if (prev.some((job) => job.id === freshJob.id)) return prev;
+                return [freshJob, ...prev];
+            });
             setJobStatusMessage("Job queued.");
 
             // Show toast with deduplication stats
@@ -3761,22 +4138,7 @@ export default function ClientPage() {
 
             const jobId = response.jobId || freshJob.id;
 
-            // Save job ID to Firestore for persistence
-            try {
-                const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-                await setDoc(jobRef, {
-                    jobId,
-                    status: freshJob.status,
-                    createdAt: serverTimestamp(),
-                    campaignId: selectedCampaignId || null,
-                    uploadError: null,
-                    uploadMetrics: null
-                }, { merge: true });
-            } catch (error) {
-                console.error('Failed to save job to Firestore:', error);
-            }
-
-            openJobStream(jobId);
+            startJobWatch(jobId);
             setModalOpen(false);
             setSelectedFile(null);
             setSelectedCampaignId("");
@@ -3833,7 +4195,8 @@ export default function ClientPage() {
 
         setUploadingPersonalizer(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const formData = new FormData();
             formData.append('file', personalizerFile);
             formData.append('idToken', idToken);
@@ -3933,7 +4296,8 @@ export default function ClientPage() {
 
             // Call backend to get enriched domain statistics
             if (user && clientId && uniqueDomains.length > 0) {
-                const idToken = await getIdToken(user);
+                const idToken = await getAccessToken();
+            if (!idToken) return;
                 const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/domains/analyze`, {
                     method: 'POST',
                     headers: {
@@ -3999,7 +4363,8 @@ export default function ClientPage() {
         setStoppingJob(true);
         setJobStatusMessage('Stopping job...');
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/stop`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -4012,7 +4377,7 @@ export default function ClientPage() {
             
             const data = await resp.json();
             
-            closeJobStream();
+            stopJobWatch();
             
             // Handle stale job cleanup
             if (data.status === 'cleaned') {
@@ -4040,7 +4405,8 @@ export default function ClientPage() {
         
         setPausingJob(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -4062,13 +4428,15 @@ export default function ClientPage() {
 
     const persistClientInfo = useCallback(async () => {
         if (!user || !clientId) return;
-        const ref = doc(firestore, "users", user.uid, "clients", clientId);
-        await setDoc(ref, {
-            name: clientName?.trim() || clientId,
-            industry: clientIndustry,
-            instantly_key: clientInstantlyKey?.trim() || "",
-            ntfy_topic: clientNtfyTopic?.trim() || ""
-        }, { merge: true });
+        await apiJson(`/api/clients/${encodeURIComponent(clientId)}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+                name: clientName?.trim() || clientId,
+                industry: clientIndustry,
+                instantly_key: clientInstantlyKey?.trim() || "",
+                ntfy_topic: clientNtfyTopic?.trim() || "",
+            }),
+        });
     }, [user, clientId, clientName, clientIndustry, clientInstantlyKey, clientNtfyTopic]);
 
     const handleSaveClientInfo = async () => {
@@ -4097,7 +4465,8 @@ export default function ClientPage() {
         setRegisteringInstantlyWebhook(true);
         try {
             await persistClientInfo();
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/webhook`,
                 {
@@ -4132,7 +4501,8 @@ export default function ClientPage() {
         setSyncingInstantlyState(true);
         try {
             await persistClientInfo();
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync`,
                 {
@@ -4169,7 +4539,8 @@ export default function ClientPage() {
         setSyncingInstantlyEmailAccounts(true);
         try {
             await persistClientInfo();
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/email-accounts/sync`,
                 {
@@ -4198,7 +4569,8 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         setSavingFollowUpSchedule(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-schedule`,
                 {
@@ -4257,7 +4629,8 @@ export default function ClientPage() {
 
         setSavingAutoResponderPrompt(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts${editingAutoResponderPrompt ? `/${editingAutoResponderPrompt.id}` : ''}`,
                 {
@@ -4310,7 +4683,8 @@ export default function ClientPage() {
 
         setDeletingAutoResponderPromptId(promptId);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts/${promptId}`,
                 {
@@ -4358,7 +4732,8 @@ export default function ClientPage() {
         setAutoResponderTestResult(null);
         setAutoResponderTestExpandedSteps(new Set());
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts/${testingAutoResponderPrompt.id}/test`,
                 {
@@ -4387,7 +4762,8 @@ export default function ClientPage() {
 
         setStoppingInstantlySync(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync-runs/${instantlySyncRun.id}/stop`,
                 {
@@ -4448,26 +4824,34 @@ export default function ClientPage() {
 
         setSavingSegment(true);
         try {
-            const segmentData = {
-                name: segmentName.trim(),
-                description: segmentDescription.trim(),
-                filters: {
-                    ...(segmentFullName && { fullName: segmentFullName }),
-                    ...(segmentFounder && { founder: segmentFounder }),
-                    ...(segmentEmail && { email: segmentEmail }),
-                    ...(segmentEmailStatus.length > 0 && { emailStatus: segmentEmailStatus }),
-                    ...(segmentCreatedAfter && { createdAfter: segmentCreatedAfter }),
-                    ...(segmentCreatedBefore && { createdBefore: segmentCreatedBefore }),
-                },
-                updatedAt: serverTimestamp(),
-                ...(editingSegment ? {} : { createdAt: serverTimestamp() })
+            const filters = {
+                ...(segmentFullName && { fullName: segmentFullName }),
+                ...(segmentFounder && { founder: segmentFounder }),
+                ...(segmentEmail && { email: segmentEmail }),
+                ...(segmentEmailStatus.length > 0 && { emailStatus: segmentEmailStatus }),
+                ...(segmentCreatedAfter && { createdAfter: segmentCreatedAfter }),
+                ...(segmentCreatedBefore && { createdBefore: segmentCreatedBefore }),
             };
 
-            const segmentId = editingSegment?.id || Date.now().toString();
-            const segmentRef = doc(firestore, "users", user.uid, "clients", clientId, "segments", segmentId);
-            await setDoc(segmentRef, segmentData, { merge: true });
+            await apiJson(`/api/clients/${encodeURIComponent(clientId)}/segments`, {
+                method: "POST",
+                body: JSON.stringify({
+                    id: editingSegment?.id,
+                    name: segmentName.trim(),
+                    filters,
+                }),
+            });
 
-            setToastMessage(editingSegment ? 'Segment updated' : 'Segment created');
+            const segmentsPayload = await apiJson<{ segments: Segment[] }>(
+                `/api/clients/${encodeURIComponent(clientId)}/segments`
+            );
+            setSegments(
+                (segmentsPayload.segments || []).sort((a, b) =>
+                    (b.updatedAt || "").localeCompare(a.updatedAt || "")
+                )
+            );
+
+            setToastMessage(editingSegment ? "Segment updated" : "Segment created");
             setToastVisible(true);
             setSegmentModalOpen(false);
         } catch (error) {
@@ -4485,11 +4869,12 @@ export default function ClientPage() {
 
         setDeletingSegmentId(segmentId);
         try {
-            // Remove from Firestore entirely
-            const segmentRef = doc(firestore, "users", user.uid, "clients", clientId, "segments", segmentId);
-            await deleteDoc(segmentRef);
-            
-            setToastMessage('Segment deleted');
+            await apiJson(`/api/clients/${encodeURIComponent(clientId)}/segments/${encodeURIComponent(segmentId)}`, {
+                method: "DELETE",
+            });
+            setSegments((prev) => prev.filter((s) => s.id !== segmentId));
+
+            setToastMessage("Segment deleted");
             setToastVisible(true);
             if (selectedSegmentId === segmentId) {
                 setSelectedSegmentId("");
@@ -4509,7 +4894,8 @@ export default function ClientPage() {
 
         setDownloadingSegmentId(segmentId);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const params = new URLSearchParams();
             params.append('clientId', clientId);
             params.append('limit', '500');
@@ -4600,7 +4986,8 @@ export default function ClientPage() {
         setSegmentLeads([]);
 
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const params = new URLSearchParams();
             params.append('clientId', clientId);
             params.append('limit', '500');
@@ -4707,7 +5094,8 @@ export default function ClientPage() {
         if (!user || !clientId || !fuScriptHtml.trim()) return;
         setSavingFollowUpScript(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const url = editingFollowUpScript
                 ? `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts/${editingFollowUpScript.id}`
                 : `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts`;
@@ -4747,7 +5135,8 @@ export default function ClientPage() {
         if (!confirmed) return;
         setDeletingFollowUpScriptId(id);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts/${id}`, {
                 method: 'DELETE',
                 headers: { Authorization: `Bearer ${idToken}` }
@@ -4771,7 +5160,8 @@ export default function ClientPage() {
         setFollowUpPreviewLoading(true);
         setFollowUpPreviewResult(null);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-preview`, {
                 method: 'POST',
                 headers: {
@@ -4801,7 +5191,8 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         setUpdatingFollowUpScriptId(script.id);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const res = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-scripts/${script.id}`,
                 {
@@ -4836,7 +5227,8 @@ export default function ClientPage() {
 
         setIsDeletingClient(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(clientId)}/delete`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -4857,11 +5249,15 @@ export default function ClientPage() {
         }
     };
 
+    const lastLeadsScrollLoadRef = useRef(0);
     const handleLeadsScroll = (event: UIEvent<HTMLDivElement>) => {
+        if (activeTab !== "leads") return;
         const target = event.currentTarget;
-        if (target.scrollTop + target.clientHeight >= target.scrollHeight - 50) {
-            loadMoreLeads();
-        }
+        if (target.scrollTop + target.clientHeight < target.scrollHeight - 50) return;
+        const now = Date.now();
+        if (now - lastLeadsScrollLoadRef.current < 400) return;
+        lastLeadsScrollLoadRef.current = now;
+        loadMoreLeads();
     };
 
     const handleUploadToInstantly = async () => {
@@ -4874,7 +5270,8 @@ export default function ClientPage() {
 
         // Fetch CSV data for preview and mapping
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             setUploading(true);
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/csv-preview`, {
                 method: 'POST',
@@ -4952,7 +5349,8 @@ export default function ClientPage() {
                 return acc;
             }, {} as Record<string, { column: string; isCustom: boolean }>);
 
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/upload-to-instantly`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -5000,12 +5398,15 @@ export default function ClientPage() {
         if (!user || !clientId) return;
 
         try {
-            const jobRef = doc(firestore, "users", user.uid, "clients", clientId, "activeJob", "current");
-            await setDoc(jobRef, { status: 'discarded', uploadError: null, uploadMetrics: null }, { merge: true });
+            await apiFetch(`/api/clients/${encodeURIComponent(clientId)}/active-job/discard`, {
+                method: "POST",
+                body: JSON.stringify({}),
+            });
             setJobPendingUpload(null);
             setJobState(null);
+            setActiveJobStatus("discarded");
         } catch (error) {
-            console.error('Failed to discard job:', error);
+            console.error("Failed to discard job:", error);
         }
     };
 
@@ -5016,7 +5417,8 @@ export default function ClientPage() {
 
         setDeletingJobId(jobId);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/delete`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -5043,9 +5445,10 @@ export default function ClientPage() {
 
     // Manual upload handlers
     const fetchSqlCampaignList = async () => {
-        const token = await user?.getIdToken();
+        const token = await getAccessToken();
+        if (!token) return;
         const campaignsResponse = await fetch(
-            `${getPipelineBaseUrl()}/api/clients/${clientId}/campaigns/list?agencyId=${user?.uid}`,
+            `${getPipelineBaseUrl()}/api/clients/${clientId}/campaigns/list?agencyId=${encodeURIComponent(agencyId || "")}`,
             { headers: { Authorization: `Bearer ${token}` } }
         );
 
@@ -5058,7 +5461,8 @@ export default function ClientPage() {
     };
 
     const fetchInterestedAutoResponderPrompts = async () => {
-        const token = await user?.getIdToken();
+        const token = await getAccessToken();
+        if (!token) return;
         const response = await fetch(
             `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/prompts`,
             { headers: { Authorization: `Bearer ${token}` } }
@@ -5095,7 +5499,8 @@ export default function ClientPage() {
         }
         try {
             setVerificationImportParsing(true);
-            const idToken = await user?.getIdToken();
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const formData = new FormData();
             formData.append('file', file);
             const response = await fetchWithRetry(
@@ -5134,7 +5539,8 @@ export default function ClientPage() {
         }
         try {
             setVerificationImportLoading(true);
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const formData = new FormData();
             formData.append('file', verificationImportFile);
             formData.append('clientId', clientId);
@@ -5172,7 +5578,7 @@ export default function ClientPage() {
 
         try {
             const campaigns = await fetchSqlCampaignList();
-            setInstantlyCsvOverrideCampaigns(campaigns);
+            setInstantlyCsvOverrideCampaigns(campaigns || []);
         } catch (error) {
             console.error('Error loading campaigns for Instantly CSV import:', error);
             setToastMessage('Failed to load campaigns for manual override');
@@ -5188,7 +5594,8 @@ export default function ClientPage() {
         }
 
         try {
-            const token = await user?.getIdToken();
+            const token = await getAccessToken();
+        if (!token) return;
             
             const response = await fetch(
                 `${getPipelineBaseUrl()}/api/jobs/${jobId}/revert-manual-upload`,
@@ -5233,7 +5640,8 @@ export default function ClientPage() {
 
         try {
             setInstantlyCsvImportLoading(true);
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const formData = new FormData();
             formData.append('idToken', idToken);
             formData.append('file', instantlyCsvImportFile);
@@ -5329,7 +5737,8 @@ export default function ClientPage() {
         setLeadExportModalOpen(false);
         setExportingCsv(true);
         try {
-            const idToken = await getIdToken(user);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
             const includeLatestEvent = selectedLeadExportFields.some((fieldKey) => (
                 LEAD_EXPORT_FIELDS.find((field) => field.key === fieldKey)?.group === 'Events'
             ));
@@ -5690,6 +6099,17 @@ export default function ClientPage() {
                                                 fontWeight: 600,
                                                 color: 'var(--app-text-high)',
                                                 borderBottom: '1px solid var(--app-border)'
+                                            }}>Email find</th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'var(--app-bg)',
+                                                textAlign: 'left',
+                                                padding: '0.75rem 1rem',
+                                                fontWeight: 600,
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)'
                                             }}>Email Status</th>
                                             <th style={{
                                                 position: 'sticky',
@@ -5753,13 +6173,20 @@ export default function ClientPage() {
                                                     overflow: 'hidden',
                                                     textOverflow: 'ellipsis',
                                                     whiteSpace: 'nowrap'
-                                                }}>{displayEmail(lead.email, lead.status)}</td>
+                                                }}>{formatRawEmailValue(lead.email)}</td>
+                                                <td style={{
+                                                    padding: '0.75rem 1rem',
+                                                    minWidth: '120px',
+                                                    color: 'var(--app-text-muted)'
+                                                }}>
+                                                    {displayEmailFindState(lead.email, lead.emailFindCompletedAt)}
+                                                </td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
                                                     minWidth: '140px'
                                                 }}>
                                                     {(() => {
-                                                        const meta = getLeadStatusChipMeta(lead.status);
+                                                        const meta = getLeadStatusChipMeta(lead.status, lead.emailVerifyCompletedAt);
                                                         return (
                                                             <span className={`lead-pastel-chip lead-pastel-chip--status-${meta.variant}`}>
                                                                 {meta.label}
@@ -6589,7 +7016,7 @@ export default function ClientPage() {
                                         onClick={() => {
                                             setSelectedJobId(null);
                                             setJobState(null);
-                                            closeJobStream();
+                                            stopJobWatch();
                                         }}
                                         aria-label="Deselect job"
                                         style={{
@@ -6708,6 +7135,23 @@ export default function ClientPage() {
                                                 {activeStatusLabel}
                                             </p>
                                         )}
+                                        {(jobState?.status === 'running' || jobState?.status === 'queued') && recentJobLogLines.length > 0 && (
+                                            <ul
+                                                className="pipeline-panel__subtitle"
+                                                style={{
+                                                    marginTop: '0.5rem',
+                                                    marginBottom: 0,
+                                                    paddingLeft: '1.1rem',
+                                                    fontSize: '0.8rem',
+                                                    opacity: 0.75,
+                                                    lineHeight: 1.45
+                                                }}
+                                            >
+                                                {recentJobLogLines.map((line, index) => (
+                                                    <li key={`${line}-${index}`}>{line}</li>
+                                                ))}
+                                            </ul>
+                                        )}
                                     </div>
                                     {(jobState?.status === 'completed' || canUploadToInstantly) && (
                                         <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
@@ -6801,6 +7245,21 @@ export default function ClientPage() {
                                                 </div>
                                             );
                                         })()}
+
+                                        {displayJobCost !== null && displayJobCost > 0 && (
+                                            <div style={{
+                                                marginTop: "1rem",
+                                                padding: "0.75rem 1rem",
+                                                background: "var(--app-surface-3)",
+                                                borderRadius: "8px",
+                                                border: "1px solid var(--app-border)",
+                                                fontSize: "0.875rem",
+                                                fontVariantNumeric: "tabular-nums",
+                                            }}>
+                                                <span style={{ opacity: 0.65 }}>Estimated run cost </span>
+                                                <strong>${displayJobCost.toFixed(2)}</strong>
+                                            </div>
+                                        )}
                                         
                                         <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
                                         {[...STAGE_ORDER].map((stageKey) => {
@@ -6835,35 +7294,100 @@ export default function ClientPage() {
                                                 const processedRaw = total ?? 0;
                                                 const processed = processedRaw > 0 ? processedRaw : (dedupedTotal ?? 0);
                                                 const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
-                                                const cost = summary?.cost || stats?.cost;
+                                                const cost = stageCostFromStage(stage);
                                                 heroNumber = found;
                                                 heroLabel = "Found";
                                                 subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
-                                                if (typeof cost === "number") costFooter = `Cost $${cost.toFixed(2)}`;
+                                                if (cost !== null && cost > 0) costFooter = `Cost $${cost.toFixed(2)}`;
                                             } else if (stageKey === "emailDiscovery") {
-                                                const found = (summary?.Found as number) ?? (summary?.found as number) ?? throughputNum ?? 0;
+                                                const found =
+                                                    extractNumberFrom(stats, ["Found", "found"])
+                                                    ?? (typeof stage?.progress?.found === "number"
+                                                        ? stage.progress.found
+                                                        : null)
+                                                    ?? extractNumberFrom(summary, ["Found", "found"])
+                                                    ?? throughputNum
+                                                    ?? 0;
                                                 const attempted = typeof stage?.progress?.processed === "number"
                                                     ? stage.progress.processed
                                                     : total ?? 0;
                                                 heroNumber = found;
                                                 heroLabel = "Emails Found";
-                                                subtext = attempted > 0 ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate` : "Awaiting...";
+                                                subtext = attempted > 0
+                                                    ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
+                                                    : "Awaiting...";
+                                                const emailCost = stageCostFromStage(stage);
+                                                if (emailCost !== null && emailCost > 0) {
+                                                    costFooter = `Cost $${emailCost.toFixed(2)}`;
+                                                }
                                             } else if (stageKey === "verification") {
-                                                const safe = (summary?.Valid as number) ?? (summary?.valid as number) ?? 0;
-                                                const risky = (summary?.["Valid-Risky"] as number) ?? (summary?.["valid-risky"] as number) ?? 0;
-                                                const verified = total ?? 0;
+                                                const safe =
+                                                    extractNumberFrom(summary, ["Valid", "valid"])
+                                                    ?? extractNumberFrom(stats, ["valid", "Valid"])
+                                                    ?? 0;
+                                                const risky =
+                                                    extractNumberFrom(summary, ["Valid-Risky", "valid-risky"])
+                                                    ?? extractNumberFrom(stats, ["valid-risky", "Valid-Risky"])
+                                                    ?? 0;
+                                                const verified =
+                                                    typeof stage?.progress?.processed === "number"
+                                                        ? stage.progress.processed
+                                                        : total ?? 0;
                                                 heroNumber = verified;
                                                 heroLabel = "Verfified";
                                                 const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
-                                                subtext = safe > 0 ? `${safe.toLocaleString()} safe${riskyText}` : "Awaiting...";
+                                                subtext =
+                                                    verified > 0
+                                                        ? `${safe.toLocaleString()} safe • ${verified.toLocaleString()} checked${riskyText}`
+                                                        : "Awaiting...";
+                                                const verifyCost = stageCostFromStage(stage);
+                                                if (verifyCost !== null && verifyCost > 0) {
+                                                    costFooter = `Cost $${verifyCost.toFixed(2)}`;
+                                                }
                                             } else if (stageKey === "personalization") {
-                                                const personalized = (summary?.Personalized as number) ?? (summary?.personalized as number) ?? (stats?.personalized as number) ?? throughputNum ?? 0;
-                                                const candidates = total ?? 0;
+                                                const personalized =
+                                                    extractNumberFrom(stats, ["personalized", "Personalized"])
+                                                    ?? (typeof stage?.progress?.processed === "number"
+                                                        ? stage.progress.processed
+                                                        : null)
+                                                    ?? extractNumberFrom(summary, ["personalized", "Personalized"])
+                                                    ?? throughputNum
+                                                    ?? 0;
+                                                const candidates =
+                                                    total
+                                                    ?? extractNumberFrom(summary, ["total", "queued", "attempted"])
+                                                    ?? 0;
+                                                const processedNow =
+                                                    typeof stage?.progress?.processed === "number"
+                                                        ? stage.progress.processed
+                                                        : personalized;
                                                 const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
+                                                const skipped = summary?.skipped === true;
+                                                const shopifyStores = (summary?.shopifyStores as number) ?? (summary?.["Shopify Stores"] as number) ?? 0;
                                                 heroNumber = personalized;
                                                 heroLabel = "Ready";
-                                                subtext = candidates > 0 ? `${candidates.toLocaleString()} total` : "Awaiting...";
+                                                if (stage?.status === "completed" && skipped) {
+                                                    subtext =
+                                                        shopifyStores > 0
+                                                            ? `Skipped — ${shopifyStores.toLocaleString()} Shopify, 0 personalized`
+                                                            : "Skipped — no Shopify stores / no eligible leads";
+                                                } else if (
+                                                    stage?.status === "running"
+                                                    && candidates > 0
+                                                ) {
+                                                    subtext = `${processedNow.toLocaleString()} / ${candidates.toLocaleString()} personalized`;
+                                                } else if (candidates > 0) {
+                                                    subtext = `${candidates.toLocaleString()} total`;
+                                                } else if (stage?.status === "completed") {
+                                                    subtext = "Completed — none personalized";
+                                                } else {
+                                                    subtext = "Awaiting...";
+                                                }
                                                 if (failed > 0) subtext += ` • ${failed} failed`;
+                                                const personalizationCost = stageCostFromStage(stage);
+                                                if (personalizationCost !== null && personalizationCost > 0) {
+                                                    costFooter = `Cost $${personalizationCost.toFixed(2)}`;
+                                                }
                                             }
                                             
                                             return (
@@ -9196,7 +9720,7 @@ export default function ClientPage() {
                                         </select>
                                         <span className="settings-field__hint">
                                             {dedupeStrategy === 'include'
-                                                ? 'Existing leads are reprocessed and only non-empty incoming fields are merged into SQL.'
+                                                ? 'Re-runs enrichment for domains in this file: only non-empty CSV/API values override DB; blank or "Not Found" cells keep existing data and skip later stages. Mapped email/founder columns define which rows are in scope.'
                                                 : 'Deduplication is scoped to this client.'}
                                         </span>
                                     </label>
@@ -10652,7 +11176,7 @@ export default function ClientPage() {
                                 {/* Status badge row */}
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                                     {(() => {
-                                        const chip = getLeadStatusChipMeta(selectedLead.status);
+                                        const chip = getLeadStatusChipMeta(selectedLead.status, selectedLead.emailVerifyCompletedAt);
                                         const colorMap: Record<string, { bg: string; border: string; text: string }> = {
                                             'valid': { bg: 'rgba(34, 197, 94, 0.15)', border: 'rgba(34, 197, 94, 0.4)', text: '#4ade80' },
                                             'valid-risky': { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)', text: '#facc15' },
@@ -10749,7 +11273,23 @@ export default function ClientPage() {
                                     )}
                                     <span style={{ color: 'var(--app-text-faint)' }}>Email</span>
                                     <span style={{ color: 'var(--app-text-high)', wordBreak: 'break-all' }}>
-                                        {displayEmail(selectedLead.email, selectedLead.status)}
+                                        {formatRawEmailValue(selectedLead.email)}
+                                    </span>
+                                    <span style={{ color: 'var(--app-text-faint)' }}>Email find</span>
+                                    <span style={{ color: 'var(--app-text-high)' }}>
+                                        {displayEmailFindState(selectedLead.email, selectedLead.emailFindCompletedAt)}
+                                    </span>
+                                    <span style={{ color: 'var(--app-text-faint)' }}>Email status (SMTP)</span>
+                                    <span style={{ color: 'var(--app-text-high)' }}>
+                                        {displayEmailStatus(selectedLead.status, selectedLead.emailVerifyCompletedAt)}
+                                    </span>
+                                    <span style={{ color: 'var(--app-text-faint)' }}>Email find completed</span>
+                                    <span style={{ color: 'var(--app-text-high)' }}>
+                                        {formatLeadStageTimestamp(selectedLead.emailFindCompletedAt)}
+                                    </span>
+                                    <span style={{ color: 'var(--app-text-faint)' }}>Email verify completed</span>
+                                    <span style={{ color: 'var(--app-text-high)' }}>
+                                        {formatLeadStageTimestamp(selectedLead.emailVerifyCompletedAt)}
                                     </span>
                                     {selectedLead.createdAt && (
                                         <>
@@ -11112,12 +11652,6 @@ export default function ClientPage() {
                                         <span style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{selectedLead.id}</span>
                                         <span>Job ID</span>
                                         <span style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{selectedLead.jobId || '—'}</span>
-                                        {selectedLead.lastVerifiedAt && (
-                                            <>
-                                                <span>Verified</span>
-                                                <span>{new Date(selectedLead.lastVerifiedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                                            </>
-                                        )}
                                         {selectedLead.updatedAt && (
                                             <>
                                                 <span>Updated</span>

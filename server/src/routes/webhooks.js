@@ -1,11 +1,11 @@
 import crypto from 'crypto';
 import express from 'express';
-import { firestore } from '../config/firebase.js';
 import { searchLead, sendToClay } from '../services/leadWebhook.js';
 import { processInstantlyWebhookEvent, validateInstantlyWebhookSecret } from '../services/instantlyState.js';
 import { upsertLead } from '../services/leads.js';
 import { pool } from '../lib/db.js';
-import { getOrCreateClient } from '../services/db/queries.js';
+import { getOrCreateClient, resolveClientRow } from '../services/db/queries.js';
+import { getAgencySettings, apiKeysFromSettings } from '../services/db/agencySettings.js';
 
 const router = express.Router();
 
@@ -79,26 +79,24 @@ async function handleLeadWebhookEvent(req, res) {
     };
 
     try {
-        const userSnap = await firestore.collection('users').doc(userId).get();
-        if (!userSnap.exists) {
-            return res.status(404).json({ error: 'User not found.' });
+        const settings = await getAgencySettings(userId);
+        if (!settings) {
+            return res.status(404).json({ error: 'Agency not found.' });
         }
-        const userData = userSnap.data() || {};
-        const serperKey = (userData.serper_key || '').toString();
-        const openaiKey = (userData.openai_key || '').toString();
-        const openaiModel = (userData.openai_founder_model || '').toString() || undefined;
+        const keys = apiKeysFromSettings(settings);
+        const serperKey = (keys.serper || '').toString();
+        const openaiKey = (keys.openai || '').toString();
+        const openaiModel = (settings.openai_founder_model || '').toString() || undefined;
 
         if (!serperKey) {
-            return res.status(400).json({ error: 'User is missing Serper API key.' });
+            return res.status(400).json({ error: 'Agency is missing Serper API key.' });
         }
 
-        const clientRef = firestore.collection('users').doc(userId).collection('clients').doc(clientId);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) {
+        const clientRow = await resolveClientRow(userId, clientId);
+        if (!clientRow) {
             return res.status(404).json({ error: 'Client not found.' });
         }
-        const clientData = clientSnap.data() || {};
-        const clayWebhookUrl = pickClayWebhook(userData, clientData);
+        const clayWebhookUrl = pickClayWebhook(settings, clientRow);
 
         let searchResult;
         try {

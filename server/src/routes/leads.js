@@ -513,8 +513,19 @@ const LEAD_FILTER_FIELDS = [
         ]
     },
     {
-        key: 'last_verified_at',
-        label: 'Last Verified',
+        key: 'email_find_completed_at',
+        label: 'Email Find Completed',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        key: 'email_verify_completed_at',
+        label: 'Email Verify Completed',
         type: 'date',
         operators: [
             { key: 'on_or_after', label: 'On Or After' },
@@ -745,7 +756,7 @@ function leadFiltersRequireInsights(filters) {
 }
 
 const DATE_FILTER_FIELDS = new Set([
-    'created_at', 'last_contacted_at', 'added_to_campaign_at', 'last_verified_at', 'last_reply_at'
+    'created_at', 'last_contacted_at', 'added_to_campaign_at', 'email_find_completed_at', 'email_verify_completed_at', 'last_reply_at'
 ]);
 const NUMERIC_FILTER_FIELDS = new Set([
     'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max'
@@ -1048,18 +1059,34 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             continue;
         }
 
-        // ── last_verified_at ───────────────────────────────────────────────
-        if (fieldKey === 'last_verified_at') {
+        // ── email_find_completed_at ────────────────────────────────────────
+        if (fieldKey === 'email_find_completed_at') {
             if (operatorKey === 'on_or_after') {
                 const ref = bindParam(String(normalizedValue));
-                clauses.push(`c.last_verified_at >= ${ref}::timestamptz`);
+                clauses.push(`c.email_find_completed_at >= ${ref}::timestamptz`);
             } else if (operatorKey === 'on_or_before') {
                 const ref = bindParam(String(normalizedValue).slice(0, 10));
-                clauses.push(`c.last_verified_at < (${ref}::date + INTERVAL '1 day')`);
+                clauses.push(`c.email_find_completed_at < (${ref}::date + INTERVAL '1 day')`);
             } else if (operatorKey === 'is_empty') {
-                clauses.push(`c.last_verified_at IS NULL`);
+                clauses.push(`c.email_find_completed_at IS NULL`);
             } else if (operatorKey === 'not_empty') {
-                clauses.push(`c.last_verified_at IS NOT NULL`);
+                clauses.push(`c.email_find_completed_at IS NOT NULL`);
+            }
+            continue;
+        }
+
+        // ── email_verify_completed_at ──────────────────────────────────────
+        if (fieldKey === 'email_verify_completed_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`c.email_verify_completed_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`c.email_verify_completed_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`c.email_verify_completed_at IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`c.email_verify_completed_at IS NOT NULL`);
             }
             continue;
         }
@@ -1380,16 +1407,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             whereClause += ` AND (c.full_name IS NULL OR c.full_name = '' OR LOWER(c.full_name) LIKE '%not found%' OR LOWER(c.full_name) = 'not_found')`;
         }
 
-        // Filter by email existence
+        // Filter by email discovery (not SMTP status)
         if (emailFilter === 'exists') {
-            // Email finder ran (has status) and email found
-            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND c.email IS NOT NULL AND c.email != '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND c.email IS NOT NULL AND BTRIM(c.email) <> '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
         } else if (emailFilter === 'not_found') {
-            // Email finder ran (has status) but no email found
-            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND (c.email IS NULL OR c.email = '')`;
+            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
         } else if (emailFilter === 'not_run') {
-            // Email finder never ran (no status) AND no email exists (not backfilled from Instantly)
-            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '') AND (c.email IS NULL OR c.email = '')`;
+            whereClause += ` AND c.email_find_completed_at IS NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
         }
 
         if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
@@ -1584,7 +1608,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     c.full_name,
                     c.email,
                     c.email_status,
-                    c.last_verified_at,
+                    c.email_find_completed_at,
+                    c.email_verify_completed_at,
                     c.last_contacted_at,
                     c.confidence,
                     c.personalization_first_line,
@@ -1656,7 +1681,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pc.full_name,
                 pc.email,
                 pc.email_status,
-                pc.last_verified_at,
+                pc.email_find_completed_at,
+                pc.email_verify_completed_at,
                 pc.last_contacted_at,
                 pc.confidence,
                 pc.personalization_first_line,
@@ -1729,7 +1755,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             status: row.email_status,
             verified: row.email_status === 'valid',
             confidence: row.confidence,
-            lastVerifiedAt: row.last_verified_at,
+            emailFindCompletedAt: row.email_find_completed_at,
+            emailVerifyCompletedAt: row.email_verify_completed_at,
             lastContactedAt: row.last_contacted_at,
             firstLine: row.personalization_first_line,
             jobId: row.job_id,
@@ -2467,11 +2494,11 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
         }
 
         if (emailFilter === 'exists') {
-            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND c.email IS NOT NULL AND c.email != '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
+            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND c.email IS NOT NULL AND BTRIM(c.email) <> '' AND LOWER(c.email) NOT LIKE '%not found%' AND LOWER(c.email) != 'not_found'`;
         } else if (emailFilter === 'not_found') {
-            whereClause += ` AND c.email_status IS NOT NULL AND c.email_status != '' AND (c.email IS NULL OR c.email = '')`;
+            whereClause += ` AND c.email_find_completed_at IS NOT NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
         } else if (emailFilter === 'not_run') {
-            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '') AND (c.email IS NULL OR c.email = '')`;
+            whereClause += ` AND c.email_find_completed_at IS NULL AND (c.email IS NULL OR BTRIM(c.email) = '')`;
         }
 
         if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
@@ -2787,7 +2814,7 @@ router.post('/leads/verification-import/preview', verifyFirebaseToken, uploadVer
 /**
  * POST /leads/verification-import
  *
- * Update email_status and last_verified_at for contacts matched by email.
+ * Update email_status and email_verify_completed_at for contacts matched by email.
  * Only updates contacts that belong to the authenticated agency + client.
  *
  * Body: multipart/form-data
@@ -2795,7 +2822,7 @@ router.post('/leads/verification-import/preview', verifyFirebaseToken, uploadVer
  *   clientId      – client slug (required)
  *   emailColumn   – CSV column name whose value is the email address (required)
  *   statusColumn  – CSV column name whose value is the email status  (required)
- *   verifiedAtColumn – CSV column name whose value is an ISO date for last_verified_at (optional)
+ *   verifiedAtColumn – CSV column name whose value is an ISO date for email_verify_completed_at (optional)
  */
 router.post('/leads/verification-import', verifyFirebaseToken, uploadVerification.single('file'), async (req, res) => {
     try {
@@ -2859,8 +2886,8 @@ router.post('/leads/verification-import', verifyFirebaseToken, uploadVerificatio
             const result = await pool.query(
                 `UPDATE contacts AS c
                  SET
-                     email_status     = v.new_status,
-                     last_verified_at = v.new_verified_at::timestamptz,
+                     email_status              = v.new_status,
+                     email_verify_completed_at = v.new_verified_at::timestamptz,
                      updated_at       = NOW()
                  FROM (
                      SELECT

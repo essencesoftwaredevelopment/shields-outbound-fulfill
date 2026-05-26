@@ -52,17 +52,12 @@ export interface PipelineJob {
     uploadedAt?: string | null;
     discarded?: boolean;
     paused?: boolean;
-}
-
-export interface PipelineLogEntry {
-    message: string | null;
-    meta?: Record<string, unknown>;
-    timestamp: string;
+    activityMessage?: string | null;
+    activityUpdatedAt?: string | null;
 }
 
 export type PipelineServerEvent =
     | { type: "state"; state: PipelineJob }
-    | { type: "log"; log: PipelineLogEntry }
     | { type: "error"; error: string };
 
 export interface CreateJobResponse {

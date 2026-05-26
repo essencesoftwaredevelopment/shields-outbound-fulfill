@@ -1,7 +1,6 @@
 import crypto from 'crypto';
-import { firestore } from '../config/firebase.js';
 import { pool } from '../config/db.js';
-import { getOrCreateClient } from './db/queries.js';
+import { getOrCreateClient, listClientsWithInstantlyKey } from './db/queries.js';
 import { createInterestedAutoResponderDraftFromEvent } from './interestedAutoResponder.js';
 
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
@@ -2105,19 +2104,12 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
 }
 
 export async function listInstantlySyncClients() {
-    const snapshot = await firestore.collectionGroup('clients').get();
-    return snapshot.docs
-        .map((doc) => {
-            const parent = doc.ref.parent?.parent;
-            const agencyId = parent?.id || null;
-            const instantlyKey = asNullableText(doc.data()?.instantly_key);
-            return {
-                agencyId,
-                clientSlug: doc.id,
-                instantlyKey
-            };
-        })
-        .filter((item) => item.agencyId && item.clientSlug && item.instantlyKey);
+    const rows = await listClientsWithInstantlyKey();
+    return rows.map((row) => ({
+        agencyId: row.agencyId,
+        clientSlug: row.clientSlug,
+        instantlyKey: row.instantlyKey
+    }));
 }
 
 /**

@@ -24,21 +24,17 @@ import { normalizeDomain } from '../utils/domain.js';
 import * as queries from './db/queries.js';
 
 /**
- * Parse and normalize email status from various sources
- * Maps email finder statuses to database valid values
+ * Normalize SMTP / verification status for contacts.email_status only.
+ * Does not map email-finder lookup outcomes (use email_find_completed_at for that).
  */
 export function normalizeEmailStatus(rawStatus) {
     if (!rawStatus) return null;
     const status = String(rawStatus).toLowerCase().trim();
 
-    // Already valid
     if (['valid', 'risky', 'invalid', 'unknown'].includes(status)) return status;
 
-    // Map email finder statuses
-    if (status === 'found') return 'valid';
-    if (status === 'not_found') return 'invalid';
+    if (status === 'valid-risky') return 'risky';
     if (status.startsWith('error')) return 'unknown';
-    if (status === 'skipped_no_founder') return null;
 
     return 'unknown';
 }
@@ -52,8 +48,8 @@ function buildContactPayload(row, type) {
     const founderName = String(row.founder_name || row.full_name || row.name || '').trim() || null;
     const confidence = row.confidence ? Number(row.confidence) : null;
     const email = String(row.email || '').trim() || null;
-    const lookupStatus = String(row.lookup_status || '').trim() || null;
-    const emailStatus = String(row.email_status || lookupStatus || '').trim() || null;
+    const verificationStatus = String(row.email_status || '').trim() || null;
+    const completedAt = new Date().toISOString();
 
     if (!domain) return null;
 
@@ -61,10 +57,25 @@ function buildContactPayload(row, type) {
         return { domain, roleType: 'founder', fullName: founderName, confidence: Number.isFinite(confidence) ? confidence : null };
     }
     if (type === 'emails') {
-        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: normalizeEmailStatus(lookupStatus), confidence: Number.isFinite(confidence) ? confidence : null };
+        return {
+            domain,
+            roleType: 'founder',
+            fullName: founderName,
+            email,
+            emailFindCompletedAt: completedAt,
+            confidence: Number.isFinite(confidence) ? confidence : null
+        };
     }
     if (type === 'verification') {
-        return { domain, roleType: 'founder', fullName: founderName, email, emailStatus: normalizeEmailStatus(emailStatus), lastVerifiedAt: emailStatus ? new Date().toISOString() : null };
+        const emailStatus = normalizeEmailStatus(verificationStatus);
+        return {
+            domain,
+            roleType: 'founder',
+            fullName: founderName,
+            email,
+            emailStatus,
+            emailVerifyCompletedAt: emailStatus ? completedAt : null
+        };
     }
     if (type === 'personalization') {
         const firstLine = String(row.personalization_first_line || row.first_line || row.personalization || '').trim() || null;
@@ -76,7 +87,7 @@ function buildContactPayload(row, type) {
 /**
  * Upsert an in-memory batch of lead rows (no CSV needed)
  */
-export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobId = null }) {
+export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobId = null, mergeMode = 'preserve' }) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     if (!agencyId || !clientId) return;
 
@@ -99,9 +110,10 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobI
                 full_name: p.fullName || null,
                 email: p.email || null,
                 email_status: p.emailStatus || null,
+                email_find_completed_at: p.emailFindCompletedAt || null,
+                email_verify_completed_at: p.emailVerifyCompletedAt || null,
                 confidence: p.confidence || null,
                 personalization_first_line: p.personalizationFirstLine || null,
-                last_verified_at: p.lastVerifiedAt || null,
                 job_id: jobId
             };
         }).filter((r) => r.company_id);
@@ -109,7 +121,10 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobI
         console.log(`[upsertLeadRowsBatch] Filtered to ${contactRows.length} contacts with valid company_id`);
 
         if (contactRows.length > 0) {
-            await batchUpsertContacts(client, agencyId, clientId, contactRows);
+            await batchUpsertContacts(client, agencyId, clientId, contactRows, {
+                mergeMode,
+                upsertType: type
+            });
         }
     });
 }
@@ -163,7 +178,7 @@ export async function getLeadStats(agencyId) {
     return result.rows[0] || {};
 }
 
-async function upsertContact({ agencyId, companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, lastVerifiedAt = null, jobId = null }) {
+async function upsertContact({ agencyId, companyId, roleType = 'founder', fullName = null, email = null, emailStatus = null, confidence = null, jobId = null }) {
     try {
         await queries.upsertContact(agencyId, companyId, roleType, {
             full_name: fullName,
@@ -227,13 +242,15 @@ export async function upsertLeadsFromCsv({ agencyId, clientId, csvPath, type, jo
                 full_name: p.fullName || null,
                 email: p.email || null,
                 email_status: p.emailStatus || null,
+                email_find_completed_at: p.emailFindCompletedAt || null,
+                email_verify_completed_at: p.emailVerifyCompletedAt || null,
                 confidence: p.confidence || null,
                 personalization_first_line: p.personalizationFirstLine || null,
                 job_id: jobId
             })).filter((r) => r.company_id);
 
             if (contactRows.length > 0) {
-                await batchUpsertContacts(client, agencyId, clientId, contactRows);
+                await batchUpsertContacts(client, agencyId, clientId, contactRows, { upsertType: type });
             }
         });
     }
@@ -282,12 +299,14 @@ export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, sta
                                 full_name: p.fullName || null,
                                 email: p.email || null,
                                 email_status: p.emailStatus || null,
+                                email_find_completed_at: p.emailFindCompletedAt || null,
+                                email_verify_completed_at: p.emailVerifyCompletedAt || null,
                                 confidence: p.confidence || null,
                                 job_id: jobId
                             })).filter((r) => r.company_id);
 
                             if (contactRows.length > 0) {
-                                await batchUpsertContacts(client, agencyId, clientId, contactRows);
+                                await batchUpsertContacts(client, agencyId, clientId, contactRows, { upsertType: type });
                             }
 
                             // Write checkpoint
@@ -315,12 +334,14 @@ export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, sta
                     full_name: p.fullName || null,
                     email: p.email || null,
                     email_status: p.emailStatus || null,
+                    email_find_completed_at: p.emailFindCompletedAt || null,
+                    email_verify_completed_at: p.emailVerifyCompletedAt || null,
                     confidence: p.confidence || null,
                     job_id: jobId
                 })).filter((r) => r.company_id);
 
                 if (contactRows.length > 0) {
-                    await batchUpsertContacts(client, agencyId, clientId, contactRows);
+                    await batchUpsertContacts(client, agencyId, clientId, contactRows, { upsertType: type });
                 }
 
                 const cursorValue = `${processedCount + rows.length}`;
@@ -342,6 +363,46 @@ export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, sta
  * Filter domains to exclude already-processed ones (deduplication)
  * Returns filtered CSV path and statistics
  */
+/**
+ * Mark job_domains as skipped when company already exists (SQL queue mode).
+ */
+export async function filterJobDomainsForDedupe({ agencyId, clientId, jobId, dedupeStrategy = 'skip' }) {
+    const { pool } = await import('../config/db.js');
+    const { markJobDomainsSkipped } = await import('./db/jobs.js');
+
+    const pending = await pool.query(
+        `SELECT domain_normalized FROM job_domains WHERE job_id = $1 AND status = 'pending'`,
+        [jobId]
+    );
+    const domains = pending.rows.map((r) => r.domain_normalized);
+    const stats = {
+        total: domains.length,
+        unique: domains.length,
+        duplicatesRemoved: 0,
+        skipped: 0,
+        existing: 0,
+        new: domains.length
+    };
+    if (!domains.length) return { stats };
+
+    const existingSet = await getExistingDomainsSet(clientId, domains);
+    stats.existing = existingSet.size;
+
+    if (dedupeStrategy === 'skip') {
+        const toSkip = domains.filter((d) => existingSet.has(d));
+        stats.skipped = toSkip.length;
+        stats.new = domains.length - toSkip.length;
+        if (toSkip.length) {
+            await markJobDomainsSkipped(jobId, toSkip);
+        }
+    } else {
+        stats.skipped = 0;
+        stats.new = domains.length - existingSet.size;
+    }
+
+    return { stats };
+}
+
 export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain' }) {
     if (!agencyId || !clientId || !domainsCsvPath) {
         console.warn(`[${jobId}] Missing agencyId/clientId/domainsCsvPath`);

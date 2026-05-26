@@ -4,7 +4,7 @@ An automated lead generation and enrichment platform for outbound sales campaign
 
 ## Architecture Overview
 
-Shields Outbound is a full-stack TypeScript/JavaScript application with a Next.js frontend and Express backend, connected via real-time Server-Sent Events (SSE) for job monitoring. The system processes CSV files through a sequential pipeline, with each stage producing intermediate CSV files that feed into the next stage.
+Shields Outbound is a full-stack TypeScript/JavaScript application with a Next.js frontend and Express backend. Pipeline job progress is persisted to Postgres and pushed to the UI primarily via **Supabase Realtime** (`postgres_changes` on `jobs`). The system processes CSV files through a sequential pipeline, with each stage producing intermediate CSV files that feed into the next stage.
 
 ### System Components
 
@@ -13,7 +13,7 @@ Shields Outbound is a full-stack TypeScript/JavaScript application with a Next.j
 - **Authentication**: Firebase Auth with JWT token verification
 - **API Key Vault**: Secure storage/retrieval of API keys per user in Firestore
 - **Client Management**: Multi-tenant client organization with lead tracking
-- **SSE Client**: EventSource connection for real-time job updates
+- **Job Realtime**: Supabase Realtime subscription on `jobs` (`lib/hooks/useJobRealtime.ts`)
 
 **Backend (Express + Node.js)**
 - **Job Pipeline Orchestration**: Sequential stage execution with state management
@@ -23,9 +23,10 @@ Shields Outbound is a full-stack TypeScript/JavaScript application with a Next.j
 - **Webhook Support**: Incoming lead capture and webhook processing
 
 **Data Storage**
-- **Firebase Firestore**: Users, clients, leads, job metadata
+- **Postgres (Cloud SQL / Supabase)**: Jobs, job domains, leads, queue (`public.jobs`, etc.)
+- **Firebase Firestore**: Auth-linked settings, API keys, and legacy client metadata where still referenced
 - **File System**: Temporary CSV files for each job stage (`server/tmp/jobs/{jobId}/`)
-- **In-Memory**: Active job state map for real-time updates
+- **In-Memory (worker only)**: Active job map while a child process runs; not streamed to the browser
 
 ## How It Works
 
@@ -49,24 +50,29 @@ User uploads CSV → createPipelineJob() → FormData with file + idToken + opti
       • Filter out duplicates (skip strategy) or track stats (include strategy)
       • Write filtered list to tmp/{jobId}/domains-filtered.csv
   → Respond with jobId immediately
-  → Start processJob() asynchronously
+  → Enqueue job on `job_queue` (worker runs `processJob` in a child process)
 ```
 
 ### 2. Real-Time Job Monitoring
 
-**SSE Connection:**
+**Supabase Realtime (primary):**
 ```
-Frontend connects to /api/jobs/{jobId}/stream
-  → Server maintains Set of active response streams for this job
-  → Backend broadcasts state updates via: stream.write(`data: ${JSON.stringify(payload)}\n\n`)
-  → Frontend receives events: {type: 'state'|'log', payload}
-  → UI updates progress bars, stage status, and live logs in real-time
+Worker persists job → UPDATE public.jobs
+  → Supabase Realtime postgres_changes (filtered by job id)
+  → useJobRealtime() in the client page
+  → mergeJobState() updates stage cards, % complete, activityMessage, cost
 ```
 
-**State Management:**
-- Job state stored in-memory Map with periodic Firestore persistence
+**REST (secondary, not streaming):**
+- `GET /api/jobs/:id` once when a watch starts or a job is selected (catch-up snapshot)
+- `GET /api/clients/:clientId/active-job` polled ~every 3s while a run is active (discovers which job to subscribe to)
+
+**State management:**
+- Source of truth: `public.jobs` row (`stages`, `status`, `cost`, `options.activityMessage`, …)
 - Each stage tracks: status, startedAt, completedAt, summary, error, progress
 - Progress updates include: processed count, total count, cost accumulation
+
+**Not used:** SSE (`/api/jobs/:id/stream`), Firestore job documents, or periodic job snapshot polling during runs.
 
 ### 3. Pipeline Stage Execution
 
@@ -316,7 +322,7 @@ The Next.js dev server rewrites `/api/*` to the Express backend, so the UI talks
 - React 19 with TypeScript
 - Tailwind CSS v4 for styling
 - Firebase SDK (Auth + Firestore client)
-- EventSource API for SSE connections
+- Supabase JS client for Realtime (`postgres_changes` on `jobs`)
 - Stripe.js for payment processing
 
 **Backend:**
@@ -417,7 +423,7 @@ The Next.js dev server rewrites `/api/*` to the Express backend, so the UI talks
 
 ### Jobs
 - `POST /api/jobs` - Create new job (multipart/form-data)
-- `GET /api/jobs/:id/stream` - SSE connection for job updates
+- `GET /api/jobs/:id` - Job snapshot (stages, status, cost; used on watch start, not streamed)
 - `GET /api/jobs/:id/result?scope=all|valid` - Download CSV result
 - `POST /api/jobs/:id/upload` - Upload to campaign with column mapping
 - `POST /api/jobs/:id/pause` - Pause running job
@@ -479,6 +485,7 @@ shields-outbound/
 ├── components/              # React components
 ├── lib/                     # Client-side utilities
 │   ├── firebase/           # Firebase client config
+│   ├── hooks/              # useJobRealtime, useClientJobsRealtime
 │   └── pipeline/           # API client for backend
 ├── server/                  # Express backend
 │   ├── src/
@@ -565,10 +572,11 @@ Temporary files stored in `server/tmp/jobs/{jobId}/`:
 - Check Firestore rules allow writes
 - Look for BulkWriter errors in logs
 
-**SSE connection drops:**
-- Implement reconnection logic in frontend
-- Check proxy/load balancer timeout settings
-- Increase server keep-alive timeout
+**Pipeline UI not updating during a run:**
+- Confirm `0022_supabase_rls_realtime.sql` ran and `jobs` is in the `supabase_realtime` publication
+- Check browser auth: RLS policy `jobs_agency_select` must allow `SELECT` for the signed-in agency
+- Verify the worker is running (`shields-outbound-worker` / `npm run worker`) and `persistJobState` is not failing in server logs
+- In DevTools, confirm a Supabase channel is subscribed for `job-realtime-{jobId}`
 
 ## Contributing
 

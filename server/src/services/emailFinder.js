@@ -344,8 +344,22 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkPaused = null, onBatch = null } = {}) {
+export async function runEmailFinder({
+    inputCsv,
+    outputCsv,
+    founders: foundersInput = null,
+    apiKeys,
+    provider = PROVIDERS.TRYKITT,
+    log = () => {},
+    job = null,
+    checkpoint = null,
+    checkPaused = null,
+    refreshControl = null,
+    onBatch = null,
+    pricing = null
+} = {}) {
     const API_KEY = apiKeys.kitt;
+    const requestCost = Number(pricing?.request_cost) || 0;
 
     // Validate based on provider
     if (provider === PROVIDERS.TRYKITT && !API_KEY) {
@@ -353,7 +367,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
     }
 
     log(`Using email finding provider: ${provider}`);
-    const founders = await readFounders(inputCsv);
+    const founders = foundersInput || (inputCsv ? await readFounders(inputCsv) : []);
     const totalRows = founders.length;
 
     const indexedFounders = founders.map((row, index) => ({ ...row, index }));
@@ -366,6 +380,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
 
     const limit = pLimit(CONCURRENCY);
     let completedEligible = 0;
+    let stageCost = 0;
     const stats = { Found: 0, 'Not Found': 0, Skipped: 0, errors: 0 };
     const results = new Array(totalRows);
     const controller = new AbortController();
@@ -419,7 +434,17 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
                 return;
             }
             // Check if paused and abort if so
-            if (checkPaused && checkPaused()) {
+            if (checkpoint) {
+                try {
+                    await checkpoint();
+                } catch (err) {
+                    if (err?.code === 'JOB_PAUSED' || err?.code === 'JOB_CANCELLED') {
+                        controller.abort();
+                        return;
+                    }
+                    throw err;
+                }
+            } else if (checkPaused && checkPaused()) {
                 log(`Emails: paused by user at ${completedEligible}/${eligibleTotal}`);
                 controller.abort();
                 return;
@@ -457,6 +482,7 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
 
             if (email) {
                 stats['Found'] += 1;
+                stageCost += requestCost;
             } else if (String(status).startsWith('error')) {
                 stats.errors += 1;
             } else {
@@ -464,13 +490,18 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
             }
 
             completedEligible += 1;
+            const costNumber = Number(stageCost.toFixed(6));
             const progressPayload = {
                 progress: {
                     stage: 'emailDiscovery',
                     processed: completedEligible,
                     total: eligibleTotal,
                     found: stats['Found'],
-                    stats
+                    cost: costNumber,
+                    stats: {
+                        ...stats,
+                        Cost: `$${costNumber.toFixed(2)}`
+                    }
                 }
             };
             if (completedEligible % 10 === 0 || completedEligible <= 5 || completedEligible === eligibleTotal) {
@@ -505,44 +536,50 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
             }
         });
     } else {
-        // Check for pause every 100ms and abort if paused
+        let controlPollTick = 0;
         const pauseCheckInterval = setInterval(() => {
-            if (checkPaused && checkPaused() && !controller.signal.aborted) {
-                log(`Emails: aborting due to pause`);
-                controller.abort();
-            }
+            void (async () => {
+                controlPollTick += 1;
+                if (refreshControl && controlPollTick % 5 === 0) {
+                    await refreshControl();
+                } else if (checkPaused) {
+                    checkPaused();
+                }
+                if (checkPaused && checkPaused() && !controller.signal.aborted) {
+                    const reason = job?.cancelled ? 'cancelled' : 'paused';
+                    log(`Emails: aborting (${reason}) at ${completedEligible}/${eligibleTotal}`);
+                    controller.abort();
+                }
+            })();
         }, 100);
 
         try {
             await Promise.all(tasks);
             await flushBatch(true);
             await flushPromise;
+            if (controller.signal.aborted) {
+                await flushBatch(true);
+                await flushPromise;
+                if (refreshControl) await refreshControl();
+                if (job?.cancelled || (checkPaused && checkPaused())) {
+                    const err = new Error('Job cancelled during email discovery');
+                    err.code = 'JOB_CANCELLED';
+                    throw err;
+                }
+                const err = new Error('Job paused during email discovery');
+                err.code = 'JOB_PAUSED';
+                throw err;
+            }
         } catch (error) {
+            if (error?.code === 'JOB_PAUSED' || error?.code === 'JOB_CANCELLED') {
+                await flushBatch(true);
+                await flushPromise;
+            }
             // If credit exhausted, write partial results and re-throw
             if (error.code === 'CREDIT_EXHAUSTED') {
                 console.log(`[EMAIL_FINDER] Writing partial results before pausing...`);
                 await flushBatch(true);
                 await flushPromise;
-                
-                // Write what we have so far
-                const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
-                writer.write('domain,founder_name,email,lookup_status\n');
-                results.forEach((row, index) => {
-                    const safeRow = row || {
-                        domain: founders[index]?.domain,
-                        founder_name: founders[index]?.founder_name,
-                        email: '',
-                        status: 'not_processed'
-                    };
-                    const rowCsv = [
-                        toCsvValue(safeRow.domain),
-                        toCsvValue(safeRow.founder_name),
-                        toCsvValue(safeRow.email),
-                        toCsvValue(safeRow.status)
-                    ].join(',');
-                    writer.write(rowCsv + '\n');
-                });
-                writer.end();
                 
                 throw error; // Re-throw to propagate to runStage
             }
@@ -552,34 +589,41 @@ export async function runEmailFinder({ inputCsv, outputCsv, apiKeys, provider = 
         }
     }
 
-    const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
-    writer.write('domain,founder_name,email,lookup_status\n');
-    results.forEach((row, index) => {
-        const safeRow = row || {
-            domain: founders[index]?.domain,
-            founder_name: founders[index]?.founder_name,
-            email: '',
-            status: 'not_processed'
-        };
-        const rowCsv = [
-            toCsvValue(safeRow.domain),
-            toCsvValue(safeRow.founder_name),
-            toCsvValue(safeRow.email),
-            toCsvValue(safeRow.status)
-        ].join(',');
-        writer.write(`${rowCsv}\n`);
-    });
+    if (outputCsv) {
+        const writer = fs.createWriteStream(outputCsv, { flags: 'w' });
+        writer.write('domain,founder_name,email,lookup_status\n');
+        results.forEach((row, index) => {
+            const safeRow = row || {
+                domain: founders[index]?.domain,
+                founder_name: founders[index]?.founder_name,
+                email: '',
+                status: 'not_processed'
+            };
+            const rowCsv = [
+                toCsvValue(safeRow.domain),
+                toCsvValue(safeRow.founder_name),
+                toCsvValue(safeRow.email),
+                toCsvValue(safeRow.status)
+            ].join(',');
+            writer.write(`${rowCsv}\n`);
+        });
+        writer.end();
+        await new Promise(res => writer.on('finish', res));
+        log(`Emails: lookup finished. Results written to ${outputCsv}`);
+    } else {
+        log('Emails: lookup finished.');
+    }
 
-    writer.end();
-    await new Promise(res => writer.on('finish', res));
-
-    log(`Emails: lookup finished. Results written to ${outputCsv}`);
-
+    const cost = Number(stageCost.toFixed(6));
     return {
         totalRows,
         eligible: eligibleTotal,
         processed: completedEligible,
-        ...stats
+        cost,
+        Found: stats.Found,
+        'Not Found': stats['Not Found'],
+        Skipped: stats.Skipped,
+        errors: stats.errors
     };
 }
 

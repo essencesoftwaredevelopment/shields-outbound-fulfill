@@ -1,38 +1,82 @@
 /**
  * Jobs API endpoints (Pipeline orchestration)
  *
- * CANONICAL AGENCY IDENTIFIER RULE:
- * The Firestore users/{uid} document ID is the canonical agency identifier.
- * This same Firebase Auth uid is used directly as agency_id in all PostgreSQL tables.
- * No reconciliation or mapping is required.
- *
- * This route manages:
- * 1. Firestore orchestration (job state, status, client metadata)
- * 2. CSV file uploads and processing
- * 3. Integration with PostgreSQL via the leads service (see services/leads.js)
- *
- * All PostgreSQL operations are scoped by agency_id derived from the verified Firebase token.
+ * Jobs API — pipeline orchestration backed by PostgreSQL (jobs, job_queue, contacts).
+ * agency_id is the legacy tenant id resolved from Supabase Auth via agency_auth_map.
  */
 
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
-import { admin, firestore } from '../config/firebase.js';
-import { buildUnifiedRows } from '../utils/csv.js';
-import { attachCampaignToLeads, filterAndWriteProcessedDomains, incrementCampaignLeadCount } from '../services/leads.js';
-import { createJobRecord, processJob, jobs, logJob, markCancelled, markPaused, markResumed, resolveJobPaths, serializeJob, closeStreams } from '../services/jobPipeline.js';
-import { getOrCreateClient } from '../services/db/queries.js';
+import {
+    buildUnifiedRowsFromDb,
+    getJobById,
+    jobRowToState,
+    setActiveJob,
+    updateJobControl,
+    listJobsForClient,
+    getActiveJobForClient,
+    deleteJobFromDb,
+    clearActiveJobForClient,
+} from '../services/db/jobs.js';
+import { getAgencySettings, apiKeysFromSettings } from '../services/db/agencySettings.js';
+import { resolveAgencyId } from '../utils/bearerAuth.js';
+import { agencyFromRequest, clientContextFromRequest } from '../utils/requestContext.js';
+import { writeJobControl } from '../services/jobControl.js';
+import { TMP_ROOT } from '../config/paths.js';
+import { resolveJobPaths } from '../services/jobPipeline.js';
+import { attachCampaignToLeads, incrementCampaignLeadCount } from '../services/leads.js';
+import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, serializeJob } from '../services/jobPipeline.js';
+import { getOrCreateClient, getClientRowBySlug, resolveClientRow } from '../services/db/queries.js';
 import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
-import { TMP_ROOT } from '../config/paths.js';
-import { ensureJobControl, readJobControl, writeJobControl } from '../services/jobControl.js';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
+import { forceTerminateRunner } from '../services/jobRunner.js';
+import { normalizeDomain } from '../utils/domain.js';
 import OpenAI from 'openai';
 
 const router = express.Router();
-const JOB_EXECUTION_MODE = String(process.env.JOB_EXECUTION_MODE || 'inline').toLowerCase();
-const USE_QUEUE_EXECUTION = JOB_EXECUTION_MODE === 'queue';
+const personalizerStatusById = new Map();
+
+function readPersonalizerStatus(jobId) {
+    const cached = personalizerStatusById.get(jobId);
+    if (cached) return cached;
+    const statusPath = path.join(TMP_ROOT, 'jobs', jobId, 'status.json');
+    if (!fs.existsSync(statusPath)) return null;
+    try {
+        return JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+function writePersonalizerStatus(jobId, patch) {
+    const base = readPersonalizerStatus(jobId) || {
+        id: jobId,
+        status: 'running',
+        stages: {
+            shopifyDetection: { status: 'pending' },
+            klaviyoDetection: { status: 'pending' },
+            productFetch: { status: 'pending' },
+            personalization: { status: 'pending' }
+        },
+        result: null,
+        error: null
+    };
+    const next = {
+        ...base,
+        ...patch,
+        stages: { ...base.stages, ...(patch.stages || {}) },
+        updatedAt: new Date().toISOString()
+    };
+    personalizerStatusById.set(jobId, next);
+    const statusPath = path.join(TMP_ROOT, 'jobs', jobId, 'status.json');
+    fs.mkdirSync(path.dirname(statusPath), { recursive: true });
+    fs.writeFileSync(statusPath, JSON.stringify(next));
+    return next;
+}
+
 const PERSONALIZATION_FIRST_LINE_PROMPT = ({ domain, productList, variantNumber }) => `You are analyzing multiple products from a Shopify store (domain: ${domain}).
 
 Your task:
@@ -273,113 +317,14 @@ function buildStages(rawStages = null) {
     return stages;
 }
 
-function jobDocRef(uid, clientId, jobId) {
-    return firestore
-        .collection('users').doc(uid)
-        .collection('clients').doc(clientId)
-        .collection('jobs').doc(jobId);
-}
-
-async function getFirestoreOwnedJob({ jobId, uid, clientId }) {
-    const ref = jobDocRef(uid, clientId, jobId);
-    const snap = await ref.get();
-    if (!snap.exists) {
-        return { job: null, ref, exists: false };
-    }
-    return { job: snap.data() || {}, ref, exists: true };
-}
-
 async function loadApiKeys(uid) {
-    const userDoc = await firestore.collection('users').doc(uid).get();
-    if (!userDoc.exists) {
-        throw new Error(`User not found for uid ${uid}`);
+    const settings = await getAgencySettings(uid);
+    if (!settings) {
+        throw new Error(`Agency settings not found for ${uid}`);
     }
-    const data = userDoc.data() || {};
-    return {
-        openai: data.openai_key || '',
-        serper: data.serper_key || '',
-        kitt: data.trykitt_key || ''
-    };
-}
-
-async function startInlineResumeJob({ jobId, uid, clientId, persistedJob }) {
-    const jobDir = path.join(TMP_ROOT, jobId);
-    const domainsPath = path.join(jobDir, 'domains.csv');
-    if (!fs.existsSync(domainsPath)) {
-        throw new Error(`Job input file missing for ${jobId}`);
-    }
-
-    const filteredPath = (persistedJob?.filteredPath && fs.existsSync(persistedJob.filteredPath))
-        ? persistedJob.filteredPath
-        : (fs.existsSync(path.join(jobDir, 'domains-filtered.csv'))
-            ? path.join(jobDir, 'domains-filtered.csv')
-            : null);
-
-    const control = ensureJobControl(jobId, {
-        paused: false,
-        cancelled: false
-    });
-    const apiKeys = await loadApiKeys(uid);
-
-    const runtimeJob = {
-        id: jobId,
-        status: 'queued',
-        createdAt: persistedJob?.createdAt || new Date().toISOString(),
-        completedAt: null,
-        error: null,
-        fileName: persistedJob?.fileName || 'domains.csv',
-        apiKeys,
-        uid,
-        clientId,
-        sqlClientId: persistedJob?.sqlClientId || null,
-        dedupeStrategy: persistedJob?.dedupeStrategy || 'skip',
-        cancelled: !!control.cancelled,
-        paused: !!control.paused,
-        skipFounderFinder: !!persistedJob?.skipFounderFinder,
-        skipEmailFinder: !!persistedJob?.skipEmailFinder,
-        skipVerification: !!persistedJob?.skipVerification,
-        skipDomainCheck: !!persistedJob?.skipDomainCheck,
-        findFounder: persistedJob?.findFounder !== false,
-        industry: persistedJob?.industry || null,
-        nicheId: persistedJob?.nicheId || null,
-        nicheLabel: persistedJob?.nicheLabel || null,
-        personalizeFirstLine: !!persistedJob?.personalizeFirstLine,
-        productPromptVersion: persistedJob?.productPromptVersion || 'old',
-        productPromptProducts: Number.isFinite(persistedJob?.productPromptProducts) ? persistedJob.productPromptProducts : 3,
-        emailVerificationProvider: persistedJob?.emailVerificationProvider || 'trykitt',
-        columnMapping: persistedJob?.columnMapping || { domain: 'domain', founder: '', email: '' },
-        cost: typeof persistedJob?.cost === 'number' ? persistedJob.cost : 0,
-        stages: buildStages(persistedJob?.stages || null),
-        logs: [],
-        streams: [],
-        dedupeStats: persistedJob?.dedupeStats || null,
-        __persistedOnce: true,
-        paths: {
-            dir: jobDir,
-            tmpDir: jobDir,
-            domains: domainsPath,
-            filtered: filteredPath,
-            founders: path.join(jobDir, 'founders.csv'),
-            emails: path.join(jobDir, 'emails.csv'),
-            final: path.join(jobDir, 'final.csv'),
-            personalized: path.join(jobDir, 'personalized.csv'),
-            upload: path.join(jobDir, 'upload.csv')
-        }
-    };
-
-    jobs.set(runtimeJob.id, runtimeJob);
-    setImmediate(() => {
-        processJob(runtimeJob)
-            .catch((err) => {
-                console.error(`[${runtimeJob.id}] Inline resumed job execution failed:`, err?.message || err);
-            })
-            .finally(() => {
-                closeStreams(runtimeJob);
-                jobs.delete(runtimeJob.id);
-            });
-    });
-
-    return runtimeJob;
+    const keys = apiKeysFromSettings(settings);
+    keys.kitt = settings.trykitt_key || '';
+    return keys;
 }
 
 const upload = multer({
@@ -409,16 +354,15 @@ const uploadFields = upload.fields([
 // Get CSV preview for column mapping
 router.post('/jobs/:id/csv-preview', async (req, res) => {
     try {
-        const { idToken, clientId } = req.body || {};
+        const { clientId } = req.body || {};
         const jobId = req.params.id;
 
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
 
-        await admin.auth().verifyIdToken(idToken);
+        await agencyFromRequest(req);
 
-        const unified = await buildUnifiedRows({ jobId, scope: 'valid', resolveJobPaths });
+        const unified = await buildUnifiedRowsFromDb(jobId, 'valid');
         if (!unified.length) {
             return res.status(404).json({ error: 'No verified leads available for upload.' });
         }
@@ -441,52 +385,24 @@ router.post('/jobs', uploadFields, async (req, res) => {
             return res.status(400).json({ error: 'Missing CSV file upload.' });
         }
 
-        const idToken = req.body.idToken;
-        if (!idToken) {
-            return res.status(400).json({ error: 'Missing ID token.' });
-        }
-
-        // Verify the ID token
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        const uid = decodedToken.uid;
-
-        // Fetch API keys from Firestore
-        const userDoc = await firestore.collection('users').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(400).json({ error: 'User not found.' });
-        }
-        const userData = userDoc.data();
-        const apiKeys = {
-            openai: userData?.openai_key || '',
-            serper: userData?.serper_key || '',
-            kitt: userData?.trykitt_key || ''
-        };
-
-        // Get email verification provider preference (default to trykitt)
-        const emailVerificationProvider = userData?.email_verification_provider || 'trykitt';
+        const uid = await agencyFromRequest(req);
+        const settings = await getAgencySettings(uid);
+        const apiKeys = apiKeysFromSettings(settings);
+        apiKeys.kitt = settings?.trykitt_key || '';
+        const emailVerificationProvider = settings?.email_verification_provider || 'trykitt';
 
         if (!apiKeys.openai || !apiKeys.serper) {
-            return res.status(400).json({ error: 'Missing required API keys (OpenAI, Serper) in user vault.' });
+            return res.status(400).json({ error: 'Missing required API keys (OpenAI, Serper) in agency settings.' });
         }
-
-        // Only require Kitt key if using trykitt provider
         if (emailVerificationProvider === 'trykitt' && !apiKeys.kitt) {
             return res.status(400).json({ error: 'Missing Kitt API key for TryKitt provider.' });
         }
 
         const file = req.files.file[0];
         const clientSlug = (req.body.clientId || '').toString().trim();
-        
-        // Resolve client slug to numeric ID for SQL operations (get or create client)
-        let sqlClientId;
-        try {
-            sqlClientId = await getOrCreateClient(uid, clientSlug);
-        } catch (error) {
-            console.error('Failed to resolve client ID:', error);
-            return res.status(500).json({ error: 'Failed to resolve client ID.' });
-        }
-        
-        const dedupeStrategy = (req.body.dedupeStrategy || 'skip').toString(); // 'skip' | 'include'
+        const sqlClientId = await getOrCreateClient(uid, clientSlug);
+
+        const dedupeStrategy = (req.body.dedupeStrategy || 'skip').toString();
         const rawSkipFounder = String(req.body.skipFounderFinder || '').toLowerCase() === 'true';
         const rawFindFounder = String(req.body.findFounder ?? 'true').toLowerCase() !== 'false';
         const skipFounderFinder = rawSkipFounder || !rawFindFounder;
@@ -501,18 +417,11 @@ router.post('/jobs', uploadFields, async (req, res) => {
             ? Math.max(1, Math.min(productPromptProductsParsed, 5))
             : 3;
         let skipVerification = String(req.body.skipVerification || '').toLowerCase() === 'true';
-        
-        // Auto-skip verification when using self-hosted email finding (emails are already verified)
-        if (emailVerificationProvider === 'self_hosted') {
-            skipVerification = true;
-        }
-        
+        if (emailVerificationProvider === 'self_hosted') skipVerification = true;
         const skipEmailFinder = String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
         const skipDomainCheck = String(req.body.skipDomainCheck || '').toLowerCase() === 'true';
-        const domainColumn = (req.body.domainColumn || 'domain').toString().trim();
-        const founderColumn = (req.body.founderColumn || '').toString().trim();
-        const emailColumn = (req.body.emailColumn || '').toString().trim();
-        const job = createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientSlug, dedupeStrategy, {
+
+        const job = await createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientSlug, dedupeStrategy, {
             skipFounderFinder,
             skipEmailFinder,
             skipVerification,
@@ -527,127 +436,102 @@ router.post('/jobs', uploadFields, async (req, res) => {
             emailVerificationProvider,
             sqlClientId,
             columnMapping: {
-                domain: domainColumn,
-                founder: founderColumn,
-                email: emailColumn
+                domain: (req.body.domainColumn || 'domain').toString().trim(),
+                founder: (req.body.founderColumn || '').toString().trim(),
+                email: (req.body.emailColumn || '').toString().trim()
             }
         });
-        logJob(job, `Job ${USE_QUEUE_EXECUTION ? 'queued' : 'started inline'} with file ${job.fileName} for user ${uid}`);
 
-        // Calculate dedupe stats synchronously before responding
-        try {
-            const { filtered: filteredDomainsPath, stats: dedupeStats } = await filterAndWriteProcessedDomains({
-                agencyId: job.uid,
-                clientId: job.sqlClientId,
-                jobId: job.id,
-                domainsCsvPath: job.paths.domains,
-                dedupeStrategy: job.dedupeStrategy,
-                domainColumn: domainColumn
-            });
-            job.dedupeStats = dedupeStats;
-            job.paths.filtered = filteredDomainsPath; // Store filtered path for processJob to use
-            logJob(job, `Deduplication complete: ${dedupeStats.total} total, ${dedupeStats.skipped} skipped, ${dedupeStats.new} new`);
-        } catch (err) {
-            console.error('Deduplication error:', err);
-            // Continue with job processing even if deduplication fails
-        }
+        await setActiveJob(job.id, uid, sqlClientId);
+        await updateJobControl(job.id, { paused: false, cancelled: false });
+        logJob(job, `Job queued with file ${job.fileName}`);
 
-        if (USE_QUEUE_EXECUTION) {
-            await enqueuePipelineJob({
-                jobId: job.id,
-                uid,
-                clientId: job.clientId,
-                payload: buildQueuePayload(job)
-            });
-        }
-
-        await firestore
-            .collection('users').doc(uid)
-            .collection('clients').doc(job.clientId)
-            .collection('jobs').doc(job.id)
-            .set({
-                ...serializeJob(job),
-                logs: Array.isArray(job.logs) ? job.logs.slice(-200) : [],
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                createdAtServer: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-
-        await firestore
-            .collection('users').doc(uid)
-            .collection('clients').doc(job.clientId)
-            .collection('activeJob').doc('current')
-            .set({
-                jobId: job.id,
-                status: USE_QUEUE_EXECUTION ? 'queued' : 'running',
-                error: null,
-                uploadError: null,
-                uploadMetrics: null,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-
-        ensureJobControl(job.id, { paused: false, cancelled: false });
-
-        if (USE_QUEUE_EXECUTION) {
-            closeStreams(job);
-            jobs.delete(job.id);
-        } else {
-            setImmediate(() => {
-                processJob(job)
-                    .catch((err) => {
-                        console.error(`[${job.id}] Inline job execution failed:`, err?.message || err);
-                    })
-                    .finally(() => {
-                        closeStreams(job);
-                        jobs.delete(job.id);
-                    });
-            });
-        }
+        await enqueuePipelineJob({
+            jobId: job.id,
+            uid,
+            clientId: job.clientId,
+            payload: buildQueuePayload(job)
+        });
+        jobs.delete(job.id);
 
         res.status(201).json({ jobId: job.id, job: serializeJob(job) });
     } catch (error) {
         console.error('Job creation error:', error);
-        res.status(500).json({ error: 'Failed to create job.' });
+        res.status(500).json({ error: error?.message || 'Failed to create job.' });
     }
 });
 
 router.get('/jobs/:id', async (req, res) => {
-    const jobId = req.params.id;
-    
-    // First check in-memory jobs (active/running jobs)
-    const job = jobs.get(jobId);
-    if (job) {
-        return res.json({ job: serializeJob(job) });
-    }
-    
-    // If not in memory, try to fetch from Firestore (completed jobs)
     try {
-        const idToken = req.headers.authorization?.replace('Bearer ', '');
-        if (!idToken) {
-            return res.status(404).json({ error: 'Job not found in memory and no auth token provided' });
+        const jobId = req.params.id;
+        const memoryJob = jobs.get(jobId);
+        if (memoryJob) {
+            return res.json({ job: serializeJob(memoryJob) });
         }
-        
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
-        const clientId = req.query.clientId;
-        
-        if (!clientId) {
-            return res.status(404).json({ error: 'Job not found in memory and no clientId provided' });
-        }
-        
-        const jobRef = firestore
-            .collection('users').doc(uid)
-            .collection('clients').doc(clientId)
-            .collection('jobs').doc(jobId);
-        
-        const snapshot = await jobRef.get();
-        if (!snapshot.exists) {
+
+        const agencyId = await agencyFromRequest(req);
+        const row = await getJobById(jobId, agencyId);
+        if (!row) {
             return res.status(404).json({ error: 'Job not found' });
         }
-        
-        return res.json({ job: snapshot.data() });
+        return res.json({ job: jobRowToState(row) });
     } catch (error) {
-        console.error(`Failed to fetch job ${jobId} from Firestore:`, error);
-        return res.status(404).json({ error: 'Job not found' });
+        console.error('GET job error:', error);
+        res.status(500).json({ error: 'Failed to load job' });
+    }
+});
+
+router.get('/jobs', async (req, res) => {
+    try {
+        const clientSlug = req.query.clientId;
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId required' });
+        }
+        const { agencyId, sqlClientId } = await clientContextFromRequest(req, clientSlug);
+        const rows = await listJobsForClient(agencyId, sqlClientId);
+        res.json({ jobs: rows.map(jobRowToState) });
+    } catch (error) {
+        console.error('LIST jobs error:', error);
+        res.status(500).json({ error: 'Failed to list jobs' });
+    }
+});
+
+router.post('/clients/:clientId/active-job/discard', async (req, res) => {
+    try {
+        const { agencyId, sqlClientId } = await clientContextFromRequest(req, req.params.clientId);
+        const row = await getActiveJobForClient(agencyId, sqlClientId);
+        if (row) {
+            await clearActiveJobForClient(agencyId, sqlClientId, { jobId: row.id, uploadStatus: 'discarded' });
+            await pool.query(
+                `UPDATE jobs SET status = 'discarded', upload_status = 'discarded', is_active = false, updated_at = NOW()
+                 WHERE id = $1 AND agency_id = $2`,
+                [row.id, agencyId]
+            );
+        }
+        res.json({ ok: true });
+    } catch (error) {
+        const status = error.statusCode || 500;
+        res.status(status).json({ error: error.message || 'Failed to discard active job.' });
+    }
+});
+
+router.get('/clients/:clientId/active-job', async (req, res) => {
+    try {
+        const { agencyId, sqlClientId } = await clientContextFromRequest(req, req.params.clientId);
+        const row = await getActiveJobForClient(agencyId, sqlClientId);
+        res.json({
+            activeJob: row
+                ? {
+                    jobId: row.id,
+                    status: row.status,
+                    upload_status: row.upload_status,
+                    upload_error: row.upload_error,
+                    upload_metrics: row.upload_metrics
+                }
+                : null
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to load active job' });
     }
 });
 
@@ -655,91 +539,58 @@ router.get('/jobs/:id', async (req, res) => {
 router.post('/jobs/:id/stop', async (req, res) => {
     try {
         const jobId = req.params.id;
-        const { idToken, clientId } = req.body || {};
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        const { clientId } = req.body || {};
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const { agencyId, sqlClientId, row } = await clientContextFromRequest(req, clientId);
+        const dbRow = await getJobById(jobId, agencyId);
+        if (!dbRow || dbRow.client_slug !== (row?.slug || clientId)) {
+            return res.status(404).json({ error: 'Job not found.' });
+        }
 
         const localJob = jobs.get(jobId);
-        if (localJob && (localJob.uid !== uid || localJob.clientId !== clientId)) {
+        if (localJob && (localJob.uid !== agencyId || localJob.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to stop this job.' });
         }
 
-        let queueJob = null;
-        let persistedJob = null;
-        let persistedJobRef = null;
-        if (!localJob) {
-            const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
-            if (ownership.error) {
-                if (ownership.error === 'Unauthorized.') {
-                    return res.status(403).json({ error: 'Unauthorized to stop this job.' });
-                }
-                const persisted = await getFirestoreOwnedJob({ jobId, uid, clientId });
-                if (!persisted.exists) {
-                    return res.status(404).json({ error: 'Job not found.' });
-                }
-                persistedJob = persisted.job;
-                persistedJobRef = persisted.ref;
-            } else {
-                queueJob = ownership.queueJob;
-            }
-        } else {
-            queueJob = await getQueueJob(jobId);
+        const queueJob = await getQueueJob(jobId);
+        if (queueJob && (queueJob.uid !== agencyId || queueJob.clientId !== clientId)) {
+            return res.status(403).json({ error: 'Unauthorized to stop this job.' });
         }
 
-        if (queueJob?.status === 'completed') {
+        if (dbRow.status === 'completed') {
             return res.json({ status: 'completed', message: 'Job already completed.' });
         }
-        if (queueJob?.status === 'cancelled') {
-            return res.json({ status: 'cancelled', message: 'Job already cancelled.' });
-        }
-        if (persistedJob?.status === 'completed') {
-            return res.json({ status: 'completed', message: 'Job already completed.' });
-        }
-        if (persistedJob?.status === 'cancelled') {
+        if (dbRow.cancelled || dbRow.status === 'cancelled') {
             return res.json({ status: 'cancelled', message: 'Job already cancelled.' });
         }
 
         writeJobControl(jobId, { cancelled: true, paused: false });
+        await updateJobControl(jobId, { cancelled: true, paused: false });
         if (queueJob) {
             await updateQueueControl(jobId, { cancelled: true, paused: false });
-        }
-        if (queueJob?.status === 'queued' || queueJob?.status === 'paused') {
-            await setQueueStatus(jobId, 'cancelled', { error: 'Cancelled by user' });
+            if (['queued', 'paused', 'running'].includes(queueJob.status)) {
+                await setQueueStatus(jobId, 'cancelled', { error: 'Cancelled by user' });
+            }
         }
 
-        if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
+        void forceTerminateRunner(jobId).catch((err) => {
+            console.error(`[${jobId}] Force terminate after stop:`, err?.message || err);
+        });
+
+        if (localJob && localJob.uid === agencyId && localJob.clientId === clientId) {
             localJob.cancelled = true;
-            markCancelled(localJob, 'Cancelled by user');
+            await markCancelled(localJob, 'Cancelled by user');
         }
 
-        if (!localJob && !queueJob && persistedJobRef) {
-            await persistedJobRef.set({
-                status: 'cancelled',
-                cancelled: true,
-                paused: false,
-                error: 'Cancelled by user',
-                completedAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        }
-
-        // Update activeJob doc to reflect cancellation
-        try {
-            const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
-            await activeJobRef.set({
-                jobId,
-                status: 'cancelled',
-                uploadError: null,
-                uploadMetrics: null,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        } catch (err) {
-            console.warn('Failed to persist cancelled status to Firestore', err?.message || err);
-        }
+        await clearActiveJobForClient(agencyId, sqlClientId, { jobId, uploadStatus: 'cancelled' });
+        await pool.query(
+            `UPDATE jobs SET status = 'cancelled', cancelled = true, paused = false,
+                error = 'Cancelled by user', completed_at = NOW(), updated_at = NOW()
+             WHERE id = $1 AND agency_id = $2`,
+            [jobId, agencyId]
+        );
 
         if (!localJob && !queueJob) {
             return res.json({
@@ -751,94 +602,29 @@ router.post('/jobs/:id/stop', async (req, res) => {
         return res.json({ status: 'cancelled' });
     } catch (error) {
         console.error('Stop job error:', error);
-        return res.status(500).json({ error: 'Failed to cancel job.' });
+        const status = error.statusCode || 500;
+        return res.status(status).json({ error: error.message || 'Failed to cancel job.' });
     }
 });
 
-// Pause a running job
 router.post('/jobs/:id/pause', async (req, res) => {
     try {
         const jobId = req.params.id;
-        const { idToken, clientId } = req.body || {};
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
-        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
-        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+        const agencyId = await agencyFromRequest(req);
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const row = await getJobById(jobId, agencyId);
+        if (!row) return res.status(404).json({ error: 'Job not found.' });
 
-        const localJob = jobs.get(jobId);
-        if (localJob && (localJob.uid !== uid || localJob.clientId !== clientId)) {
-            return res.status(403).json({ error: 'Unauthorized to pause this job.' });
-        }
-
-        let queueJob = null;
-        let persistedJob = null;
-        let persistedJobRef = null;
-        if (!localJob) {
-            const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
-            if (ownership.error) {
-                if (ownership.error === 'Unauthorized.') {
-                    return res.status(403).json({ error: 'Unauthorized to pause this job.' });
-                }
-                const persisted = await getFirestoreOwnedJob({ jobId, uid, clientId });
-                if (!persisted.exists) {
-                    return res.status(404).json({ error: 'Job not found.' });
-                }
-                persistedJob = persisted.job;
-                persistedJobRef = persisted.ref;
-            } else {
-                queueJob = ownership.queueJob;
-            }
-        } else {
-            queueJob = await getQueueJob(jobId);
-        }
-
-        if (queueJob?.status === 'cancelled') {
-            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot pause.' });
-        }
-        if (persistedJob?.status === 'cancelled') {
-            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot pause.' });
-        }
-        if (persistedJob?.status === 'completed') {
-            return res.json({ status: 'completed', message: 'Job already completed.' });
-        }
-        if (queueJob?.status === 'paused' || queueJob?.control?.paused || localJob?.paused || persistedJob?.paused) {
-            return res.json({ status: 'paused', message: 'Job already paused.' });
-        }
-
-        writeJobControl(jobId, { paused: true });
+        writeJobControl(jobId, { paused: true, cancelled: false });
+        await updateJobControl(jobId, { paused: true });
+        const queueJob = await getQueueJob(jobId);
         if (queueJob) {
             await updateQueueControl(jobId, { paused: true });
-        }
-        if (queueJob?.status === 'queued') {
-            await setQueueStatus(jobId, 'paused');
+            if (queueJob.status === 'queued') await setQueueStatus(jobId, 'paused');
         }
 
-        if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
-            markPaused(localJob, 'Paused by user');
-        }
-        if (!localJob && !queueJob && persistedJobRef) {
-            await persistedJobRef.set({
-                status: 'paused',
-                paused: true,
-                pausedAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        }
-
-        // Update activeJob doc
-        try {
-            const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
-            await activeJobRef.set({
-                jobId,
-                status: 'paused',
-                pausedAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        } catch (err) {
-            console.warn('Failed to persist paused status to Firestore', err?.message || err);
-        }
+        const localJob = jobs.get(jobId);
+        if (localJob) await markPaused(localJob, 'Paused by user');
 
         return res.json({ status: 'paused' });
     } catch (error) {
@@ -847,157 +633,60 @@ router.post('/jobs/:id/pause', async (req, res) => {
     }
 });
 
-// Resume a paused job
 router.post('/jobs/:id/resume', async (req, res) => {
     try {
         const jobId = req.params.id;
-        const { idToken, clientId } = req.body || {};
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
-        if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
-        if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
-
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
-
-        const localJob = jobs.get(jobId);
-        if (localJob && (localJob.uid !== uid || localJob.clientId !== clientId)) {
-            return res.status(403).json({ error: 'Unauthorized to resume this job.' });
+        const clientId = (req.body?.clientId || req.query?.clientId || '').toString().trim();
+        if (!jobId || !clientId) {
+            return res.status(400).json({ error: 'Missing job ID or client ID.' });
         }
 
-        let queueJob = null;
-        let persistedJob = null;
-        let persistedJobRef = null;
-        if (!localJob) {
-            const ownership = await verifyQueuedJobOwnership({ jobId, uid, clientId });
-            if (ownership.error) {
-                if (ownership.error === 'Unauthorized.') {
-                    return res.status(403).json({ error: 'Unauthorized to resume this job.' });
-                }
-                const persisted = await getFirestoreOwnedJob({ jobId, uid, clientId });
-                if (!persisted.exists) {
-                    return res.status(404).json({ error: 'Job not found.' });
-                }
-                persistedJob = persisted.job;
-                persistedJobRef = persisted.ref;
-            } else {
-                queueJob = ownership.queueJob;
-            }
-        } else {
-            queueJob = await getQueueJob(jobId);
+        const uid = await resolveAgencyId(req);
+        const row = await getJobById(jobId, uid);
+        if (!row || row.client_slug !== clientId) {
+            return res.status(404).json({ error: 'Job not found.' });
         }
-
-        if (queueJob?.status === 'cancelled') {
+        if (row.cancelled) {
             return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
         }
-        if (persistedJob?.status === 'cancelled') {
-            return res.json({ status: 'cancelled', message: 'Job is cancelled, cannot resume.' });
-        }
-        if (persistedJob?.status === 'completed') {
+        if (row.status === 'completed') {
             return res.json({ status: 'completed', message: 'Job already completed.' });
         }
-
-        const control = readJobControl(jobId);
-        const queuePaused = queueJob?.status === 'paused' || !!queueJob?.control?.paused;
-        const persistedPaused = persistedJob?.status === 'paused' || !!persistedJob?.paused;
-        const localPaused = !!localJob?.paused;
-        const isPaused = queuePaused || persistedPaused || localPaused || !!control?.paused;
-        if (!isPaused) {
-            const fallbackStatus = queueJob?.status || localJob?.status || persistedJob?.status || 'unknown';
-            return res.json({ status: fallbackStatus, message: 'Job is not paused.' });
+        if (!row.paused) {
+            return res.json({ status: row.status, message: 'Job is not paused.' });
         }
 
-        writeJobControl(jobId, { paused: false, cancelled: false });
+        const localJob = jobs.get(jobId);
+        const queueJob = await getQueueJob(jobId);
+
+        if (localJob) {
+            await markResumed(localJob);
+        }
+
+        await updateJobControl(jobId, { paused: false, cancelled: false });
         if (queueJob) {
             await updateQueueControl(jobId, { paused: false, cancelled: false });
-        }
-        if (queueJob?.status === 'paused') {
-            await setQueueStatus(jobId, 'queued', { error: null });
-        }
-
-        if (localJob && localJob.uid === uid && localJob.clientId === clientId) {
-            markResumed(localJob);
-        }
-
-        let resumedStatus = queueJob?.status === 'running'
-            ? 'running'
-            : (localJob ? 'running' : 'queued');
-
-        if (!localJob && !queueJob) {
-            if (USE_QUEUE_EXECUTION) {
-                const inferredFilteredPath = path.join(TMP_ROOT, jobId, 'domains-filtered.csv');
-                const payload = {
-                    id: jobId,
-                    fileName: persistedJob?.fileName || 'domains.csv',
-                    createdAt: persistedJob?.createdAt || new Date().toISOString(),
-                    dedupeStrategy: persistedJob?.dedupeStrategy || 'skip',
-                    sqlClientId: persistedJob?.sqlClientId || null,
-                    skipFounderFinder: !!persistedJob?.skipFounderFinder,
-                    skipEmailFinder: !!persistedJob?.skipEmailFinder,
-                    skipVerification: !!persistedJob?.skipVerification,
-                    skipDomainCheck: !!persistedJob?.skipDomainCheck,
-                    findFounder: persistedJob?.findFounder !== false,
-                    industry: persistedJob?.industry || null,
-                    nicheId: persistedJob?.nicheId || null,
-                    nicheLabel: persistedJob?.nicheLabel || null,
-                    personalizeFirstLine: !!persistedJob?.personalizeFirstLine,
-                    productPromptVersion: persistedJob?.productPromptVersion || 'old',
-                    productPromptProducts: Number.isFinite(persistedJob?.productPromptProducts) ? persistedJob.productPromptProducts : 3,
-                    emailVerificationProvider: persistedJob?.emailVerificationProvider || 'trykitt',
-                    columnMapping: persistedJob?.columnMapping || { domain: 'domain', founder: '', email: '' },
-                    dedupeStats: persistedJob?.dedupeStats || null,
-                    cost: typeof persistedJob?.cost === 'number' ? persistedJob.cost : 0,
-                    stages: persistedJob?.stages || null,
-                    filteredPath: (persistedJob?.filteredPath && fs.existsSync(persistedJob.filteredPath))
-                        ? persistedJob.filteredPath
-                        : (fs.existsSync(inferredFilteredPath) ? inferredFilteredPath : null)
-                };
-
-                await enqueuePipelineJob({
-                    jobId,
-                    uid,
-                    clientId,
-                    payload
-                });
-                await updateQueueControl(jobId, { paused: false, cancelled: false });
+            if (queueJob.status === 'paused') {
                 await setQueueStatus(jobId, 'queued', { error: null });
-                resumedStatus = 'queued';
-            } else {
-                await startInlineResumeJob({
-                    jobId,
-                    uid,
-                    clientId,
-                    persistedJob
-                });
-                resumedStatus = 'running';
             }
         }
 
-        if (persistedJobRef) {
-            await persistedJobRef.set({
-                status: resumedStatus,
-                paused: false,
-                resumedAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        }
+        const payload = buildQueuePayload(jobRowToState(row));
+        await enqueuePipelineJob({ jobId, uid, clientId, payload });
+        await setQueueStatus(jobId, 'queued', { error: null });
+        const resumedStatus = 'queued';
 
-        // Update activeJob doc
-        try {
-            const activeJobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('activeJob').doc('current');
-            await activeJobRef.set({
-                jobId,
-                status: resumedStatus,
-                resumedAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        } catch (err) {
-            console.warn('Failed to persist resumed status to Firestore', err?.message || err);
-        }
+        await pool.query(
+            `UPDATE jobs SET status = $2, paused = false, resumed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+            [jobId, resumedStatus]
+        );
+        await setActiveJob(jobId, uid, row.client_id);
 
         return res.json({ status: resumedStatus });
     } catch (error) {
         console.error('Resume job error:', error);
-        return res.status(500).json({ error: 'Failed to resume job.' });
+        const status = error.statusCode || 500;
+        return res.status(status).json({ error: error.message || 'Failed to resume job.' });
     }
 });
 
@@ -1005,20 +694,22 @@ router.post('/jobs/:id/resume', async (req, res) => {
 router.post('/jobs/:id/delete', async (req, res) => {
     try {
         const jobId = req.params.id;
-        const { idToken, clientId } = req.body || {};
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        const { clientId } = req.body || {};
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const { agencyId, sqlClientId } = await clientContextFromRequest(req, clientId);
+        const dbRow = await getJobById(jobId, agencyId);
+        if (!dbRow || dbRow.client_slug !== clientId) {
+            return res.status(404).json({ error: 'Job not found.' });
+        }
 
         const job = jobs.get(jobId);
         const queueJob = await getQueueJob(jobId);
-        if (queueJob && (queueJob.uid !== uid || queueJob.clientId !== clientId)) {
+        if (queueJob && (queueJob.uid !== agencyId || queueJob.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to delete this job.' });
         }
-        if (job && (job.uid !== uid || job.clientId !== clientId)) {
+        if (job && (job.uid !== agencyId || job.clientId !== clientId)) {
             return res.status(403).json({ error: 'Unauthorized to delete this job.' });
         }
 
@@ -1026,7 +717,6 @@ router.post('/jobs/:id/delete', async (req, res) => {
             if (!job.cancelled && job.status === 'running') {
                 markCancelled(job, 'Deleted by user');
             }
-            closeStreams(job);
             jobs.delete(jobId);
         }
 
@@ -1045,53 +735,23 @@ router.post('/jobs/:id/delete', async (req, res) => {
             console.warn(`[${jobId}] Failed to delete queue record`, err?.message || err);
         }
 
-        try {
-            const jobRef = firestore
-                .collection('users').doc(uid)
-                .collection('clients').doc(clientId)
-                .collection('jobs').doc(jobId);
-            await jobRef.delete();
-
-            const activeRef = firestore
-                .collection('users').doc(uid)
-                .collection('clients').doc(clientId)
-                .collection('activeJob').doc('current');
-            const activeSnap = await activeRef.get();
-            const isCurrent = activeSnap.exists && (activeSnap.data()?.jobId === jobId);
-            if (isCurrent) {
-                await activeRef.set({
-                    status: 'deleted',
-                    jobId: null,
-                    uploadError: null,
-                    uploadMetrics: null,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-            }
-        } catch (err) {
-            console.warn(`[${jobId}] Failed to delete Firestore job record`, err?.message || err);
-        }
+        await clearActiveJobForClient(agencyId, sqlClientId, { jobId, uploadStatus: 'deleted' });
+        await deleteJobFromDb(jobId, agencyId);
 
         return res.json({ status: 'deleted' });
     } catch (error) {
         console.error('Delete job error:', error);
-        return res.status(500).json({ error: 'Failed to delete job.' });
+        const status = error.statusCode || 500;
+        return res.status(status).json({ error: error.message || 'Failed to delete job.' });
     }
 });
 
 router.get('/jobs/:id/result', async (req, res) => {
     const jobId = req.params.id;
     const scopeParam = (req.query?.scope || '').toString() === 'valid' ? 'valid' : 'all';
-    const { job, finalPath } = resolveJobPaths(jobId);
-
-    if (!fs.existsSync(finalPath)) {
-        return res.status(404).json({ error: 'Result file missing' });
-    }
-    if (job && job.status !== 'completed' && job.status !== 'pending-upload') {
-        return res.status(409).json({ error: 'Job not completed yet' });
-    }
 
     try {
-        const rows = await buildUnifiedRows({ jobId, scope: scopeParam, resolveJobPaths });
+        const rows = await buildUnifiedRowsFromDb(jobId, scopeParam === 'valid' ? 'valid' : 'all');
         if (!rows.length) {
             return res.status(404).json({ error: 'No data to export.' });
         }
@@ -1114,156 +774,30 @@ router.get('/jobs/:id/result', async (req, res) => {
     }
 });
 
-router.get('/jobs/:id/stream', (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
-
-    const job = jobs.get(req.params.id);
-    if (!job) {
-        (async () => {
-            const jobId = req.params.id;
-            let queueJob = await getQueueJob(jobId);
-            if (!queueJob?.uid || !queueJob?.clientId) {
-                const cg = await firestore.collectionGroup('jobs')
-                    .where('id', '==', jobId)
-                    .limit(1)
-                    .get();
-                if (!cg.empty) {
-                    const [jobDoc] = cg.docs;
-                    const parent = jobDoc.ref.parent?.parent; // clients/{clientId}
-                    const userRef = parent?.parent?.parent?.parent; // users/{uid}
-                    if (parent?.id && userRef?.id) {
-                        queueJob = { uid: userRef.id, clientId: parent.id };
-                    }
-                }
-            }
-
-            if (!queueJob?.uid || !queueJob?.clientId) {
-                res.write(`data: ${JSON.stringify({ type: 'error', error: 'Job not found' })}\n\n`);
-                return res.end();
-            }
-
-            const jobRef = firestore
-                .collection('users').doc(queueJob.uid)
-                .collection('clients').doc(queueJob.clientId)
-                .collection('jobs').doc(jobId);
-
-            let sentLogCount = 0;
-            const unsubscribe = jobRef.onSnapshot(
-                (snap) => {
-                    if (!snap.exists) {
-                        res.write(`data: ${JSON.stringify({ type: 'error', error: 'Job not found' })}\n\n`);
-                        return;
-                    }
-
-                    const state = snap.data() || {};
-                    const logs = Array.isArray(state.logs) ? state.logs : [];
-                    if (logs.length > sentLogCount) {
-                        for (let i = sentLogCount; i < logs.length; i += 1) {
-                            res.write(`data: ${JSON.stringify({ type: 'log', log: logs[i] })}\n\n`);
-                        }
-                        sentLogCount = logs.length;
-                    }
-
-                    res.write(`data: ${JSON.stringify({ type: 'state', state })}\n\n`);
-                },
-                (error) => {
-                    console.error(`[${jobId}] Firestore stream error:`, error?.message || error);
-                    res.write(`data: ${JSON.stringify({ type: 'error', error: 'Stream disconnected' })}\n\n`);
-                }
-            );
-
-            const keepAlive = setInterval(() => {
-                res.write(': keep-alive\n\n');
-            }, 25000);
-
-            req.on('close', () => {
-                clearInterval(keepAlive);
-                unsubscribe();
-                res.end();
-            });
-        })().catch((error) => {
-            console.error('Job stream setup error:', error);
-            res.write(`data: ${JSON.stringify({ type: 'error', error: 'Failed to open job stream' })}\n\n`);
-            res.end();
-        });
-        return;
-    }
-
-    job.logs.forEach(entry => {
-        res.write(`data: ${JSON.stringify({ type: 'log', log: entry })}\n\n`);
-    });
-    res.write(`data: ${JSON.stringify({ type: 'state', state: serializeJob(job) })}\n\n`);
-
-    job.streams.push(res);
-
-    const keepAlive = setInterval(() => {
-        res.write(': keep-alive\n\n');
-    }, 25000);
-
-    req.on('close', () => {
-        clearInterval(keepAlive);
-        job.streams = job.streams.filter(stream => stream !== res);
-        res.end();
-    });
-});
-
 router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
     const jobId = req.params.id;
-    let activeJobRef = null;
-    let jobDocRef = null;
     let campaignIdParam = null;
 
     const recordUploadStatus = async (count, total) => {
-        if (!activeJobRef) {
-            return;
-        }
         try {
-            const updates = [
-                activeJobRef.set({
-                    jobId,
-                    status: 'uploaded',
-                    uploadMetrics: { count, total },
-                    uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
-                    campaignId: campaignIdParam || null,
-                    uploadError: admin.firestore.FieldValue.delete ? admin.firestore.FieldValue.delete() : null,
-                }, { merge: true })
-            ];
-
-            if (jobDocRef) {
-                updates.push(
-                    jobDocRef.set({
-                        instantlyUpload: {
-                            count,
-                            total,
-                            campaignId: campaignIdParam || null,
-                            uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
-                        },
-                    }, { merge: true })
-                );
-            }
-
-            await Promise.all(updates);
-        } catch (firestoreError) {
-            console.error('Failed to record Instantly upload status:', firestoreError);
+            await updateActiveJobStatus(jobId, 'uploaded', {
+                uploadMetrics: { count, total, campaignId: campaignIdParam || null },
+                uploadError: null,
+                status: 'uploaded'
+            });
+        } catch (err) {
+            console.error('Failed to record upload status:', err);
         }
     };
 
     const recordUploadFailure = async (message) => {
-        if (!activeJobRef) {
-            return;
-        }
         try {
-            await activeJobRef.set({
-                jobId,
-                status: 'pending-upload',
+            await updateActiveJobStatus(jobId, 'pending-upload', {
                 uploadError: message,
-                lastUploadErrorAt: admin.firestore.FieldValue.serverTimestamp(),
-            }, { merge: true });
-        } catch (firestoreError) {
-            console.error('Failed to persist Instantly upload error state:', firestoreError);
+                status: 'pending-upload'
+            });
+        } catch (err) {
+            console.error('Failed to record upload failure:', err);
         }
     };
 
@@ -1271,30 +805,23 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
         const { idToken, clientId, campaignId, columnMapping, customVariables, skipOptions } = req.body || {};
         campaignIdParam = campaignId;
 
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
         if (!columnMapping) return res.status(400).json({ error: 'Missing column mapping.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const uid = await resolveAgencyId(req);
 
-        // Get client's Instantly API key
-        const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) {
+        const clientRow = await getClientRowBySlug(uid, clientId);
+        if (!clientRow) {
             return res.status(404).json({ error: 'Client not found' });
         }
-        const instantlyKey = clientSnap.data()?.instantly_key || '';
+        const instantlyKey = clientRow.instantly_key || '';
         if (!instantlyKey) {
             return res.status(400).json({ error: 'Client has no Instantly API key configured' });
         }
 
-        activeJobRef = clientRef.collection('activeJob').doc('current');
-        jobDocRef = clientRef.collection('jobs').doc(jobId);
-
-        const verified = await buildUnifiedRows({ jobId, scope: 'valid', resolveJobPaths });
+        const verified = await buildUnifiedRowsFromDb(jobId, 'valid');
 
         if (verified.length === 0) {
             await recordUploadStatus(0, 0);
@@ -1495,27 +1022,18 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
 router.post('/jobs/:jobId/mark-manual-upload', async (req, res) => {
     try {
         const { jobId } = req.params;
-        const { idToken, clientId, campaignId, notes } = req.body;
+        const { clientId, campaignId, notes } = req.body;
 
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
-
-        // Get SQL client_id
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [uid, clientId]
-        );
-
-        if (clientResult.rows.length === 0) {
+        const uid = await agencyFromRequest(req);
+        const clientRow = await resolveClientRow(uid, clientId);
+        if (!clientRow) {
             return res.status(404).json({ error: 'Client not found in SQL.' });
         }
-
-        const sqlClientId = clientResult.rows[0].id;
+        const sqlClientId = clientRow.id;
 
         // Verify campaign exists and get its info
         const campaignResult = await pool.query(
@@ -1611,30 +1129,27 @@ router.post('/jobs/:jobId/mark-manual-upload', async (req, res) => {
     }
 });
 
-// GET /api/jobs/batch/upload-status - Get upload status for multiple jobs
+// POST /api/jobs/batch/upload-status - Get upload status for multiple jobs
 router.post('/jobs/batch/upload-status', async (req, res) => {
     try {
-        const { jobIds, clientId, agencyId } = req.body;
+        const { jobIds, clientId } = req.body;
 
         if (!Array.isArray(jobIds) || jobIds.length === 0) {
             return res.status(400).json({ error: 'jobIds must be a non-empty array.' });
         }
 
-        if (!clientId || !agencyId) {
-            return res.status(400).json({ error: 'Missing clientId or agencyId.' });
+        const clientSlug = String(clientId || '').trim();
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'Missing clientId.' });
         }
 
-        // Get SQL client_id
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-
-        if (clientResult.rows.length === 0) {
+        const agencyId = await agencyFromRequest(req);
+        const clientRow = await resolveClientRow(agencyId, clientSlug);
+        if (!clientRow) {
             return res.json({ statusMap: {} });
         }
 
-        const sqlClientId = clientResult.rows[0].id;
+        const sqlClientId = clientRow.id;
 
         // Get upload status for all jobs in a single query
         const uploadsResult = await pool.query(
@@ -1681,23 +1196,19 @@ router.post('/jobs/batch/upload-status', async (req, res) => {
 router.get('/jobs/:jobId/upload-status', async (req, res) => {
     try {
         const { jobId } = req.params;
-        const { clientId, agencyId } = req.query;
+        const clientSlug = String(req.query.clientId || '').trim();
 
-        if (!clientId || !agencyId) {
-            return res.status(400).json({ error: 'Missing clientId or agencyId query parameters.' });
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'Missing clientId query parameter.' });
         }
 
-        // Get SQL client_id
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-
-        if (clientResult.rows.length === 0) {
+        const agencyId = await agencyFromRequest(req);
+        const clientRow = await resolveClientRow(agencyId, clientSlug);
+        if (!clientRow) {
             return res.json({ uploads: [] });
         }
 
-        const sqlClientId = clientResult.rows[0].id;
+        const sqlClientId = clientRow.id;
 
         // Get upload status aggregated by campaign and source
         const uploadsResult = await pool.query(
@@ -1772,14 +1283,12 @@ router.get('/jobs/:jobId/qualified-count', async (req, res) => {
 router.delete('/jobs/:jobId/revert-manual-upload', async (req, res) => {
     try {
         const { jobId } = req.params;
-        const { idToken, campaignId } = req.body;
+        const { campaignId } = req.body;
 
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const uid = await agencyFromRequest(req);
 
         // Delete only manual uploads for this job and campaign by this user
         const result = await pool.query(
@@ -1808,37 +1317,23 @@ router.delete('/jobs/:jobId/revert-manual-upload', async (req, res) => {
 // POST /api/jobs/check-domains - Check which domains already exist in the database
 router.post('/jobs/check-domains', async (req, res) => {
     try {
-        const { domains, clientId, agencyId } = req.body;
+        const { domains, clientId: clientSlug } = req.body;
 
         if (!Array.isArray(domains) || domains.length === 0) {
             return res.status(400).json({ error: 'domains must be a non-empty array.' });
         }
 
-        if (!clientId || !agencyId) {
-            return res.status(400).json({ error: 'Missing clientId or agencyId.' });
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'Missing clientId.' });
         }
 
-        // Normalize domains (lowercase, trim, remove protocols) and dedupe
-        const normalizedDomainsRaw = domains.map(d => {
-            if (!d) return '';
-            return String(d)
-                .toLowerCase()
-                .trim()
-                .replace(/^https?:\/\//, '')
-                .replace(/^www\./, '')
-                .split('/')[0]
-                .split('?')[0];
-        }).filter(Boolean);
+        const agencyId = await agencyFromRequest(req);
+
+        const normalizedDomainsRaw = domains.map((d) => normalizeDomain(d)).filter(Boolean);
         const uniqueDomains = Array.from(new Set(normalizedDomainsRaw));
 
-        // Get SQL client_id
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-
-        if (clientResult.rows.length === 0) {
-            // Client doesn't exist yet, all domains are new
+        const clientRow = await resolveClientRow(agencyId, String(clientSlug).trim());
+        if (!clientRow?.id) {
             return res.json({
                 totalDomains: normalizedDomainsRaw.length,
                 uniqueDomains: uniqueDomains.length,
@@ -1852,7 +1347,7 @@ router.post('/jobs/check-domains', async (req, res) => {
             });
         }
 
-        const sqlClientId = clientResult.rows[0].id;
+        const sqlClientId = clientRow.id;
 
         // First, find which domains exist in the database
         const existingDomainsQuery = `
@@ -1961,19 +1456,13 @@ const personalizerFields = upload.fields([
 // Replace PERSONALIZATION_TEST_PROMPT above with your hardcoded prompt as needed.
 router.get('/jobs/personalizer/test-prompt', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization || '';
-        const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-        const idToken = (req.query?.idToken || bearerToken || '').toString().trim();
         let openaiKey = '';
-
-        if (idToken) {
-            const decodedToken = await admin.auth().verifyIdToken(idToken);
-            const uid = decodedToken.uid;
-
-            const userDoc = await firestore.collection('users').doc(uid).get();
-            if (userDoc.exists) {
-                openaiKey = (userDoc.data()?.openai_key || '').toString().trim();
-            }
+        try {
+            const agencyId = await agencyFromRequest(req);
+            const keys = await loadApiKeys(agencyId);
+            openaiKey = (keys.openai || '').toString().trim();
+        } catch {
+            openaiKey = '';
         }
 
         if (!openaiKey) {
@@ -1982,7 +1471,7 @@ router.get('/jobs/personalizer/test-prompt', async (req, res) => {
 
         if (!openaiKey) {
             return res.status(400).json({
-                error: 'Missing OpenAI key. Set OPENAI_API_KEY in server env, or pass a valid Firebase token for user vault lookup.'
+                error: 'Missing OpenAI key. Set OPENAI_API_KEY in server env, or sign in with agency vault keys configured.'
             });
         }
 
@@ -2045,35 +1534,29 @@ router.get('/jobs/personalizer/test-prompt', async (req, res) => {
     }
 });
 
+router.get('/jobs/personalizer/:jobId/status', async (req, res) => {
+    try {
+        const status = readPersonalizerStatus(req.params.jobId);
+        if (!status) {
+            return res.status(404).json({ error: 'Personalizer job not found.' });
+        }
+        return res.json({ job: status });
+    } catch (error) {
+        console.error('Personalizer status error:', error);
+        return res.status(500).json({ error: 'Failed to load personalizer status.' });
+    }
+});
+
 router.post('/jobs/personalizer', personalizerFields, async (req, res) => {
     try {
         if (!req.files?.file || !req.files.file[0]) {
             return res.status(400).json({ error: 'Missing CSV file upload.' });
         }
 
-        const idToken = req.body.idToken;
-        if (!idToken) {
-            return res.status(400).json({ error: 'Missing ID token.' });
-        }
-
-        // Verify the ID token
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        const uid = decodedToken.uid;
-
-        // Fetch API keys from Firestore
-        const userDoc = await firestore.collection('users').doc(uid).get();
-        if (!userDoc.exists) {
-            return res.status(400).json({ error: 'User not found.' });
-        }
-        const userData = userDoc.data();
-        const apiKeys = {
-            openai: userData?.openai_key || '',
-            serper: userData?.serper_key || '',
-            kitt: userData?.trykitt_key || ''
-        };
-
+        const agencyId = await agencyFromRequest(req);
+        const apiKeys = await loadApiKeys(agencyId);
         if (!apiKeys.openai) {
-            return res.status(400).json({ error: 'Missing OpenAI API key in user vault.' });
+            return res.status(400).json({ error: 'Missing OpenAI API key in agency vault.' });
         }
 
         const file = req.files.file[0];
@@ -2082,66 +1565,44 @@ router.post('/jobs/personalizer', personalizerFields, async (req, res) => {
         const checkKlaviyo = String(req.body.checkKlaviyo || '').toLowerCase() === 'true';
         const removeB2B = String(req.body.removeB2B || '').toLowerCase() === 'true';
 
-        // Create job ID and paths
         const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const jobDir = path.join(TMP_ROOT, 'jobs', jobId);
         fs.mkdirSync(jobDir, { recursive: true });
 
         const inputCsv = path.join(jobDir, 'input.csv');
         const outputCsv = path.join(jobDir, 'personalized.csv');
-
-        // Write uploaded file
         fs.writeFileSync(inputCsv, file.buffer);
 
-        // Create job record in Firestore
-        const jobRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId).collection('jobs').doc(jobId);
-        await jobRef.set({
-            id: jobId,
+        writePersonalizerStatus(jobId, {
             fileName: file.originalname,
             status: 'running',
-            stages: {
-                shopifyDetection: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null },
-                klaviyoDetection: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null },
-                productFetch: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null },
-                personalization: { status: 'pending', startedAt: null, completedAt: null, summary: null, error: null, progress: null }
-            },
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            completedAt: null,
             clientId,
-            config: {
-                productsToPull,
-                checkKlaviyo,
-                removeB2B
-            }
+            config: { productsToPull, checkKlaviyo, removeB2B }
         });
 
-        // Helper to update stage status
         const updateStage = async (stage, updates) => {
-            const updateData = {};
-            Object.entries(updates).forEach(([key, value]) => {
-                if (key === 'startedAt' || key === 'completedAt') {
-                    updateData[`stages.${stage}.${key}`] = admin.firestore.FieldValue.serverTimestamp();
-                } else {
-                    updateData[`stages.${stage}.${key}`] = value;
+            const current = readPersonalizerStatus(jobId) || {};
+            writePersonalizerStatus(jobId, {
+                stages: {
+                    ...(current.stages || {}),
+                    [stage]: {
+                        ...((current.stages || {})[stage] || {}),
+                        ...updates,
+                        ...(updates.startedAt ? { startedAt: new Date().toISOString() } : {}),
+                        ...(updates.completedAt ? { completedAt: new Date().toISOString() } : {})
+                    }
                 }
-            });
-            await jobRef.update(updateData).catch(err => {
-                console.error(`[${jobId}] Failed to update stage ${stage}:`, err);
             });
         };
 
-        // Run pipeline asynchronously
         (async () => {
             try {
-                // Stage 1: Shopify Detection
                 await updateStage('shopifyDetection', { status: 'running', startedAt: true });
 
                 const log = (message, meta) => {
                     console.log(`[${jobId}] ${message || ''}`);
-                    // Update progress in Firestore if meta contains progress
-                    if (meta?.progress) {
-                        const stage = meta.progress.stage;
-                        updateStage(stage, { progress: meta.progress }).catch(() => {});
+                    if (meta?.progress?.stage) {
+                        updateStage(meta.progress.stage, { progress: meta.progress }).catch(() => {});
                     }
                 };
 
@@ -2153,14 +1614,13 @@ router.post('/jobs/personalizer', personalizerFields, async (req, res) => {
                     productsToPull,
                     checkKlaviyo,
                     removeB2B,
-                    jobRef,
+                    jobRef: null,
                     updateStage
                 });
 
-                // Update final status
-                await jobRef.update({
+                writePersonalizerStatus(jobId, {
                     status: 'completed',
-                    completedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    completedAt: new Date().toISOString(),
                     result: {
                         shopifyStores: result.shopifyStores,
                         klaviyoStores: result.klaviyoStores,
@@ -2169,27 +1629,25 @@ router.post('/jobs/personalizer', personalizerFields, async (req, res) => {
                         estimatedCost: result.estimatedCost
                     }
                 });
-
                 console.log(`[${jobId}] ✓ Pipeline completed successfully`);
-
             } catch (error) {
                 console.error(`[${jobId}] Pipeline error:`, error);
-                await jobRef.update({
+                writePersonalizerStatus(jobId, {
                     status: 'failed',
                     error: error.message,
-                    completedAt: admin.firestore.FieldValue.serverTimestamp()
+                    completedAt: new Date().toISOString()
                 });
             }
         })();
 
-        res.status(201).json({ 
+        res.status(201).json({
             jobId,
             message: 'Personalizer job started'
         });
-
     } catch (error) {
         console.error('Personalizer job creation error:', error);
-        res.status(500).json({ error: 'Failed to create personalizer job.' });
+        const status = error.statusCode || 500;
+        res.status(status).json({ error: error.message || 'Failed to create personalizer job.' });
     }
 });
 

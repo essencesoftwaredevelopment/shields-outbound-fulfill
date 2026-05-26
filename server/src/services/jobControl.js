@@ -55,6 +55,15 @@ export function readJobControl(jobId) {
     }
 }
 
+/** Apply control.json flags onto an in-memory job (works across processes / after watch restart). */
+export function applyJobControlFileToJob(job) {
+    if (!job?.id) return { paused: false, cancelled: false };
+    const file = readJobControl(job.id);
+    if (file.paused) job.paused = true;
+    if (file.cancelled) job.cancelled = true;
+    return file;
+}
+
 export function writeJobControl(jobId, patch = {}) {
     const controlPath = getControlFilePath(jobId);
     const current = ensureJobControl(jobId);

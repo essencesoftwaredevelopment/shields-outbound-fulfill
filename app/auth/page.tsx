@@ -2,8 +2,7 @@
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from "firebase/auth";
-import { firebaseAuth } from "@/lib/firebase/auth";
+import { supabase } from "@/lib/supabase/client";
 
 export default function AuthPage() {
     const router = useRouter();
@@ -20,9 +19,11 @@ export default function AuthPage() {
 
         try {
             if (mode === "signin") {
-                await signInWithEmailAndPassword(firebaseAuth, email, password);
+                const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+                if (signInError) throw signInError;
             } else {
-                await createUserWithEmailAndPassword(firebaseAuth, email, password);
+                const { error: signUpError } = await supabase.auth.signUp({ email, password });
+                if (signUpError) throw signUpError;
             }
             router.replace("/");
         } catch (authError) {

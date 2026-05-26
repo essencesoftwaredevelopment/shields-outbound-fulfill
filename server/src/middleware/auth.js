@@ -1,58 +1,56 @@
 /**
- * Firebase authentication middleware for Express routes.
- *
- * CANONICAL AGENCY IDENTIFIER RULE:
- * The Firestore users/{uid} document ID is the canonical agency identifier.
- * This same Firebase Auth uid is used directly as agency_id in all PostgreSQL tables.
- * No reconciliation or mapping is required.
- *
- * This middleware:
- * 1. Extracts the ID token from the Authorization header
- * 2. Verifies it using Firebase Admin SDK
- * 3. Derives agency_id from the decoded token's uid
- * 4. Attaches agency_id to req.agencyId
- *
- * All SQL queries must be scoped by this derived agency_id.
- * The frontend never sends agency_id; it is always derived from the verified token.
+ * Supabase authentication middleware for Express routes.
+ * req.agencyId = legacy agency_id from agency_auth_map when mapped, else Supabase user id.
  */
 
-import { admin } from '../config/firebase.js';
+import { getSupabaseAdmin } from '../config/supabase.js';
+import { env } from '../config/env.js';
+import { resolveLegacyAgencyId } from '../services/db/agencyAuthMap.js';
 
-/**
- * Middleware: Verify Firebase ID token and derive agency_id
- * Attaches req.auth with agencyId and other user context
- *
- * @param {Express.Request} req
- * @param {Express.Response} res
- * @param {Function} next
- */
-export async function verifyFirebaseToken(req, res, next) {
+let supabaseAdmin = null;
+
+function getAdmin() {
+    if (!supabaseAdmin) {
+        if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+            throw new Error('Supabase auth is not configured (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)');
+        }
+        supabaseAdmin = getSupabaseAdmin();
+    }
+    return supabaseAdmin;
+}
+
+export async function verifySupabaseToken(req, res, next) {
     try {
         const authHeader = req.headers.authorization;
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
             return res.status(401).json({ error: 'Missing or invalid Authorization header' });
         }
 
-        const idToken = authHeader.slice(7); // Remove 'Bearer ' prefix
-        const decoded = await admin.auth().verifyIdToken(idToken);
+        const token = authHeader.slice(7);
+        const { data, error } = await getAdmin().auth.getUser(token);
 
-        // Extract uid as agency_id (canonical identifier; no mapping table needed)
-        // Attach to req.auth for consistency and future extensibility
+        if (error || !data?.user) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+
+        const user = data.user;
+        const agencyId = await resolveLegacyAgencyId(user.id);
         req.auth = {
-            agencyId: decoded.uid,
-            uid: decoded.uid,
-            email: decoded.email,
-            emailVerified: decoded.email_verified
+            agencyId,
+            supabaseUserId: user.id,
+            uid: agencyId,
+            email: user.email,
+            emailVerified: !!user.email_confirmed_at
         };
-
-        // Also set req.agencyId for backward compatibility with existing code
-        req.agencyId = decoded.uid;
-
+        req.agencyId = agencyId;
         next();
     } catch (error) {
-        console.error('Firebase token verification failed:', error.message);
+        console.error('Supabase token verification failed:', error.message);
         res.status(401).json({ error: 'Unauthorized' });
     }
 }
 
-export default verifyFirebaseToken;
+/** @deprecated alias */
+export const verifyFirebaseToken = verifySupabaseToken;
+
+export default verifySupabaseToken;

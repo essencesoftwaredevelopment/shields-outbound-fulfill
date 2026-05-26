@@ -143,7 +143,8 @@ CREATE TABLE contacts (
     full_name TEXT,
     email TEXT,
     email_status TEXT CHECK (email_status IN ('valid', 'risky', 'invalid', 'unknown')),
-    last_verified_at TIMESTAMPTZ,
+    email_find_completed_at TIMESTAMPTZ,
+    email_verify_completed_at TIMESTAMPTZ,
     last_contacted_at TIMESTAMPTZ,  -- Send safety: prevents accidental resends
     confidence NUMERIC(5,2),
     personalization_first_line TEXT,
@@ -160,7 +161,9 @@ CREATE TABLE contacts (
 
 **Key Features:**
 - **`role_type`**: Differentiates between founders and decision-makers
-- **`email_status`**: Tracks email verification state (`valid`, `risky`, `invalid`, `unknown`)
+- **`email_status`**: SMTP verification result only (`valid`, `risky`, `invalid`, `unknown`)
+- **`email_find_completed_at`**: When email discovery finished for this contact
+- **`email_verify_completed_at`**: When SMTP verification finished for this contact
 - **`last_contacted_at`**: Send-safety mechanism to prevent duplicate outreach
 - **`personalization_first_line`**: Stores AI-generated personalization content
 

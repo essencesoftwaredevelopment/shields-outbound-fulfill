@@ -38,6 +38,14 @@ Key files:
 - server/src/services/db/queries.js
 - server/src/lib/db.js
 
+## Execution model (queue-only)
+
+- The API **never** runs `processJob` inline. Upload and resume always enqueue `job_queue`.
+- A dedicated worker process (`src/worker/queueWorker.js`) claims jobs and runs `runJobChild.js`.
+- Child PID is stored on `job_queue.runner_pid` for hybrid stop (cooperative cancel, then SIGTERM/SIGKILL).
+- Local dev: `npm run dev:all` in `server/` (API + worker), or run `npm run dev` and `npm run worker` in two terminals.
+- Production: PM2 must run **both** `shields-outbound-server` and `shields-outbound-worker` (see `ecosystem.config.cjs`).
+
 ## Job Lifecycle
 
 ### 1) CSV Upload and Job Creation
@@ -63,7 +71,7 @@ Behavior:
   - personalizeFirstLine
   - columnMapping for domain/founder/email columns
 - Creates a job record in memory and writes the input CSV to tmp/jobs/<jobId>/domains.csv.
-- Runs dedupe against existing SQL domains, then begins pipeline processing.
+- Runs dedupe against existing SQL domains, then enqueues the job for the worker.
 
 ### 2) Domain Prep
 
@@ -195,30 +203,40 @@ buildUnifiedRows merges final.csv + personalized.csv by domain and builds:
 
 The upload.csv is used for Instantly uploads and exports.
 
-## Job State, SSE, and Firestore
+## Job state and live UI (Postgres + Supabase Realtime)
 
-In-memory state:
+**Persistence (source of truth):**
 
-- Jobs are tracked in a Map keyed by jobId.
-- Each job holds stages, logs, paths, and options.
+- Job rows live in Cloud SQL / Supabase `public.jobs` (`stages`, `status`, `cost`, `dedupe_stats`, `options`, etc.).
+- The worker calls `persistJobState()` on progress and stage transitions (throttled during long stages; stage start/complete always flush).
+- Live status text is stored in `jobs.options.activityMessage` / `activityUpdatedAt` (not a `logs` JSON column).
 
-Realtime updates:
+**Worker in-memory:**
 
-- Server-sent events (SSE) are used for streaming job logs and progress.
-- Firestore persistence is throttled to reduce write cost:
-  - Update every N records or after a minimum interval.
-  - Stage transitions and completion always force an update.
+- While a child process runs, `jobPipeline.js` keeps a Map for the active job (paths, API keys, throttling counters).
+- That Map is not streamed to the browser; the UI reads Postgres via Realtime.
 
-Firestore documents:
+**Frontend (primary: Supabase Realtime):**
 
-- users/{uid}/clients/{clientId}/jobs/{jobId}
-- users/{uid}/clients/{clientId}/activeJob/current
+- `lib/hooks/useJobRealtime.ts` subscribes to `postgres_changes` on `jobs` (`UPDATE`, filtered by `id`).
+- On subscribe, the hook also runs a one-shot `SELECT` for the current row.
+- `app/clients/[clientId]/page.tsx` merges payloads into `jobState` (`mergeJobState`).
+- `useClientJobsRealtime` listens for job `INSERT`/`UPDATE`/`DELETE` on the client and refreshes the job history list (debounced).
+
+**Frontend (secondary REST, not streaming):**
+
+- `GET /api/jobs/:id` — bootstrap when selecting or starting a watch (`fetchJobSnapshot`).
+- `GET /api/clients/:clientId/active-job` — polled every ~3s while a run is active to discover which job to watch and start Realtime.
+
+**Not used:** Server-Sent Events (`GET /api/jobs/:id/stream`), Firestore job documents, or 2s job snapshot polling during runs.
+
+**Realtime setup:** migration `0022_supabase_rls_realtime.sql` (RLS on `jobs` + `supabase_realtime` publication). Browser auth must satisfy `jobs_agency_select`.
 
 ## Pause, Resume, Cancel
 
-- Pause: Marks job as paused and persists state; processing aborts safely.
-- Resume: Continues from in-memory state and existing checkpoints.
-- Cancel: Marks job failed, closes streams, and persists state.
+- Pause: Cooperative — `control.json` + DB; stages checkpoint between external calls; founder contacts upsert every **50** results.
+- Stop: Sets `cancelled`, then hybrid terminate via `runner_pid` (8s cooperative, SIGTERM, SIGKILL).
+- Resume: Re-enqueues the same `job_id`; worker continues from SQL/`job_domains`/Serper cache.
 
 ## Instantly Uploads
 
@@ -250,7 +268,7 @@ Behavior:
   - Are recorded in job.stages[stage].error
   - Cause the job to pause (not fail permanently)
 - Credit exhaustion is treated as a pause with a user-facing error.
-- Cancelled jobs close SSE streams and skip remaining stages.
+- Cancelled jobs skip remaining stages; live UI updates come from Postgres via Supabase Realtime.
 
 ## Files and Paths
 

@@ -2,8 +2,7 @@
 
 import { ReactNode, useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
-import { signOut } from "firebase/auth";
-import { firebaseAuth } from "@/lib/firebase/auth";
+import { supabase } from "@/lib/supabase/client";
 
 type ThemeMode = "dark" | "light" | "auto";
 
@@ -106,7 +105,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                             className="sidebar__btn"
                             onClick={async () => {
                                 try {
-                                    await signOut(firebaseAuth);
+                                    await supabase.auth.signOut();
                                     router.replace('/auth');
                                 } catch (err) {
                                     console.warn('Logout failed', err);

@@ -304,7 +304,36 @@ function computeFounderCost({ tokensIn = 0, tokensOut = 0, pricing }) {
     return { serperCost, openaiCost, leadCost };
 }
 
-export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, log = () => { }, checkpointDir = null, onBatch = null }) {
+async function assertNotStopped({ checkpoint, checkPaused }) {
+    if (checkpoint) {
+        await checkpoint();
+        return;
+    }
+    if (checkPaused && checkPaused()) {
+        const err = new Error('Job paused');
+        err.code = 'JOB_PAUSED';
+        throw err;
+    }
+}
+
+const FOUNDER_CONTACT_UPSERT_BATCH_SIZE = 50;
+const FOUNDER_DONE_BATCH_SIZE = 50;
+
+export async function runFounderFinder({
+    domains: domainsInput = null,
+    listPendingDomains = null,
+    loadSerperCache = null,
+    saveSerperCache = null,
+    markDomainDone = null,
+    markDomainsDone = null,
+    checkpoint = null,
+    checkPaused = null,
+    apiKeys,
+    pricing,
+    log = () => {},
+    onBatch = null,
+    totalDomainCount = null
+}) {
     const OPENAI_API_KEY = apiKeys.openai;
     const SERPER_API_KEY = apiKeys.serper;
 
@@ -317,97 +346,52 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    // Setup checkpoint files
-    const serperCheckpointFile = checkpointDir ? path.join(checkpointDir, 'serper-results.json') : null;
-    const progressCheckpointFile = checkpointDir ? path.join(checkpointDir, 'founders-progress.json') : null;
-    
-    // Load existing checkpoint data if resuming
     let serperCache = {};
-    let processedDomains = new Set();
-    let savedRpm = null;
-    
-    if (serperCheckpointFile && fs.existsSync(serperCheckpointFile)) {
-        try {
-            serperCache = JSON.parse(fs.readFileSync(serperCheckpointFile, 'utf-8'));
-            log(`Founders: loaded ${Object.keys(serperCache).length} cached Serper results`);
-        } catch (err) {
-            log(`Founders: failed to load Serper cache: ${err.message}`);
-        }
-    }
-    
-    if (progressCheckpointFile && fs.existsSync(progressCheckpointFile)) {
-        try {
-            const progress = JSON.parse(fs.readFileSync(progressCheckpointFile, 'utf-8'));
-            processedDomains = new Set(progress.processedDomains || []);
-            const parsedSavedRpm = Number.parseInt(String(progress.currentRpm ?? ''), 10);
-            savedRpm = Number.isFinite(parsedSavedRpm) && parsedSavedRpm > 0 ? parsedSavedRpm : null;
-            log(`Founders: resuming from checkpoint with ${processedDomains.size} already processed${savedRpm ? ` at ${savedRpm} RPM` : ''}`);
-        } catch (err) {
-            log(`Founders: failed to load progress checkpoint: ${err.message}`);
-        }
+    if (loadSerperCache) {
+        serperCache = await loadSerperCache();
+        log(`Founders: loaded ${Object.keys(serperCache).length} cached Serper results from database`);
     }
 
-    // Initialize adaptive rate limiter with restart-safe defaults.
-    let initialRpm = AI_MAX_RPM;
-    if (!AI_RESET_RPM_ON_RESUME && savedRpm) {
-        initialRpm = clamp(savedRpm, AI_MIN_RPM, AI_MAX_RPM);
-        if (initialRpm !== savedRpm) {
-            log(`Founders: clamped saved RPM from ${savedRpm} to ${initialRpm} (range ${AI_MIN_RPM}-${AI_MAX_RPM})`);
-        }
-    } else if (AI_RESET_RPM_ON_RESUME && savedRpm) {
-        log(`Founders: ignoring saved RPM ${savedRpm}; reset-on-resume enabled`);
-    }
-    const aiRateLimiter = new AdaptiveRateLimiter(AI_MIN_RPM, AI_MAX_RPM, initialRpm, {
+    const processedDomains = new Set();
+    const aiRateLimiter = new AdaptiveRateLimiter(AI_MIN_RPM, AI_MAX_RPM, AI_MAX_RPM, {
         successThreshold: AI_SUCCESS_THRESHOLD
     });
-    log(`Founders: initialized adaptive rate limiter at ${aiRateLimiter.getCurrentRpm()} RPM (min ${AI_MIN_RPM}, max ${AI_MAX_RPM}, concurrency ${AI_CONCURRENCY_LIMIT})`);
+    log(`Founders: initialized adaptive rate limiter at ${aiRateLimiter.getCurrentRpm()} RPM`);
 
-    // Only delete output if starting fresh
-    if (fs.existsSync(outputCsv) && processedDomains.size === 0) {
-        fs.unlinkSync(outputCsv);
-        log('Founders: existing output file deleted.');
+    let pendingRows = [];
+    if (Array.isArray(domainsInput) && domainsInput.length) {
+        pendingRows = domainsInput.map((d, i) => ({
+            domain_normalized: typeof d === 'string' ? d : d.domain,
+            sort_order: i
+        }));
+    } else if (listPendingDomains) {
+        pendingRows = await listPendingDomains();
     }
 
-    log(`Founders: reading domains from ${inputCsv}`);
-    const domains = await readDomains(inputCsv);
-    log(`Founders: total domains to process: ${domains.length}`);
+    const domains = pendingRows.map((r) => r.domain_normalized).filter(Boolean);
+    const totalDomains = Number.isFinite(totalDomainCount) && totalDomainCount > 0
+        ? totalDomainCount
+        : domains.length + processedDomains.size;
+
+    log(`Founders: ${domains.length} pending domains (${totalDomains} total for job)`);
 
     if (!domains.length) {
-        throw new Error('No domains found in uploaded CSV.');
-    }
-
-    const writer = fs.createWriteStream(outputCsv, { flags: 'a' });
-    if (processedDomains.size === 0) {
-        writer.write('domain,founder_name\n');
+        return {
+            total: totalDomains,
+            processed: 0,
+            Found: 0,
+            'Not Found': 0,
+            Errors: 0,
+            Cost: '$0.00'
+        };
     }
 
     const serperLimit = pLimit(SERPER_CONCURRENCY);
     const aiLimit = pLimit(AI_CONCURRENCY_LIMIT);
-    
-    // Helper to save Serper results to checkpoint
-    const saveSerperCheckpoint = () => {
-        if (serperCheckpointFile) {
-            try {
-                fs.writeFileSync(serperCheckpointFile, JSON.stringify(serperCache, null, 2));
-            } catch (err) {
-                log(`Failed to save Serper checkpoint: ${err.message}`);
-            }
-        }
-    };
-    
-    // Helper to save progress checkpoint
-    const saveProgressCheckpoint = () => {
-        if (progressCheckpointFile) {
-            try {
-                fs.writeFileSync(progressCheckpointFile, JSON.stringify({
-                    processedDomains: Array.from(processedDomains),
-                    currentRpm: aiRateLimiter ? aiRateLimiter.getCurrentRpm() : AI_MAX_RPM,
-                    timestamp: new Date().toISOString()
-                }));
-            } catch (err) {
-                log(`Failed to save progress checkpoint: ${err.message}`);
-            }
-        }
+
+    const persistSerperBatch = async (batchEntries) => {
+        if (!saveSerperCache || !batchEntries.length) return;
+        await saveSerperCache(batchEntries);
     };
 
     let processed = 0;
@@ -428,19 +412,39 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
     let openaiCostTotal = 0;
     const pendingBatch = [];
     let flushPromise = Promise.resolve();
-    const UPSERT_BATCH_SIZE = 100;
+    const doneDomainsBuffer = [];
+
+    const flushDomainsDone = async (force = false) => {
+        const flushFn = markDomainsDone
+            || (markDomainDone
+                ? async (domains) => {
+                    for (const domain of domains) {
+                        await markDomainDone(domain);
+                    }
+                }
+                : null);
+        if (!flushFn) return;
+        if (!force && doneDomainsBuffer.length < FOUNDER_DONE_BATCH_SIZE) return;
+        const batch = doneDomainsBuffer.splice(0, doneDomainsBuffer.length);
+        if (!batch.length) return;
+        await flushFn(batch);
+    };
 
     const flushBatch = async (force = false) => {
         if (!onBatch) return;
-        if (!force && pendingBatch.length < UPSERT_BATCH_SIZE) return;
+        if (!force && pendingBatch.length < FOUNDER_CONTACT_UPSERT_BATCH_SIZE) return;
         const batch = pendingBatch.splice(0, pendingBatch.length);
         if (batch.length === 0) return;
         flushPromise = flushPromise.then(() => onBatch(batch));
         await flushPromise;
+        log(`Founders: upserted ${batch.length} contacts to database`);
     };
+
+    const control = { checkpoint, checkPaused };
 
     const serperTasks = chunks.map((chunk, batchIdx) =>
         serperLimit(async () => {
+            await assertNotStopped(control);
             if (fatalQuotaError || fatalTaskError) {
                 return;
             }
@@ -475,6 +479,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
             
             // Only make Serper request if we have uncached domains
             if (domainsToFetch.length > 0) {
+                await assertNotStopped(control);
                 const fetchPayload = domainsToFetch.map(q => ({ q, num: 10 }));
                 const fetchConfig = {
                     method: 'post',
@@ -502,10 +507,21 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                     serperCache[domain] = rows[i] || {};
                 }
                 
-                saveSerperCheckpoint();
+                const cacheWrites = domainsToFetch.map((_, i) => ({
+                    domain: domains[domainIndices[i]],
+                    payload: rows[i] || {}
+                }));
+                await persistSerperBatch(cacheWrites);
+                await assertNotStopped(control);
                 log(`Founders: fetched and cached Serper batch ${batchIdx + 1}/${chunks.length} with ${domainsToFetch.length} new queries`);
             } else {
                 log(`Founders: using cached results for batch ${batchIdx + 1}/${chunks.length}`);
+            }
+
+            if ((batchIdx + 1) % 10 === 0 || batchIdx + 1 === chunks.length) {
+                log(`Founders: Serper ${batchIdx + 1} / ${chunks.length}`, {
+                    progress: { stage: 'founders', processed: batchIdx + 1, total: chunks.length }
+                });
             }
 
             for (let k = 0; k < chunk.items.length; k++) {
@@ -527,6 +543,7 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                 }));
 
                 const task = aiLimit(async () => {
+                    await assertNotStopped(control);
                     if (fatalQuotaError || fatalTaskError) {
                         return;
                     }
@@ -537,7 +554,9 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
 
                     if (searchResults.length > 0) {
                         try {
+                            await assertNotStopped(control);
                             const result = await aiFindFounder(searchResults, domain, log, openai, aiRateLimiter);
+                            await assertNotStopped(control);
                             name = result?.name || 'Not Found';
                             tokensIn = result?.tokensIn || 0;
                             tokensOut = result?.tokensOut || 0;
@@ -581,26 +600,24 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                     const progressPayload = {
                         progress: {
                             stage: 'founders',
+                            cost: costNumber,
                             stats: {
-                                'Total': domains.length,
+                                'Total': totalDomains,
                                 'Processed': processed,
                                 'Found': foundCount,
                                 'Not Found': notFoundCount,
                                 'Errors': errorCount,
                                 'RPM': currentRpm,
-                                'Cost': `$${costNumber}`
+                                'Cost': `$${costNumber.toFixed(2)}`
                             }
                         }
                     };
                     if (processed % 25 === 0 || processed <= 10) {
                         const rate = foundCount + notFoundCount > 0 ? ((foundCount / (foundCount + notFoundCount)) * 100).toFixed(2) : '0.00';
-                        log(`Founders: processed ${processed}/${domains.length} | find rate ${rate}%`, progressPayload);
+                        log(`Founders: processed ${processed}/${totalDomains} | find rate ${rate}%`, progressPayload);
                     } else {
                         log(null, progressPayload);
                     }
-
-                    const safe = (name || '').replace(/"/g, '""');
-                    writer.write(`${domain},"${safe}"\n`);
 
                     if (onBatch) {
                         pendingBatch.push({
@@ -611,11 +628,9 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
                         await flushBatch(false);
                     }
                     
-                    // Mark as processed and save checkpoint
                     processedDomains.add(domain);
-                    if (processed % 10 === 0) {
-                        saveProgressCheckpoint();
-                    }
+                    doneDomainsBuffer.push(domain);
+                    await flushDomainsDone(false);
                 }).catch((err) => {
                     fatalTaskError = fatalTaskError || err;
                 });
@@ -633,36 +648,32 @@ export async function runFounderFinder({ inputCsv, outputCsv, apiKeys, pricing, 
         }
         await flushBatch(true);
         await flushPromise;
+        await flushDomainsDone(true);
     } catch (err) {
         try {
             await flushBatch(true);
             await flushPromise;
+            await flushDomainsDone(true);
         } catch {
             // If flush also fails, preserve original error cause.
         }
         throw err;
     }
 
-    writer.end();
-    await new Promise(res => writer.on('finish', res));
-    
-    // Save final checkpoint
-    saveProgressCheckpoint();
-    saveSerperCheckpoint();
-
     if (fatalQuotaError) {
         throw fatalQuotaError;
     }
 
     const summary = {
-        total: domains.length,
-        processed: foundCount,
+        total: totalDomains,
+        processed: foundCount + notFoundCount,
         'Found': foundCount,
         'Not Found': notFoundCount,
         'Errors': errorCount,
+        cost: Number(stageCost.toFixed(6)),
         'Cost': `$${stageCost.toFixed(2)}`
     };
 
-    log(`Founders: done. Results written to ${outputCsv}`);
+    log('Founders: done.');
     return summary;
 }

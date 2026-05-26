@@ -1,23 +1,26 @@
 /**
- * Clients/Agency API endpoints (Firestore-based orchestration layer)
- *
- * CANONICAL AGENCY IDENTIFIER RULE:
- * The Firestore users/{uid} document ID is the canonical agency identifier.
- * This same Firebase Auth uid is used directly as agency_id in all PostgreSQL tables.
- * No reconciliation or mapping is required.
- *
- * Note: This route manages Firestore collections (orchestration and UI state).
- * PostgreSQL tables are managed by the jobs service and are scoped by agency_id derived from
- * the verified Firebase token.
+ * Clients API — tenant clients, segments, Instantly sync, and related SQL-backed state.
  */
 
 import express from 'express';
 import multer from 'multer';
 import { parse as csvParse } from 'csv-parse/sync';
-import { admin, firestore } from '../config/firebase.js';
 import { pool } from '../config/db.js';
 import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
-import { getOrCreateClient } from '../services/db/queries.js';
+import { resolveAgencyId } from '../utils/bearerAuth.js';
+import {
+    getOrCreateClient,
+    getClientRowBySlug,
+    resolveClientRow,
+    deleteClientForAgency,
+    clientRowToApi,
+    patchClientRow,
+    listClientSegments,
+    upsertClientSegment,
+    deleteClientSegment,
+    listClientsForAgency,
+    upsertClientBySlug
+} from '../services/db/queries.js';
 import {
     beginInstantlySyncRun,
     buildInstantlyWebhookTargetUrl,
@@ -216,88 +219,155 @@ function extractContactNameFromRow(row, headerLookup) {
     return `${firstName} ${lastName}`.trim();
 }
 
-async function deleteAllDocs(ref) {
-    const batchSize = 300;
-    let lastDoc = null;
-    while (true) {
-        let query = ref.orderBy('__name__').limit(batchSize);
-        if (lastDoc) query = query.startAfter(lastDoc);
-        const snap = await query.get();
-        if (snap.empty) break;
-        const batch = firestore.batch();
-        snap.docs.forEach((d) => batch.delete(d.ref));
-        await batch.commit();
-        lastDoc = snap.docs[snap.docs.length - 1];
-        if (snap.size < batchSize) break;
+async function requireClientWithInstantly(agencyId, clientIdOrSlug) {
+    const row = await resolveClientRow(agencyId, clientIdOrSlug);
+    if (!row) {
+        const error = new Error('Client not found.');
+        error.statusCode = 404;
+        throw error;
     }
-}
-
-async function verifyAgencyIdFromRequest(req) {
-    const authHeader = String(req.headers.authorization || '').trim();
-    const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
-    const idToken = bearerMatch?.[1] || String(req.query?.idToken || req.body?.idToken || '').trim();
-    if (!idToken) {
-        const error = new Error('Missing ID token.');
+    const instantlyKey = String(row.instantly_key || '').trim();
+    if (!instantlyKey) {
+        const error = new Error('Client is missing Instantly API key.');
         error.statusCode = 400;
         throw error;
     }
-
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    return decoded.uid;
+    return { row, instantlyKey };
 }
+
+async function verifyAgencyIdFromRequest(req) {
+    return resolveAgencyId(req);
+}
+
+router.get('/clients', requireAuth, async (req, res) => {
+    try {
+        const rows = await listClientsForAgency(req.agencyId);
+        res.json({
+            clients: rows.map((r) => ({
+                id: r.slug,
+                sqlId: r.id,
+                name: r.name || r.slug,
+                industry: r.industry || null,
+                instantly_key: r.instantly_key || ''
+            }))
+        });
+    } catch (error) {
+        console.error('List clients error:', error);
+        res.status(500).json({ error: 'Failed to list clients.' });
+    }
+});
 
 // Create client via server (uses Admin SDK; bypasses client-side rules)
 router.post('/clients', async (req, res) => {
     try {
-        const { idToken, name, industry, instantly_key } = req.body || {};
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
+        const { name, industry, instantly_key } = req.body || {};
         if (!name || typeof name !== 'string') return res.status(400).json({ error: 'Client name is required.' });
         const allowedIndustries = new Set(['ecom', 'saas', 'agency', 'local']);
         const industryVal = typeof industry === 'string' ? industry : '';
         if (!allowedIndustries.has(industryVal)) return res.status(400).json({ error: 'Invalid industry.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
-
+        const uid = await resolveAgencyId(req);
         const slug = name.trim().toLowerCase().replace(/\s+/g, '-').slice(0, 60);
-        const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(slug);
-        await clientRef.set({
-            id: slug,
+        await upsertClientBySlug(uid, {
+            slug,
             name: name.trim(),
             industry: industryVal,
-            instantly_key: (instantly_key || '').toString().trim(),
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+            instantly_key: (instantly_key || '').toString().trim()
+        });
 
         res.status(201).json({ id: slug });
     } catch (error) {
         console.error('Client creation error:', error);
-        res.status(500).json({ error: 'Failed to create client.' });
+        const status = error.statusCode || 500;
+        res.status(status).json({ error: error.message || 'Failed to create client.' });
     }
 });
 
-// Delete a client and cascade delete known subcollections
-router.post('/clients/:id/delete', async (req, res) => {
+router.get('/clients/:id', requireAuth, async (req, res) => {
     try {
-        const { idToken } = req.body || {};
-        const clientId = req.params.id;
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
-        if (!clientId) return res.status(400).json({ error: 'Missing client id.' });
+        const row = await resolveClientRow(req.agencyId, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        res.json({ client: clientRowToApi(row) });
+    } catch (error) {
+        console.error('GET client error:', error);
+        res.status(500).json({ error: 'Failed to load client.' });
+    }
+});
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+router.patch('/clients/:id', requireAuth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const row = await patchClientRow(req.agencyId, req.params.id, {
+            name: body.name,
+            industry: body.industry,
+            instantly_key: body.instantly_key,
+            ntfy_topic: body.ntfy_topic
+        });
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        res.json({ client: clientRowToApi(row) });
+    } catch (error) {
+        console.error('PATCH client error:', error);
+        res.status(500).json({ error: 'Failed to update client.' });
+    }
+});
 
-        const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
-        const subs = ['processed-domains', 'leads'];
-        for (const sub of subs) {
-            const colRef = clientRef.collection(sub);
-            await deleteAllDocs(colRef);
+router.get('/clients/:id/segments', requireAuth, async (req, res) => {
+    try {
+        const row = await resolveClientRow(req.agencyId, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const segments = await listClientSegments(req.agencyId, row.id);
+        res.json({ segments });
+    } catch (error) {
+        console.error('List segments error:', error);
+        res.status(500).json({ error: 'Failed to list segments.' });
+    }
+});
+
+router.post('/clients/:id/segments', requireAuth, async (req, res) => {
+    try {
+        const row = await resolveClientRow(req.agencyId, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const { id, name, filters } = req.body || {};
+        if (!name || typeof name !== 'string') {
+            return res.status(400).json({ error: 'Segment name is required.' });
         }
-        await clientRef.delete();
+        const segmentId = await upsertClientSegment(req.agencyId, row.id, {
+            id,
+            name: name.trim(),
+            filters: filters || {}
+        });
+        res.status(201).json({ id: segmentId });
+    } catch (error) {
+        console.error('Upsert segment error:', error);
+        res.status(500).json({ error: 'Failed to save segment.' });
+    }
+});
+
+router.delete('/clients/:id/segments/:segmentId', requireAuth, async (req, res) => {
+    try {
+        const row = await resolveClientRow(req.agencyId, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const ok = await deleteClientSegment(req.agencyId, row.id, req.params.segmentId);
+        if (!ok) return res.status(404).json({ error: 'Segment not found.' });
         res.json({ ok: true });
     } catch (error) {
-        console.error('Client cascade delete error:', error);
-        res.status(500).json({ error: 'Failed to delete client.' });
+        console.error('Delete segment error:', error);
+        res.status(500).json({ error: 'Failed to delete segment.' });
+    }
+});
+
+router.post('/clients/:id/delete', async (req, res) => {
+    try {
+        const clientId = req.params.id;
+        if (!clientId) return res.status(400).json({ error: 'Missing client id.' });
+        const agencyId = await resolveAgencyId(req);
+        const deleted = await deleteClientForAgency(agencyId, clientId);
+        if (!deleted) return res.status(404).json({ error: 'Client not found.' });
+        res.json({ ok: true });
+    } catch (error) {
+        const status = error.statusCode || 500;
+        console.error('Client delete error:', error);
+        res.status(status).json({ error: error.message || 'Failed to delete client.' });
     }
 });
 
@@ -309,19 +379,15 @@ router.post('/clients/:id/campaigns', async (req, res) => {
             params: req.params,
             hasBody: !!req.body,
         });
-        const { idToken } = req.body || {};
         const clientId = req.params.id;
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientId) return res.status(400).json({ error: 'Missing client id.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const uid = await resolveAgencyId(req);
         console.log('[campaigns] verified user', { uid, clientId });
 
-        const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
-        const instantlyKey = (clientSnap.data()?.instantly_key || '').toString().trim();
+        const clientRow = await getClientRowBySlug(uid, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+        const instantlyKey = (clientRow.instantly_key || '').toString().trim();
         if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
 
         // Fetch campaigns from Instantly API (prefer v2) for last N days
@@ -381,25 +447,6 @@ router.post('/clients/:id/campaigns', async (req, res) => {
             return res.status(502).json({ error: 'Failed to fetch campaigns from Instantly.' });
         }
 
-        // Upsert campaigns into subcollection
-        const colRef = clientRef.collection('campaigns');
-        const batch = firestore.batch();
-        campaigns.forEach((c) => {
-            const id = (c.id || c.campaignId || c.uuid || c._id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).toString();
-            const ref = colRef.doc(id);
-            const created = c.timestamp_created || c.createdAt || c.created_at || c.created || c.created_at_utc || null;
-            batch.set(ref, {
-                id,
-                name: c.name || c.title || c.campaign_name || '',
-                status: typeof c.status !== 'undefined' ? c.status : (c.state || ''),
-                createdAt: created ? new Date(created).toISOString() : null,
-                raw: c,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        });
-        await batch.commit();
-        console.log('[campaigns] upsert complete', { uid, clientId, wrote: campaigns.length });
-
         // Sync campaigns to SQL (instantly_campaigns table)
         try {
             if (campaigns.length > 0) {
@@ -443,21 +490,6 @@ router.post('/clients/:id/campaigns', async (req, res) => {
             // Don't fail the request if SQL sync fails
         }
 
-        // Update client doc with active campaigns count (status === 1)
-        try {
-            const activeCount = campaigns.filter(c => {
-                const statusVal = typeof c.status !== 'undefined' ? c.status : (c.state || null);
-                return Number(statusVal) === 1;
-            }).length;
-            await clientRef.set({
-                activeCampaigns: activeCount,
-                campaignsLastSynced: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-            console.log('[campaigns] client activeCampaigns updated', { clientId, activeCount });
-        } catch (e) {
-            console.warn('[campaigns] failed to set activeCampaigns', e?.message || e);
-        }
-
         // Return count
         res.json({ count: campaigns.length });
     } catch (error) {
@@ -468,20 +500,12 @@ router.post('/clients/:id/campaigns', async (req, res) => {
 
 router.post('/clients/:id/instantly/webhook', async (req, res) => {
     try {
-        const { idToken, rotateSecret = false } = req.body || {};
+        const { rotateSecret = false } = req.body || {};
         const clientSlug = req.params.id;
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const agencyId = decoded.uid;
-
-        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
-
-        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
-        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+        const agencyId = await resolveAgencyId(req);
+        const { instantlyKey } = await requireClientWithInstantly(agencyId, clientSlug);
 
         const targetUrl = buildInstantlyWebhookTargetUrl(req, agencyId, clientSlug);
         if (!targetUrl) return res.status(400).json({ error: 'Could not determine webhook target URL.' });
@@ -495,13 +519,6 @@ router.post('/clients/:id/instantly/webhook', async (req, res) => {
             rotateSecret: !!rotateSecret
         });
 
-        await clientRef.set({
-            instantlyWebhookId: result.webhook?.id || null,
-            instantlyWebhookUrl: result.webhook?.target_hook_url || targetUrl,
-            instantlyWebhookStatus: typeof result.webhook?.status === 'number' ? result.webhook.status : null,
-            instantlyWebhookUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
         res.json({
             clientId: result.clientId,
             webhookId: result.webhook?.id || null,
@@ -510,28 +527,20 @@ router.post('/clients/:id/instantly/webhook', async (req, res) => {
             secret: result.secret
         });
     } catch (error) {
+        const status = error.statusCode || 500;
         console.error('Error registering Instantly webhook:', error);
-        res.status(500).json({ error: 'Failed to register Instantly webhook.' });
+        res.status(status).json({ error: error.message || 'Failed to register Instantly webhook.' });
     }
 });
 
 router.post('/clients/:id/instantly/sync', async (req, res) => {
     try {
         setNoStoreHeaders(res);
-        const { idToken } = req.body || {};
         const clientSlug = req.params.id;
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const agencyId = decoded.uid;
-
-        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
-
-        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
-        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+        const agencyId = await resolveAgencyId(req);
+        const { instantlyKey } = await requireClientWithInstantly(agencyId, clientSlug);
 
         const result = await beginInstantlySyncRun({
             agencyId,
@@ -554,20 +563,11 @@ router.post('/clients/:id/instantly/sync', async (req, res) => {
 router.post('/clients/:id/instantly/email-accounts/sync', async (req, res) => {
     try {
         setNoStoreHeaders(res);
-        const { idToken } = req.body || {};
         const clientSlug = req.params.id;
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const agencyId = decoded.uid;
-
-        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
-
-        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
-        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+        const agencyId = await resolveAgencyId(req);
+        const { instantlyKey } = await requireClientWithInstantly(agencyId, clientSlug);
 
         const result = await syncClientEmailAccounts({
             agencyId,
@@ -586,22 +586,13 @@ router.post('/clients/:id/instantly/email-accounts/sync', async (req, res) => {
 router.post('/clients/:id/follow-ups/run-now', async (req, res) => {
     try {
         setNoStoreHeaders(res);
-        const { idToken, dryRun = false } = req.body || {};
+        const { dryRun = false } = req.body || {};
         const clientSlug = req.params.id;
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientSlug) return res.status(400).json({ error: 'Missing client id.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const agencyId = decoded.uid;
-
-        const clientRef = firestore.collection('users').doc(agencyId).collection('clients').doc(clientSlug);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
-
-        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
-        if (!instantlyKey) return res.status(400).json({ error: 'Client is missing Instantly API key.' });
-
-        const sqlClientId = await getOrCreateClient(agencyId, clientSlug);
+        const agencyId = await resolveAgencyId(req);
+        const { row, instantlyKey } = await requireClientWithInstantly(agencyId, clientSlug);
+        const sqlClientId = row.id;
         const summary = await runFollowUpsForClient({
             agencyId,
             clientSlug,
@@ -902,23 +893,18 @@ router.get('/clients/:clientId/campaigns/list', async (req, res) => {
 router.post('/clients/:clientId/instantly-import/merge', upload.single('file'), async (req, res) => {
     try {
         const { clientId } = req.params;
-        const idToken = String(req.body?.idToken || '').trim();
         const notesRaw = String(req.body?.notes || '').trim();
         const campaignNameOverridesRaw = String(req.body?.campaignNameOverrides || '').trim();
         const file = req.file;
 
-        if (!idToken) return res.status(400).json({ error: 'Missing ID token.' });
         if (!clientId) return res.status(400).json({ error: 'Missing client id.' });
         if (!file?.buffer) return res.status(400).json({ error: 'Missing CSV file upload.' });
 
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        const uid = decoded.uid;
+        const uid = await resolveAgencyId(req);
+        const clientRow = await resolveClientRow(uid, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
 
-        const clientRef = firestore.collection('users').doc(uid).collection('clients').doc(clientId);
-        const clientSnap = await clientRef.get();
-        if (!clientSnap.exists) return res.status(404).json({ error: 'Client not found.' });
-
-        const instantlyKey = String(clientSnap.data()?.instantly_key || '').trim();
+        const instantlyKey = String(clientRow.instantly_key || '').trim();
         if (!instantlyKey) {
             return res.status(400).json({ error: 'Client has no Instantly API key configured.' });
         }

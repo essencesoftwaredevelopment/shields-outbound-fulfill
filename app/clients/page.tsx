@@ -2,11 +2,10 @@
 
 import { useEffect, useMemo, useState, useRef } from "react";
 import { useRouter, usePathname } from "next/navigation";
-import { collection, getDocs, onSnapshot, doc, getDoc } from "firebase/firestore";
-import { getIdToken } from "firebase/auth";
-import { firebaseAuth } from "@/lib/firebase/auth";
 import { useAuth } from "@/hooks/use-auth";
-import { firestore } from "@/lib/firebase/firestore";
+import { useAgencyId } from "@/lib/hooks/useAgencyId";
+import { apiFetch, apiJson } from "@/lib/api/http";
+import { getAccessToken } from "@/lib/supabase/session";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 
@@ -58,15 +57,15 @@ export default function ClientsPage() {
     const router = useRouter();
     const pathname = usePathname();
     const { user, loading } = useAuth();
+    const { agencyId } = useAgencyId();
     const [clients, setClients] = useState<Array<{ id: string; name: string; activeCampaigns?: number }>>([]);
     const [campaignCounts, setCampaignCounts] = useState<Record<string, number>>({});
-    const campaignUnsubsRef = useState<Record<string, () => void>>({})[0];
     const [selectedClientId, setSelectedClientId] = useState<string>("");
     const [selectedClient, setSelectedClient] = useState<{ id: string; name: string; totalLeads?: number; instantly_key?: string; industry?: string } | null>(null);
     const [campaigns, setCampaigns] = useState<Array<{ id: string; name: string; status?: string; createdAt?: string }>>([]);
     const [syncingCampaigns, setSyncingCampaigns] = useState(false);
     const [syncMessage, setSyncMessage] = useState<string>("");
-    const [companiesCount, setCompaniesCount] = useState<number>(0);
+    const [companyCountsByClient, setCompanyCountsByClient] = useState<Record<string, number>>({});
     const modalRef = useRef<HTMLDivElement>(null);
 
     const niches = useMemo<Niche[]>(
@@ -80,9 +79,9 @@ export default function ClientsPage() {
     );
 
     const instantlyWebhookUrl = useMemo(() => {
-        if (!user || !selectedClientId) return "";
-        return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${user.uid}/${selectedClientId}`;
-    }, [user, selectedClientId]);
+        if (!agencyId || !selectedClientId) return "";
+        return `https://api.shieldsoutboundserver.org/webhook/instantly/events/${agencyId}/${selectedClientId}`;
+    }, [agencyId, selectedClientId]);
 
     useEffect(() => {
         if (!loading && !user) {
@@ -90,109 +89,29 @@ export default function ClientsPage() {
         }
     }, [loading, user, router]);
 
-    // Fetch total companies count from SQL database
+    const clientIdsKey = useMemo(
+        () => clients.map((c) => c.id).filter(Boolean).sort().join(","),
+        [clients]
+    );
+
     useEffect(() => {
-        if (!user) {
-            setCompaniesCount(0);
+        if (!user?.id) {
+            setClients([]);
+            setCompanyCountsByClient({});
             return;
         }
-        
         let cancelled = false;
-        
+
         (async () => {
             try {
-                const currentUser = firebaseAuth.currentUser;
-                const idToken = currentUser ? await getIdToken(currentUser) : null;
-                if (!idToken || cancelled) return;
-                
-                const response = await fetchWithRetry(
-                    `${getPipelineBaseUrl()}/api/stats/companies-count`,
-                    {
-                        headers: { 
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        }
-                    }
-                );
-                
-                if (response.ok && !cancelled) {
-                    const data = await response.json();
-                    setCompaniesCount(data.count || 0);
-                }
-            } catch (error) {
-                console.error('Failed to fetch companies count:', error);
-                if (!cancelled) setCompaniesCount(0);
-            }
-        })();
-        
-        return () => { cancelled = true; };
-    }, [user]);
-
-    useEffect(() => {
-        if (!user) {
-            setClients([]);
-            // cleanup campaign listeners
-            Object.values(campaignUnsubsRef).forEach(unsub => { try { unsub(); } catch { } });
-            Object.keys(campaignUnsubsRef).forEach(k => delete campaignUnsubsRef[k]);
-            return;
-        }
-        let cancelled = false;
-
-        const colRef = collection(firestore, "users", user.uid, "clients");
-
-        const unsubscribe = onSnapshot(
-            colRef,
-            (snap) => {
+                const data = await apiJson<{ clients: Array<{ id: string; name: string }> }>("/api/clients");
                 if (cancelled) return;
-                const rows = snap.docs.map((d) => ({
-                    id: d.id,
-                    name: (d.data().name as string) || d.id,
-                    activeCampaigns: (d.data().activeCampaigns as number) || 0,
+                const rows = (data.clients || []).map((c) => ({
+                    id: c.id,
+                    name: c.name || c.id,
+                    activeCampaigns: 0,
                 }));
                 setClients(rows);
-                // keep selection in sync if present
-                if (selectedClientId) {
-                    const match = rows.find(r => r.id === selectedClientId) || null;
-                    setSelectedClient(match ? { ...match } : null);
-                }
-                // wire up per-client campaigns listeners to compute active counts in real time
-                rows.forEach((row) => {
-                    if (campaignUnsubsRef[row.id]) return; // already listening
-                    const col = collection(firestore, "users", user.uid, "clients", row.id, "campaigns");
-                    const unsub = onSnapshot(col, (csnap) => {
-                        if (cancelled) return;
-                        let count = 0;
-                        csnap.docs.forEach((doc) => {
-                            const st = doc.data().status;
-                            if (Number(st) === 1) count += 1;
-                        });
-                        setCampaignCounts((prev) => ({ ...prev, [row.id]: count }));
-                    }, () => {
-                        if (!cancelled) setCampaignCounts((prev) => ({ ...prev, [row.id]: 0 }));
-                    });
-                    campaignUnsubsRef[row.id] = unsub;
-                });
-            },
-            () => {
-                if (!cancelled) setClients([]);
-            }
-        );
-
-        (async () => {
-            try {
-                const snap = await getDocs(colRef);
-                if (!cancelled) {
-                    const rows = snap.docs.map((d) => ({
-                        id: d.id,
-                        name: (d.data().name as string) || d.id,
-                        activeCampaigns: (d.data().activeCampaigns as number) || 0,
-                    }));
-                    setClients(rows);
-                    if (selectedClientId) {
-                        const match = rows.find(r => r.id === selectedClientId) || null;
-                        setSelectedClient(match ? { ...match } : null);
-                    }
-                }
             } catch {
                 if (!cancelled) setClients([]);
             }
@@ -200,71 +119,123 @@ export default function ClientsPage() {
 
         return () => {
             cancelled = true;
-            try { unsubscribe(); } catch { }
-            // cleanup campaign listeners
-            Object.values(campaignUnsubsRef).forEach(unsub => { try { unsub(); } catch { } });
-            Object.keys(campaignUnsubsRef).forEach(k => delete campaignUnsubsRef[k]);
         };
-    }, [user]);
+    }, [user?.id]);
 
-    // Load full selected client details when selected
     useEffect(() => {
-        if (!user || !selectedClientId) {
+        if (!user?.id || !clientIdsKey) {
+            setCompanyCountsByClient({});
+            return;
+        }
+        let cancelled = false;
+
+        (async () => {
+            try {
+                const token = await getAccessToken();
+                if (!token || cancelled) return;
+                const params = new URLSearchParams({ clientIds: clientIdsKey });
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/stats/companies-counts?${params}`,
+                    {
+                        headers: {
+                            Authorization: `Bearer ${token}`,
+                            "Content-Type": "application/json",
+                        },
+                    }
+                );
+                if (response.ok && !cancelled) {
+                    const data = (await response.json()) as { counts?: Record<string, number> };
+                    setCompanyCountsByClient(data.counts || {});
+                }
+            } catch (error) {
+                console.error("Failed to fetch company counts:", error);
+                if (!cancelled) setCompanyCountsByClient({});
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [user?.id, clientIdsKey]);
+
+    useEffect(() => {
+        if (!selectedClientId) {
+            setSelectedClient(null);
+            setCampaigns([]);
+            return;
+        }
+        const match = clients.find((c) => c.id === selectedClientId) || null;
+        if (match) {
+            setSelectedClient((prev) => (prev?.id === match.id ? prev : { ...match }));
+        }
+    }, [selectedClientId, clients]);
+
+    useEffect(() => {
+        if (!user || !selectedClientId || !agencyId) {
             setSelectedClient(null);
             setCampaigns([]);
             return;
         }
         let cancelled = false;
+
         (async () => {
             try {
-                const ref = doc(firestore, "users", user.uid, "clients", selectedClientId);
-                const snap = await getDoc(ref);
-                if (!cancelled) {
-                    const data = snap.data() || {};
-                    setSelectedClient({
-                        id: selectedClientId,
-                        name: (data.name as string) || selectedClientId,
-                        totalLeads: (data.totalLeads as number) || 0,
-                        instantly_key: (data.instantly_key as string) || "",
-                        industry: (data.industry as string) || "",
-                    });
-                }
+                const clientData = await apiJson<{
+                    client: {
+                        id: string;
+                        name: string;
+                        industry?: string;
+                        instantly_key?: string;
+                    };
+                }>(`/api/clients/${encodeURIComponent(selectedClientId)}`);
+
+                const campaignsData = await apiFetch(
+                    `/api/clients/${encodeURIComponent(selectedClientId)}/campaigns/list?agencyId=${encodeURIComponent(agencyId)}`
+                ).then((r) => r.json() as Promise<{ campaigns?: Array<{ id: string | number; name: string; status?: number }> }>);
+
+                if (cancelled) return;
+
+                setSelectedClient({
+                    id: selectedClientId,
+                    name: clientData.client?.name || selectedClientId,
+                    totalLeads: 0,
+                    instantly_key: clientData.client?.instantly_key || "",
+                    industry: clientData.client?.industry || "",
+                });
+
+                const rows = (campaignsData.campaigns || []).map((c) => ({
+                    id: String(c.id),
+                    name: c.name || String(c.id),
+                    status: String(c.status ?? ""),
+                    createdAt: "",
+                }));
+                setCampaigns(rows);
+
+                const activeCount = rows.filter((c) => Number(c.status) === 1).length;
+                setCampaignCounts((prev) => ({ ...prev, [selectedClientId]: activeCount }));
             } catch {
                 if (!cancelled) {
-                    const match = clients.find(c => c.id === selectedClientId) || null;
+                    const match = clients.find((c) => c.id === selectedClientId) || null;
                     setSelectedClient(match ? { ...match } : null);
+                    setCampaigns([]);
                 }
             }
         })();
-        // subscribe to campaigns subcollection
-        const campaignsCol = collection(firestore, "users", user.uid, "clients", selectedClientId, "campaigns");
-        const unsub = onSnapshot(campaignsCol, (snap) => {
-            if (cancelled) return;
-            const rows = snap.docs.map((d) => ({
-                id: d.id,
-                name: (d.data().name as string) || d.id,
-                status: (d.data().status as string) || "",
-                createdAt: (d.data().createdAt as string) || ""
-            }));
-            setCampaigns(rows);
-        }, () => {
-            if (!cancelled) setCampaigns([]);
-        });
-        return () => { cancelled = true; };
-    }, [selectedClientId, user]);
+
+        return () => {
+            cancelled = true;
+        };
+    }, [selectedClientId, user?.id, agencyId, clients]);
 
     async function handleRefreshCampaigns() {
         if (!user || !selectedClientId) return;
         setSyncingCampaigns(true);
         setSyncMessage("");
         try {
-            const currentUser = firebaseAuth.currentUser;
-            const idToken = currentUser ? await getIdToken(currentUser) : null;
-            if (!idToken) throw new Error("Missing auth token");
-            const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(selectedClientId)}/campaigns`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ idToken })
+            const resp = await apiFetch(`/api/clients/${encodeURIComponent(selectedClientId)}/campaigns`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
             });
             if (!resp.ok) {
                 const data = await resp.json().catch(() => ({}));
@@ -323,7 +294,9 @@ export default function ClientsPage() {
                                     <div className="niche-card__text">
                                         <p className="niche-card__label">{client.name}</p>
                                         <p className="niche-card__detail">
-                                            <strong className="card-big-data">{companiesCount.toLocaleString()}</strong>
+                                            <strong className="card-big-data">
+                                                {(companyCountsByClient[client.id] ?? 0).toLocaleString()}
+                                            </strong>
                                             <br />
                                             companies in database
                                         </p>

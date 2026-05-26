@@ -21,6 +21,23 @@ const B2B_KEYWORDS = [
 
 const NEW_PROMPT_MODEL = 'gpt-5-mini';
 
+/** Emits stage progress so jobPipeline persists to SQL + Supabase Realtime. */
+function reportPersonalizationProgress(log, processed, total, stats = {}) {
+    const safeTotal = Math.max(1, Number(total) || 1);
+    const done = Math.min(Math.max(0, Number(processed) || 0), safeTotal);
+    const progress = {
+        stage: 'personalization',
+        processed: done,
+        total: safeTotal,
+        stats: { personalized: done, ...stats }
+    };
+    if (typeof stats.cost === 'number' && Number.isFinite(stats.cost)) {
+        progress.cost = stats.cost;
+        progress.stats.Cost = `$${stats.cost.toFixed(2)}`;
+    }
+    log?.(`Personalization progress: ${done}/${safeTotal}`, { progress });
+}
+
 function normalizeHostname(urlOrDomain) {
     let hostname = urlOrDomain.trim().toLowerCase();
     // Fix malformed URLs
@@ -96,6 +113,8 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
         return { total: 0, shopifyStores: 0 };
     }
 
+    reportPersonalizationProgress(log, 0, rows.length, { phase: 'shopify_detection', shopifyStores: 0 });
+
     const results = [];
     let processed = 0;
     let shopifyCount = 0;
@@ -111,10 +130,6 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
                 processed++;
 
                 if (isShopify) shopifyCount++;
-
-                if (processed % 50 === 0) {
-                    log?.(`DNS lookup progress: ${processed}/${rows.length} (${shopifyCount} Shopify stores found)`);
-                }
 
                 return {
                     domain,
@@ -133,6 +148,10 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
         const batch = rows.slice(i, i + concurrency);
         const batchResults = await processBatch(batch);
         results.push(...batchResults);
+        reportPersonalizationProgress(log, Math.min(i + batch.length, rows.length), rows.length, {
+            phase: 'shopify_detection',
+            shopifyStores: shopifyCount
+        });
     }
 
     // Write results
@@ -398,7 +417,8 @@ async function personalizeWithNewPromptFromShopify({
     concurrency = 12,
     model = NEW_PROMPT_MODEL,
     removeB2B = true,
-    onBatch = null
+    onBatch = null,
+    checkpoint = null
 }) {
     log?.(`Generating personalized first lines with New Prompt (${model})...`);
 
@@ -422,6 +442,8 @@ async function personalizeWithNewPromptFromShopify({
         fs.writeFileSync(outputCsv, 'domain,url,title,description,date,first_line\n');
         return { personalized: 0, productsFetched: 0, failed: 0 };
     }
+
+    reportPersonalizationProgress(log, 0, rows.length, { phase: 'generating' });
 
     const writeStream = fs.createWriteStream(outputCsv);
     const stringifier = csvStringify({
@@ -527,6 +549,7 @@ async function personalizeWithNewPromptFromShopify({
     };
 
     const runRow = async (row) => {
+        if (checkpoint) await checkpoint();
         const domain = normalizeHostname(row.domain || '');
         if (!domain) return null;
 
@@ -612,6 +635,7 @@ async function personalizeWithNewPromptFromShopify({
     };
 
     for (let i = 0; i < rows.length; i += concurrency) {
+        if (checkpoint) await checkpoint();
         const batch = rows.slice(i, i + concurrency);
         const results = await Promise.allSettled(batch.map((row) => runRow(row)));
         for (const result of results) {
@@ -631,7 +655,14 @@ async function personalizeWithNewPromptFromShopify({
             }
         }
         await flushBatch(false);
-        log?.(`New prompt personalization progress: ${Math.min(i + concurrency, rows.length)}/${rows.length}`);
+        const runningCost =
+            (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
+        reportPersonalizationProgress(log, Math.min(i + batch.length, rows.length), rows.length, {
+            phase: 'generating',
+            productsFetched,
+            failed,
+            cost: Number(runningCost.toFixed(6))
+        });
     }
 
     stringifier.end();
@@ -642,14 +673,21 @@ async function personalizeWithNewPromptFromShopify({
         await flushBatch(true);
     }
 
-    const estimatedCost = (totalInputTokens * 0.00025 / 1000) + (totalOutputTokens * 0.002 / 1000);
+    const estimatedCost = (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
+    reportPersonalizationProgress(log, processed, rows.length, {
+        phase: 'generating',
+        productsFetched,
+        failed,
+        cost: Number(estimatedCost.toFixed(6))
+    });
+
     log?.(`New prompt personalization complete: ${processed} rows. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
 
     return {
         personalized: processed,
         productsFetched,
         failed,
-        estimatedCost
+        estimatedCost: Number(estimatedCost.toFixed(6))
     };
 }
 
@@ -850,27 +888,6 @@ Description: ${description}
                     const firstLine = await generateFirstLine(title, description, timeframe);
                     processed++;
 
-                    if (processed % 5 === 0) {
-                        const avgTokens = processed > 0 ? Math.round((totalInputTokens + totalOutputTokens) / processed) : 0;
-                        log?.(`Personalization progress: ${processed}/${rows.length} (avg ${avgTokens} tokens/request)`, {
-                            progress: {
-                                stage: 'personalization',
-                                processed,
-                                total: rows.length,
-                                stats: { personalized: processed }
-                            }
-                        });
-                    } else {
-                        log?.(null, {
-                            progress: {
-                                stage: 'personalization',
-                                processed,
-                                total: rows.length,
-                                stats: { personalized: processed }
-                            }
-                        });
-                    }
-
                     return {
                         domain,
                         url: row.url || '',
@@ -913,6 +930,12 @@ Description: ${description}
     for (let i = 0; i < rows.length; i += concurrency) {
         const batch = rows.slice(i, i + concurrency);
         await processBatch(batch);
+        const runningCost =
+            (totalInputTokens * 0.00015) / 1000 + (totalOutputTokens * 0.0006) / 1000;
+        reportPersonalizationProgress(log, Math.min(i + batch.length, rows.length), rows.length, {
+            phase: 'generating',
+            cost: Number(runningCost.toFixed(6))
+        });
     }
 
     stringifier.end();
@@ -923,14 +946,17 @@ Description: ${description}
         await flushBatch(true);
     }
 
-    const estimatedCost = (totalInputTokens * 0.00015 / 1000) + (totalOutputTokens * 0.0006 / 1000);
+    const estimatedCost = (totalInputTokens * 0.00015) / 1000 + (totalOutputTokens * 0.0006) / 1000;
+    reportPersonalizationProgress(log, processed, rows.length, {
+        phase: 'generating',
+        cost: Number(estimatedCost.toFixed(6))
+    });
     log?.(`Personalization complete: ${processed} first lines generated`);
     log?.(`Token usage: ${totalInputTokens.toLocaleString()} input, ${totalOutputTokens.toLocaleString()} output (~$${estimatedCost.toFixed(4)})`);
 
     return {
         personalized: processed,
-        // inputTokens: totalInputTokens,
-        // outputTokens: totalOutputTokens,
+        cost: estimatedCost,
         'Estimated Cost': estimatedCost
     };
 }
@@ -944,7 +970,8 @@ export async function runPersonalization({
     removeB2B = true,
     productPromptVersion = 'old',
     productPromptProducts = 3,
-    onBatch = null
+    onBatch = null,
+    checkpoint = null
 }) {
     const jobDir = path.dirname(inputCsv);
     const shopifyDetectionCsv = path.join(jobDir, 'shopify-detection.csv');
@@ -991,9 +1018,11 @@ export async function runPersonalization({
             concurrency: personalizationConcurrency,
             model: NEW_PROMPT_MODEL,
             removeB2B,
-            onBatch
+            onBatch,
+            checkpoint
         });
 
+        const estimatedCost = newPromptStats.estimatedCost || 0;
         return {
             processed: newPromptStats.personalized,
             total: shopifyStats.total,
@@ -1002,7 +1031,8 @@ export async function runPersonalization({
             ['Products Failed']: newPromptStats.failed,
             ['Products Removed']: 0,
             ['Personalized']: newPromptStats.personalized,
-            ['Estimated Cost']: newPromptStats.estimatedCost || 0
+            cost: estimatedCost,
+            ['Estimated Cost']: estimatedCost
         };
     }
 
@@ -1062,6 +1092,7 @@ export async function runPersonalization({
         onBatch
     });
 
+    const estimatedCost = personalizeStats['Estimated Cost'] || 0;
     return {
         processed: personalizeStats.personalized,
         total: shopifyStats.total,
@@ -1070,6 +1101,7 @@ export async function runPersonalization({
         ['Products Failed']: fetchStats.failed,
         ['Products Removed']: cleanStats.removed,
         ['Personalized']: personalizeStats.personalized,
-        ['Estimated Cost']: personalizeStats['Estimated Cost']
+        cost: estimatedCost,
+        ['Estimated Cost']: estimatedCost
     };
 }

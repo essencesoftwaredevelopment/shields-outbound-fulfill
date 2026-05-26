@@ -5,6 +5,7 @@
     "type": "module",
     "scripts": {
         "dev": "node --watch src/index.js",
+        "dev:all": "bash scripts/dev-all.sh",
         "worker": "node src/worker/queueWorker.js",
         "instantly:worker": "node src/worker/instantlySyncWorker.js",
         "instantly:sync": "node src/scripts/run-instantly-sync-once.js",
@@ -12,6 +13,7 @@
         "followups:send-once": "node src/scripts/run-follow-ups-once.js",
         "personalizer:local": "node src/scripts/run-personalizer-local.js",
         "db:ping": "node scripts/db-ping.js",
+        "db:migrate:firestore-users-clients": "node src/scripts/migrate-firestore-to-sql/migrate-users-clients.js",
         "db:migration:capture-baseline": "bash scripts/migration/capture-cloudsql-baseline.sh",
         "db:migration:export-data": "bash scripts/migration/export-cloudsql-data.sh",
         "db:migration:import-target": "bash scripts/migration/import-into-supabase.sh",
@@ -20,6 +22,7 @@
         "test": "node --test \"src/utils/__tests__/*.test.js\""
     },
     "dependencies": {
+        "@supabase/supabase-js": "^2.106.2",
         "axios": "^1.7.7",
         "cors": "^2.8.5",
         "csv-parse": "^5.5.4",

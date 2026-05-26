@@ -12,7 +12,6 @@
  */
 
 import { pool } from '../config/db.js';
-import { firestore } from '../config/firebase.js';
 import { sendInstantlyReply } from './instantlyState.js';
 import crypto from 'crypto';
 
@@ -706,15 +705,11 @@ export async function runFollowUpsOnce({
     batchSize = BATCH_SIZE_DEFAULT,
     logger = console.log
 } = {}) {
-    const snapshot = await firestore.collectionGroup('clients').get();
-    const allClients = snapshot.docs
-        .map((doc) => {
-            const parent = doc.ref.parent?.parent;
-            const agencyId = parent?.id || null;
-            const instantlyKey = doc.data()?.instantly_key?.trim() || null;
-            return { agencyId, clientSlug: doc.id, instantlyKey };
-        })
-        .filter((c) => c.agencyId && c.clientSlug && c.instantlyKey);
+    const { listClientsWithInstantlyKey } = await import('./db/queries.js');
+    const allClients = await listClientsWithInstantlyKey({
+        agencyId: filterAgencyId || null,
+        clientSlug: filterClientSlug || null
+    });
 
     const selected = allClients.filter((c) => {
         if (filterAgencyId && c.agencyId !== filterAgencyId) return false;
