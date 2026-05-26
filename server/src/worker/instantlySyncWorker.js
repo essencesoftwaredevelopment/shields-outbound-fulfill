@@ -1,7 +1,11 @@
 import pLimit from 'p-limit';
 import { listInstantlySyncClients, runInstantlySyncJob } from '../services/instantlyState.js';
 
-const POLL_INTERVAL_MS = Math.max(parseInt(process.env.INSTANTLY_SYNC_INTERVAL_MS || '900000', 10) || 900000, 60000);
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = Math.max(
+    parseInt(process.env.INSTANTLY_SYNC_INTERVAL_MS || String(ONE_DAY_MS), 10) || ONE_DAY_MS,
+    60000
+);
 const CONCURRENCY = Math.max(parseInt(process.env.INSTANTLY_SYNC_CONCURRENCY || '2', 10) || 2, 1);
 
 let shutdownRequested = false;

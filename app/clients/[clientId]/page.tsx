@@ -304,6 +304,7 @@ const NEGATIVE_ACTIVITY_LABELS = new Set(["not interested", "wrong person", "los
 const NEUTRAL_ACTIVITY_LABELS = new Set(["out of office", "neutral", "no show", "unsubscribed"]);
 
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
+const INSTANTLY_SYNC_POLL_MS = 5000;
 
 const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
     { key: 'founder_name', label: 'Founder Name', group: 'Lead', defaultSelected: true },
@@ -3171,15 +3172,32 @@ export default function ClientPage() {
             return;
         }
 
-        stopInstantlySyncPolling();
-        instantlySyncPollRef.current = setInterval(() => {
-            fetchInstantlySyncRun(runId).catch((error) => {
+        const poll = async () => {
+            if (typeof document !== 'undefined' && document.hidden) return;
+            try {
+                const run = await fetchInstantlySyncRun(runId);
+                if (!run || !ACTIVE_INSTANTLY_SYNC_STATUSES.has(run.status || '')) {
+                    stopInstantlySyncPolling();
+                }
+            } catch (error) {
                 console.error('Failed to poll Instantly sync run:', error);
-            });
-        }, 2000);
+            }
+        };
+
+        stopInstantlySyncPolling();
+        void poll();
+        instantlySyncPollRef.current = setInterval(() => {
+            void poll();
+        }, INSTANTLY_SYNC_POLL_MS);
+
+        const onVisibilityChange = () => {
+            if (!document.hidden) void poll();
+        };
+        document.addEventListener('visibilitychange', onVisibilityChange);
 
         return () => {
             stopInstantlySyncPolling();
+            document.removeEventListener('visibilitychange', onVisibilityChange);
         };
     }, [instantlySyncRun?.id, instantlySyncRun?.status, fetchInstantlySyncRun, stopInstantlySyncPolling]);
 

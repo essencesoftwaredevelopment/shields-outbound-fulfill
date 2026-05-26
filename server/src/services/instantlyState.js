@@ -881,6 +881,55 @@ async function getInstantlySyncRunRowById(runId) {
     return result.rows[0] || null;
 }
 
+const INSTANTLY_SYNC_STALE_MS = {
+    queued: 15 * 60 * 1000,
+    running: 45 * 60 * 1000,
+    cancelling: 5 * 60 * 1000
+};
+
+async function reconcileStaleInstantlySyncRun(run) {
+    if (!run) return null;
+    const status = String(run.status || '').toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(INSTANTLY_SYNC_STALE_MS, status)) {
+        return run;
+    }
+
+    const updatedAtMs = new Date(run.updatedAt || run.startedAt || 0).getTime();
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) return run;
+
+    const staleAfterMs = INSTANTLY_SYNC_STALE_MS[status];
+    if (Date.now() - updatedAtMs < staleAfterMs) {
+        return run;
+    }
+
+    if (status === 'cancelling') {
+        const metadata = mergeMetadataPatch(run.metadata, {
+            cancelledAt: new Date().toISOString(),
+            phase: 'cancelled',
+            staleReconciledAt: new Date().toISOString()
+        });
+        return updateInstantlySyncRun(run.id, {
+            status: 'cancelled',
+            progress_message: 'Sync cancelled (stop request timed out)',
+            completed_at: new Date().toISOString(),
+            current_campaign_id: null,
+            current_campaign_name: null,
+            metadata
+        });
+    }
+
+    return updateInstantlySyncRun(run.id, {
+        status: 'failed',
+        progress_message: status === 'queued' ? 'Sync never started (timed out)' : 'Sync timed out (no progress)',
+        error: 'Sync run stopped responding and was marked failed.',
+        completed_at: new Date().toISOString(),
+        phase: 'failed',
+        metadata: mergeMetadataPatch(run.metadata, {
+            staleReconciledAt: new Date().toISOString()
+        })
+    });
+}
+
 export async function getInstantlySyncRun({ agencyId, clientSlug, runId }) {
     const clientId = await getOrCreateClient(agencyId, clientSlug);
     const result = await pool.query(
@@ -892,7 +941,8 @@ export async function getInstantlySyncRun({ agencyId, clientSlug, runId }) {
          LIMIT 1`,
         [runId, agencyId, clientId]
     );
-    return normalizeSyncRunRow(result.rows[0] || null);
+    const run = normalizeSyncRunRow(result.rows[0] || null);
+    return reconcileStaleInstantlySyncRun(run);
 }
 
 export async function getLatestInstantlySyncRun({ agencyId, clientSlug }) {
@@ -906,7 +956,8 @@ export async function getLatestInstantlySyncRun({ agencyId, clientSlug }) {
          LIMIT 1`,
         [agencyId, clientId]
     );
-    return normalizeSyncRunRow(result.rows[0] || null);
+    const run = normalizeSyncRunRow(result.rows[0] || null);
+    return reconcileStaleInstantlySyncRun(run);
 }
 
 export async function requestStopInstantlySyncRun({ agencyId, clientSlug, runId }) {
