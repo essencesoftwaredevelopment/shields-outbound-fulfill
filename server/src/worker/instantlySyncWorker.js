@@ -1,5 +1,9 @@
 import pLimit from 'p-limit';
-import { listInstantlySyncClients, runInstantlySyncJob } from '../services/instantlyState.js';
+import {
+    isAutomaticInstantlySyncEnabled,
+    listInstantlySyncClients,
+    runInstantlySyncJob
+} from '../services/instantlyState.js';
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const POLL_INTERVAL_MS = Math.max(
@@ -32,6 +36,10 @@ async function runPass() {
                 triggerSource: 'scheduled',
                 logger: (message) => console.log(`[instantly-sync][${label}] ${message}`)
             });
+            if (result.skipped) {
+                console.log(`[instantly-sync] Skipped ${label}; automatic sync disabled`);
+                return null;
+            }
             if (result.alreadyRunning) {
                 console.log(`[instantly-sync] Skipped ${label}; sync run ${result.run?.id} already in progress`);
                 return result.run;
@@ -53,6 +61,11 @@ async function runPass() {
 }
 
 async function loop() {
+    if (!isAutomaticInstantlySyncEnabled()) {
+        console.log('[instantly-sync] Automatic sync disabled (INSTANTLY_SYNC_AUTOMATIC_ENABLED is not true). Exiting.');
+        process.exit(0);
+    }
+
     console.log(`[instantly-sync] Worker started (interval ${POLL_INTERVAL_MS}ms, concurrency ${CONCURRENCY})`);
     while (!shutdownRequested) {
         const startedAt = Date.now();

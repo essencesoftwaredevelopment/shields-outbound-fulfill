@@ -32,7 +32,8 @@ const baseEnv = {
   ...(envOrUnset('SUPABASE_URL') ? { SUPABASE_URL: process.env.SUPABASE_URL } : {}),
   ...(envOrUnset('SUPABASE_SERVICE_ROLE_KEY') ? { SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY } : {}),
   ...(envOrUnset('SUPABASE_ANON_KEY') ? { SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY } : {}),
-  // Default: one full Instantly sync pass per client per 24h (override via INSTANTLY_SYNC_INTERVAL_MS).
+  // Scheduled Instantly sync is off by default (manual sync via UI / POST .../instantly/sync still works).
+  INSTANTLY_SYNC_AUTOMATIC_ENABLED: process.env.INSTANTLY_SYNC_AUTOMATIC_ENABLED || 'false',
   INSTANTLY_SYNC_INTERVAL_MS: process.env.INSTANTLY_SYNC_INTERVAL_MS || 86400000,
   INSTANTLY_SYNC_CONCURRENCY: process.env.INSTANTLY_SYNC_CONCURRENCY || 2,
   INSTANTLY_REQUEST_TIMEOUT_MS: process.env.INSTANTLY_REQUEST_TIMEOUT_MS || 20000,
@@ -63,17 +64,7 @@ module.exports = {
       },
       autorestart: true
     },
-    {
-      name: 'shields-outbound-instantly-sync',
-      script: 'src/worker/instantlySyncWorker.js',
-      cwd: '/root/shields-outbound/server',
-      instances: 1,
-      exec_mode: 'fork',
-      env: {
-        ...baseEnv
-      },
-      autorestart: true
-    },
+    // shields-outbound-instantly-sync removed — automatic sync disabled (see INSTANTLY_SYNC_AUTOMATIC_ENABLED).
     {
       name: 'shields-outbound-followup-worker',
       script: 'src/worker/followUpWorker.js',

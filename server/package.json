@@ -9,6 +9,7 @@
         "worker": "node src/worker/queueWorker.js",
         "instantly:worker": "node src/worker/instantlySyncWorker.js",
         "instantly:sync": "node src/scripts/run-instantly-sync-once.js",
+        "instantly:stop-all": "node src/scripts/stop-all-instantly-syncs.js",
         "followups:worker": "node src/worker/followUpWorker.js",
         "followups:send-once": "node src/scripts/run-follow-ups-once.js",
         "personalizer:local": "node src/scripts/run-personalizer-local.js",

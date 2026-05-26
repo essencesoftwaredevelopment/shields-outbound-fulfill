@@ -960,6 +960,44 @@ export async function getLatestInstantlySyncRun({ agencyId, clientSlug }) {
     return reconcileStaleInstantlySyncRun(run);
 }
 
+export function isAutomaticInstantlySyncEnabled() {
+    return String(process.env.INSTANTLY_SYNC_AUTOMATIC_ENABLED || 'false').toLowerCase() === 'true';
+}
+
+/**
+ * Cancel every queued/running/cancelling sync run (DB + in-process abort for this Node process).
+ */
+export async function stopAllActiveInstantlySyncRuns({ reason = 'Sync stopped' } = {}) {
+    const result = await pool.query(
+        `SELECT id, metadata
+         FROM instantly_sync_runs
+         WHERE status IN ('queued', 'running', 'cancelling')
+         ORDER BY id ASC`
+    );
+
+    const stopped = [];
+    for (const row of result.rows) {
+        const runId = Number(row.id);
+        abortInstantlyRequestsForRun(runId);
+        const metadata = mergeMetadataPatch(row.metadata, {
+            stopRequestedAt: new Date().toISOString(),
+            cancelledAt: new Date().toISOString(),
+            cancelReason: reason
+        });
+        const updated = await updateInstantlySyncRun(runId, {
+            status: 'cancelled',
+            progress_message: reason,
+            completed_at: new Date().toISOString(),
+            current_campaign_id: null,
+            current_campaign_name: null,
+            metadata
+        });
+        if (updated) stopped.push(updated);
+    }
+
+    return stopped;
+}
+
 export async function requestStopInstantlySyncRun({ agencyId, clientSlug, runId }) {
     const clientId = await getOrCreateClient(agencyId, clientSlug);
     const current = await pool.query(
@@ -1042,6 +1080,11 @@ export async function beginInstantlySyncRun({ agencyId, clientSlug, instantlyKey
 }
 
 export async function runInstantlySyncJob({ agencyId, clientSlug, instantlyKey, triggerSource = 'scheduled', logger = () => {} }) {
+    if (triggerSource === 'scheduled' && !isAutomaticInstantlySyncEnabled()) {
+        logger('Scheduled Instantly sync skipped (INSTANTLY_SYNC_AUTOMATIC_ENABLED is not true).');
+        return { run: null, alreadyRunning: false, summary: null, skipped: true };
+    }
+
     const clientState = await resolveClientState(agencyId, clientSlug);
     if (!clientState) {
         throw new Error('Client not found in SQL.');
