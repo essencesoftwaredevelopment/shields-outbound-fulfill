@@ -27,8 +27,6 @@ import {
     syncJobControlFromDb,
     updateJobControl,
     getEmailFindQueue,
-    countEmailDiscoveryEligibleForJob,
-    countEmailFindCompletedForJob,
     getVerifyQueue,
     getPersonalizeQueue,
     jobHasRemainingPipelineWork,
@@ -847,24 +845,15 @@ async function processJob(job) {
                         resumed: true
                     };
                 }
-                const [eligibleTotal, emailFindDone] = await Promise.all([
-                    countEmailDiscoveryEligibleForJob(job.uid, job.sqlClientId, job.id),
-                    countEmailFindCompletedForJob(job.uid, job.sqlClientId, job.id)
-                ]);
                 const foundersStageTotal = job.stages?.founders?.summary?.processed;
-                const progressTotal = Math.max(
-                    eligibleTotal,
-                    typeof foundersStageTotal === 'number' ? foundersStageTotal : 0,
-                    emailFindDone + queueRows.length
-                );
-                const persistedDone = job.stages?.emailDiscovery?.progress?.processed;
-                const progressOffset = Math.min(
-                    progressTotal,
-                    Math.max(
-                        emailFindDone,
-                        typeof persistedDone === 'number' ? persistedDone : 0
-                    )
-                );
+                const jobEmailTotal =
+                    typeof foundersStageTotal === 'number' && foundersStageTotal > 0
+                        ? foundersStageTotal
+                        : processableCount > 0
+                          ? processableCount
+                          : queueRows.length;
+                const progressTotal = jobEmailTotal;
+                const progressOffset = Math.max(0, jobEmailTotal - queueRows.length);
 
                 log(
                     job,
