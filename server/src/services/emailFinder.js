@@ -357,7 +357,11 @@ export async function runEmailFinder({
     checkPaused = null,
     refreshControl = null,
     onBatch = null,
-    pricing = null
+    pricing = null,
+    /** Job-wide progress: already-finished lookups before this run segment. */
+    progressOffset = 0,
+    /** Job-wide progress: total eligible founders for the job. */
+    progressTotal = null
 } = {}) {
     const API_KEY = apiKeys.kitt;
     const requestCost = Number(pricing?.request_cost) || 0;
@@ -376,8 +380,18 @@ export async function runEmailFinder({
         row => !!row.domain && !needsSkip(row.founder_name)
     );
     const eligibleTotal = eligibleFounders.length;
+    const jobTotal = Number.isFinite(progressTotal) && progressTotal > 0
+        ? progressTotal
+        : progressOffset + eligibleTotal;
+    const displayProcessed = (n) => progressOffset + n;
 
-    log(`Emails: ${totalRows} founders loaded | ${eligibleTotal} eligible for lookup.`);
+    log(
+        progressOffset > 0
+            ? `Emails: ${eligibleTotal} remaining lookup(s) (${displayProcessed(0)}/${jobTotal} done so far).`
+            : eligibleTotal === totalRows
+                ? `Emails: ${eligibleTotal} eligible for lookup.`
+                : `Emails: ${eligibleTotal} eligible for lookup (${totalRows - eligibleTotal} skipped in batch).`
+    );
 
     const limit = pLimit(CONCURRENCY);
     let completedEligible = 0;
@@ -389,7 +403,8 @@ export async function runEmailFinder({
     // In-flight batch for incremental upserts
     const pendingBatch = [];
     let flushPromise = Promise.resolve();
-    const BATCH_SIZE = 100;
+    // Flush often so pause/resume can rely on email_find_completed_at in SQL.
+    const BATCH_SIZE = 10;
 
     const flushBatch = async (force = false) => {
         if (!onBatch) return;
@@ -463,7 +478,7 @@ export async function runEmailFinder({
                     throw err;
                 }
             } else if (checkPaused && checkPaused()) {
-                log(`Emails: paused by user at ${completedEligible}/${eligibleTotal}`);
+                log(`Emails: paused by user at ${displayProcessed(completedEligible)}/${jobTotal}`);
                 controller.abort();
                 return;
             }
@@ -498,6 +513,10 @@ export async function runEmailFinder({
                 status = `error: ${error?.message || 'unknown'}`;
             }
 
+            if (controller.signal.aborted) {
+                return;
+            }
+
             if (email) {
                 stats['Found'] += 1;
                 stageCost += requestCost;
@@ -509,11 +528,12 @@ export async function runEmailFinder({
 
             completedEligible += 1;
             const costNumber = Number(stageCost.toFixed(6));
+            const processedJobWide = displayProcessed(completedEligible);
             const progressPayload = {
                 progress: {
                     stage: 'emailDiscovery',
-                    processed: completedEligible,
-                    total: eligibleTotal,
+                    processed: processedJobWide,
+                    total: jobTotal,
                     found: stats['Found'],
                     cost: costNumber,
                     stats: {
@@ -523,7 +543,7 @@ export async function runEmailFinder({
                 }
             };
             if (completedEligible % 10 === 0 || completedEligible <= 5 || completedEligible === eligibleTotal) {
-                log(`Emails: processed ${completedEligible}/${eligibleTotal} eligible founders`, progressPayload);
+                log(`Emails: processed ${processedJobWide}/${jobTotal} eligible founders`, progressPayload);
             } else {
                 log(null, progressPayload);
             }
@@ -547,8 +567,8 @@ export async function runEmailFinder({
         log('Emails: no eligible founders to process, skipping lookups.', {
             progress: {
                 stage: 'emailDiscovery',
-                processed: 0,
-                total: 0,
+                processed: displayProcessed(0),
+                total: jobTotal,
                 found: 0,
                 stats
             }
@@ -565,8 +585,9 @@ export async function runEmailFinder({
                 }
                 if (checkPaused && checkPaused() && !controller.signal.aborted) {
                     const reason = job?.cancelled ? 'cancelled' : (job?.paused ? 'paused' : 'stopped');
-                    log(`Emails: aborting (${reason}) at ${completedEligible}/${eligibleTotal}`);
+                    log(`Emails: aborting (${reason}) at ${displayProcessed(completedEligible)}/${jobTotal}`);
                     controller.abort();
+                    await flushBatch(true);
                 }
             })();
         }, 100);
@@ -633,7 +654,7 @@ export async function runEmailFinder({
     return {
         totalRows,
         eligible: eligibleTotal,
-        processed: completedEligible,
+        processed: displayProcessed(completedEligible),
         cost,
         Found: stats.Found,
         'Not Found': stats['Not Found'],

@@ -500,6 +500,21 @@ export async function jobHasRemainingPipelineWork({
     return false;
 }
 
+/** Founders for this job that already finished email discovery (any outcome). */
+export async function countEmailFindCompletedForJob(jobId) {
+    const result = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM contacts c
+         WHERE c.job_id = $1
+           AND c.role_type = 'founder'
+           AND c.email_find_completed_at IS NOT NULL
+           AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
+           AND LOWER(BTRIM(c.full_name)) <> 'not found'`,
+        [jobId]
+    );
+    return result.rows[0]?.count ?? 0;
+}
+
 export async function getEmailFindQueue(agencyId, clientId, jobId, { reprocessInclude = false, limit = 5000 } = {}) {
     const emailConstraint = reprocessInclude
         ? ''

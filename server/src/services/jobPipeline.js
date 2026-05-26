@@ -27,6 +27,7 @@ import {
     syncJobControlFromDb,
     updateJobControl,
     getEmailFindQueue,
+    countEmailFindCompletedForJob,
     getVerifyQueue,
     getPersonalizeQueue,
     jobHasRemainingPipelineWork,
@@ -828,18 +829,48 @@ async function processJob(job) {
         } else {
             const reprocessInclude = isReprocessExistingDomains(job);
             const queueLimit = Math.max(totalForJob, processableCount, 5000);
-            const founders = (
-                await getEmailFindQueue(job.uid, job.sqlClientId, job.id, { reprocessInclude, limit: queueLimit })
-            ).map((r) => ({
-                domain: r.domain,
-                founder_name: r.founder_name
-            }));
-            await runStageIfNeeded(job, 'emailDiscovery', () =>
-                runEmailFinder({
+            await runStageIfNeeded(job, 'emailDiscovery', async () => {
+                const queueRows = await getEmailFindQueue(
+                    job.uid,
+                    job.sqlClientId,
+                    job.id,
+                    { reprocessInclude, limit: queueLimit }
+                );
+                if (!queueRows.length) {
+                    const prior = job.stages?.emailDiscovery?.summary || {};
+                    log(job, 'Emails: no remaining lookups (already completed for this job).');
+                    return {
+                        processed: prior.processed ?? 0,
+                        found: prior.found ?? prior.Found ?? 0,
+                        cost: prior.cost ?? 0,
+                        resumed: true
+                    };
+                }
+                const progressOffset = await countEmailFindCompletedForJob(job.id);
+                const foundersStageTotal = job.stages?.founders?.summary?.processed;
+                const progressTotal = Math.max(
+                    progressOffset + queueRows.length,
+                    typeof foundersStageTotal === 'number' ? foundersStageTotal : 0,
+                    job.stages?.emailDiscovery?.progress?.total ?? 0
+                ) || progressOffset + queueRows.length;
+
+                log(
+                    job,
+                    progressOffset > 0
+                        ? `Emails: ${queueRows.length} remaining (${progressOffset}/${progressTotal} already done).`
+                        : `Emails: ${queueRows.length} lookup(s) queued.`
+                );
+                const founders = queueRows.map((r) => ({
+                    domain: r.domain,
+                    founder_name: r.founder_name
+                }));
+                return runEmailFinder({
                     founders,
                     apiKeys: job.apiKeys,
                     provider: job.emailVerificationProvider,
                     pricing: job.pricing?.stages?.emailDiscovery || DEFAULT_PRICING.stages.emailDiscovery,
+                    progressOffset,
+                    progressTotal,
                     log: (message, meta) => log(job, message, meta),
                     job,
                     checkpoint: () => gate.checkpoint(),
@@ -855,8 +886,8 @@ async function processJob(job) {
                             mergeMode: enrichmentMergeMode(job)
                         });
                     }
-                })
-            );
+                });
+            });
         }
         computeJobCost(job);
 
