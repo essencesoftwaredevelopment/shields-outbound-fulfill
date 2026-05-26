@@ -34,6 +34,7 @@ import {
     markJobDomainFounderExcluded,
     listJobDomainsForJob,
     buildUnifiedRowsFromDb,
+    countFinishedLeadsForJob,
     insertJob
 } from './db/jobs.js';
 import { pool } from '../config/db.js';
@@ -1042,9 +1043,9 @@ async function processJob(job) {
         if (job.cancelled) return await markCancelled(job);
 
         setActivity(job, 'Finalizing job results…');
-        const uploadRows = await buildUnifiedRowsFromDb(job.id, 'complete');
+        const finishedCount = await countFinishedLeadsForJob(job.id);
         job.activity = null;
-        log(job, `Job complete: ${uploadRows.length} leads ready for export`);
+        log(job, `Job complete: ${finishedCount} leads ready for export`);
 
         job.status = 'completed';
         job.completedAt = new Date().toISOString();

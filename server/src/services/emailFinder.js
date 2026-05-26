@@ -404,8 +404,8 @@ export async function runEmailFinder({
     // In-flight batch for incremental upserts
     const pendingBatch = [];
     let flushPromise = Promise.resolve();
-    // Flush often so pause/resume can rely on email_find_completed_at in SQL.
-    const BATCH_SIZE = 10;
+    // Flush in batches so pause/resume can rely on email_find_completed_at in SQL.
+    const BATCH_SIZE = 50;
 
     const flushBatch = async (force = false) => {
         if (!onBatch) return;

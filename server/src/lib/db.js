@@ -82,8 +82,6 @@ export async function batchUpsertCompanies(txClient, agencyId, clientId, rows) {
         return domainMap;
     }
 
-    console.log(`[batchUpsertCompanies] Upserting ${uniqueDomains.length} unique domains for agency ${agencyId}, client ${clientId}`);
-
     const maxDomainsPerChunk = Math.max(1, MAX_SAFE_QUERY_PARAMS - COMPANY_FIXED_PARAMS);
     const domainChunks = chunkArray(uniqueDomains, maxDomainsPerChunk);
 
@@ -117,7 +115,6 @@ export async function batchUpsertCompanies(txClient, agencyId, clientId, rows) {
             }
         }
 
-        console.log(`[batchUpsertCompanies] Upserted ${totalUpserted} companies across ${domainChunks.length} chunk(s)`);
         return domainMap;
     } catch (err) {
         console.error(`[batchUpsertCompanies] Query failed:`, err.message);

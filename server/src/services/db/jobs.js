@@ -669,6 +669,21 @@ export async function getPersonalizeQueue(
     return result.rows;
 }
 
+/** Count finished leads for a job without materializing every row. */
+export async function countFinishedLeadsForJob(jobId) {
+    const result = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM contacts c
+         WHERE c.job_id = $1
+           AND c.role_type = 'founder'
+           AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+           AND c.personalization_first_line IS NOT NULL
+           AND BTRIM(c.personalization_first_line) <> ''`,
+        [jobId]
+    );
+    return result.rows[0]?.count ?? 0;
+}
+
 export async function buildUnifiedRowsFromDb(jobId, scope = 'valid') {
     let statusFilter = '';
     if (scope === 'valid') {

@@ -96,8 +96,6 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobI
 
     await withTx(async (client) => {
         const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
-        
-        console.log(`[upsertLeadRowsBatch] Domain map has ${domainMap.size} entries`);
 
         const contactRows = payloads.map((p) => {
             const company_id = domainMap.get(p.domain);
@@ -117,8 +115,6 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobI
                 job_id: jobId
             };
         }).filter((r) => r.company_id);
-        
-        console.log(`[upsertLeadRowsBatch] Filtered to ${contactRows.length} contacts with valid company_id`);
 
         if (contactRows.length > 0) {
             await batchUpsertContacts(client, agencyId, clientId, contactRows, {
