@@ -27,7 +27,6 @@ import {
     syncJobControlFromDb,
     updateJobControl,
     getEmailFindQueue,
-    countEmailFindCompletedForJob,
     countEmailDiscoveryEligibleForJob,
     getVerifyQueue,
     getPersonalizeQueue,
@@ -847,25 +846,24 @@ async function processJob(job) {
                         resumed: true
                     };
                 }
-                const progressOffset = await countEmailFindCompletedForJob(
-                    job.uid,
-                    job.sqlClientId,
-                    job.id
-                );
                 const eligibleTotal = await countEmailDiscoveryEligibleForJob(
                     job.uid,
                     job.sqlClientId,
                     job.id
                 );
                 const foundersStageTotal = job.stages?.founders?.summary?.processed;
-                const progressTotal = eligibleTotal
-                    || (typeof foundersStageTotal === 'number' ? foundersStageTotal : 0)
-                    || queueRows.length + progressOffset;
+                const progressTotal = Math.max(
+                    eligibleTotal,
+                    typeof foundersStageTotal === 'number' ? foundersStageTotal : 0,
+                    queueRows.length
+                );
+                // Derive from cohort size − queue so "done" + "remaining" never double-count.
+                const progressOffset = Math.max(0, progressTotal - queueRows.length);
 
                 log(
                     job,
                     progressOffset > 0
-                        ? `Emails: ${queueRows.length} remaining (${progressOffset}/${progressTotal} already done for this upload).`
+                        ? `Emails: ${queueRows.length} remaining (${progressOffset}/${progressTotal} done for this upload).`
                         : `Emails: ${queueRows.length} lookup(s) queued (${progressTotal} in cohort).`
                 );
                 const founders = queueRows.map((r) => ({

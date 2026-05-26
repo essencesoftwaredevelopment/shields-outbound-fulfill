@@ -515,7 +515,7 @@ const EMAIL_DISCOVERY_COHORT_SQL = `
 /** Founders in this job's upload cohort eligible for email discovery. */
 export async function countEmailDiscoveryEligibleForJob(agencyId, clientId, jobId) {
     const result = await pool.query(
-        `SELECT COUNT(*)::int AS count ${EMAIL_DISCOVERY_COHORT_SQL}`,
+        `SELECT COUNT(DISTINCT c.id)::int AS count ${EMAIL_DISCOVERY_COHORT_SQL}`,
         [agencyId, clientId, jobId]
     );
     return result.rows[0]?.count ?? 0;
@@ -524,7 +524,7 @@ export async function countEmailDiscoveryEligibleForJob(agencyId, clientId, jobI
 /** Founders in this job's cohort that already finished email discovery (any outcome). */
 export async function countEmailFindCompletedForJob(agencyId, clientId, jobId) {
     const result = await pool.query(
-        `SELECT COUNT(*)::int AS count ${EMAIL_DISCOVERY_COHORT_SQL}
+        `SELECT COUNT(DISTINCT c.id)::int AS count ${EMAIL_DISCOVERY_COHORT_SQL}
            AND c.email_find_completed_at IS NOT NULL`,
         [agencyId, clientId, jobId]
     );
@@ -537,7 +537,10 @@ export async function getEmailFindQueue(agencyId, clientId, jobId, { reprocessIn
         : `AND (c.email IS NULL OR BTRIM(c.email) = '') AND c.email_find_completed_at IS NULL`;
 
     const result = await pool.query(
-        `SELECT c.id AS contact_id, co.domain_normalized AS domain, c.full_name AS founder_name
+        `SELECT DISTINCT ON (c.id)
+                c.id AS contact_id,
+                co.domain_normalized AS domain,
+                c.full_name AS founder_name
          FROM contacts c
          JOIN companies co ON co.id = c.company_id
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized

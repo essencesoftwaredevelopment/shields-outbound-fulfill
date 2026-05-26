@@ -383,7 +383,7 @@ export async function runEmailFinder({
     const jobTotal = Number.isFinite(progressTotal) && progressTotal > 0
         ? progressTotal
         : progressOffset + eligibleTotal;
-    const displayProcessed = (n) => progressOffset + n;
+    const displayProcessed = (n) => Math.min(progressOffset + n, jobTotal);
 
     log(
         progressOffset > 0
