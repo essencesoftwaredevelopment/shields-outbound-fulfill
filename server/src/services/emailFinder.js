@@ -4,7 +4,7 @@ import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
 import http from 'http';
-import { throwIfJobStopped } from './jobControlGate.js';
+import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
 
 dotenv.config();
 
@@ -518,6 +518,11 @@ export async function runEmailFinder({
                 return;
             }
 
+            if (await refreshJobControlFlags(job, refreshControl, checkPaused)) {
+                controller.abort();
+                return;
+            }
+
             if (email) {
                 stats['Found'] += 1;
                 stageCost += requestCost;
@@ -582,20 +587,18 @@ export async function runEmailFinder({
             }
         });
     } else {
-        let controlPollTick = 0;
         const pauseCheckInterval = setInterval(() => {
             void (async () => {
-                controlPollTick += 1;
-                if (refreshControl && controlPollTick % 5 === 0) {
-                    await refreshControl();
-                } else if (checkPaused) {
-                    checkPaused();
-                }
-                if (checkPaused && checkPaused() && !controller.signal.aborted) {
-                    const reason = job?.cancelled ? 'cancelled' : (job?.paused ? 'paused' : 'stopped');
-                    log(`Emails: aborting (${reason}) at ${displayProcessed(completedEligible)}/${jobTotal}`);
-                    controller.abort();
-                    await flushBatch(true);
+                try {
+                    const stopped = await refreshJobControlFlags(job, refreshControl, checkPaused);
+                    if (stopped && !controller.signal.aborted) {
+                        const reason = job?.cancelled ? 'cancelled' : 'paused';
+                        log(`Emails: aborting (${reason}) at ${displayProcessedCapped(completedEligible)}/${jobTotal}`);
+                        controller.abort();
+                        await flushBatch(true);
+                    }
+                } catch (err) {
+                    console.warn(`[emailFinder] pause poll failed: ${err?.message || err}`);
                 }
             })();
         }, 100);
@@ -603,7 +606,8 @@ export async function runEmailFinder({
         try {
             await Promise.all(tasks);
             await flushAllPending();
-            if (controller.signal.aborted) {
+            const stopped = await refreshJobControlFlags(job, refreshControl, checkPaused);
+            if (stopped || controller.signal.aborted) {
                 await flushAllPending();
                 await throwIfJobStopped(job, refreshControl, {
                     cancelledMessage: 'Job cancelled during email discovery',

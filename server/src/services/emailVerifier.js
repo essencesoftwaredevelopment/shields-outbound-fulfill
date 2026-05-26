@@ -4,7 +4,7 @@ import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
 import http from 'http';
-import { throwIfJobStopped } from './jobControlGate.js';
+import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
 
 dotenv.config();
 
@@ -439,18 +439,27 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
         })
     );
 
-    // Check for pause every 100ms and abort if paused
     const pauseCheckInterval = setInterval(() => {
-        if (checkPaused && checkPaused() && !controller.signal.aborted) {
-            log(`Verify: aborting due to pause`);
-            controller.abort();
-        }
+        void (async () => {
+            try {
+                const stopped = await refreshJobControlFlags(job, refreshControl, checkPaused);
+                if (stopped && !controller.signal.aborted) {
+                    const reason = job?.cancelled ? 'cancelled' : 'paused';
+                    log(`Verify: aborting (${reason}) at ${completed}/${toVerify.length}`);
+                    controller.abort();
+                    await flushAllPending();
+                }
+            } catch (err) {
+                console.warn(`[emailVerifier] pause poll failed: ${err?.message || err}`);
+            }
+        })();
     }, 100);
 
     try {
         await Promise.all(tasks);
         await flushAllPending();
-        if (controller.signal.aborted) {
+        const stopped = await refreshJobControlFlags(job, refreshControl, checkPaused);
+        if (stopped || controller.signal.aborted) {
             await flushAllPending();
             await throwIfJobStopped(job, refreshControl, {
                 cancelledMessage: 'Job cancelled during verification',

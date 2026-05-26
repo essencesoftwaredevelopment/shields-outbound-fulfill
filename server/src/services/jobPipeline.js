@@ -188,6 +188,13 @@ async function runStage(job, stageKey, handler) {
     updateStage(job, stageKey, { status: 'running', startedAt: new Date().toISOString(), error: null });
     try {
         const summary = await handler();
+        applyJobControlFileToJob(job);
+        if (job.cancelled) {
+            throw createJobCancelledError('Job cancelled');
+        }
+        if (job.paused) {
+            throw createJobPausedError('Job paused');
+        }
         const safeSummary = normalizeStageSummary(summary || {});
         updateStage(job, stageKey, { status: 'completed', completedAt: new Date().toISOString(), summary: safeSummary });
         computeJobCost(job);
@@ -894,6 +901,9 @@ async function processJob(job) {
 
         await syncJobControl(job);
         if (job.cancelled) return await markCancelled(job);
+        if (job.paused) {
+            throw createJobPausedError('Job paused');
+        }
 
         if (job.skipVerification) {
             await runStageIfNeeded(job, 'verification', async () => {

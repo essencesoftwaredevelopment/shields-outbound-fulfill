@@ -1,6 +1,18 @@
 import { applyJobControlFileToJob } from './jobControl.js';
 import { syncJobControlFromDb } from './db/jobs.js';
 
+/** Refresh pause/cancel flags from control file + DB (when refresh is provided). */
+export async function refreshJobControlFlags(job, refresh, checkPaused) {
+    if (typeof refresh === 'function') {
+        await refresh();
+    } else if (typeof checkPaused === 'function') {
+        checkPaused();
+    } else if (job?.id) {
+        applyJobControlFileToJob(job);
+    }
+    return !!(job?.paused || job?.cancelled);
+}
+
 export function createJobCancelledError(message = 'Job cancelled') {
     const err = new Error(message);
     err.code = 'JOB_CANCELLED';
