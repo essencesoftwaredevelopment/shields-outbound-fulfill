@@ -28,6 +28,7 @@ import {
     updateJobControl,
     getEmailFindQueue,
     countEmailFindCompletedForJob,
+    countEmailDiscoveryEligibleForJob,
     getVerifyQueue,
     getPersonalizeQueue,
     jobHasRemainingPipelineWork,
@@ -846,19 +847,26 @@ async function processJob(job) {
                         resumed: true
                     };
                 }
-                const progressOffset = await countEmailFindCompletedForJob(job.id);
+                const progressOffset = await countEmailFindCompletedForJob(
+                    job.uid,
+                    job.sqlClientId,
+                    job.id
+                );
+                const eligibleTotal = await countEmailDiscoveryEligibleForJob(
+                    job.uid,
+                    job.sqlClientId,
+                    job.id
+                );
                 const foundersStageTotal = job.stages?.founders?.summary?.processed;
-                const progressTotal = Math.max(
-                    progressOffset + queueRows.length,
-                    typeof foundersStageTotal === 'number' ? foundersStageTotal : 0,
-                    job.stages?.emailDiscovery?.progress?.total ?? 0
-                ) || progressOffset + queueRows.length;
+                const progressTotal = eligibleTotal
+                    || (typeof foundersStageTotal === 'number' ? foundersStageTotal : 0)
+                    || queueRows.length + progressOffset;
 
                 log(
                     job,
                     progressOffset > 0
-                        ? `Emails: ${queueRows.length} remaining (${progressOffset}/${progressTotal} already done).`
-                        : `Emails: ${queueRows.length} lookup(s) queued.`
+                        ? `Emails: ${queueRows.length} remaining (${progressOffset}/${progressTotal} already done for this upload).`
+                        : `Emails: ${queueRows.length} lookup(s) queued (${progressTotal} in cohort).`
                 );
                 const founders = queueRows.map((r) => ({
                     domain: r.domain,

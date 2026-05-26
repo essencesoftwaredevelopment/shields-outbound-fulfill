@@ -500,17 +500,33 @@ export async function jobHasRemainingPipelineWork({
     return false;
 }
 
-/** Founders for this job that already finished email discovery (any outcome). */
-export async function countEmailFindCompletedForJob(jobId) {
+/** Shared cohort for email discovery counts (must match getEmailFindQueue scope). */
+const EMAIL_DISCOVERY_COHORT_SQL = `
+    FROM contacts c
+    JOIN companies co ON co.id = c.company_id
+    JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+    WHERE c.agency_id = $1 AND c.client_id = $2 AND c.job_id = $3
+      AND c.role_type = 'founder'
+      AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
+      AND LOWER(BTRIM(c.full_name)) <> 'not found'
+      AND COALESCE(jd.raw_row->'_enrichment'->>'inFounderCohort', 'true') = 'true'
+      ${COHORT_ELIGIBLE_SQL}`;
+
+/** Founders in this job's upload cohort eligible for email discovery. */
+export async function countEmailDiscoveryEligibleForJob(agencyId, clientId, jobId) {
     const result = await pool.query(
-        `SELECT COUNT(*)::int AS count
-         FROM contacts c
-         WHERE c.job_id = $1
-           AND c.role_type = 'founder'
-           AND c.email_find_completed_at IS NOT NULL
-           AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
-           AND LOWER(BTRIM(c.full_name)) <> 'not found'`,
-        [jobId]
+        `SELECT COUNT(*)::int AS count ${EMAIL_DISCOVERY_COHORT_SQL}`,
+        [agencyId, clientId, jobId]
+    );
+    return result.rows[0]?.count ?? 0;
+}
+
+/** Founders in this job's cohort that already finished email discovery (any outcome). */
+export async function countEmailFindCompletedForJob(agencyId, clientId, jobId) {
+    const result = await pool.query(
+        `SELECT COUNT(*)::int AS count ${EMAIL_DISCOVERY_COHORT_SQL}
+           AND c.email_find_completed_at IS NOT NULL`,
+        [agencyId, clientId, jobId]
     );
     return result.rows[0]?.count ?? 0;
 }
