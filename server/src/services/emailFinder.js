@@ -461,6 +461,24 @@ export async function runEmailFinder({
         }
     });
 
+    const persistLookupRow = async (row, domain, founderName, email, status, { forceFlush = false } = {}) => {
+        results[row.index] = {
+            domain,
+            founder_name: founderName,
+            email,
+            status
+        };
+        if (!onBatch) return;
+        pendingBatch.push({
+            domain,
+            founder_name: founderName,
+            email,
+            lookup_status: status,
+            confidence: row.confidence
+        });
+        await flushBatch(forceFlush);
+    };
+
     const tasks = eligibleFounders.map(row =>
         limit(async () => {
             // Check if already aborted
@@ -479,7 +497,7 @@ export async function runEmailFinder({
                     throw err;
                 }
             } else if (checkPaused && checkPaused()) {
-                log(`Emails: paused by user at ${displayProcessed(completedEligible)}/${jobTotal}`);
+                log(`Emails: paused by user at ${displayProcessedCapped(completedEligible)}/${jobTotal}`);
                 controller.abort();
                 return;
             }
@@ -515,11 +533,13 @@ export async function runEmailFinder({
             }
 
             if (controller.signal.aborted) {
+                await persistLookupRow(row, domain, founderName, email, status, { forceFlush: true });
                 return;
             }
 
             if (await refreshJobControlFlags(job, refreshControl, checkPaused)) {
                 controller.abort();
+                await persistLookupRow(row, domain, founderName, email, status, { forceFlush: true });
                 return;
             }
 
@@ -561,18 +581,7 @@ export async function runEmailFinder({
                 log(null, progressPayload);
             }
 
-            results[row.index] = {
-                domain,
-                founder_name: founderName,
-                email,
-                status
-            };
-
-            // Queue incremental upsert batch
-            if (onBatch) {
-                pendingBatch.push({ domain, founder_name: founderName, email, lookup_status: status, confidence: row.confidence });
-                await flushBatch(false);
-            }
+            await persistLookupRow(row, domain, founderName, email, status);
         })
     );
 
