@@ -1382,12 +1382,9 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
             return res.status(400).json({ error: 'contactEmail is required' });
         }
 
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
-        const sqlClientId = clientResult.rows[0].id;
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientRow.id;
 
         const contactResult = await pool.query(
             `SELECT id, email
@@ -1481,13 +1478,10 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
     try {
         const agencyId = req.agencyId;
         const { clientId } = req.params;
-        const clientResult = await pool.query(
-            'SELECT id, follow_up_send_days FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
-        const sqlClientId = clientResult.rows[0].id;
-        const sendDays = clientResult.rows[0].follow_up_send_days ?? [1, 2, 3, 4, 5];
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientRow.id;
+        const sendDays = clientRow.follow_up_send_days ?? [1, 2, 3, 4, 5];
         const result = await pool.query(
             `SELECT id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at
              FROM follow_up_scripts
@@ -1510,12 +1504,9 @@ router.post('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res
         if (!htmlTemplate) {
             return res.status(400).json({ error: 'html_template is required' });
         }
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
-        const sqlClientId = clientResult.rows[0].id;
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientRow.id;
         const result = await pool.query(
             `INSERT INTO follow_up_scripts (client_id, active, script_order, name, subject_template, html_template, text_template)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -1540,12 +1531,9 @@ router.put('/clients/:clientId/follow-up-scripts/:id', requireAuth, async (req, 
         if (!htmlTemplate) {
             return res.status(400).json({ error: 'html_template is required' });
         }
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
-        const sqlClientId = clientResult.rows[0].id;
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientRow.id;
         const result = await pool.query(
             `UPDATE follow_up_scripts
              SET active = $1, script_order = $2, name = $3, subject_template = $4, html_template = $5, text_template = $6, updated_at = NOW()
@@ -1568,12 +1556,9 @@ router.delete('/clients/:clientId/follow-up-scripts/:id', requireAuth, async (re
     try {
         const agencyId = req.agencyId;
         const { clientId, id } = req.params;
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
-        const sqlClientId = clientResult.rows[0].id;
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientRow.id;
         const result = await pool.query(
             'DELETE FROM follow_up_scripts WHERE id = $1 AND client_id = $2 RETURNING id',
             [id, sqlClientId]
@@ -1600,12 +1585,9 @@ router.put('/clients/:clientId/follow-up-schedule', requireAuth, async (req, res
             return res.status(400).json({ error: 'send_days contained no valid day integers (0–6)' });
         }
 
-        const clientResult = await pool.query(
-            'SELECT id FROM clients WHERE agency_id = $1 AND name = $2',
-            [agencyId, clientId]
-        );
-        if (!clientResult.rows.length) return res.status(404).json({ error: 'Client not found' });
-        const sqlClientId = clientResult.rows[0].id;
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const sqlClientId = clientRow.id;
 
         await pool.query(
             'UPDATE clients SET follow_up_send_days = $1, updated_at = NOW() WHERE id = $2',
