@@ -1,7 +1,10 @@
 import crypto from 'crypto';
 import { pool } from '../config/db.js';
 import { getOrCreateClient, getClientRowBySlug, listClientsWithInstantlyKey } from './db/queries.js';
-import { createInterestedAutoResponderDraftFromEvent } from './interestedAutoResponder.js';
+import {
+    cancelNonInterestedAutoResponderDrafts,
+    createInterestedAutoResponderDraftFromEvent
+} from './interestedAutoResponder.js';
 
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_SYNC_PAGE_LIMIT = Math.max(1, Math.min(parseInt(process.env.INSTANTLY_SYNC_PAGE_LIMIT || '100', 10) || 100, 100));
@@ -475,7 +478,9 @@ function buildEventPatch(event, eventTimestamp) {
         lead_not_interested: -1,
         lead_wrong_person: -2,
         lead_neutral: 0,
-        lead_no_show: -4
+        lead_no_show: -4,
+        'bad fit': -1,
+        risky: -1
     };
 
     if (Object.prototype.hasOwnProperty.call(interestByEventType, eventType)) {
@@ -2219,6 +2224,14 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
                      AND (last_contacted_at IS NULL OR last_contacted_at < $2::timestamptz)`,
                     [contactId, eventPatch.timestampLastContact]
                 );
+            }
+
+            if (
+                eventPatch.interestStatus !== null
+                && eventPatch.interestStatus !== undefined
+                && eventPatch.interestStatus !== 1
+            ) {
+                await cancelNonInterestedAutoResponderDrafts(client, contactId, sqlCampaignId);
             }
         }
 

@@ -9,7 +9,9 @@ import {
     generateDraftReply,
     getInterestedAutoResponderDraftByToken,
     sendInterestedAutoResponderDraftByToken,
-    updateInterestedAutoResponderDraftTextByToken
+    updateInterestedAutoResponderDraftTextByToken,
+    cancelStalePendingReviewDraftsForClient,
+    NON_INTERESTED_LAST_EVENT_TYPES
 } from '../services/interestedAutoResponder.js';
 import { resolveTemplateVars, renderTemplate } from '../services/followUpSender.js';
 
@@ -445,17 +447,30 @@ router.get('/clients/:clientId/interested-autoresponder/drafts/pending-review', 
         const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
 
+        await cancelStalePendingReviewDraftsForClient(pool, clientRow.id);
+
         const result = await pool.query(
             `SELECT d.id, d.lead_email, d.eaccount, d.thread_subject, d.rendered_text,
                     d.review_token, d.created_at, d.updated_at,
-                    ic.name AS campaign_name
+                    ic.name AS campaign_name,
+                    cic.interest_status,
+                    cic.interest_status_label,
+                    cic.last_event_type
              FROM interested_autoresponder_drafts d
              LEFT JOIN instantly_campaigns ic ON ic.id = d.campaign_id
+             INNER JOIN contact_instantly_campaigns cic
+                 ON cic.contact_id = d.contact_id
+                 AND cic.campaign_id = d.campaign_id
+                 AND cic.active = TRUE
              WHERE d.client_id = $1
                AND d.status = 'pending_review'
+               AND cic.interest_status = 1
+               AND NOT (
+                   LOWER(COALESCE(cic.last_event_type, '')) = ANY($2::text[])
+               )
              ORDER BY d.created_at DESC
              LIMIT 50`,
-            [clientRow.id]
+            [clientRow.id, NON_INTERESTED_LAST_EVENT_TYPES]
         );
         res.json({ drafts: result.rows });
     } catch (error) {

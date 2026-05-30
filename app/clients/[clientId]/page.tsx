@@ -307,6 +307,39 @@ const POSITIVE_ACTIVITY_LABELS = new Set(["interested", "meeting booked", "meeti
 const NEGATIVE_ACTIVITY_LABELS = new Set(["not interested", "wrong person", "lost", "bad fit", "risky", "bounced"]);
 const NEUTRAL_ACTIVITY_LABELS = new Set(["out of office", "neutral", "no show", "unsubscribed"]);
 
+const NON_INTERESTED_LAST_EVENT_TYPES = new Set([
+    "bad fit",
+    "lead_not_interested",
+    "lead_wrong_person",
+    "lead_no_show",
+    "lead_neutral",
+    "lead_out_of_office",
+    "email_bounced",
+    "lead_unsubscribed",
+    "lead_meeting_booked",
+    "lead_meeting_completed",
+    "lead_closed",
+    "bounced",
+    "unsubscribed",
+    "lost",
+    "risky",
+    "not interested",
+    "wrong person",
+    "no show",
+]);
+
+function isPendingReviewDraftCurrentlyInterested(draft: {
+    interest_status?: number | null;
+    last_event_type?: string | null;
+}) {
+    if (typeof draft.interest_status === "number" && draft.interest_status !== 1) {
+        return false;
+    }
+    const lastEventType = String(draft.last_event_type || "").trim().toLowerCase();
+    if (!lastEventType) return true;
+    return !NON_INTERESTED_LAST_EVENT_TYPES.has(lastEventType);
+}
+
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
 const INSTANTLY_SYNC_POLL_MS = 5000;
 
@@ -1273,12 +1306,18 @@ export default function ClientPage() {
         rendered_text: string | null;
         review_token: string | null;
         campaign_name: string | null;
+        interest_status?: number | null;
+        interest_status_label?: string | null;
+        last_event_type?: string | null;
         created_at: string;
         updated_at: string;
     };
     const [pendingReviewDrafts, setPendingReviewDrafts] = useState<PendingReviewDraft[]>([]);
     const [pendingReviewDraftsLoading, setPendingReviewDraftsLoading] = useState(false);
     const [expandedDraftId, setExpandedDraftId] = useState<number | null>(null);
+    const [animatedPendingDraftIds, setAnimatedPendingDraftIds] = useState<Set<number>>(new Set());
+    const previousPendingDraftIdsRef = useRef<Set<number> | null>(null);
+    const pendingDraftAnimationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const instantlyWebhookUrl = useMemo(() => {
         if (!user || !clientId || !agencyId) return "";
@@ -2943,6 +2982,51 @@ export default function ClientPage() {
         latestEvent: row.latestEvent || null
     }), []);
 
+    const openLeadDetailFromEmail = useCallback(async (email: string) => {
+        const trimmedEmail = email.trim();
+        const normalizedEmail = trimmedEmail.toLowerCase();
+        if (!trimmedEmail || !user || !clientId) return;
+
+        const cachedLead = leads.find((lead) => lead.email?.toLowerCase() === normalizedEmail);
+        if (cachedLead) {
+            setSelectedLead(cachedLead);
+            setLeadModalTab('detail');
+            setShowLeadAdvanced(false);
+            return;
+        }
+
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const params = new URLSearchParams();
+            params.append('clientId', clientId);
+            params.append('limit', '5');
+            params.append('search', trimmedEmail);
+            params.append('searchField', 'email');
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                headers: { Authorization: `Bearer ${idToken}` }
+            });
+            if (!response.ok) {
+                throw new Error(`Failed to fetch lead (${response.status})`);
+            }
+            const data = await response.json();
+            const matchedRow = (Array.isArray(data.leads) ? data.leads : []).find(
+                (row: { email?: string | null }) => String(row.email || '').toLowerCase() === normalizedEmail
+            );
+            if (!matchedRow) {
+                setToastMessage(`No lead found for ${trimmedEmail}`);
+                return;
+            }
+            const lead = mapApiLeadRow(matchedRow);
+            setSelectedLead(lead);
+            setLeadModalTab('detail');
+            setShowLeadAdvanced(false);
+        } catch (error) {
+            console.error('Error opening lead detail from email:', error);
+            setToastMessage('Failed to open lead detail.');
+        }
+    }, [clientId, leads, mapApiLeadRow, user]);
+
     const fetchLeadTotal = useCallback(async () => {
         if (!user || !clientId) return;
         try {
@@ -3795,10 +3879,12 @@ export default function ClientPage() {
         }
     }, [user, clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
 
-    const fetchPendingReviewDrafts = useCallback(async () => {
+    const fetchPendingReviewDrafts = useCallback(async (showLoading = true) => {
         if (!user || !clientId) return;
         try {
-            setPendingReviewDraftsLoading(true);
+            if (showLoading) {
+                setPendingReviewDraftsLoading(true);
+            }
             const token = await getAccessToken();
             if (!token) return;
             const response = await fetchWithRetry(
@@ -3807,11 +3893,43 @@ export default function ClientPage() {
             );
             const data = await response.json();
             if (!response.ok) throw new Error(data?.error || `Failed to fetch drafts (${response.status})`);
-            setPendingReviewDrafts(data.drafts || []);
+
+            const draftRows: PendingReviewDraft[] = (data.drafts || []).filter(
+                (draft: PendingReviewDraft) => isPendingReviewDraftCurrentlyInterested(draft)
+            );
+            const draftIds = draftRows.map((draft) => draft.id);
+            const previousDraftIds = previousPendingDraftIdsRef.current;
+
+            if (pendingDraftAnimationTimeoutRef.current) {
+                clearTimeout(pendingDraftAnimationTimeoutRef.current);
+                pendingDraftAnimationTimeoutRef.current = null;
+            }
+
+            if (!previousDraftIds) {
+                previousPendingDraftIdsRef.current = new Set(draftIds);
+                setAnimatedPendingDraftIds(new Set());
+            } else {
+                const newDraftIds = draftIds.filter((id) => !previousDraftIds.has(id));
+                previousPendingDraftIdsRef.current = new Set(draftIds);
+
+                if (newDraftIds.length > 0) {
+                    setAnimatedPendingDraftIds(new Set(newDraftIds));
+                    pendingDraftAnimationTimeoutRef.current = setTimeout(() => {
+                        setAnimatedPendingDraftIds(new Set());
+                        pendingDraftAnimationTimeoutRef.current = null;
+                    }, 1800);
+                } else {
+                    setAnimatedPendingDraftIds(new Set());
+                }
+            }
+
+            setPendingReviewDrafts(draftRows);
         } catch (error) {
             console.error('Error fetching pending review drafts:', error);
         } finally {
-            setPendingReviewDraftsLoading(false);
+            if (showLoading) {
+                setPendingReviewDraftsLoading(false);
+            }
         }
     }, [user, clientId]);
 
@@ -3883,16 +4001,25 @@ export default function ClientPage() {
     useEffect(() => {
         previousRecentEventIdsRef.current = null;
         setAnimatedRecentEventIds(new Set());
+        previousPendingDraftIdsRef.current = null;
+        setAnimatedPendingDraftIds(new Set());
 
         if (recentEventAnimationTimeoutRef.current) {
             clearTimeout(recentEventAnimationTimeoutRef.current);
             recentEventAnimationTimeoutRef.current = null;
+        }
+        if (pendingDraftAnimationTimeoutRef.current) {
+            clearTimeout(pendingDraftAnimationTimeoutRef.current);
+            pendingDraftAnimationTimeoutRef.current = null;
         }
     }, [clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
 
     useEffect(() => () => {
         if (recentEventAnimationTimeoutRef.current) {
             clearTimeout(recentEventAnimationTimeoutRef.current);
+        }
+        if (pendingDraftAnimationTimeoutRef.current) {
+            clearTimeout(pendingDraftAnimationTimeoutRef.current);
         }
     }, []);
 
@@ -3920,7 +4047,8 @@ export default function ClientPage() {
         let messageRef = 0;
         let joinRef = "1";
         let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-        let refreshTimeout: ReturnType<typeof setTimeout> | null = null;
+        let refreshAnalyticsTimeout: ReturnType<typeof setTimeout> | null = null;
+        let refreshDraftsTimeout: ReturnType<typeof setTimeout> | null = null;
         let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
         let socket: WebSocket | null = null;
         let closed = false;
@@ -3938,12 +4066,21 @@ export default function ClientPage() {
             }
         };
 
-        const scheduleRefresh = () => {
-            if (refreshTimeout) {
-                clearTimeout(refreshTimeout);
+        const scheduleAnalyticsRefresh = () => {
+            if (refreshAnalyticsTimeout) {
+                clearTimeout(refreshAnalyticsTimeout);
             }
-            refreshTimeout = setTimeout(() => {
+            refreshAnalyticsTimeout = setTimeout(() => {
                 fetchInstantlyEventAnalytics(false);
+            }, 250);
+        };
+
+        const scheduleDraftsRefresh = () => {
+            if (refreshDraftsTimeout) {
+                clearTimeout(refreshDraftsTimeout);
+            }
+            refreshDraftsTimeout = setTimeout(() => {
+                fetchPendingReviewDrafts(false);
             }, 250);
         };
 
@@ -3992,6 +4129,12 @@ export default function ClientPage() {
                                 schema: "public",
                                 table: "contact_instantly_events",
                                 filter: `client_id=eq.${sqlClientId}`
+                            },
+                            {
+                                event: "*",
+                                schema: "public",
+                                table: "interested_autoresponder_drafts",
+                                filter: `client_id=eq.${sqlClientId}`
                             }
                         ],
                         private: false
@@ -4016,7 +4159,8 @@ export default function ClientPage() {
                 try {
                     const payload = JSON.parse(event.data);
                     if (payload?.event === "postgres_changes" && payload?.topic === topic) {
-                        scheduleRefresh();
+                        scheduleAnalyticsRefresh();
+                        scheduleDraftsRefresh();
                         return;
                     }
                     if (payload?.event === "system" && payload?.topic === topic) {
@@ -4063,8 +4207,11 @@ export default function ClientPage() {
 
         return () => {
             closed = true;
-            if (refreshTimeout) {
-                clearTimeout(refreshTimeout);
+            if (refreshAnalyticsTimeout) {
+                clearTimeout(refreshAnalyticsTimeout);
+            }
+            if (refreshDraftsTimeout) {
+                clearTimeout(refreshDraftsTimeout);
             }
             if (reconnectTimeout) {
                 clearTimeout(reconnectTimeout);
@@ -4081,7 +4228,7 @@ export default function ClientPage() {
             }
             socket?.close();
         };
-    }, [activeTab, instantlyEventAnalytics, instantlyEventAnalyticsLoading, fetchInstantlyEventAnalytics]);
+    }, [activeTab, instantlyEventAnalytics, instantlyEventAnalyticsLoading, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
 
     // Instantly upload status: when job list membership changes, not on every pipeline UPDATE.
     useEffect(() => {
@@ -7017,9 +7164,6 @@ export default function ClientPage() {
                                                 // Total individual events across this lead group
                                                 const totalEvtCount = group.items.reduce((sum, g) => sum + g.batchCount, 0);
 
-                                                // Find matching lead for modal
-                                                const matchedLead = email ? leads.find(l => l.email?.toLowerCase() === email.toLowerCase()) ?? null : null;
-
                                                 return (
                                                     <div key={primaryEvt.id}>
                                                         {showSeparator && dayLabel && (
@@ -7094,28 +7238,46 @@ export default function ClientPage() {
                                                                     }}>
                                                                         {timeStr}
                                                                     </span>
-                                                                    {matchedLead && (
+                                                                    {email && (
                                                                         <button
                                                                             type="button"
                                                                             title="Open lead detail"
-                                                                            onClick={(e) => { e.stopPropagation(); setSelectedLead(matchedLead); }}
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                void openLeadDetailFromEmail(email);
+                                                                            }}
                                                                             style={{
                                                                                 flexShrink: 0,
                                                                                 display: "inline-flex",
                                                                                 alignItems: "center",
-                                                                                justifyContent: "center",
-                                                                                width: "18px",
-                                                                                height: "18px",
+                                                                                gap: "0.2rem",
+                                                                                padding: "0.1rem 0.35rem",
                                                                                 borderRadius: "4px",
                                                                                 border: "1px solid var(--app-border-mid)",
                                                                                 background: "var(--app-surface-2)",
                                                                                 color: "var(--app-text-faint)",
-                                                                                fontSize: "0.65rem",
+                                                                                fontSize: "0.68rem",
+                                                                                fontWeight: 600,
                                                                                 cursor: "pointer",
                                                                                 lineHeight: 1,
                                                                             }}
                                                                         >
-                                                                            ↗
+                                                                            Open
+                                                                            <svg
+                                                                                width="11"
+                                                                                height="11"
+                                                                                viewBox="0 0 24 24"
+                                                                                fill="none"
+                                                                                stroke="currentColor"
+                                                                                strokeWidth="2"
+                                                                                strokeLinecap="round"
+                                                                                strokeLinejoin="round"
+                                                                                aria-hidden="true"
+                                                                            >
+                                                                                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                                                                                <polyline points="15 3 21 3 21 9" />
+                                                                                <line x1="10" y1="14" x2="21" y2="3" />
+                                                                            </svg>
                                                                         </button>
                                                                     )}
                                                                 </div>
@@ -7229,6 +7391,7 @@ export default function ClientPage() {
                                     <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
                                         {pendingReviewDrafts.map((draft, idx) => {
                                             const isExpanded = expandedDraftId === draft.id;
+                                            const isAnimated = animatedPendingDraftIds.has(draft.id);
                                             const draftDate = new Date(draft.created_at);
                                             const timeStr = Number.isNaN(draftDate.getTime()) ? "" : draftDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
                                             const dateStr = Number.isNaN(draftDate.getTime()) ? "" : draftDate.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
@@ -7241,7 +7404,11 @@ export default function ClientPage() {
                                                 : null;
 
                                             return (
-                                                <div key={draft.id} style={{ borderTop: idx > 0 ? "1px solid var(--app-border)" : "none" }}>
+                                                <div
+                                                    key={draft.id}
+                                                    className={isAnimated ? "are-event are-event--new" : undefined}
+                                                    style={{ borderTop: idx > 0 ? "1px solid var(--app-border)" : "none" }}
+                                                >
                                                     <div
                                                         style={{
                                                             padding: "0.6rem 0.25rem",

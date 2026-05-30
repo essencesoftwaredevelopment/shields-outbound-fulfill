@@ -18,6 +18,35 @@ const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
 
+/** Instantly last_event_type values that mean the lead is no longer interested. */
+export const NON_INTERESTED_LAST_EVENT_TYPES = [
+    'bad fit',
+    'lead_not_interested',
+    'lead_wrong_person',
+    'lead_no_show',
+    'lead_neutral',
+    'lead_out_of_office',
+    'email_bounced',
+    'lead_unsubscribed',
+    'lead_meeting_booked',
+    'lead_meeting_completed',
+    'lead_closed',
+    'bounced',
+    'unsubscribed',
+    'lost',
+    'risky',
+    'not interested',
+    'wrong person',
+    'no show'
+];
+
+export function isCampaignCurrentlyInterested({ interest_status: interestStatus, last_event_type: lastEventType } = {}) {
+    if (interestStatus !== 1) return false;
+    const normalizedLastEvent = String(lastEventType || '').trim().toLowerCase();
+    if (!normalizedLastEvent) return true;
+    return !NON_INTERESTED_LAST_EVENT_TYPES.includes(normalizedLastEvent);
+}
+
 function isPopupFormGenerateRetryableError(error) {
     return error?.name === 'AbortError' || error instanceof TypeError;
 }
@@ -223,6 +252,49 @@ async function cancelSupersededOpenDrafts(db, contactId, campaignId) {
            AND status = ANY($3::text[])
          RETURNING id`,
         [contactId, campaignId, OPEN_DRAFT_STATUSES]
+    );
+    return result.rows.map((row) => row.id);
+}
+
+/** Cancel open drafts when the lead's Instantly interest status is no longer "interested" (1). */
+export async function cancelNonInterestedAutoResponderDrafts(db, contactId, campaignId) {
+    const result = await db.query(
+        `UPDATE interested_autoresponder_drafts d
+         SET status = 'cancelled',
+             updated_at = NOW()
+         FROM contact_instantly_campaigns cic
+         WHERE d.contact_id = $1
+           AND d.campaign_id = $2
+           AND d.contact_id = cic.contact_id
+           AND d.campaign_id = cic.campaign_id
+           AND d.status = ANY($3::text[])
+           AND (
+               COALESCE(cic.interest_status, -999) <> 1
+               OR LOWER(COALESCE(cic.last_event_type, '')) = ANY($4::text[])
+           )
+         RETURNING d.id`,
+        [contactId, campaignId, OPEN_DRAFT_STATUSES, NON_INTERESTED_LAST_EVENT_TYPES]
+    );
+    return result.rows.map((row) => row.id);
+}
+
+/** Sweep stale open drafts for a client whose interest status has moved away from interested. */
+export async function cancelStalePendingReviewDraftsForClient(db, clientId) {
+    const result = await db.query(
+        `UPDATE interested_autoresponder_drafts d
+         SET status = 'cancelled',
+             updated_at = NOW()
+         FROM contact_instantly_campaigns cic
+         WHERE d.client_id = $1
+           AND d.contact_id = cic.contact_id
+           AND d.campaign_id = cic.campaign_id
+           AND d.status = 'pending_review'
+           AND (
+               COALESCE(cic.interest_status, -999) <> 1
+               OR LOWER(COALESCE(cic.last_event_type, '')) = ANY($2::text[])
+           )
+         RETURNING d.id`,
+        [clientId, NON_INTERESTED_LAST_EVENT_TYPES]
     );
     return result.rows.map((row) => row.id);
 }
