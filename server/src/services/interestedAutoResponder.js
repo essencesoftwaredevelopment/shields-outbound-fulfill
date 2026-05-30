@@ -213,18 +213,18 @@ async function fetchPromptConfig(db, clientId, campaignId) {
     return result.rows[0] || null;
 }
 
-async function fetchOpenDraft(db, contactId, campaignId) {
+async function cancelSupersededOpenDrafts(db, contactId, campaignId) {
     const result = await db.query(
-        `SELECT *
-         FROM interested_autoresponder_drafts
+        `UPDATE interested_autoresponder_drafts
+         SET status = 'cancelled',
+             updated_at = NOW()
          WHERE contact_id = $1
            AND campaign_id = $2
            AND status = ANY($3::text[])
-         ORDER BY created_at DESC
-         LIMIT 1`,
+         RETURNING id`,
         [contactId, campaignId, OPEN_DRAFT_STATUSES]
     );
-    return result.rows[0] || null;
+    return result.rows.map((row) => row.id);
 }
 
 async function fetchSourceEventDetails(db, sourceEventId) {
@@ -409,46 +409,7 @@ async function sendInstantlyReplyDirect(apiKey, replyPayload) {
     return null;
 }
 
-async function upsertDraftRow(db, draft) {
-    if (draft.id) {
-        const result = await db.query(
-            `UPDATE interested_autoresponder_drafts
-             SET source_event_id = $2,
-                 review_token = $3,
-                 review_token_expires_at = $4,
-                 status = $5,
-                 blocked_reason = $6,
-                 reply_to_uuid = $7,
-                 eaccount = $8,
-                 thread_subject = $9,
-                 lead_email = $10,
-                 previous_lead_message = $11,
-                 system_prompt_version = $12,
-                 model = $13,
-                 rendered_text = $14,
-                 updated_at = NOW()
-             WHERE id = $1
-             RETURNING *`,
-            [
-                draft.id,
-                draft.source_event_id,
-                draft.review_token,
-                draft.review_token_expires_at,
-                draft.status,
-                draft.blocked_reason,
-                draft.reply_to_uuid,
-                draft.eaccount,
-                draft.thread_subject,
-                draft.lead_email,
-                draft.previous_lead_message,
-                draft.system_prompt_version,
-                draft.model,
-                draft.rendered_text
-            ]
-        );
-        return result.rows[0] || null;
-    }
-
+async function insertDraftRow(db, draft) {
     const result = await db.query(
         `INSERT INTO interested_autoresponder_drafts (
             agency_id, client_id, campaign_id, contact_id, instantly_lead_id, source_event_id,
@@ -502,11 +463,10 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
     const client = await pool.connect();
     try {
-        const [promptConfig, sourceEvent, threadMetadata, openDraft, settings] = await Promise.all([
+        const [promptConfig, sourceEvent, threadMetadata, settings] = await Promise.all([
             fetchPromptConfig(client, clientId, campaignId),
             fetchSourceEventDetails(client, sourceEventId),
             fetchLatestThreadMetadata(client, contactId, campaignId),
-            fetchOpenDraft(client, contactId, campaignId),
             fetchAgencyAndClientSettings(agencyId, clientId)
         ]);
 
@@ -514,8 +474,9 @@ export async function createInterestedAutoResponderDraftFromEvent({
             return { created: false, reason: 'missing_active_prompt' };
         }
 
-        if (openDraft?.status === 'pending_review') {
-            return { created: false, reason: 'draft_already_pending', draftId: openDraft.id };
+        const cancelledDraftIds = await cancelSupersededOpenDrafts(client, contactId, campaignId);
+        if (cancelledDraftIds.length) {
+            logger(`[interested-autoresponder] cancelled superseded drafts for contact=${contactId} campaign=${campaignId}: ${cancelledDraftIds.join(', ')}`);
         }
 
         const previousLeadMessage = asTrimmedText(sourceEvent?.message_text)
@@ -523,20 +484,18 @@ export async function createInterestedAutoResponderDraftFromEvent({
             || null;
         const normalizedLeadEmail = asTrimmedText(leadEmail)
             || asTrimmedText(sourceEvent?.lead_email)
-            || asTrimmedText(openDraft?.lead_email)
             || '';
         const replyToUuid = asTrimmedText(threadMetadata.reply_to_uuid);
         const eaccount = asTrimmedText(threadMetadata.eaccount);
         const threadSubject = asTrimmedText(threadMetadata.thread_subject);
 
         if (!replyToUuid || !eaccount) {
-            const blockedDraft = await upsertDraftRow(client, {
-                id: openDraft?.id || null,
+            const blockedDraft = await insertDraftRow(client, {
                 agency_id: agencyId,
                 client_id: clientId,
                 campaign_id: campaignId,
                 contact_id: contactId,
-                instantly_lead_id: instantlyLeadId || openDraft?.instantly_lead_id || null,
+                instantly_lead_id: instantlyLeadId || null,
                 source_event_id: sourceEventId,
                 review_token: null,
                 review_token_expires_at: null,
@@ -555,13 +514,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
         }
 
         if (!settings.openaiKey) {
-            const failedDraft = await upsertDraftRow(client, {
-                id: openDraft?.id || null,
+            const failedDraft = await insertDraftRow(client, {
                 agency_id: agencyId,
                 client_id: clientId,
                 campaign_id: campaignId,
                 contact_id: contactId,
-                instantly_lead_id: instantlyLeadId || openDraft?.instantly_lead_id || null,
+                instantly_lead_id: instantlyLeadId || null,
                 source_event_id: sourceEventId,
                 review_token: null,
                 review_token_expires_at: null,
@@ -599,13 +557,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 essenceAiPreviewUrl
             });
         } catch (error) {
-            const failedDraft = await upsertDraftRow(client, {
-                id: openDraft?.id || null,
+            const failedDraft = await insertDraftRow(client, {
                 agency_id: agencyId,
                 client_id: clientId,
                 campaign_id: campaignId,
                 contact_id: contactId,
-                instantly_lead_id: instantlyLeadId || openDraft?.instantly_lead_id || null,
+                instantly_lead_id: instantlyLeadId || null,
                 source_event_id: sourceEventId,
                 review_token: null,
                 review_token_expires_at: null,
@@ -625,13 +582,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
         const reviewToken = generateReviewToken();
         const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();
-        const savedDraft = await upsertDraftRow(client, {
-            id: openDraft?.id || null,
+        const savedDraft = await insertDraftRow(client, {
             agency_id: agencyId,
             client_id: clientId,
             campaign_id: campaignId,
             contact_id: contactId,
-            instantly_lead_id: instantlyLeadId || openDraft?.instantly_lead_id || null,
+            instantly_lead_id: instantlyLeadId || null,
             source_event_id: sourceEventId,
             review_token: reviewToken,
             review_token_expires_at: reviewTokenExpiresAt,
