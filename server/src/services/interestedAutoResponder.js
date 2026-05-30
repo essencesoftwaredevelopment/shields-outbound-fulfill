@@ -9,9 +9,18 @@ const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const POPUP_FORM_GENERATE_URL = 'https://essence-retention-ai-popup-demo.vercel.app/api/popup-form/generate';
 const POPUP_FORM_API_KEY = 'CNl6iVR6YwmlPU9iw6gOW1LAF4roUxxPNB9YrI2kdIeMmbcfUKh4Rgdl0gdmZBQo';
+const POPUP_FORM_GENERATE_TIMEOUT_MS = Math.max(
+    Number(process.env.INTERESTED_AUTORESPONDER_POPUP_TIMEOUT_MS || 90_000) || 90_000,
+    1
+);
+const POPUP_FORM_GENERATE_MAX_ATTEMPTS = 2;
 const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
+
+function isPopupFormGenerateRetryableError(error) {
+    return error?.name === 'AbortError' || error instanceof TypeError;
+}
 
 export async function callPopupFormGenerate(leadEmail) {
     const atIndex = String(leadEmail || '').indexOf('@');
@@ -20,30 +29,57 @@ export async function callPopupFormGenerate(leadEmail) {
         console.log('[popup-form/generate] skipped — no domain extractable from leadEmail:', leadEmail);
         return null;
     }
-    console.log(`[popup-form/generate] calling for domain=${domain}`);
+
+    const previewUrl = `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
     const start = Date.now();
-    try {
-        const response = await fetch(POPUP_FORM_GENERATE_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': POPUP_FORM_API_KEY
-            },
-            body: JSON.stringify({ domain })
-        });
-        const elapsed = Date.now() - start;
-        if (!response.ok) {
-            console.warn(`[popup-form/generate] non-200 response status=${response.status} domain=${domain} elapsed=${elapsed}ms`);
+
+    for (let attempt = 0; attempt < POPUP_FORM_GENERATE_MAX_ATTEMPTS; attempt += 1) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), POPUP_FORM_GENERATE_TIMEOUT_MS);
+        try {
+            console.log(
+                `[popup-form/generate] calling for domain=${domain} attempt=${attempt + 1}/${POPUP_FORM_GENERATE_MAX_ATTEMPTS} timeoutMs=${POPUP_FORM_GENERATE_TIMEOUT_MS}`
+            );
+            const response = await fetch(POPUP_FORM_GENERATE_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': POPUP_FORM_API_KEY
+                },
+                body: JSON.stringify({ domain }),
+                signal: controller.signal
+            });
+            const elapsed = Date.now() - start;
+            if (!response.ok) {
+                const retryable = response.status === 429 || response.status >= 500;
+                console.warn(
+                    `[popup-form/generate] non-200 response status=${response.status} domain=${domain} elapsed=${elapsed}ms attempt=${attempt + 1}/${POPUP_FORM_GENERATE_MAX_ATTEMPTS}`
+                );
+                if (retryable && attempt < POPUP_FORM_GENERATE_MAX_ATTEMPTS - 1) {
+                    await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+                    continue;
+                }
+                return null;
+            }
+            console.log(`[popup-form/generate] success domain=${domain} elapsed=${elapsed}ms previewUrl=${previewUrl}`);
+            return previewUrl;
+        } catch (err) {
+            const elapsed = Date.now() - start;
+            const reason = err?.name === 'AbortError' ? 'timeout' : err.message;
+            console.error(
+                `[popup-form/generate] fetch error domain=${domain} elapsed=${elapsed}ms attempt=${attempt + 1}/${POPUP_FORM_GENERATE_MAX_ATTEMPTS}: ${reason}`
+            );
+            if (isPopupFormGenerateRetryableError(err) && attempt < POPUP_FORM_GENERATE_MAX_ATTEMPTS - 1) {
+                await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+                continue;
+            }
             return null;
+        } finally {
+            clearTimeout(timeoutId);
         }
-        const previewUrl = `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
-        console.log(`[popup-form/generate] success domain=${domain} elapsed=${elapsed}ms previewUrl=${previewUrl}`);
-        return previewUrl;
-    } catch (err) {
-        const elapsed = Date.now() - start;
-        console.error(`[popup-form/generate] fetch error domain=${domain} elapsed=${elapsed}ms:`, err.message);
-        return null;
     }
+
+    return null;
 }
 
 function asTrimmedText(value) {
