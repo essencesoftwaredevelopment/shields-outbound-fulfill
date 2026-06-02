@@ -18,33 +18,23 @@ const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
 
-/** Instantly last_event_type values that mean the lead is no longer interested. */
-export const NON_INTERESTED_LAST_EVENT_TYPES = [
-    'bad fit',
-    'lead_not_interested',
-    'lead_wrong_person',
-    'lead_no_show',
-    'lead_neutral',
-    'lead_out_of_office',
-    'email_bounced',
-    'lead_unsubscribed',
-    'lead_meeting_booked',
-    'lead_meeting_completed',
-    'lead_closed',
-    'bounced',
-    'unsubscribed',
-    'lost',
-    'risky',
-    'not interested',
-    'wrong person',
-    'no show'
+/** last_event_type values where a pending-review draft is still valid (lead still at "interested"). */
+export const INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES = [
+    'lead_interested',
+    'interested',
+    'reply_received',
+    'interested_reply_sent',
+    'email_sent',
+    'email_opened',
+    'email_link_clicked',
+    'state_sync'
 ];
 
 export function isCampaignCurrentlyInterested({ interest_status: interestStatus, last_event_type: lastEventType } = {}) {
     if (interestStatus !== 1) return false;
     const normalizedLastEvent = String(lastEventType || '').trim().toLowerCase();
     if (!normalizedLastEvent) return true;
-    return !NON_INTERESTED_LAST_EVENT_TYPES.includes(normalizedLastEvent);
+    return INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES.includes(normalizedLastEvent);
 }
 
 function isPopupFormGenerateRetryableError(error) {
@@ -270,10 +260,13 @@ export async function cancelNonInterestedAutoResponderDrafts(db, contactId, camp
            AND d.status = ANY($3::text[])
            AND (
                COALESCE(cic.interest_status, -999) <> 1
-               OR LOWER(COALESCE(cic.last_event_type, '')) = ANY($4::text[])
+               OR (
+                   COALESCE(cic.last_event_type, '') <> ''
+                   AND NOT (LOWER(cic.last_event_type) = ANY($4::text[]))
+               )
            )
          RETURNING d.id`,
-        [contactId, campaignId, OPEN_DRAFT_STATUSES, NON_INTERESTED_LAST_EVENT_TYPES]
+        [contactId, campaignId, OPEN_DRAFT_STATUSES, INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES]
     );
     return result.rows.map((row) => row.id);
 }
@@ -291,10 +284,13 @@ export async function cancelStalePendingReviewDraftsForClient(db, clientId) {
            AND d.status = 'pending_review'
            AND (
                COALESCE(cic.interest_status, -999) <> 1
-               OR LOWER(COALESCE(cic.last_event_type, '')) = ANY($2::text[])
+               OR (
+                   COALESCE(cic.last_event_type, '') <> ''
+                   AND NOT (LOWER(cic.last_event_type) = ANY($2::text[]))
+               )
            )
          RETURNING d.id`,
-        [clientId, NON_INTERESTED_LAST_EVENT_TYPES]
+        [clientId, INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES]
     );
     return result.rows.map((row) => row.id);
 }

@@ -239,6 +239,7 @@ type InstantlyEventAnalyticsRecentEvent = {
     event_type: string;
     reply_category?: string | null;
     lead_email?: string | null;
+    contact_id?: string | null;
     email_account?: string | null;
     message_text?: string | null;
     reply_text_snippet?: string | null;
@@ -269,6 +270,7 @@ type CollatableActivityEvent = {
     event_timestamp: string;
     campaign_name?: string | null;
     lead_email?: string | null;
+    contact_id?: string | null;
     message_text?: string | null;
     reply_text_snippet?: string | null;
     reply_category?: string | null;
@@ -307,25 +309,15 @@ const POSITIVE_ACTIVITY_LABELS = new Set(["interested", "meeting booked", "meeti
 const NEGATIVE_ACTIVITY_LABELS = new Set(["not interested", "wrong person", "lost", "bad fit", "risky", "bounced"]);
 const NEUTRAL_ACTIVITY_LABELS = new Set(["out of office", "neutral", "no show", "unsubscribed"]);
 
-const NON_INTERESTED_LAST_EVENT_TYPES = new Set([
-    "bad fit",
-    "lead_not_interested",
-    "lead_wrong_person",
-    "lead_no_show",
-    "lead_neutral",
-    "lead_out_of_office",
-    "email_bounced",
-    "lead_unsubscribed",
-    "lead_meeting_booked",
-    "lead_meeting_completed",
-    "lead_closed",
-    "bounced",
-    "unsubscribed",
-    "lost",
-    "risky",
-    "not interested",
-    "wrong person",
-    "no show",
+const INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES = new Set([
+    "lead_interested",
+    "interested",
+    "reply_received",
+    "interested_reply_sent",
+    "email_sent",
+    "email_opened",
+    "email_link_clicked",
+    "state_sync",
 ]);
 
 function isPendingReviewDraftCurrentlyInterested(draft: {
@@ -337,7 +329,7 @@ function isPendingReviewDraftCurrentlyInterested(draft: {
     }
     const lastEventType = String(draft.last_event_type || "").trim().toLowerCase();
     if (!lastEventType) return true;
-    return !NON_INTERESTED_LAST_EVENT_TYPES.has(lastEventType);
+    return INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES.has(lastEventType);
 }
 
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
@@ -1709,7 +1701,7 @@ export default function ClientPage() {
     }, [selectedLead?.id]);
 
     useEffect(() => {
-        if (!selectedLead || !user) {
+        if (!selectedLead || !user || !selectedLead.id) {
             setLeadEvents([]);
             return;
         }
@@ -2982,12 +2974,16 @@ export default function ClientPage() {
         latestEvent: row.latestEvent || null
     }), []);
 
-    const openLeadDetailFromEmail = useCallback(async (email: string) => {
-        const trimmedEmail = email.trim();
+    const openLeadDetail = useCallback(async ({ email, contactId }: { email?: string; contactId?: string }) => {
+        const trimmedEmail = email?.trim() || '';
         const normalizedEmail = trimmedEmail.toLowerCase();
-        if (!trimmedEmail || !user || !clientId) return;
+        const normalizedContactId = contactId?.trim() || '';
+        if ((!trimmedEmail && !normalizedContactId) || !user || !clientId) return;
 
-        const cachedLead = leads.find((lead) => lead.email?.toLowerCase() === normalizedEmail);
+        const cachedLead = leads.find((lead) => (
+            (normalizedContactId && lead.id === normalizedContactId)
+            || (normalizedEmail && lead.email?.toLowerCase() === normalizedEmail)
+        ));
         if (cachedLead) {
             setSelectedLead(cachedLead);
             setLeadModalTab('detail');
@@ -2995,34 +2991,43 @@ export default function ClientPage() {
             return;
         }
 
+        setSelectedLead({
+            id: normalizedContactId,
+            email: trimmedEmail,
+            domain: '',
+            status: '',
+            verified: false,
+            firstLine: '',
+            founderName: '',
+        });
+        setLeadModalTab('detail');
+        setShowLeadAdvanced(false);
+
         try {
             const idToken = await getAccessToken();
             if (!idToken) return;
-            const params = new URLSearchParams();
-            params.append('clientId', clientId);
-            params.append('limit', '5');
-            params.append('search', trimmedEmail);
-            params.append('searchField', 'email');
-            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+            const params = new URLSearchParams({ clientId });
+            if (normalizedContactId) {
+                params.append('contactId', normalizedContactId);
+            } else {
+                params.append('email', trimmedEmail);
+            }
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/lookup?${params.toString()}`, {
                 headers: { Authorization: `Bearer ${idToken}` }
             });
             if (!response.ok) {
                 throw new Error(`Failed to fetch lead (${response.status})`);
             }
             const data = await response.json();
-            const matchedRow = (Array.isArray(data.leads) ? data.leads : []).find(
-                (row: { email?: string | null }) => String(row.email || '').toLowerCase() === normalizedEmail
-            );
-            if (!matchedRow) {
-                setToastMessage(`No lead found for ${trimmedEmail}`);
+            if (!data?.lead) {
+                setSelectedLead(null);
+                setToastMessage(trimmedEmail ? `No lead found for ${trimmedEmail}` : 'Lead not found.');
                 return;
             }
-            const lead = mapApiLeadRow(matchedRow);
-            setSelectedLead(lead);
-            setLeadModalTab('detail');
-            setShowLeadAdvanced(false);
+            setSelectedLead(mapApiLeadRow(data.lead));
         } catch (error) {
-            console.error('Error opening lead detail from email:', error);
+            console.error('Error opening lead detail:', error);
+            setSelectedLead(null);
             setToastMessage('Failed to open lead detail.');
         }
     }, [clientId, leads, mapApiLeadRow, user]);
@@ -7244,7 +7249,10 @@ export default function ClientPage() {
                                                                             title="Open lead detail"
                                                                             onClick={(e) => {
                                                                                 e.stopPropagation();
-                                                                                void openLeadDetailFromEmail(email);
+                                                                                void openLeadDetail({
+                                                                                    email,
+                                                                                    contactId: primaryEvt.contact_id || undefined,
+                                                                                });
                                                                             }}
                                                                             style={{
                                                                                 flexShrink: 0,

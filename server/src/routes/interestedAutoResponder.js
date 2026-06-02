@@ -11,7 +11,7 @@ import {
     sendInterestedAutoResponderDraftByToken,
     updateInterestedAutoResponderDraftTextByToken,
     cancelStalePendingReviewDraftsForClient,
-    NON_INTERESTED_LAST_EVENT_TYPES
+    INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES
 } from '../services/interestedAutoResponder.js';
 import { resolveTemplateVars, renderTemplate } from '../services/followUpSender.js';
 
@@ -465,12 +465,13 @@ router.get('/clients/:clientId/interested-autoresponder/drafts/pending-review', 
              WHERE d.client_id = $1
                AND d.status = 'pending_review'
                AND cic.interest_status = 1
-               AND NOT (
-                   LOWER(COALESCE(cic.last_event_type, '')) = ANY($2::text[])
+               AND (
+                   COALESCE(cic.last_event_type, '') = ''
+                   OR LOWER(cic.last_event_type) = ANY($2::text[])
                )
              ORDER BY d.created_at DESC
              LIMIT 50`,
-            [clientRow.id, NON_INTERESTED_LAST_EVENT_TYPES]
+            [clientRow.id, INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES]
         );
         res.json({ drafts: result.rows });
     } catch (error) {

@@ -2226,13 +2226,7 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
                 );
             }
 
-            if (
-                eventPatch.interestStatus !== null
-                && eventPatch.interestStatus !== undefined
-                && eventPatch.interestStatus !== 1
-            ) {
-                await cancelNonInterestedAutoResponderDrafts(client, contactId, sqlCampaignId);
-            }
+            await cancelNonInterestedAutoResponderDrafts(client, contactId, sqlCampaignId);
         }
 
         const workspaceId = asNullableText(event?.workspace) || clientState.instantly_workspace_id;

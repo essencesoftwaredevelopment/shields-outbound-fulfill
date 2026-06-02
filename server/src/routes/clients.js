@@ -760,6 +760,7 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
                 LOWER(COALESCE(cie.event_type, 'unknown')) AS event_type,
                 cie.reply_category,
                 cie.lead_email,
+                cie.contact_id::text AS contact_id,
                 cie.email_account,
                 cie.message_text,
                 cie.reply_text_snippet,

@@ -1884,6 +1884,166 @@ router.get('/leads/filter-fields', verifyFirebaseToken, async (_req, res) => {
 });
 
 /**
+ * GET /leads/lookup
+ *
+ * Fast single-lead lookup for opening the lead detail panel from analytics/events.
+ * Accepts either contactId or email (email is case-insensitive exact match).
+ */
+router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        const contactIdRaw = typeof req.query.contactId === 'string' ? req.query.contactId.trim() : '';
+        const emailRaw = typeof req.query.email === 'string' ? req.query.email.trim() : '';
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId parameter is required.' });
+        }
+
+        const parsedContactId = Number.parseInt(contactIdRaw, 10);
+        const hasContactId = Number.isInteger(parsedContactId) && parsedContactId > 0;
+        const normalizedEmail = emailRaw.toLowerCase();
+
+        if (!hasContactId && !normalizedEmail) {
+            return res.status(400).json({ error: 'contactId or email is required.' });
+        }
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+
+        const result = await pool.query(
+            `SELECT
+                c.id,
+                c.role_type,
+                c.full_name,
+                c.email,
+                c.email_status,
+                c.email_find_completed_at,
+                c.email_verify_completed_at,
+                c.last_contacted_at,
+                c.confidence,
+                c.personalization_first_line,
+                c.job_id,
+                c.created_at,
+                c.updated_at,
+                co.domain_normalized,
+                ci.annual_revenue_text,
+                ci.annual_revenue_min,
+                ci.annual_revenue_max,
+                ci.uses_klaviyo,
+                ci.klaviyo_percent,
+                ci.discovery_call_held,
+                ci.last_discovery_call_at,
+                ci.source AS insight_source,
+                ci.notes AS insight_notes,
+                ci.attributes AS insight_attributes,
+                (
+                    SELECT COUNT(*)::int
+                    FROM contact_instantly_campaigns cic_count
+                    WHERE cic_count.contact_id = c.id
+                ) AS campaign_count_all_time,
+                (
+                    SELECT COUNT(*)::int
+                    FROM contact_instantly_campaigns cic_count
+                    WHERE cic_count.contact_id = c.id
+                      AND cic_count.active = TRUE
+                ) AS campaign_count_active,
+                (
+                    SELECT MAX(cic_count.added_at)
+                    FROM contact_instantly_campaigns cic_count
+                    WHERE cic_count.contact_id = c.id
+                      AND cic_count.active = TRUE
+                ) AS last_campaign_added_at,
+                (
+                    SELECT json_agg(
+                        json_build_object(
+                            'campaignId', ic.instantly_campaign_id,
+                            'campaignName', ic.name,
+                            'addedAt', cic.added_at,
+                            'active', cic.active,
+                            'lastReplyAt', cic.timestamp_last_reply,
+                            'lastReplyCategory', cic.last_reply_category,
+                            'leadStatus', cic.lead_status_label,
+                            'interestStatus', cic.interest_status_label,
+                            'lastSyncedAt', cic.last_synced_at,
+                            'lastBounceAt', cic.last_bounce_at,
+                            'timestampLastInterestChange', cic.timestamp_last_interest_change
+                        )
+                        ORDER BY COALESCE(cic.last_synced_at, cic.added_at) DESC NULLS LAST, cic.added_at DESC NULLS LAST
+                    )
+                    FROM contact_instantly_campaigns cic
+                    JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+                    WHERE cic.contact_id = c.id
+                      AND cic.active = TRUE
+                ) AS campaigns_data
+             FROM contacts c
+             JOIN companies co ON co.id = c.company_id
+             LEFT JOIN contact_insights ci ON ci.contact_id = c.id
+             WHERE c.agency_id = $1
+               AND c.client_id = $2
+               AND (
+                   ($3::bigint IS NOT NULL AND c.id = $3)
+                   OR ($4::text IS NOT NULL AND LOWER(c.email) = $4)
+               )
+             LIMIT 1`,
+            [
+                agencyId,
+                clientId,
+                hasContactId ? parsedContactId : null,
+                normalizedEmail || null
+            ]
+        );
+
+        const row = result.rows[0];
+        if (!row) {
+            return res.status(404).json({ error: 'Lead not found.' });
+        }
+
+        res.json({
+            lead: {
+                id: row.id,
+                domain: row.domain_normalized,
+                email: row.email,
+                founderName: row.full_name,
+                roleType: typeof row.role_type === 'string' && row.role_type.startsWith('instantly:')
+                    ? 'instantly_lead'
+                    : row.role_type,
+                status: row.email_status,
+                verified: row.email_status === 'valid',
+                confidence: row.confidence,
+                emailFindCompletedAt: row.email_find_completed_at,
+                emailVerifyCompletedAt: row.email_verify_completed_at,
+                lastContactedAt: row.last_contacted_at,
+                firstLine: row.personalization_first_line,
+                jobId: row.job_id,
+                createdAt: row.created_at,
+                updatedAt: row.updated_at,
+                campaignCountAllTime: row.campaign_count_all_time,
+                campaignCountActive: row.campaign_count_active,
+                lastCampaignAddedAt: row.last_campaign_added_at,
+                campaignsData: row.campaigns_data || [],
+                latestEvent: null,
+                insights: {
+                    annualRevenueText: row.annual_revenue_text,
+                    annualRevenueMin: row.annual_revenue_min,
+                    annualRevenueMax: row.annual_revenue_max,
+                    usesKlaviyo: row.uses_klaviyo,
+                    klaviyoPercent: row.klaviyo_percent,
+                    discoveryCallHeld: row.discovery_call_held,
+                    lastDiscoveryCallAt: row.last_discovery_call_at,
+                    source: row.insight_source,
+                    notes: row.insight_notes,
+                    attributes: row.insight_attributes || {}
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Error looking up lead:', error);
+        res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to look up lead.' });
+    }
+});
+
+/**
  * POST /leads/mark-sent
  *
  * Mark contacts as sent/exported by updating last_contacted_at.
