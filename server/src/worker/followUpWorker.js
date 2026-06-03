@@ -15,7 +15,6 @@
 import pLimit from 'p-limit';
 import { runFollowUpsForClient } from '../services/followUpSender.js';
 import { listInstantlySyncClients } from '../services/instantlyState.js';
-import { pool } from '../config/db.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -110,15 +109,6 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function resolveClientId(agencyId, clientSlug) {
-    // Match on both agency_id and name (Firestore doc ID = clients.name slug)
-    const res = await pool.query(
-        `SELECT id FROM clients WHERE agency_id = $1 AND name = $2 LIMIT 1`,
-        [agencyId, clientSlug]
-    );
-    return Number(res.rows[0]?.id) || null;
-}
-
 async function runPass() {
     const clients = await listInstantlySyncClients();
     console.log(`[follow-up-worker] Found ${clients.length} client(s) with Instantly keys`);
@@ -130,9 +120,9 @@ async function runPass() {
     const results = await Promise.allSettled(
         clients.map((client) => limit(async () => {
             const label = `${client.agencyId}/${client.clientSlug}`;
-            const clientId = await resolveClientId(client.agencyId, client.clientSlug);
+            const clientId = Number(client.clientId) || null;
             if (!clientId) {
-                console.log(`[follow-up-worker] No SQL client for ${label}, skipping`);
+                console.log(`[follow-up-worker] Missing client_id for ${label}, skipping`);
                 return null;
             }
             console.log(`[follow-up-worker] Running for ${label} (client_id=${clientId})`);

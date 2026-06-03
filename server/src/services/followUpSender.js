@@ -725,30 +725,9 @@ export async function runFollowUpsOnce({
     const overallSummary = { sent: 0, blocked: 0, skipped: 0, failed: 0, dryRun: 0, eligible: 0 };
 
     for (const client of selected) {
-        // Resolve SQL client_id
-        let clientId;
-        try {
-            const res = await pool.query(
-                `SELECT id FROM clients WHERE agency_id = $1 AND name = $2 LIMIT 1`,
-                [client.agencyId, client.clientSlug]
-            );
-            if (!res.rows.length) {
-                // Try by slug match with relaxed case
-                const res2 = await pool.query(
-                    `SELECT id FROM clients WHERE agency_id = $1 LIMIT 1`,
-                    [client.agencyId]
-                );
-                clientId = Number(res2.rows[0]?.id) || null;
-            } else {
-                clientId = Number(res.rows[0].id);
-            }
-        } catch (err) {
-            logger(`[follow-up] Failed to resolve SQL client for ${client.agencyId}/${client.clientSlug}: ${err.message}`);
-            continue;
-        }
-
+        const clientId = Number(client.clientId) || null;
         if (!clientId) {
-            logger(`[follow-up] No SQL client row found for ${client.agencyId}/${client.clientSlug}, skipping`);
+            logger(`[follow-up] Missing client_id for ${client.agencyId}/${client.clientSlug}, skipping`);
             continue;
         }
 

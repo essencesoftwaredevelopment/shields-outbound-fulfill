@@ -2745,6 +2745,7 @@ async function runReplyInterestStatusReconcile({
                 contactId,
                 instantlyLeadId: resolvedLeadId,
                 sourceEventId: eventId,
+                replySourceEventId: replyEventId,
                 leadEmail: normalizedLeadEmail,
                 logger
             });
@@ -3049,6 +3050,7 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
 export async function listInstantlySyncClients() {
     const rows = await listClientsWithInstantlyKey();
     return rows.map((row) => ({
+        clientId: row.clientId,
         agencyId: row.agencyId,
         clientSlug: row.clientSlug,
         instantlyKey: row.instantlyKey

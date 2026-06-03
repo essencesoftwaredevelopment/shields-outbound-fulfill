@@ -306,6 +306,82 @@ async function fetchSourceEventDetails(db, sourceEventId) {
     return result.rows[0] || null;
 }
 
+function extractMessageTextFromEventRow(row) {
+    if (!row) return null;
+
+    const direct = asTrimmedText(row.message_text) || asTrimmedText(row.reply_text_snippet);
+    if (direct) return direct;
+
+    let payload = row.payload;
+    if (typeof payload === 'string') {
+        try {
+            payload = JSON.parse(payload);
+        } catch {
+            payload = null;
+        }
+    }
+    if (!payload || typeof payload !== 'object') return null;
+
+    const nested = payload.data && typeof payload.data === 'object' ? payload.data : null;
+    return asTrimmedText(
+        payload.message_text
+        || payload.reply_text
+        || payload.text
+        || payload.body
+        || payload.message
+        || payload.reply_text_snippet
+        || nested?.message_text
+        || nested?.reply_text
+        || nested?.text
+        || nested?.body
+    );
+}
+
+async function fetchRecentThreadMessages(db, contactId, campaignId, { limit = 5 } = {}) {
+    const result = await db.query(
+        `SELECT message_text, reply_text_snippet, payload, event_timestamp
+         FROM contact_instantly_events
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND (
+               message_text IS NOT NULL
+               OR reply_text_snippet IS NOT NULL
+               OR COALESCE(payload->>'message_text', '') <> ''
+               OR COALESCE(payload->>'reply_text', '') <> ''
+               OR COALESCE(payload->>'text', '') <> ''
+           )
+         ORDER BY event_timestamp DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT $3`,
+        [contactId, campaignId, limit]
+    );
+
+    const parts = result.rows
+        .slice()
+        .reverse()
+        .map((row) => extractMessageTextFromEventRow(row))
+        .filter(Boolean);
+
+    return parts.length ? parts.join('\n\n---\n\n') : null;
+}
+
+async function resolvePreviousLeadMessageForDraft(db, {
+    sourceEvent,
+    contactId,
+    campaignId,
+    replySourceEventId = null
+}) {
+    if (replySourceEventId) {
+        const replyEvent = await fetchSourceEventDetails(db, replySourceEventId);
+        const fromReply = extractMessageTextFromEventRow(replyEvent);
+        if (fromReply) return fromReply;
+    }
+
+    const fromSource = extractMessageTextFromEventRow(sourceEvent);
+    if (fromSource) return fromSource;
+
+    return fetchRecentThreadMessages(db, contactId, campaignId);
+}
+
 async function fetchLatestThreadMetadata(db, contactId, campaignId) {
     const result = await db.query(
         `SELECT
@@ -522,6 +598,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
     contactId,
     instantlyLeadId,
     sourceEventId,
+    replySourceEventId = null,
     leadEmail,
     logger = () => {}
 }) {
@@ -547,9 +624,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
             logger(`[interested-autoresponder] cancelled superseded drafts for contact=${contactId} campaign=${campaignId}: ${cancelledDraftIds.join(', ')}`);
         }
 
-        const previousLeadMessage = asTrimmedText(sourceEvent?.message_text)
-            || asTrimmedText(sourceEvent?.reply_text_snippet)
-            || null;
+        const previousLeadMessage = await resolvePreviousLeadMessageForDraft(client, {
+            sourceEvent,
+            contactId,
+            campaignId,
+            replySourceEventId
+        });
         const normalizedLeadEmail = asTrimmedText(leadEmail)
             || asTrimmedText(sourceEvent?.lead_email)
             || '';

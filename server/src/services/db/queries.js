@@ -653,7 +653,8 @@ export async function deleteClientSegment(agencyId, sqlClientId, segmentId) {
 
 export async function listClientsWithInstantlyKey({ agencyId = null, clientSlug = null } = {}) {
     let sql = `
-        SELECT agency_id, COALESCE(slug, REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g')) AS client_slug,
+        SELECT id, agency_id,
+               COALESCE(slug, REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g')) AS client_slug,
                instantly_key
         FROM clients
         WHERE instantly_key IS NOT NULL AND BTRIM(instantly_key) <> ''
@@ -671,6 +672,7 @@ export async function listClientsWithInstantlyKey({ agencyId = null, clientSlug 
     return result.rows
         .filter((r) => r.instantly_key?.trim())
         .map((r) => ({
+            clientId: Number(r.id),
             agencyId: r.agency_id,
             clientSlug: r.client_slug,
             instantlyKey: r.instantly_key.trim()
