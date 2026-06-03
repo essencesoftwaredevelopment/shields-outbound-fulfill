@@ -13,9 +13,25 @@ const INSTANTLY_RATE_LIMIT_PER_SECOND = Math.max(parseInt(process.env.INSTANTLY_
 const INSTANTLY_MAX_RETRIES = Math.max(parseInt(process.env.INSTANTLY_MAX_RETRIES || '4', 10) || 4, 0);
 const INSTANTLY_RETRY_BASE_DELAY_MS = Math.max(parseInt(process.env.INSTANTLY_RETRY_BASE_DELAY_MS || '1000', 10) || 1000, 100);
 const INSTANTLY_SYNC_PROGRESS_BATCH_SIZE = Math.max(parseInt(process.env.INSTANTLY_SYNC_PROGRESS_BATCH_SIZE || '25', 10) || 25, 1);
+const INSTANTLY_REPLY_INTEREST_RECONCILE_DELAY_MS = 10_000;
+const INSTANTLY_REPLY_INTEREST_RECONCILE_WINDOW_MS = 10_000;
+const INSTANTLY_INTEREST_STATUS_WEBHOOK_EVENT_TYPES = [
+    'lead_interested',
+    'lead_meeting_booked',
+    'lead_meeting_completed',
+    'lead_closed',
+    'lead_out_of_office',
+    'lead_not_interested',
+    'lead_wrong_person',
+    'lead_neutral',
+    'lead_no_show',
+    'bad fit',
+    'risky'
+];
 const INSTANTLY_MIN_REQUEST_INTERVAL_MS = Math.max(Math.ceil(1000 / INSTANTLY_RATE_LIMIT_PER_SECOND), 1);
 const instantlyNextRequestAtByKey = new Map();
 const instantlyAbortControllersByRunId = new Map();
+const replyInterestReconcileTimers = new Map();
 
 const clientStateCache = new Map();
 const CLIENT_STATE_CACHE_TTL_MS = 60_000;
@@ -747,6 +763,59 @@ async function fetchCampaignLeads(apiKey, instantlyCampaignId, { syncRunId = nul
     }
 
     return rows;
+}
+
+async function fetchInstantlyLeadById(apiKey, leadId, { syncRunId = null } = {}) {
+    const normalizedLeadId = asNullableText(leadId);
+    if (!normalizedLeadId) return null;
+    return instantlyRequest({
+        apiKey,
+        path: `/api/v2/leads/${encodeURIComponent(normalizedLeadId)}`,
+        method: 'GET',
+        syncRunId
+    });
+}
+
+async function fetchInstantlyLeadForReplyReconcile(apiKey, { instantlyCampaignId, leadId, email }) {
+    const normalizedLeadId = asNullableText(leadId);
+    if (normalizedLeadId) {
+        try {
+            return await fetchInstantlyLeadById(apiKey, normalizedLeadId);
+        } catch (error) {
+            if (!(error instanceof InstantlyRequestError) || (error.statusCode && error.statusCode !== 404)) {
+                throw error;
+            }
+        }
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+    const normalizedCampaignId = asNullableText(instantlyCampaignId);
+    if (!normalizedEmail || !normalizedCampaignId) return null;
+
+    const payload = await instantlyRequest({
+        apiKey,
+        path: '/api/v2/leads/list',
+        method: 'POST',
+        body: {
+            campaign: normalizedCampaignId,
+            contacts: [normalizedEmail],
+            limit: 1
+        }
+    });
+    const items = extractItems(payload);
+    return items[0] || null;
+}
+
+export function isInstantlyReplyWebhookEvent(eventType) {
+    const normalized = asNullableText(eventType)?.toLowerCase();
+    return normalized === 'reply_received' || normalized === 'reply' || normalized === 'replied';
+}
+
+export function shouldApplyInterestStatusFromReplyReconcile({ previousInterestStatus, nextInterestStatus }) {
+    const prior = asNullableInt(previousInterestStatus);
+    const next = asNullableInt(nextInterestStatus);
+    if (prior === next) return false;
+    return mapInterestStatusToEventType(next) !== null;
 }
 
 async function publishInstantlySyncProgress(runId, patch = {}) {
@@ -1583,7 +1652,8 @@ export function mapInterestStatusToEventType(interestStatus) {
     return INTEREST_STATUS_TO_EVENT_TYPE.get(numericStatus) || null;
 }
 
-function buildSyncReconcileFingerprint({
+function buildInterestReconcileFingerprint({
+    source,
     contactId,
     campaignId,
     previousInterestStatus,
@@ -1591,7 +1661,7 @@ function buildSyncReconcileFingerprint({
     eventTimestamp
 }) {
     const base = [
-        'sync_reconcile',
+        source,
         String(contactId),
         String(campaignId),
         String(previousInterestStatus ?? ''),
@@ -1686,6 +1756,43 @@ async function hasRecentInterestedWebhookEvent(db, { contactId, campaignId, even
     return result.rowCount > 0;
 }
 
+async function hasRecentInterestStatusWebhookNearReply(db, {
+    contactId,
+    campaignId,
+    replyEventTimestamp,
+    windowMs = INSTANTLY_REPLY_INTEREST_RECONCILE_WINDOW_MS
+}) {
+    const anchor = asNullableTimestamp(replyEventTimestamp);
+    if (!anchor) return false;
+
+    const windowSeconds = Math.max(windowMs, 0) / 1000;
+    const result = await db.query(
+        `SELECT 1
+         FROM contact_instantly_events
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND source = 'webhook'
+           AND LOWER(event_type) = ANY($3::text[])
+           AND event_timestamp >= $4::timestamptz - ($5::double precision * INTERVAL '1 second')
+           AND event_timestamp <= $4::timestamptz + ($5::double precision * INTERVAL '1 second')
+         LIMIT 1`,
+        [contactId, campaignId, INSTANTLY_INTEREST_STATUS_WEBHOOK_EVENT_TYPES, anchor, windowSeconds]
+    );
+    return result.rowCount > 0;
+}
+
+async function loadContactCampaignInterestState(db, contactId, campaignId) {
+    const result = await db.query(
+        `SELECT interest_status, instantly_lead_id, timestamp_last_interest_change
+         FROM contact_instantly_campaigns
+         WHERE contact_id = $1
+           AND campaign_id = $2
+         LIMIT 1`,
+        [contactId, campaignId]
+    );
+    return result.rows[0] || null;
+}
+
 async function hasOpenInterestedAutoresponderDraft(db, contactId, campaignId) {
     const result = await db.query(
         `SELECT 1
@@ -1731,7 +1838,7 @@ async function applyInterestEventPatchToCampaign(db, {
     );
 }
 
-async function insertSyncReconcileInterestEvent(db, {
+async function insertReconcileInterestEvent(db, {
     agencyId,
     clientId,
     contactId,
@@ -1743,7 +1850,8 @@ async function insertSyncReconcileInterestEvent(db, {
     eventTimestamp,
     previousInterestStatus,
     nextInterestStatus,
-    syncStartedAt
+    reconcileSource,
+    reconcileContext = {}
 }) {
     const syntheticEvent = {
         event_type: eventType,
@@ -1753,10 +1861,11 @@ async function insertSyncReconcileInterestEvent(db, {
         lead_email: leadEmail,
         previous_interest_status: previousInterestStatus,
         next_interest_status: nextInterestStatus,
-        synced_at: syncStartedAt,
-        source: 'sync_reconcile'
+        source: reconcileSource,
+        ...reconcileContext
     };
-    const fingerprint = buildSyncReconcileFingerprint({
+    const fingerprint = buildInterestReconcileFingerprint({
+        source: reconcileSource,
         contactId,
         campaignId,
         previousInterestStatus,
@@ -1784,7 +1893,7 @@ async function insertSyncReconcileInterestEvent(db, {
             leadEmail,
             eventTimestamp,
             fingerprint,
-            'sync_reconcile',
+            reconcileSource,
             JSON.stringify(syntheticEvent)
         ]
     );
@@ -1820,7 +1929,7 @@ async function applySyncInterestReconciliation(db, {
 
         const eventTimestamp = change.timestamp_last_interest_change || syncStartedAt;
         const leadEmail = normalizeEmail(emailByContactId.get(change.contact_id));
-        const { eventId, eventPatch, deduplicated } = await insertSyncReconcileInterestEvent(db, {
+        const { eventId, eventPatch, deduplicated } = await insertReconcileInterestEvent(db, {
             agencyId,
             clientId,
             contactId: change.contact_id,
@@ -1832,7 +1941,8 @@ async function applySyncInterestReconciliation(db, {
             eventTimestamp,
             previousInterestStatus: change.previous_interest_status,
             nextInterestStatus: change.next_interest_status,
-            syncStartedAt
+            reconcileSource: 'sync_reconcile',
+            reconcileContext: { synced_at: syncStartedAt }
         });
 
         if (deduplicated || !eventId) continue;
@@ -2431,6 +2541,224 @@ export async function syncClientInstantlyState({
     }
 }
 
+function replyInterestReconcileTimerKey(clientId, contactId, campaignId) {
+    return `${clientId}::${contactId}::${campaignId}`;
+}
+
+function scheduleReplyInterestStatusReconcile({
+    agencyId,
+    clientSlug,
+    clientId,
+    contactId,
+    campaignId,
+    instantlyCampaignId,
+    instantlyLeadId,
+    leadEmail,
+    replyEventId,
+    replyEventTimestamp,
+    logger = () => {}
+}) {
+    if (!clientId || !contactId || !campaignId || !instantlyCampaignId) return;
+
+    const timerKey = replyInterestReconcileTimerKey(clientId, contactId, campaignId);
+    const existingTimer = replyInterestReconcileTimers.get(timerKey);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    const timer = setTimeout(() => {
+        replyInterestReconcileTimers.delete(timerKey);
+        void runReplyInterestStatusReconcile({
+            agencyId,
+            clientSlug,
+            clientId,
+            contactId,
+            campaignId,
+            instantlyCampaignId,
+            instantlyLeadId,
+            leadEmail,
+            replyEventId,
+            replyEventTimestamp,
+            logger
+        }).catch((error) => {
+            logger(`[instantly-reply-reconcile] failed: ${error?.message || error}`);
+        });
+    }, INSTANTLY_REPLY_INTEREST_RECONCILE_DELAY_MS);
+
+    replyInterestReconcileTimers.set(timerKey, timer);
+    if (typeof timer.unref === 'function') timer.unref();
+}
+
+async function runReplyInterestStatusReconcile({
+    agencyId,
+    clientSlug,
+    clientId,
+    contactId,
+    campaignId,
+    instantlyCampaignId,
+    instantlyLeadId,
+    leadEmail,
+    replyEventId,
+    replyEventTimestamp,
+    logger = () => {}
+}) {
+    const dbClient = await pool.connect();
+    try {
+        await dbClient.query('BEGIN');
+
+        if (await hasRecentInterestStatusWebhookNearReply(dbClient, {
+            contactId,
+            campaignId,
+            replyEventTimestamp
+        })) {
+            await dbClient.query('COMMIT');
+            logger(
+                `[instantly-reply-reconcile] skipped: interest status webhook received near reply`
+                + ` contact=${contactId} campaign=${campaignId}`
+            );
+            return;
+        }
+
+        await dbClient.query('COMMIT');
+    } catch (error) {
+        await dbClient.query('ROLLBACK');
+        throw error;
+    } finally {
+        dbClient.release();
+    }
+
+    const clientRow = await getClientRowBySlug(agencyId, clientSlug);
+    const apiKey = asNullableText(clientRow?.instantly_key);
+    if (!apiKey) {
+        logger('[instantly-reply-reconcile] skipped: missing Instantly API key');
+        return;
+    }
+
+    const lead = await fetchInstantlyLeadForReplyReconcile(apiKey, {
+        instantlyCampaignId,
+        leadId: instantlyLeadId,
+        email: leadEmail
+    });
+    if (!lead) {
+        logger('[instantly-reply-reconcile] skipped: lead not found in Instantly');
+        return;
+    }
+
+    const nextInterestStatus = asNullableInt(lead?.lt_interest_status);
+    const resolvedLeadId = asNullableText(lead?.id || instantlyLeadId);
+    const eventTimestamp = asNullableTimestamp(lead?.timestamp_last_interest_change)
+        || asNullableTimestamp(lead?.timestamp_updated)
+        || new Date().toISOString();
+    const normalizedLeadEmail = normalizeEmail(leadEmail);
+
+    const reconcileClient = await pool.connect();
+    try {
+        await reconcileClient.query('BEGIN');
+
+        const priorState = await loadContactCampaignInterestState(reconcileClient, contactId, campaignId);
+        const previousInterestStatus = asNullableInt(priorState?.interest_status);
+
+        if (!shouldApplyInterestStatusFromReplyReconcile({ previousInterestStatus, nextInterestStatus })) {
+            await reconcileClient.query('COMMIT');
+            logger(
+                `[instantly-reply-reconcile] no interest status transition for contact=${contactId}`
+                + ` campaign=${campaignId} (prior=${previousInterestStatus}, next=${nextInterestStatus})`
+            );
+            return;
+        }
+
+        const eventType = mapInterestStatusToEventType(nextInterestStatus);
+        if (!eventType) {
+            await reconcileClient.query('COMMIT');
+            return;
+        }
+
+        const { eventId, eventPatch, deduplicated } = await insertReconcileInterestEvent(reconcileClient, {
+            agencyId,
+            clientId,
+            contactId,
+            campaignId,
+            instantlyCampaignId,
+            instantlyLeadId: resolvedLeadId,
+            leadEmail: normalizedLeadEmail,
+            eventType,
+            eventTimestamp,
+            previousInterestStatus,
+            nextInterestStatus,
+            reconcileSource: 'reply_reconcile',
+            reconcileContext: {
+                reply_event_id: replyEventId,
+                reply_event_timestamp: replyEventTimestamp,
+                checked_at: new Date().toISOString()
+            }
+        });
+
+        if (deduplicated || !eventId) {
+            await reconcileClient.query('COMMIT');
+            return;
+        }
+
+        await applyInterestEventPatchToCampaign(reconcileClient, {
+            contactId,
+            campaignId,
+            instantlyLeadId: resolvedLeadId,
+            eventPatch
+        });
+
+        if (replyEventId && eventPatch.lastReplyCategory) {
+            await reconcileClient.query(
+                `UPDATE contact_instantly_events
+                 SET reply_category = $2
+                 WHERE id = $1
+                 AND COALESCE(reply_category, '') IS DISTINCT FROM $2`,
+                [replyEventId, eventPatch.lastReplyCategory]
+            );
+        }
+
+        await reconcileClient.query('COMMIT');
+
+        logger(
+            `[instantly-reply-reconcile] recorded synthetic ${eventType} event=${eventId}`
+            + ` contact=${contactId} campaign=${campaignId}`
+            + ` (prior=${previousInterestStatus}, next=${nextInterestStatus})`
+        );
+
+        if (nextInterestStatus !== 1) {
+            await cancelNonInterestedAutoResponderDrafts(pool, contactId, campaignId);
+            return;
+        }
+
+        if (previousInterestStatus === 1) return;
+
+        if (await hasOpenInterestedAutoresponderDraft(pool, contactId, campaignId)) {
+            logger(
+                `[instantly-reply-reconcile] skipped autoresponder: open draft`
+                + ` contact=${contactId} campaign=${campaignId}`
+            );
+            return;
+        }
+
+        try {
+            await createInterestedAutoResponderDraftFromEvent({
+                agencyId,
+                clientSlug,
+                clientId,
+                campaignId,
+                contactId,
+                instantlyLeadId: resolvedLeadId,
+                sourceEventId: eventId,
+                leadEmail: normalizedLeadEmail,
+                logger
+            });
+        } catch (draftError) {
+            logger(`[instantly-reply-reconcile] autoresponder failed: ${draftError.message}`);
+        }
+    } catch (error) {
+        await reconcileClient.query('ROLLBACK');
+        throw error;
+    } finally {
+        reconcileClient.release();
+    }
+}
+
 export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secret, event, logger = () => {} }) {
     const clientState = await resolveClientState(agencyId, clientSlug);
     if (!clientState) {
@@ -2675,6 +3003,32 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
             } catch (draftError) {
                 logger(`Interested auto-responder draft creation failed: ${draftError.message}`);
             }
+        }
+
+        if (
+            isInstantlyReplyWebhookEvent(event?.event_type)
+            && insertedEventId
+            && sqlCampaignId
+            && contactId
+            && instantlyCampaignId
+        ) {
+            scheduleReplyInterestStatusReconcile({
+                agencyId,
+                clientSlug,
+                clientId: clientState.id,
+                contactId,
+                campaignId: sqlCampaignId,
+                instantlyCampaignId,
+                instantlyLeadId: asNullableText(event?.lead_id || event?.instantly_lead_id),
+                leadEmail: normalizedEmail,
+                replyEventId: insertedEventId,
+                replyEventTimestamp: eventTimestamp,
+                logger
+            });
+            logger(
+                `[instantly-reply-reconcile] scheduled interest check in ${INSTANTLY_REPLY_INTEREST_RECONCILE_DELAY_MS}ms`
+                + ` for contact=${contactId} campaign=${sqlCampaignId}`
+            );
         }
 
         logger(`Stored Instantly webhook event ${event?.event_type || 'unknown'} for ${agencyId}/${clientSlug}`);
