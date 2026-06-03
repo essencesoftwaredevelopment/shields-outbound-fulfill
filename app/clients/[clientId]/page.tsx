@@ -1271,6 +1271,7 @@ export default function ClientPage() {
     const [instantlyCsvCampaignOverrides, setInstantlyCsvCampaignOverrides] = useState<Record<string, string>>({});
     const [instantlyCsvCampaignsLoading, setInstantlyCsvCampaignsLoading] = useState(false);
     const [registeringInstantlyWebhook, setRegisteringInstantlyWebhook] = useState(false);
+    const [instantlySyncCampaignId, setInstantlySyncCampaignId] = useState('');
     const [syncingInstantlyState, setSyncingInstantlyState] = useState(false);
     const [syncingInstantlyEmailAccounts, setSyncingInstantlyEmailAccounts] = useState(false);
     const [stoppingInstantlySync, setStoppingInstantlySync] = useState(false);
@@ -2740,7 +2741,7 @@ export default function ClientPage() {
         };
 
         fetchInstantlyCampaigns();
-    }, [user, clientId, uploadModalOpen]);
+    }, [user, clientId, uploadModalOpen, activeTab]);
 
     // Reset column mapping custom flags when modal opens
     useEffect(() => {
@@ -4999,13 +5000,19 @@ export default function ClientPage() {
             await persistClientInfo();
             const idToken = await getAccessToken();
             if (!idToken) return;
+            const selectedCampaign = instantlySyncCampaignId
+                ? instantlyCampaigns.find((c) => c.id === instantlySyncCampaignId)
+                : null;
             const response = await fetchWithRetry(
                 `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/sync`,
                 {
                     method: 'POST',
                     cache: 'no-store',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ idToken })
+                    body: JSON.stringify({
+                        idToken,
+                        ...(instantlySyncCampaignId ? { instantlyCampaignId: instantlySyncCampaignId } : {})
+                    })
                 }
             );
             const data = await response.json().catch(() => ({}));
@@ -5014,7 +5021,14 @@ export default function ClientPage() {
             }
 
             setInstantlySyncRun((data.run || null) as InstantlySyncRun | null);
-            setToastMessage(data.alreadyRunning ? 'Instantly sync is already running.' : 'Instantly sync started.');
+            const campaignLabel = selectedCampaign?.name || instantlySyncCampaignId;
+            setToastMessage(
+                data.alreadyRunning
+                    ? 'Instantly sync is already running.'
+                    : instantlySyncCampaignId
+                        ? `Instantly sync started for ${campaignLabel}.`
+                        : 'Instantly sync started for all campaigns.'
+            );
             setToastVisible(true);
         } catch (error) {
             setToastMessage(error instanceof Error ? error.message : 'Failed to sync Instantly state');
@@ -9027,6 +9041,28 @@ export default function ClientPage() {
                                         )}
                                     </div>
                                 )}
+                                <label className="settings-field" style={{ marginTop: '0.75rem' }}>
+                                    <span className="settings-field__label">Sync scope</span>
+                                    <select
+                                        value={instantlySyncCampaignId}
+                                        onChange={(e) => setInstantlySyncCampaignId(e.target.value)}
+                                        disabled={instantlyCampaignsLoading || syncingInstantlyState || stoppingInstantlySync}
+                                    >
+                                        <option value="">All campaigns</option>
+                                        {instantlyCampaigns.map((campaign) => (
+                                            <option key={campaign.id} value={campaign.id}>
+                                                {campaign.name}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <span className="settings-field__hint">
+                                        {instantlyCampaignsLoading
+                                            ? 'Loading campaigns...'
+                                            : instantlySyncCampaignId
+                                                ? 'Only the selected Instantly campaign will be synced.'
+                                                : 'Syncs every Instantly campaign for this client.'}
+                                    </span>
+                                </label>
                                 <div className="modal__actions" style={{ justifyContent: 'flex-start', marginTop: '0.75rem' }}>
                                     <button
                                         type="button"
@@ -9042,7 +9078,11 @@ export default function ClientPage() {
                                         onClick={handleSyncInstantlyState}
                                         disabled={syncingInstantlyState || syncingInstantlyEmailAccounts || stoppingInstantlySync || registeringInstantlyWebhook || isSavingClient || isDeletingClient}
                                     >
-                                        {syncingInstantlyState ? 'Syncing...' : 'Sync Instantly State'}
+                                        {syncingInstantlyState
+                                            ? 'Syncing...'
+                                            : instantlySyncCampaignId
+                                                ? 'Sync Selected Campaign'
+                                                : 'Sync Instantly State'}
                                     </button>
                                     <button
                                         type="button"

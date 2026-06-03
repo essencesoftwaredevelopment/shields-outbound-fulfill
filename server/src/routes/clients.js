@@ -541,11 +541,13 @@ router.post('/clients/:id/instantly/sync', async (req, res) => {
 
         const agencyId = await resolveAgencyId(req);
         const { instantlyKey } = await requireClientWithInstantly(agencyId, clientSlug);
+        const instantlyCampaignId = String(req.body?.instantlyCampaignId || '').trim() || null;
 
         const result = await beginInstantlySyncRun({
             agencyId,
             clientSlug,
             instantlyKey,
+            instantlyCampaignId,
             triggerSource: 'manual',
             logger: (message) => console.log(`[instantly-sync][${agencyId}/${clientSlug}] ${message}`)
         });
@@ -556,6 +558,9 @@ router.post('/clients/:id/instantly/sync', async (req, res) => {
         });
     } catch (error) {
         console.error('Error syncing Instantly state:', error);
+        if (String(error?.message || '').startsWith('Instantly campaign not found:')) {
+            return res.status(404).json({ error: error.message });
+        }
         res.status(500).json({ error: 'Failed to sync Instantly state.' });
     }
 });

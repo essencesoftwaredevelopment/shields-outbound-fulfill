@@ -603,6 +603,16 @@ async function instantlyRequest({ apiKey, path, method = 'GET', body, syncRunId 
     throw new InstantlyRequestError(`Instantly API ${method} ${path} failed after ${INSTANTLY_MAX_RETRIES + 1} attempts`);
 }
 
+function resolveInstantlyCampaignIdFromPayload(campaign) {
+    return asNullableText(campaign?.id || campaign?.campaignId || campaign?.uuid || campaign?._id);
+}
+
+function filterCampaignsForSync(campaigns, instantlyCampaignId) {
+    const targetId = asNullableText(instantlyCampaignId);
+    if (!targetId) return campaigns;
+    return campaigns.filter((campaign) => resolveInstantlyCampaignIdFromPayload(campaign) === targetId);
+}
+
 async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {}) {
     const payload = await instantlyRequest({
         apiKey,
@@ -1057,7 +1067,14 @@ async function assertSyncRunNotCancelled(syncRunId) {
     }
 }
 
-export async function beginInstantlySyncRun({ agencyId, clientSlug, instantlyKey, triggerSource = 'manual', logger = () => {} }) {
+export async function beginInstantlySyncRun({
+    agencyId,
+    clientSlug,
+    instantlyKey,
+    triggerSource = 'manual',
+    instantlyCampaignId = null,
+    logger = () => {}
+}) {
     const clientState = await resolveClientState(agencyId, clientSlug);
     if (!clientState) {
         throw new Error('Client not found in SQL.');
@@ -1074,6 +1091,7 @@ export async function beginInstantlySyncRun({ agencyId, clientSlug, instantlyKey
             agencyId,
             clientSlug,
             instantlyKey,
+            instantlyCampaignId,
             syncRunId: created.run.id,
             logger
         }).catch((error) => {
@@ -2002,7 +2020,14 @@ export async function syncClientEmailAccounts({ agencyId, clientSlug, instantlyK
     };
 }
 
-export async function syncClientInstantlyState({ agencyId, clientSlug, instantlyKey, syncRunId = null, logger = () => {} }) {
+export async function syncClientInstantlyState({
+    agencyId,
+    clientSlug,
+    instantlyKey,
+    instantlyCampaignId = null,
+    syncRunId = null,
+    logger = () => {}
+}) {
     const sqlClientId = await getOrCreateClient(agencyId, clientSlug);
     const syncStartedAt = new Date().toISOString();
 
@@ -2030,12 +2055,25 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             });
         }
 
-        const campaigns = await fetchInstantlyCampaigns(instantlyKey, { syncRunId });
-        logger(`Fetched ${campaigns.length} Instantly campaigns for ${agencyId}/${clientSlug}`);
+        const allCampaigns = await fetchInstantlyCampaigns(instantlyKey, { syncRunId });
+        const targetCampaignId = asNullableText(instantlyCampaignId);
+        const campaigns = filterCampaignsForSync(allCampaigns, targetCampaignId);
+        logger(
+            targetCampaignId
+                ? `Fetched ${allCampaigns.length} Instantly campaign(s); syncing ${campaigns.length} matching ${targetCampaignId} for ${agencyId}/${clientSlug}`
+                : `Fetched ${campaigns.length} Instantly campaigns for ${agencyId}/${clientSlug}`
+        );
+
+        if (targetCampaignId && !campaigns.length) {
+            throw new Error(`Instantly campaign not found: ${targetCampaignId}`);
+        }
+
         if (syncRunId) {
             await publishInstantlySyncProgress(syncRunId, {
                 progress_message: campaigns.length
-                    ? `Fetched ${campaigns.length} campaign(s) from Instantly`
+                    ? (targetCampaignId
+                        ? `Syncing campaign ${targetCampaignId}`
+                        : `Fetched ${campaigns.length} campaign(s) from Instantly`)
                     : 'No Instantly campaigns found',
                 total_campaigns: campaigns.length,
                 phase: 'processing_campaigns'
@@ -2050,7 +2088,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
 
         for (const campaign of campaigns) {
             await assertSyncRunNotCancelled(syncRunId);
-            const instantlyCampaignId = asNullableText(campaign?.id || campaign?.campaignId || campaign?.uuid || campaign?._id);
+            const instantlyCampaignId = resolveInstantlyCampaignIdFromPayload(campaign);
             const campaignName = asNullableText(campaign?.name || campaign?.title || campaign?.campaign_name);
             if (!instantlyCampaignId || !campaignName) continue;
 
