@@ -1548,6 +1548,351 @@ async function updateContactLastContacted(db, rows) {
     );
 }
 
+const INTEREST_STATUS_TO_EVENT_TYPE = new Map([
+    [4, 'lead_closed'],
+    [3, 'lead_meeting_completed'],
+    [2, 'lead_meeting_booked'],
+    [1, 'lead_interested'],
+    [0, 'lead_out_of_office'],
+    [-1, 'lead_not_interested'],
+    [-2, 'lead_wrong_person'],
+    [-4, 'lead_no_show']
+]);
+
+export function mapInterestStatusToEventType(interestStatus) {
+    const numericStatus = asNullableInt(interestStatus);
+    if (numericStatus === null) return null;
+    return INTEREST_STATUS_TO_EVENT_TYPE.get(numericStatus) || null;
+}
+
+function buildSyncReconcileFingerprint({
+    contactId,
+    campaignId,
+    previousInterestStatus,
+    nextInterestStatus,
+    eventTimestamp
+}) {
+    const base = [
+        'sync_reconcile',
+        String(contactId),
+        String(campaignId),
+        String(previousInterestStatus ?? ''),
+        String(nextInterestStatus ?? ''),
+        asNullableTimestamp(eventTimestamp) || ''
+    ].join('|');
+    return crypto.createHash('sha256').update(base).digest('hex');
+}
+
+export function computeInterestStatusChanges(priorByKey, snapshots) {
+    const changes = [];
+    for (const row of snapshots) {
+        const contactId = Number(row.contact_id || 0) || null;
+        const campaignId = Number(row.campaign_id || 0) || null;
+        if (!contactId || !campaignId) continue;
+
+        const key = `${contactId}::${campaignId}`;
+        const prior = priorByKey.get(key) || {};
+        const previousInterestStatus = asNullableInt(prior.interest_status);
+        const nextInterestStatus = asNullableInt(row.interest_status);
+        if (previousInterestStatus === nextInterestStatus) continue;
+
+        changes.push({
+            contact_id: contactId,
+            campaign_id: campaignId,
+            instantly_lead_id: asNullableText(row.instantly_lead_id),
+            previous_interest_status: previousInterestStatus,
+            next_interest_status: nextInterestStatus,
+            timestamp_last_interest_change: asNullableTimestamp(row.timestamp_last_interest_change)
+        });
+    }
+    return changes;
+}
+
+async function loadCampaignInterestStateMap(db, snapshots) {
+    const pairs = dedupeCampaignSnapshotRows(snapshots)
+        .map((row) => ({
+            contact_id: Number(row.contact_id || 0) || null,
+            campaign_id: Number(row.campaign_id || 0) || null
+        }))
+        .filter((row) => row.contact_id && row.campaign_id);
+    if (!pairs.length) return new Map();
+
+    const result = await db.query(
+        `WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS x(
+                contact_id BIGINT,
+                campaign_id BIGINT
+            )
+        )
+        SELECT cic.contact_id, cic.campaign_id, cic.interest_status, cic.timestamp_last_interest_change
+        FROM contact_instantly_campaigns cic
+        INNER JOIN input i
+            ON cic.contact_id = i.contact_id
+           AND cic.campaign_id = i.campaign_id`,
+        [JSON.stringify(pairs)]
+    );
+
+    const priorByKey = new Map();
+    for (const row of result.rows) {
+        priorByKey.set(`${row.contact_id}::${row.campaign_id}`, row);
+    }
+    return priorByKey;
+}
+
+async function loadContactEmailsById(db, contactIds) {
+    const ids = [...new Set(contactIds.filter((id) => Number(id) > 0))];
+    if (!ids.length) return new Map();
+
+    const result = await db.query(
+        `SELECT id, email
+         FROM contacts
+         WHERE id = ANY($1::bigint[])`,
+        [ids]
+    );
+    return new Map(result.rows.map((row) => [Number(row.id), asNullableText(row.email)]));
+}
+
+async function hasRecentInterestedWebhookEvent(db, { contactId, campaignId, eventTimestamp }) {
+    const result = await db.query(
+        `SELECT 1
+         FROM contact_instantly_events
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND LOWER(event_type) = 'lead_interested'
+           AND source = 'webhook'
+           AND event_timestamp >= COALESCE($3::timestamptz, NOW()) - INTERVAL '24 hours'
+         LIMIT 1`,
+        [contactId, campaignId, eventTimestamp]
+    );
+    return result.rowCount > 0;
+}
+
+async function hasOpenInterestedAutoresponderDraft(db, contactId, campaignId) {
+    const result = await db.query(
+        `SELECT 1
+         FROM interested_autoresponder_drafts
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND status = ANY($3::text[])
+         LIMIT 1`,
+        [contactId, campaignId, ['pending_review', 'blocked_missing_thread']]
+    );
+    return result.rowCount > 0;
+}
+
+async function applyInterestEventPatchToCampaign(db, {
+    contactId,
+    campaignId,
+    instantlyLeadId,
+    eventPatch
+}) {
+    await db.query(
+        `UPDATE contact_instantly_campaigns
+         SET instantly_lead_id = COALESCE($3, instantly_lead_id),
+             interest_status = COALESCE($4, interest_status),
+             interest_status_label = COALESCE($5, interest_status_label),
+             timestamp_last_interest_change = COALESCE($6, timestamp_last_interest_change),
+             timestamp_last_reply = COALESCE($7, timestamp_last_reply),
+             last_reply_category = COALESCE($8, last_reply_category),
+             last_event_type = COALESCE($9, last_event_type),
+             last_synced_at = NOW()
+         WHERE contact_id = $1
+           AND campaign_id = $2`,
+        [
+            contactId,
+            campaignId,
+            instantlyLeadId,
+            eventPatch.interestStatus,
+            eventPatch.interestStatusLabel,
+            eventPatch.timestampLastInterestChange,
+            eventPatch.timestampLastReply,
+            eventPatch.lastReplyCategory,
+            eventPatch.lastEventType
+        ]
+    );
+}
+
+async function insertSyncReconcileInterestEvent(db, {
+    agencyId,
+    clientId,
+    contactId,
+    campaignId,
+    instantlyCampaignId,
+    instantlyLeadId,
+    leadEmail,
+    eventType,
+    eventTimestamp,
+    previousInterestStatus,
+    nextInterestStatus,
+    syncStartedAt
+}) {
+    const syntheticEvent = {
+        event_type: eventType,
+        timestamp: eventTimestamp,
+        campaign_id: instantlyCampaignId,
+        lead_id: instantlyLeadId,
+        lead_email: leadEmail,
+        previous_interest_status: previousInterestStatus,
+        next_interest_status: nextInterestStatus,
+        synced_at: syncStartedAt,
+        source: 'sync_reconcile'
+    };
+    const fingerprint = buildSyncReconcileFingerprint({
+        contactId,
+        campaignId,
+        previousInterestStatus,
+        nextInterestStatus,
+        eventTimestamp
+    });
+    const eventPatch = buildEventPatch(syntheticEvent, eventTimestamp);
+    const insertResult = await db.query(
+        `INSERT INTO contact_instantly_events (
+            agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
+            event_type, reply_category, lead_email, event_timestamp, fingerprint, source, payload
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+        ON CONFLICT (source, fingerprint) DO NOTHING
+        RETURNING id`,
+        [
+            agencyId,
+            clientId,
+            contactId,
+            campaignId,
+            instantlyCampaignId,
+            instantlyLeadId,
+            eventType,
+            eventPatch.lastReplyCategory,
+            leadEmail,
+            eventTimestamp,
+            fingerprint,
+            'sync_reconcile',
+            JSON.stringify(syntheticEvent)
+        ]
+    );
+    return {
+        eventId: insertResult.rows[0]?.id || null,
+        eventPatch,
+        deduplicated: !insertResult.rowCount
+    };
+}
+
+async function applySyncInterestReconciliation(db, {
+    agencyId,
+    clientId,
+    instantlyCampaignId,
+    interestChanges,
+    syncStartedAt,
+    logger = () => {}
+}) {
+    const autoresponderTriggers = [];
+    if (!interestChanges.length) {
+        return { autoresponderTriggers, syntheticEventsInserted: 0 };
+    }
+
+    const emailByContactId = await loadContactEmailsById(
+        db,
+        interestChanges.map((change) => change.contact_id)
+    );
+    let syntheticEventsInserted = 0;
+
+    for (const change of interestChanges) {
+        const eventType = mapInterestStatusToEventType(change.next_interest_status);
+        if (!eventType) continue;
+
+        const eventTimestamp = change.timestamp_last_interest_change || syncStartedAt;
+        const leadEmail = normalizeEmail(emailByContactId.get(change.contact_id));
+        const { eventId, eventPatch, deduplicated } = await insertSyncReconcileInterestEvent(db, {
+            agencyId,
+            clientId,
+            contactId: change.contact_id,
+            campaignId: change.campaign_id,
+            instantlyCampaignId,
+            instantlyLeadId: change.instantly_lead_id,
+            leadEmail,
+            eventType,
+            eventTimestamp,
+            previousInterestStatus: change.previous_interest_status,
+            nextInterestStatus: change.next_interest_status,
+            syncStartedAt
+        });
+
+        if (deduplicated || !eventId) continue;
+        syntheticEventsInserted += 1;
+
+        await applyInterestEventPatchToCampaign(db, {
+            contactId: change.contact_id,
+            campaignId: change.campaign_id,
+            instantlyLeadId: change.instantly_lead_id,
+            eventPatch
+        });
+
+        if (change.next_interest_status !== 1) {
+            await cancelNonInterestedAutoResponderDrafts(db, change.contact_id, change.campaign_id);
+            continue;
+        }
+
+        if (change.previous_interest_status === 1) continue;
+
+        const skipWebhook = await hasRecentInterestedWebhookEvent(db, {
+            contactId: change.contact_id,
+            campaignId: change.campaign_id,
+            eventTimestamp
+        });
+        const skipOpenDraft = await hasOpenInterestedAutoresponderDraft(db, change.contact_id, change.campaign_id);
+        if (skipWebhook || skipOpenDraft) {
+            logger(
+                `[instantly-sync] skipped autoresponder for contact=${change.contact_id} campaign=${change.campaign_id}`
+                + ` (webhook=${skipWebhook}, openDraft=${skipOpenDraft})`
+            );
+            continue;
+        }
+
+        autoresponderTriggers.push({
+            campaignId: change.campaign_id,
+            contactId: change.contact_id,
+            instantlyLeadId: change.instantly_lead_id,
+            sourceEventId: eventId,
+            leadEmail
+        });
+        logger(
+            `[instantly-sync] queued autoresponder from sync reconcile contact=${change.contact_id}`
+            + ` campaign=${change.campaign_id} event=${eventId}`
+        );
+    }
+
+    return { autoresponderTriggers, syntheticEventsInserted };
+}
+
+async function processSyncAutoresponderTriggers({
+    agencyId,
+    clientSlug,
+    clientId,
+    triggers,
+    logger = () => {}
+}) {
+    for (const trigger of triggers) {
+        try {
+            await createInterestedAutoResponderDraftFromEvent({
+                agencyId,
+                clientSlug,
+                clientId,
+                campaignId: trigger.campaignId,
+                contactId: trigger.contactId,
+                instantlyLeadId: trigger.instantlyLeadId,
+                sourceEventId: trigger.sourceEventId,
+                leadEmail: trigger.leadEmail,
+                logger
+            });
+        } catch (error) {
+            logger(
+                `[instantly-sync] autoresponder failed contact=${trigger.contactId}`
+                + ` campaign=${trigger.campaignId}: ${error.message}`
+            );
+        }
+    }
+}
+
 export function buildInstantlyWebhookTargetUrl(req, agencyId, clientSlug) {
     const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').toString();
     const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toString();
@@ -1701,6 +2046,7 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
         let matchedLeads = 0;
         let unmatchedLeads = 0;
         let campaignsSynced = 0;
+        const syncAutoresponderTriggers = [];
 
         for (const campaign of campaigns) {
             await assertSyncRunNotCancelled(syncRunId);
@@ -1903,8 +2249,28 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             try {
                 await client.query('BEGIN');
                 if (matchedSnapshots.length > 0) {
+                    const priorByKey = await loadCampaignInterestStateMap(client, matchedSnapshots);
                     await upsertCampaignSnapshots(client, matchedSnapshots);
                     await updateContactLastContacted(client, matchedSnapshots);
+
+                    const interestChanges = computeInterestStatusChanges(priorByKey, matchedSnapshots);
+                    if (interestChanges.length) {
+                        const reconcileOutcome = await applySyncInterestReconciliation(client, {
+                            agencyId,
+                            clientId: sqlClientId,
+                            instantlyCampaignId,
+                            interestChanges,
+                            syncStartedAt,
+                            logger
+                        });
+                        syncAutoresponderTriggers.push(...reconcileOutcome.autoresponderTriggers);
+                        if (reconcileOutcome.syntheticEventsInserted > 0) {
+                            logger(
+                                `Recorded ${reconcileOutcome.syntheticEventsInserted} synthetic interest event(s)`
+                                + ` for ${campaignName}`
+                            );
+                        }
+                    }
                 }
                 await client.query(
                     `UPDATE contact_instantly_campaigns
@@ -1949,6 +2315,17 @@ export async function syncClientInstantlyState({ agencyId, clientSlug, instantly
             instantly_last_synced_at: syncStartedAt,
             instantly_last_sync_error: null
         });
+
+        if (syncAutoresponderTriggers.length) {
+            logger(`Processing ${syncAutoresponderTriggers.length} interested autoresponder trigger(s) from sync reconcile`);
+            await processSyncAutoresponderTriggers({
+                agencyId,
+                clientSlug,
+                clientId: sqlClientId,
+                triggers: syncAutoresponderTriggers,
+                logger
+            });
+        }
 
         if (syncRunId) {
             await publishInstantlySyncProgress(syncRunId, {
