@@ -539,6 +539,17 @@ const LEAD_FILTER_FIELDS = [
         ]
     },
     {
+        key: 'updated_at',
+        label: 'Last Updated',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'between', label: 'Between' },
+            { key: 'older_than_days', label: 'Older Than Days' }
+        ]
+    },
+    {
         key: 'last_contacted_at',
         label: 'Last Contacted',
         type: 'date',
@@ -795,7 +806,7 @@ function leadFiltersRequireInsights(filters) {
 }
 
 const DATE_FILTER_FIELDS = new Set([
-    'created_at', 'last_contacted_at', 'added_to_campaign_at', 'email_find_completed_at', 'email_verify_completed_at', 'last_reply_at'
+    'created_at', 'updated_at', 'last_contacted_at', 'added_to_campaign_at', 'email_find_completed_at', 'email_verify_completed_at', 'last_reply_at'
 ]);
 const NUMERIC_FILTER_FIELDS = new Set([
     'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max'
@@ -1102,6 +1113,25 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             } else if (operatorKey === 'older_than_days') {
                 const ref = bindParam(Number(normalizedValue));
                 clauses.push(`c.created_at < NOW() - (${ref}::text || ' days')::interval`);
+            }
+            continue;
+        }
+
+        // ── updated_at ─────────────────────────────────────────────────────
+        if (fieldKey === 'updated_at') {
+            if (operatorKey === 'on_or_after') {
+                const ref = bindParam(String(normalizedValue));
+                clauses.push(`c.updated_at >= ${ref}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                const ref = bindParam(String(normalizedValue).slice(0, 10));
+                clauses.push(`c.updated_at < (${ref}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'between') {
+                const refStart = bindParam(normalizedValue[0]);
+                const refEnd = bindParam(normalizedValue[1].slice(0, 10));
+                clauses.push(`c.updated_at >= ${refStart}::timestamptz AND c.updated_at < (${refEnd}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'older_than_days') {
+                const ref = bindParam(Number(normalizedValue));
+                clauses.push(`c.updated_at < NOW() - (${ref}::text || ' days')::interval`);
             }
             continue;
         }
