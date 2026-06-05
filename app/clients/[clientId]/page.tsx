@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { getAccessToken } from "@/lib/supabase/session";
 import {
@@ -15,6 +15,7 @@ import { useAgencyId } from "@/lib/hooks/useAgencyId";
 import { apiFetch, apiJson } from "@/lib/api/http";
 import { createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
+import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
 import {
     PipelineJob,
     PipelineStageKey,
@@ -3955,7 +3956,7 @@ export default function ClientPage() {
 
         fetchInstantlyEventAnalytics(true);
         fetchPendingReviewDrafts();
-    }, [activeTab, user, clientId, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
+    }, [activeTab, user, clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
 
     useEffect(() => {
         if (activeTab !== 'follow-ups' || !user || !clientId) return;
@@ -6996,66 +6997,134 @@ export default function ClientPage() {
 
                             {(!instantlyEventAnalyticsLoading || instantlyEventAnalytics) && (
                                 <>
+                            {(() => {
+                                type AnalyticsStatCard = {
+                                    key: string;
+                                    label: string;
+                                    value: number;
+                                    border: string;
+                                    icon: ReactNode;
+                                    subLabel?: string;
+                                };
+
+                                const analyticsMatchesFilters = instantlyEventAnalytics
+                                    && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType
+                                    && instantlyEventAnalytics.window?.period === instantlyEventAnalyticsPeriod;
+                                const displayAnalytics = analyticsMatchesFilters ? instantlyEventAnalytics : null;
+                                const summary = displayAnalytics?.summary;
+                                const isFiltered = instantlyEventAnalyticsEventType !== "all";
+                                const selectedEventLabel = (instantlyEventAnalytics?.availableEventTypes || []).find((option) => option.value === instantlyEventAnalyticsEventType)?.label
+                                    || displayAnalytics?.eventType?.label
+                                    || "Events";
+                                const showAnalyticsLoading = instantlyEventAnalyticsLoading || !analyticsMatchesFilters;
+                                const analyticsStatCards: AnalyticsStatCard[] = isFiltered
+                                    ? [
+                                        {
+                                            key: "total_events",
+                                            label: selectedEventLabel,
+                                            value: summary?.total_events ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M3 3v18h18" />
+                                                    <path d="M7 16l4-5 4 3 5-7" />
+                                                </svg>
+                                            )
+                                        },
+                                        {
+                                            key: "unique_contacts",
+                                            label: "Unique contacts",
+                                            value: summary?.unique_contacts ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                                                    <circle cx="9" cy="7" r="4" />
+                                                    <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                                                </svg>
+                                            )
+                                        },
+                                        {
+                                            key: "unique_campaigns",
+                                            label: "Campaigns",
+                                            value: summary?.unique_campaigns ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M4 6h16" />
+                                                    <path d="M4 12h10" />
+                                                    <path d="M4 18h14" />
+                                                </svg>
+                                            )
+                                        }
+                                    ]
+                                    : [
+                                        {
+                                            key: "emails_sent",
+                                            label: "Emails sent",
+                                            value: summary?.emails_sent ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M4 6h16v12H4z" />
+                                                    <path d="m22 7-10 7L2 7" />
+                                                </svg>
+                                            )
+                                        },
+                                        {
+                                            key: "positive_replies",
+                                            label: "Positive replies",
+                                            value: summary?.positive_replies ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                                                    <path d="m9 10 2 2 4-4" />
+                                                </svg>
+                                            )
+                                        },
+                                        {
+                                            key: "meetings_booked",
+                                            label: "Meetings booked",
+                                            value: summary?.meetings_booked ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <rect x="3" y="4" width="18" height="18" rx="2" />
+                                                    <path d="M16 2v4" />
+                                                    <path d="M8 2v4" />
+                                                    <path d="M3 10h18" />
+                                                </svg>
+                                            )
+                                        }
+                                    ];
+
+                                const followUpCard: AnalyticsStatCard = {
+                                    key: "follow_up_sent_today",
+                                    label: "Warm Follow-ups",
+                                    value: summary?.follow_up_sent_today ?? 0,
+                                    subLabel: displayAnalytics
+                                        ? `${displayAnalytics.summary.follow_up_sent_yesterday} yesterday · ${displayAnalytics.summary.follow_up_sent_7d} last 7d`
+                                        : undefined,
+                                    border: "rgba(234, 179, 8, 0.28)",
+                                    icon: (
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" />
+                                            <path d="M8 12.5l2.5 2.5L16 9" />
+                                        </svg>
+                                    )
+                                };
+
+                                return (
                             <div style={{
                                 display: "grid",
                                 gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                                gap: "1rem"
+                                gap: "1rem",
+                                opacity: showAnalyticsLoading ? 0.65 : 1,
+                                transition: "opacity 0.2s ease"
                             }}>
-                                {[
-                                    {
-                                        key: "emails_sent",
-                                        label: "Emails sent",
-                                        value: instantlyEventAnalytics?.summary.emails_sent ?? 0,
-                                        border: "var(--app-border-mid)",
-                                        icon: (
-                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                <path d="M4 6h16v12H4z" />
-                                                <path d="m22 7-10 7L2 7" />
-                                            </svg>
-                                        )
-                                    },
-                                    {
-                                        key: "positive_replies",
-                                        label: "Positive replies",
-                                        value: instantlyEventAnalytics?.summary.positive_replies ?? 0,
-                                        border: "var(--app-border-mid)",
-                                        icon: (
-                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                                                <path d="m9 10 2 2 4-4" />
-                                            </svg>
-                                        )
-                                    },
-                                    {
-                                        key: "meetings_booked",
-                                        label: "Meetings booked",
-                                        value: instantlyEventAnalytics?.summary.meetings_booked ?? 0,
-                                        border: "var(--app-border-mid)",
-                                        icon: (
-                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                <rect x="3" y="4" width="18" height="18" rx="2" />
-                                                <path d="M16 2v4" />
-                                                <path d="M8 2v4" />
-                                                <path d="M3 10h18" />
-                                            </svg>
-                                        )
-                                    },
-                                    {
-                                        key: "follow_up_sent_today",
-                                        label: "Warm Follow-ups",
-                                        value: instantlyEventAnalytics?.summary.follow_up_sent_today ?? 0,
-                                        subLabel: instantlyEventAnalytics
-                                            ? `${instantlyEventAnalytics.summary.follow_up_sent_yesterday} yesterday · ${instantlyEventAnalytics.summary.follow_up_sent_7d} last 7d`
-                                            : undefined,
-                                        border: "rgba(234, 179, 8, 0.28)",
-                                        icon: (
-                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" />
-                                                <path d="M8 12.5l2.5 2.5L16 9" />
-                                            </svg>
-                                        )
-                                    }
-                                ].map((card) => (
+                                {[...analyticsStatCards, followUpCard].map((card) => (
                                     <div
                                         key={card.key}
                                         style={{
@@ -7086,7 +7155,7 @@ export default function ClientPage() {
                                                     {card.label}
                                                 </p>
                                             </div>
-                                            {"subLabel" in card && card.subLabel && (
+                                            {card.subLabel && (
                                                 <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "var(--app-text-ghost)" }}>
                                                     {card.subLabel}
                                                 </p>
@@ -7095,6 +7164,34 @@ export default function ClientPage() {
                                     </div>
                                 ))}
                             </div>
+                                );
+                            })()}
+
+                            <InstantlyEventAnalyticsChart
+                                rows={
+                                    instantlyEventAnalytics
+                                    && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType
+                                    && instantlyEventAnalytics.window?.period === instantlyEventAnalyticsPeriod
+                                        ? instantlyEventAnalytics.byHour
+                                        : []
+                                }
+                                bucketUnit={instantlyEventAnalytics?.window.bucketUnit || "hour"}
+                                windowLabel={
+                                    INSTANTLY_ANALYTICS_PERIOD_OPTIONS.find((option) => option.value === instantlyEventAnalyticsPeriod)?.label
+                                    || instantlyEventAnalytics?.window.label
+                                    || "Last 24 hours"
+                                }
+                                eventTypeLabel={
+                                    (instantlyEventAnalytics?.availableEventTypes || []).find((option) => option.value === instantlyEventAnalyticsEventType)?.label
+                                    || instantlyEventAnalytics?.eventType?.label
+                                    || "All event types"
+                                }
+                                loading={instantlyEventAnalyticsLoading || !(
+                                    instantlyEventAnalytics
+                                    && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType
+                                    && instantlyEventAnalytics.window?.period === instantlyEventAnalyticsPeriod
+                                )}
+                            />
 
                             <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start" }}>
 
