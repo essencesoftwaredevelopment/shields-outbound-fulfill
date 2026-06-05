@@ -7120,9 +7120,7 @@ export default function ClientPage() {
                             <div style={{
                                 display: "grid",
                                 gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                                gap: "1rem",
-                                opacity: showAnalyticsLoading ? 0.65 : 1,
-                                transition: "opacity 0.2s ease"
+                                gap: "1rem"
                             }}>
                                 {[...analyticsStatCards, followUpCard].map((card) => (
                                     <div
@@ -7138,27 +7136,42 @@ export default function ClientPage() {
                                         }}
                                     >
                                         <div>
-                                            <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
-                                                {card.value.toLocaleString()}
-                                            </p>
-                                            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
-                                                <div style={{
-                                                    display: "inline-flex",
-                                                    alignItems: "center",
-                                                    justifyContent: "center",
-                                                    color: "var(--app-text)",
-                                                    flexShrink: 0
-                                                }}>
-                                                    {card.icon}
-                                                </div>
-                                                <p style={{ margin: 0, fontSize: "0.86rem", color: "var(--app-text-muted)" }}>
-                                                    {card.label}
-                                                </p>
-                                            </div>
-                                            {card.subLabel && (
-                                                <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "var(--app-text-ghost)" }}>
-                                                    {card.subLabel}
-                                                </p>
+                                            {showAnalyticsLoading ? (
+                                                <>
+                                                    <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
+                                                    <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
+                                                        <div className="analytics-skeleton" style={{ width: "18px", height: "18px", borderRadius: "999px", flexShrink: 0 }} />
+                                                        <div className="analytics-skeleton" style={{ width: "112px", height: "14px" }} />
+                                                    </div>
+                                                    {card.subLabel !== undefined && (
+                                                        <div className="analytics-skeleton" style={{ width: "148px", height: "10px", marginTop: "0.45rem" }} />
+                                                    )}
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
+                                                        {card.value.toLocaleString()}
+                                                    </p>
+                                                    <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
+                                                        <div style={{
+                                                            display: "inline-flex",
+                                                            alignItems: "center",
+                                                            justifyContent: "center",
+                                                            color: "var(--app-text)",
+                                                            flexShrink: 0
+                                                        }}>
+                                                            {card.icon}
+                                                        </div>
+                                                        <p style={{ margin: 0, fontSize: "0.86rem", color: "var(--app-text-muted)" }}>
+                                                            {card.label}
+                                                        </p>
+                                                    </div>
+                                                    {card.subLabel && (
+                                                        <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "var(--app-text-ghost)" }}>
+                                                            {card.subLabel}
+                                                        </p>
+                                                    )}
+                                                </>
                                             )}
                                         </div>
                                     </div>
