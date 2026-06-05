@@ -10,6 +10,8 @@ import multer from 'multer';
 import fs from 'fs';
 import {
     buildUnifiedRowsFromDb,
+    countUnifiedRowsByEmailStatus,
+    filterUnifiedRowsByEmailStatus,
     getJobById,
     jobHasRemainingPipelineWork,
     jobRowToState,
@@ -369,17 +371,28 @@ const uploadFields = upload.fields([
 // Get CSV preview for column mapping
 router.post('/jobs/:id/csv-preview', async (req, res) => {
     try {
-        const { clientId } = req.body || {};
+        const { clientId, emailStatusInclude } = req.body || {};
+        const includeValid = emailStatusInclude?.includeValid !== false;
+        const includeRisky = emailStatusInclude?.includeRisky !== false;
         const jobId = req.params.id;
 
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
+        if (!includeValid && !includeRisky) {
+            return res.status(400).json({ error: 'Select at least one email status to preview.' });
+        }
 
         await agencyFromRequest(req);
 
-        const unified = await buildUnifiedRowsFromDb(jobId, 'valid');
-        if (!unified.length) {
+        const allEligible = await buildUnifiedRowsFromDb(jobId, 'valid', { includeValid: true, includeRisky: true });
+        if (!allEligible.length) {
             return res.status(404).json({ error: 'No verified leads available for upload.' });
+        }
+
+        const emailStatusCounts = countUnifiedRowsByEmailStatus(allEligible);
+        const unified = filterUnifiedRowsByEmailStatus(allEligible, { includeValid, includeRisky });
+        if (!unified.length) {
+            return res.status(404).json({ error: 'No leads match the selected email statuses.' });
         }
 
         const allKeys = new Set();
@@ -387,7 +400,12 @@ router.post('/jobs/:id/csv-preview', async (req, res) => {
         const headers = Array.from(allKeys);
         const previewRows = unified.slice(0, 100);
 
-        res.json({ headers, previewRows });
+        res.json({
+            headers,
+            previewRows,
+            emailStatusCounts,
+            uploadTotal: unified.length
+        });
     } catch (error) {
         console.error('CSV preview error:', error);
         res.status(500).json({ error: 'Failed to load CSV preview.' });
@@ -864,13 +882,18 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
     };
 
     try {
-        const { idToken, clientId, campaignId, columnMapping, customVariables, skipOptions } = req.body || {};
+        const { idToken, clientId, campaignId, columnMapping, customVariables, skipOptions, emailStatusInclude } = req.body || {};
+        const includeValid = emailStatusInclude?.includeValid !== false;
+        const includeRisky = emailStatusInclude?.includeRisky !== false;
         campaignIdParam = campaignId;
 
         if (!clientId) return res.status(400).json({ error: 'Missing client ID.' });
         if (!campaignId) return res.status(400).json({ error: 'Missing campaign ID.' });
         if (!jobId) return res.status(400).json({ error: 'Missing job ID.' });
         if (!columnMapping) return res.status(400).json({ error: 'Missing column mapping.' });
+        if (!includeValid && !includeRisky) {
+            return res.status(400).json({ error: 'Select at least one email status to upload.' });
+        }
 
         const uid = await resolveAgencyId(req);
 
@@ -883,11 +906,11 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
             return res.status(400).json({ error: 'Client has no Instantly API key configured' });
         }
 
-        const verified = await buildUnifiedRowsFromDb(jobId, 'valid');
+        const verified = await buildUnifiedRowsFromDb(jobId, 'valid', { includeValid, includeRisky });
 
         if (verified.length === 0) {
             await recordUploadStatus(0, 0);
-            return res.json({ count: 0, total: 0, message: 'No verified emails to upload' });
+            return res.json({ count: 0, total: 0, message: 'No leads match the selected email statuses' });
         }
 
         // Upload to Instantly in batches

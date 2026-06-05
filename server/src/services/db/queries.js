@@ -381,7 +381,7 @@ export async function getContactsByAgency(agencyId, filters = {}) {
         paramIndex++;
     }
 
-    query += ` ORDER BY c.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    query += ` ORDER BY c.created_at DESC, c.id DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     params.push(limit, offset);
 
     const result = await pool.query(query, params);

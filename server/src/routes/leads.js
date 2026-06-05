@@ -1729,7 +1729,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
                 ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
                 WHERE ${whereClause}
-                ORDER BY ${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC
+                ORDER BY ${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC, c.id DESC
                 LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
             ),
             paged_campaign_stats AS (
@@ -1833,7 +1833,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             LEFT JOIN paged_campaign_stats pcs ON pcs.contact_id = pc.id
             LEFT JOIN contact_insights ci ON ci.contact_id = pc.id
             ${latestEventJoin}
-            ORDER BY ${requiresFilterCampaignStats ? 'pc.last_campaign_added_at DESC NULLS LAST, ' : ''}pc.created_at DESC
+            ORDER BY ${requiresFilterCampaignStats ? 'pc.last_campaign_added_at DESC NULLS LAST, ' : ''}pc.created_at DESC, pc.id DESC
         `;
         params.push(parsedLimit + 1, parsedOffset);
 

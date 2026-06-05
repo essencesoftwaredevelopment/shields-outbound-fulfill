@@ -684,12 +684,46 @@ export async function countFinishedLeadsForJob(jobId) {
     return result.rows[0]?.count ?? 0;
 }
 
-export async function buildUnifiedRowsFromDb(jobId, scope = 'valid') {
+function isValidUploadEmailStatus(status) {
+    return String(status || '').toLowerCase().trim() === 'valid';
+}
+
+function isRiskyUploadEmailStatus(status) {
+    const normalized = String(status || '').toLowerCase().trim();
+    return normalized === 'risky' || normalized === 'valid-risky';
+}
+
+export function filterUnifiedRowsByEmailStatus(rows, { includeValid = true, includeRisky = true } = {}) {
+    return rows.filter((row) => {
+        if (includeValid && isValidUploadEmailStatus(row.email_status)) return true;
+        if (includeRisky && isRiskyUploadEmailStatus(row.email_status)) return true;
+        return false;
+    });
+}
+
+export function countUnifiedRowsByEmailStatus(rows) {
+    return rows.reduce((counts, row) => {
+        if (isValidUploadEmailStatus(row.email_status)) {
+            counts.valid += 1;
+        } else if (isRiskyUploadEmailStatus(row.email_status)) {
+            counts.risky += 1;
+        }
+        return counts;
+    }, { valid: 0, risky: 0 });
+}
+
+function buildUploadEmailStatusFilter({ includeValid = true, includeRisky = true } = {}) {
+    const statuses = [];
+    if (includeValid) statuses.push('valid');
+    if (includeRisky) statuses.push('risky', 'valid-risky');
+    if (statuses.length === 0) return 'AND FALSE';
+    return `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN (${statuses.map((status) => `'${status}'`).join(', ')})`;
+}
+
+export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {}) {
     let statusFilter = '';
     if (scope === 'valid') {
-        // Treat "valid-risky" as export-eligible alongside "valid".
-        // Keep legacy "risky" for backwards compatibility with older rows.
-        statusFilter = `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid', 'valid-risky', 'risky')`;
+        statusFilter = buildUploadEmailStatusFilter(options);
     } else if (scope === 'complete') {
         statusFilter = `AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
             AND c.personalization_first_line IS NOT NULL AND BTRIM(c.personalization_first_line) <> ''`;

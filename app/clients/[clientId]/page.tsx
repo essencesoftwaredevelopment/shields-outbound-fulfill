@@ -1665,6 +1665,9 @@ export default function ClientPage() {
     const [skipWorkspaceDupes, setSkipWorkspaceDupes] = useState<boolean>(true);
     const [skipCampaignDupes, setSkipCampaignDupes] = useState<boolean>(false);
     const [skipListDupes, setSkipListDupes] = useState<boolean>(false);
+    const [includeValidEmails, setIncludeValidEmails] = useState<boolean>(true);
+    const [includeRiskyEmails, setIncludeRiskyEmails] = useState<boolean>(true);
+    const [uploadEmailStatusCounts, setUploadEmailStatusCounts] = useState<{ valid: number; risky: number } | null>(null);
 
     // Leads state
     const [leads, setLeads] = useState<Lead[]>([]);
@@ -5770,6 +5773,14 @@ export default function ClientPage() {
         loadMoreLeads();
     };
 
+    const uploadLeadCount = useMemo(() => {
+        if (!uploadEmailStatusCounts) return null;
+        let total = 0;
+        if (includeValidEmails) total += uploadEmailStatusCounts.valid;
+        if (includeRiskyEmails) total += uploadEmailStatusCounts.risky;
+        return total;
+    }, [includeValidEmails, includeRiskyEmails, uploadEmailStatusCounts]);
+
     const handleUploadToInstantly = async () => {
         const currentJobId = jobState?.id || jobPendingUpload;
         if (!currentJobId || !user) {
@@ -5777,6 +5788,9 @@ export default function ClientPage() {
             setToastVisible(true);
             return;
         }
+
+        setIncludeValidEmails(true);
+        setIncludeRiskyEmails(true);
 
         // Fetch CSV data for preview and mapping
         try {
@@ -5786,7 +5800,14 @@ export default function ClientPage() {
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${currentJobId}/csv-preview`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ idToken, clientId })
+                body: JSON.stringify({
+                    idToken,
+                    clientId,
+                    emailStatusInclude: {
+                        includeValid: true,
+                        includeRisky: true
+                    }
+                })
             });
 
             if (!response.ok) {
@@ -5805,6 +5826,7 @@ export default function ClientPage() {
             const data = await response.json();
             setCsvHeaders(data.headers || []);
             setCsvPreviewRows(data.previewRows || []);
+            setUploadEmailStatusCounts(data.emailStatusCounts || null);
 
             // Initialize column mapping with Instantly-aligned defaults
             const defaultMapping: Record<string, { column: string; isCustom: boolean }> = {
@@ -5836,6 +5858,11 @@ export default function ClientPage() {
 
         if (!selectedCampaignId) {
             alert('Please select a campaign');
+            return;
+        }
+
+        if (!includeValidEmails && !includeRiskyEmails) {
+            alert('Select at least one email status to upload.');
             return;
         }
 
@@ -5874,6 +5901,10 @@ export default function ClientPage() {
                         skip_if_in_workspace: skipWorkspaceDupes,
                         skip_if_in_campaign: skipCampaignDupes,
                         skip_if_in_list: skipListDupes
+                    },
+                    emailStatusInclude: {
+                        includeValid: includeValidEmails,
+                        includeRisky: includeRiskyEmails
                     }
                 })
             });
@@ -6258,8 +6289,10 @@ export default function ClientPage() {
             const params = buildLeadQueryParams({ limit: 5000, includeLatestEvent });
 
             const collected: Lead[] = [];
+            const seenLeadIds = new Set<string>();
             let offset = 0;
             let hasMore = true;
+            let duplicateRowsSkipped = 0;
 
             while (hasMore) {
                 params.set('offset', String(offset));
@@ -6278,7 +6311,15 @@ export default function ClientPage() {
                 const { leads: apiLeads, hasMore: more } = data;
                 const mapped: Lead[] = apiLeads.map(mapApiLeadRow);
 
-                collected.push(...mapped);
+                mapped.forEach((lead) => {
+                    const leadKey = String(lead.id);
+                    if (seenLeadIds.has(leadKey)) {
+                        duplicateRowsSkipped += 1;
+                        return;
+                    }
+                    seenLeadIds.add(leadKey);
+                    collected.push(lead);
+                });
                 offset += mapped.length;
                 hasMore = more && mapped.length > 0;
 
@@ -6313,7 +6354,13 @@ export default function ClientPage() {
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
-            setToastMessage(`Exported ${rowsToExport.length.toLocaleString()} lead${rowsToExport.length === 1 ? '' : 's'}`);
+            const exportMessage = duplicateRowsSkipped > 0
+                ? `Exported ${rowsToExport.length.toLocaleString()} lead${rowsToExport.length === 1 ? '' : 's'} (${duplicateRowsSkipped.toLocaleString()} duplicate${duplicateRowsSkipped === 1 ? '' : 's'} removed)`
+                : `Exported ${rowsToExport.length.toLocaleString()} lead${rowsToExport.length === 1 ? '' : 's'}`;
+            if (duplicateRowsSkipped > 0) {
+                console.warn(`CSV export removed ${duplicateRowsSkipped} duplicate lead row(s)`);
+            }
+            setToastMessage(exportMessage);
             setToastVisible(true);
         } catch (error) {
             console.error('CSV export failed:', error);
@@ -10945,6 +10992,42 @@ export default function ClientPage() {
                             </div>
 
                             <div style={{ marginBottom: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--app-border)' }}>
+                                <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'var(--app-text)' }}>Email verification status</div>
+                                <p style={{ margin: '0 0 0.75rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
+                                    Choose which verified emails to include in this upload.
+                                </p>
+                                <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={includeValidEmails}
+                                        onChange={(e) => setIncludeValidEmails(e.target.checked)}
+                                    />
+                                    <span className="settings-field__label" style={{ margin: 0 }}>
+                                        Include valid emails
+                                        {uploadEmailStatusCounts ? ` (${uploadEmailStatusCounts.valid.toLocaleString()})` : ''}
+                                    </span>
+                                </label>
+                                <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={includeRiskyEmails}
+                                        onChange={(e) => setIncludeRiskyEmails(e.target.checked)}
+                                    />
+                                    <span className="settings-field__label" style={{ margin: 0 }}>
+                                        Include risky emails
+                                        {uploadEmailStatusCounts ? ` (${uploadEmailStatusCounts.risky.toLocaleString()})` : ''}
+                                    </span>
+                                </label>
+                                {uploadLeadCount !== null && (
+                                    <div style={{ marginTop: '0.75rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
+                                        {uploadLeadCount > 0
+                                            ? `${uploadLeadCount.toLocaleString()} lead${uploadLeadCount === 1 ? '' : 's'} will be uploaded`
+                                            : 'Select at least one email status to upload'}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div style={{ marginBottom: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--app-border)' }}>
                                 <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'var(--app-text)' }}>Duplicate handling</div>
                                 <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
                                     <input
@@ -10977,7 +11060,18 @@ export default function ClientPage() {
 
                         <div className="modal__actions">
                             <button type="button" className="secondary-button secondary-button--active" onClick={() => setUploadModalOpen(false)}>Cancel</button>
-                            <button type="button" className="primary-button" disabled={uploading || !columnMapping.email?.column || !selectedCampaignId} onClick={handleConfirmUpload}>
+                            <button
+                                type="button"
+                                className="primary-button"
+                                disabled={
+                                    uploading
+                                    || !columnMapping.email?.column
+                                    || !selectedCampaignId
+                                    || (!includeValidEmails && !includeRiskyEmails)
+                                    || (uploadLeadCount ?? 0) === 0
+                                }
+                                onClick={handleConfirmUpload}
+                            >
                                 {uploading ? 'Uploading...' : 'Upload to Instantly'}
                             </button>
                         </div>
