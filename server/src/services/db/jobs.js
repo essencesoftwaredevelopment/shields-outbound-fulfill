@@ -159,15 +159,23 @@ export async function markJobDomainsSkipped(jobId, domains) {
     );
 }
 
-export async function listPendingJobDomains(jobId, limit = 10000) {
-    const result = await pool.query(
-        `SELECT domain_normalized, raw_row, sort_order
+/**
+ * List pending job_domains rows for a job.
+ * @param {string} jobId
+ * @param {number|null|undefined} [limit] - When set, caps rows returned (e.g. 1 for existence checks).
+ *   Omit to return all pending domains — required for uploads larger than 10k.
+ */
+export async function listPendingJobDomains(jobId, limit) {
+    const params = [jobId];
+    let sql = `SELECT domain_normalized, raw_row, sort_order
          FROM job_domains
          WHERE job_id = $1 AND status = 'pending'
-         ORDER BY sort_order ASC
-         LIMIT $2`,
-        [jobId, limit]
-    );
+         ORDER BY sort_order ASC`;
+    if (limit != null && Number.isFinite(Number(limit)) && Number(limit) > 0) {
+        sql += ' LIMIT $2';
+        params.push(Number(limit));
+    }
+    const result = await pool.query(sql, params);
     return result.rows;
 }
 

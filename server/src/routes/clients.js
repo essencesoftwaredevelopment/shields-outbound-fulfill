@@ -50,6 +50,7 @@ import {
     sanitizeHtml
 } from '../services/followUpSender.js';
 import { runFollowUpsForClient } from '../services/followUpSender.js';
+import { buildPositiveRepliesCountSql } from '../utils/positiveReplyAnalytics.js';
 
 const router = express.Router();
 const upload = multer({
@@ -697,34 +698,37 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             realtimeWebsocketUrl = null;
         }
 
-        const summaryResult = await pool.query(
-            `SELECT
-                COUNT(*)::int AS total_events,
-                COUNT(DISTINCT cie.contact_id)::int AS unique_contacts,
-                COUNT(DISTINCT cie.campaign_id)::int AS unique_campaigns,
-                COUNT(*) FILTER (
-                    WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
-                )::int AS emails_sent,
-                COUNT(*) FILTER (
-                    WHERE LOWER(COALESCE(cie.reply_category, '')) = 'positive'
-                )::int AS positive_replies,
-                COUNT(*) FILTER (
-                    WHERE LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
-                )::int AS meetings_booked,
-                COUNT(*) FILTER (
-                    WHERE LOWER(COALESCE(cie.event_type, '')) IN ('reply', 'replied')
-                )::int AS reply_events,
-                COUNT(*) FILTER (
-                    WHERE LOWER(COALESCE(cie.event_type, '')) LIKE '%bounce%'
-                )::int AS bounce_events,
-                MIN(cie.event_timestamp) AS first_event_at,
-                MAX(cie.event_timestamp) AS last_event_at
-            FROM contact_instantly_events cie
-            WHERE cie.agency_id = $1
-            AND cie.client_id = $2
-            AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}`,
-            analyticsParams
-        );
+        const [summaryResult, positiveRepliesResult] = await Promise.all([
+            pool.query(
+                `SELECT
+                    COUNT(*)::int AS total_events,
+                    COUNT(DISTINCT cie.contact_id)::int AS unique_contacts,
+                    COUNT(DISTINCT cie.campaign_id)::int AS unique_campaigns,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
+                    )::int AS emails_sent,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
+                    )::int AS meetings_booked,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(cie.event_type, '')) IN ('reply', 'replied')
+                    )::int AS reply_events,
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(cie.event_type, '')) LIKE '%bounce%'
+                    )::int AS bounce_events,
+                    MIN(cie.event_timestamp) AS first_event_at,
+                    MAX(cie.event_timestamp) AS last_event_at
+                FROM contact_instantly_events cie
+                WHERE cie.agency_id = $1
+                AND cie.client_id = $2
+                AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}`,
+                analyticsParams
+            ),
+            pool.query(
+                buildPositiveRepliesCountSql(periodConfig.eventFloorSql),
+                [agencyId, sqlClientId]
+            )
+        ]);
 
         const byHourResult = await pool.query(
             `SELECT
@@ -842,13 +846,13 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
                     unique_contacts: 0,
                     unique_campaigns: 0,
                     emails_sent: 0,
-                    positive_replies: 0,
                     meetings_booked: 0,
                     reply_events: 0,
                     bounce_events: 0,
                     first_event_at: null,
                     last_event_at: null
                 }),
+                positive_replies: positiveRepliesResult.rows[0]?.positive_replies ?? 0,
                 ...followUpStats
             },
             byHour: byHourResult.rows,
