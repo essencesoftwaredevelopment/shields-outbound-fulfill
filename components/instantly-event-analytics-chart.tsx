@@ -6,6 +6,7 @@ type ChartRow = {
     bucket: string;
     label: string;
     count: number;
+    positive_replies?: number;
 };
 
 type InstantlyEventAnalyticsChartProps = {
@@ -14,6 +15,7 @@ type InstantlyEventAnalyticsChartProps = {
     windowLabel: string;
     eventTypeLabel: string;
     loading?: boolean;
+    showPositiveReplies?: boolean;
 };
 
 type ChartPoint = {
@@ -25,7 +27,7 @@ type ChartPoint = {
 
 const CHART_WIDTH = 1000;
 const CHART_HEIGHT = 220;
-const PADDING = { top: 16, right: 12, bottom: 30, left: 12 };
+const PADDING = { top: 16, right: 40, bottom: 30, left: 40 };
 
 function buildSmoothPath(points: ChartPoint[]) {
     if (points.length === 0) return "";
@@ -58,12 +60,20 @@ function buildAreaPath(linePath: string, points: ChartPoint[], baselineY: number
     return `${linePath} L ${last.x} ${baselineY} L ${first.x} ${baselineY} Z`;
 }
 
+function formatAxisTick(value: number) {
+    if (value >= 1000) {
+        return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1).replace(/\.0$/, "")}k`;
+    }
+    return value.toLocaleString();
+}
+
 export default function InstantlyEventAnalyticsChart({
     rows,
     bucketUnit,
     windowLabel,
     eventTypeLabel,
-    loading = false
+    loading = false,
+    showPositiveReplies = false
 }: InstantlyEventAnalyticsChartProps) {
     const chartId = useId().replace(/:/g, "");
     const containerRef = useRef<HTMLDivElement>(null);
@@ -73,24 +83,51 @@ export default function InstantlyEventAnalyticsChart({
     const plotHeight = CHART_HEIGHT - PADDING.top - PADDING.bottom;
     const baselineY = PADDING.top + plotHeight;
 
+    const maxEventCount = useMemo(
+        () => Math.max(1, ...rows.map((row) => row.count)),
+        [rows]
+    );
+    const maxPositiveCount = useMemo(
+        () => Math.max(1, ...rows.map((row) => row.positive_replies ?? 0)),
+        [rows]
+    );
+
     const points = useMemo<ChartPoint[]>(() => {
         if (rows.length === 0) return [];
 
-        const maxCount = Math.max(1, ...rows.map((row) => row.count));
         const stepX = rows.length > 1 ? plotWidth / (rows.length - 1) : 0;
 
         return rows.map((row, index) => ({
             x: PADDING.left + stepX * index,
-            y: PADDING.top + plotHeight - (row.count / maxCount) * plotHeight,
+            y: PADDING.top + plotHeight - (row.count / maxEventCount) * plotHeight,
             row,
             index
         }));
-    }, [rows, plotHeight, plotWidth]);
+    }, [maxEventCount, rows, plotHeight, plotWidth]);
+
+    const positivePoints = useMemo<ChartPoint[]>(() => {
+        if (!showPositiveReplies || rows.length === 0) return [];
+
+        const stepX = rows.length > 1 ? plotWidth / (rows.length - 1) : 0;
+
+        return rows.map((row, index) => ({
+            x: PADDING.left + stepX * index,
+            y: PADDING.top + plotHeight - ((row.positive_replies ?? 0) / maxPositiveCount) * plotHeight,
+            row,
+            index
+        }));
+    }, [maxPositiveCount, plotHeight, plotWidth, rows, showPositiveReplies]);
 
     const linePath = useMemo(() => buildSmoothPath(points), [points]);
+    const positiveLinePath = useMemo(() => buildSmoothPath(positivePoints), [positivePoints]);
     const areaPath = useMemo(() => buildAreaPath(linePath, points, baselineY), [baselineY, linePath, points]);
     const totalCount = useMemo(() => rows.reduce((sum, row) => sum + row.count, 0), [rows]);
+    const totalPositiveCount = useMemo(
+        () => rows.reduce((sum, row) => sum + (row.positive_replies ?? 0), 0),
+        [rows]
+    );
     const showEveryNthLabel = rows.length > 18 ? Math.ceil(rows.length / 12) : rows.length > 10 ? 2 : 1;
+    const axisTicks = [0, 0.5, 1];
 
     const handlePointerMove = useCallback((clientX: number) => {
         const container = containerRef.current;
@@ -118,10 +155,12 @@ export default function InstantlyEventAnalyticsChart({
     }, []);
 
     const activePoint = hoverState ? points[hoverState.activeIndex] : null;
+    const activePositivePoint = hoverState && showPositiveReplies ? positivePoints[hoverState.activeIndex] : null;
     const crosshairLeftPct = hoverState ? (hoverState.mouseX / CHART_WIDTH) * 100 : 0;
     const activePointLeftPct = activePoint ? (activePoint.x / CHART_WIDTH) * 100 : 0;
     const activePointTopPct = activePoint ? (activePoint.y / CHART_HEIGHT) * 100 : 0;
-    const chartSeriesKey = rows.map((row) => `${row.bucket}:${row.count}`).join("|");
+    const activePositivePointTopPct = activePositivePoint ? (activePositivePoint.y / CHART_HEIGHT) * 100 : 0;
+    const chartSeriesKey = rows.map((row) => `${row.bucket}:${row.count}:${row.positive_replies ?? 0}`).join("|");
 
     return (
         <div style={{
@@ -136,6 +175,18 @@ export default function InstantlyEventAnalyticsChart({
                     <p style={{ margin: "0.35rem 0 0", fontSize: "0.82rem", color: "var(--app-text-muted)" }}>
                         {windowLabel} · {eventTypeLabel}
                     </p>
+                    {showPositiveReplies && !loading && rows.length > 0 && (
+                        <div style={{ display: "flex", gap: "1rem", marginTop: "0.65rem", flexWrap: "wrap" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
+                                <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #93c5fd, #3b82f6)" }} />
+                                Events
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
+                                <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #86efac, #22c55e)" }} />
+                                Positive replies
+                            </div>
+                        </div>
+                    )}
                 </div>
                 <div style={{ textAlign: "right", minWidth: "88px" }}>
                     {loading ? (
@@ -151,6 +202,14 @@ export default function InstantlyEventAnalyticsChart({
                             <p style={{ margin: "0.2rem 0 0", fontSize: "0.75rem", color: "var(--app-text-ghost)" }}>
                                 total events
                             </p>
+                            {showPositiveReplies && (
+                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "#22c55e" }}>
+                                    {totalPositiveCount.toLocaleString()}
+                                    <span style={{ marginLeft: "0.25rem", fontSize: "0.72rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
+                                        positive
+                                    </span>
+                                </p>
+                            )}
                         </>
                     )}
                 </div>
@@ -188,7 +247,7 @@ export default function InstantlyEventAnalyticsChart({
                         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
                         preserveAspectRatio="none"
                         role="img"
-                        aria-label={`Line chart of ${totalCount} events across ${rows.length} ${bucketUnit === "hour" ? "hours" : "days"}`}
+                        aria-label={`Line chart of ${totalCount} events${showPositiveReplies ? ` and ${totalPositiveCount} positive replies` : ""} across ${rows.length} ${bucketUnit === "hour" ? "hours" : "days"}`}
                         style={{ display: "block", width: "100%", height: "100%", overflow: "visible" }}
                     >
                         <defs>
@@ -200,6 +259,10 @@ export default function InstantlyEventAnalyticsChart({
                             <linearGradient id={`${chartId}-line`} x1="0" y1="0" x2="1" y2="0">
                                 <stop offset="0%" stopColor="#93c5fd" />
                                 <stop offset="100%" stopColor="#3b82f6" />
+                            </linearGradient>
+                            <linearGradient id={`${chartId}-positive-line`} x1="0" y1="0" x2="1" y2="0">
+                                <stop offset="0%" stopColor="#86efac" />
+                                <stop offset="100%" stopColor="#22c55e" />
                             </linearGradient>
                         </defs>
 
@@ -216,6 +279,38 @@ export default function InstantlyEventAnalyticsChart({
                                     strokeWidth="1"
                                     vectorEffect="non-scaling-stroke"
                                 />
+                            );
+                        })}
+
+                        {axisTicks.map((tick) => {
+                            const y = PADDING.top + plotHeight - tick * plotHeight;
+                            const eventValue = Math.round(maxEventCount * tick);
+                            const positiveValue = Math.round(maxPositiveCount * tick);
+                            return (
+                                <g key={`axis-${tick}`}>
+                                    <text
+                                        x={PADDING.left - 8}
+                                        y={y + 4}
+                                        textAnchor="end"
+                                        fill="rgba(148, 163, 184, 0.72)"
+                                        fontSize="11"
+                                        style={{ fontVariantNumeric: "tabular-nums" }}
+                                    >
+                                        {formatAxisTick(eventValue)}
+                                    </text>
+                                    {showPositiveReplies && (
+                                        <text
+                                            x={CHART_WIDTH - PADDING.right + 8}
+                                            y={y + 4}
+                                            textAnchor="start"
+                                            fill="rgba(34, 197, 94, 0.82)"
+                                            fontSize="11"
+                                            style={{ fontVariantNumeric: "tabular-nums" }}
+                                        >
+                                            {formatAxisTick(positiveValue)}
+                                        </text>
+                                    )}
+                                </g>
                             );
                         })}
 
@@ -237,6 +332,20 @@ export default function InstantlyEventAnalyticsChart({
                                 strokeLinejoin="round"
                                 pathLength={1}
                                 className="analytics-chart-line"
+                                vectorEffect="non-scaling-stroke"
+                            />
+                        )}
+
+                        {positiveLinePath && (
+                            <path
+                                d={positiveLinePath}
+                                fill="none"
+                                stroke={`url(#${chartId}-positive-line)`}
+                                strokeWidth="2.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                pathLength={1}
+                                className="analytics-chart-line analytics-chart-line--secondary"
                                 vectorEffect="non-scaling-stroke"
                             />
                         )}
@@ -297,6 +406,43 @@ export default function InstantlyEventAnalyticsChart({
                         </>
                     )}
 
+                    {hoverState && activePositivePoint && (
+                        <>
+                            <div
+                                aria-hidden
+                                style={{
+                                    position: "absolute",
+                                    top: `${activePositivePointTopPct}%`,
+                                    left: `${activePointLeftPct}%`,
+                                    width: "20px",
+                                    height: "20px",
+                                    transform: "translate(-50%, -50%)",
+                                    borderRadius: "999px",
+                                    background: "rgba(34, 197, 94, 0.16)",
+                                    pointerEvents: "none",
+                                    zIndex: 2
+                                }}
+                            />
+                            <div
+                                aria-hidden
+                                style={{
+                                    position: "absolute",
+                                    top: `${activePositivePointTopPct}%`,
+                                    left: `${activePointLeftPct}%`,
+                                    width: "10px",
+                                    height: "10px",
+                                    transform: "translate(-50%, -50%)",
+                                    borderRadius: "999px",
+                                    background: "#22c55e",
+                                    border: "2px solid rgba(255, 255, 255, 0.9)",
+                                    boxShadow: "0 0 0 1px rgba(34, 197, 94, 0.35)",
+                                    pointerEvents: "none",
+                                    zIndex: 3
+                                }}
+                            />
+                        </>
+                    )}
+
                     {hoverState && activePoint && (
                         <div
                             style={{
@@ -323,6 +469,14 @@ export default function InstantlyEventAnalyticsChart({
                                     event{activePoint.row.count === 1 ? "" : "s"}
                                 </span>
                             </p>
+                            {showPositiveReplies && (
+                                <p style={{ margin: "0.35rem 0 0", fontSize: "0.82rem", fontWeight: 600, color: "#86efac", lineHeight: 1.2 }}>
+                                    {(activePoint.row.positive_replies ?? 0).toLocaleString()}
+                                    <span style={{ marginLeft: "0.25rem", fontSize: "0.68rem", fontWeight: 500, color: "rgba(134, 239, 172, 0.72)" }}>
+                                        positive
+                                    </span>
+                                </p>
+                            )}
                         </div>
                     )}
                     </div>

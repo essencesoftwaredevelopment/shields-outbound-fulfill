@@ -792,6 +792,10 @@ body {
   animation: analyticsChartLineDraw 1.1s cubic-bezier(0.22, 1, 0.36, 1) 0.1s forwards;
 }
 
+.analytics-chart-line--secondary {
+  animation-delay: 0.25s;
+}
+
 .analytics-chart-area {
   opacity: 0;
   animation: analyticsChartAreaFade 0.8s ease 0.35s forwards;

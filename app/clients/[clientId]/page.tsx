@@ -218,6 +218,7 @@ type InstantlyEventAnalyticsByHourRow = {
     bucket: string;
     label: string;
     count: number;
+    positive_replies?: number;
 };
 
 type InstantlyEventAnalyticsPeriod = "24h" | "7d" | "30d" | "90d";
@@ -7017,6 +7018,13 @@ export default function ClientPage() {
                                     || displayAnalytics?.eventType?.label
                                     || "Events";
                                 const showAnalyticsLoading = instantlyEventAnalyticsLoading || !analyticsMatchesFilters;
+                                const positiveReplyRateLabel = displayAnalytics
+                                    ? `${(
+                                        displayAnalytics.summary.emails_sent > 0
+                                            ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.emails_sent) * 100
+                                            : 0
+                                    ).toFixed(2)}% PRR`
+                                    : undefined;
                                 const analyticsStatCards: AnalyticsStatCard[] = isFiltered
                                     ? [
                                         {
@@ -7076,6 +7084,7 @@ export default function ClientPage() {
                                             key: "positive_replies",
                                             label: "Positive replies",
                                             value: summary?.positive_replies ?? 0,
+                                            subLabel: positiveReplyRateLabel,
                                             border: "var(--app-border-mid)",
                                             icon: (
                                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -7199,6 +7208,7 @@ export default function ClientPage() {
                                     || instantlyEventAnalytics?.eventType?.label
                                     || "All event types"
                                 }
+                                showPositiveReplies={instantlyEventAnalyticsEventType === "all"}
                                 loading={instantlyEventAnalyticsLoading || !(
                                     instantlyEventAnalytics
                                     && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType

@@ -50,7 +50,7 @@ import {
     sanitizeHtml
 } from '../services/followUpSender.js';
 import { runFollowUpsForClient } from '../services/followUpSender.js';
-import { buildPositiveRepliesCountSql } from '../utils/positiveReplyAnalytics.js';
+import { loadInstantlyEventAnalytics } from '../utils/instantlyEventAnalytics.js';
 
 const router = express.Router();
 const upload = multer({
@@ -683,7 +683,6 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
         const periodConfig = INSTANTLY_ANALYTICS_PERIODS[requestedPeriod] || INSTANTLY_ANALYTICS_PERIODS['24h'];
         const requestedEventType = String(req.query?.eventType || 'all').trim().toLowerCase();
         const eventTypeFilter = buildInstantlyEventTypeFilterClause(requestedEventType, 'cie', '$3');
-        const analyticsParams = [agencyId, sqlClientId, ...eventTypeFilter.params];
 
         let realtimeWebsocketUrl = null;
         try {
@@ -698,126 +697,38 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             realtimeWebsocketUrl = null;
         }
 
-        const [summaryResult, positiveRepliesResult] = await Promise.all([
-            pool.query(
-                `SELECT
-                    COUNT(*)::int AS total_events,
-                    COUNT(DISTINCT cie.contact_id)::int AS unique_contacts,
-                    COUNT(DISTINCT cie.campaign_id)::int AS unique_campaigns,
-                    COUNT(*) FILTER (
-                        WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
-                    )::int AS emails_sent,
-                    COUNT(*) FILTER (
-                        WHERE LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
-                    )::int AS meetings_booked,
-                    COUNT(*) FILTER (
-                        WHERE LOWER(COALESCE(cie.event_type, '')) IN ('reply', 'replied')
-                    )::int AS reply_events,
-                    COUNT(*) FILTER (
-                        WHERE LOWER(COALESCE(cie.event_type, '')) LIKE '%bounce%'
-                    )::int AS bounce_events,
-                    MIN(cie.event_timestamp) AS first_event_at,
-                    MAX(cie.event_timestamp) AS last_event_at
-                FROM contact_instantly_events cie
-                WHERE cie.agency_id = $1
-                AND cie.client_id = $2
-                AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}`,
-                analyticsParams
-            ),
-            pool.query(
-                buildPositiveRepliesCountSql(periodConfig.eventFloorSql),
-                [agencyId, sqlClientId]
-            )
-        ]);
-
-        const byHourResult = await pool.query(
-            `SELECT
-                TO_CHAR(hours.bucket, 'YYYY-MM-DD\"T\"HH24:00:00\"Z\"') AS bucket,
-                ${periodConfig.bucketLabelSql} AS label,
-                COALESCE(counts.count, 0)::int AS count
-            FROM generate_series(
-                ${periodConfig.bucketStartSql},
-                ${periodConfig.bucketEndSql},
-                INTERVAL '1 ${periodConfig.bucketUnit}'
-            ) AS hours(bucket)
-            LEFT JOIN (
-                SELECT
-                    ${periodConfig.bucketTruncSql} AS bucket,
-                    COUNT(*)::int AS count
-                FROM contact_instantly_events cie
-                WHERE cie.agency_id = $1
-                AND cie.client_id = $2
-                AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}
-                GROUP BY 1
-            ) counts ON counts.bucket = hours.bucket
-            ORDER BY hours.bucket ASC`,
-            analyticsParams
-        );
-
-        const eventTypeResult = await pool.query(
-            `SELECT DISTINCT LOWER(COALESCE(cie.event_type, 'unknown')) AS event_type
-            FROM contact_instantly_events cie
-            WHERE cie.agency_id = $1
-            AND cie.client_id = $2
-            AND cie.event_timestamp >= ${periodConfig.eventFloorSql}`,
-            [agencyId, sqlClientId]
-        );
-
-        const recentEventsResult = await pool.query(
-            `SELECT
-                cie.id::text AS id,
-                LOWER(COALESCE(cie.event_type, 'unknown')) AS event_type,
-                cie.reply_category,
-                cie.lead_email,
-                cie.contact_id::text AS contact_id,
-                cie.email_account,
-                cie.message_text,
-                cie.reply_text_snippet,
-                cie.event_timestamp,
-                ic.name AS campaign_name
-            FROM contact_instantly_events cie
-            LEFT JOIN instantly_campaigns ic ON ic.id = cie.campaign_id
-            WHERE cie.agency_id = $1
-            AND cie.client_id = $2
-            AND cie.event_timestamp >= ${periodConfig.eventFloorSql}${eventTypeFilter.clause}
-            ORDER BY cie.event_timestamp DESC NULLS LAST, cie.created_at DESC NULLS LAST, cie.id DESC
-            LIMIT 25`,
-            analyticsParams
-        );
-
-        const followUpStatsResult = await pool.query(
-            `SELECT
-                COUNT(*) FILTER (
-                    WHERE fus.sent_for_date = CURRENT_DATE
-                )::int AS follow_up_sent_today,
-                COUNT(*) FILTER (
-                    WHERE fus.sent_for_date = CURRENT_DATE - INTERVAL '1 day'
-                )::int AS follow_up_sent_yesterday,
-                COUNT(*) FILTER (
-                    WHERE fus.sent_for_date >= CURRENT_DATE - INTERVAL '6 days'
-                )::int AS follow_up_sent_7d
-            FROM follow_up_sends fus
-            WHERE fus.client_id = $1
-              AND fus.status = 'sent'`,
-            [sqlClientId]
-        );
-        const followUpStats = followUpStatsResult.rows[0] || {
-            follow_up_sent_today: 0,
-            follow_up_sent_yesterday: 0,
-            follow_up_sent_7d: 0
-        };
+        const analytics = await loadInstantlyEventAnalytics({
+            pool,
+            agencyId,
+            sqlClientId,
+            periodConfig,
+            eventTypeFilter
+        });
 
         const availableEventTypes = [
             { value: 'all', label: formatInstantlyEventTypeLabel('all') },
             ...Array.from(
                 new Map(
-                    eventTypeResult.rows
+                    analytics.eventTypeRows
                         .map((row) => normalizeInstantlyEventType(row.event_type))
                         .filter(Boolean)
                         .map((value) => [value, { value, label: formatInstantlyEventTypeLabel(value) }])
                 ).values()
             )
         ];
+
+        const summaryDefaults = {
+            total_events: 0,
+            unique_contacts: 0,
+            unique_campaigns: 0,
+            emails_sent: 0,
+            meetings_booked: 0,
+            reply_events: 0,
+            bounce_events: 0,
+            first_event_at: null,
+            last_event_at: null,
+            positive_replies: 0
+        };
 
         res.json({
             clientSqlId: sqlClientId,
@@ -832,8 +743,8 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
                 period: periodConfig.period,
                 label: periodConfig.label,
                 bucketUnit: periodConfig.bucketUnit,
-                startAt: new Date(byHourResult.rows[0]?.bucket || Date.now()).toISOString(),
-                endAt: new Date(byHourResult.rows[byHourResult.rows.length - 1]?.bucket || Date.now()).toISOString()
+                startAt: new Date(analytics.byHour[0]?.bucket || Date.now()).toISOString(),
+                endAt: new Date(analytics.byHour[analytics.byHour.length - 1]?.bucket || Date.now()).toISOString()
             },
             eventType: {
                 value: eventTypeFilter.normalized,
@@ -841,22 +752,11 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             },
             availableEventTypes,
             summary: {
-                ...(summaryResult.rows[0] || {
-                    total_events: 0,
-                    unique_contacts: 0,
-                    unique_campaigns: 0,
-                    emails_sent: 0,
-                    meetings_booked: 0,
-                    reply_events: 0,
-                    bounce_events: 0,
-                    first_event_at: null,
-                    last_event_at: null
-                }),
-                positive_replies: positiveRepliesResult.rows[0]?.positive_replies ?? 0,
-                ...followUpStats
+                ...(analytics.summary || summaryDefaults),
+                ...analytics.followUpStats
             },
-            byHour: byHourResult.rows,
-            recentEvents: recentEventsResult.rows
+            byHour: analytics.byHour,
+            recentEvents: analytics.recentEvents
         });
     } catch (error) {
         const statusCode = Number(error?.statusCode || 500);

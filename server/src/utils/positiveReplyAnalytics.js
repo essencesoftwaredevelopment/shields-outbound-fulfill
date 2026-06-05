@@ -119,20 +119,23 @@ export function countQualifiedInterestedContacts(events, { periodStart, periodEn
     return qualifiedCount;
 }
 
-export function buildPositiveRepliesCountSql(periodFloorSql) {
+export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql) {
     const qualifyingEventTypesSql = Array.from(QUALIFYING_EVENT_TYPES)
         .map((eventType) => `'${eventType}'`)
         .join(',\n                        ');
 
     return `
-        WITH period_interested_contacts AS (
-            SELECT DISTINCT cie.contact_id
+        period_interested_contacts AS (
+            SELECT DISTINCT ON (cie.contact_id)
+                cie.contact_id,
+                cie.event_timestamp AS interested_at
             FROM contact_instantly_events cie
             WHERE cie.agency_id = $1
               AND cie.client_id = $2
               AND cie.contact_id IS NOT NULL
               AND LOWER(TRIM(COALESCE(cie.event_type, ''))) = '${INTERESTED_EVENT_TYPE}'
               AND cie.event_timestamp >= ${periodFloorSql}
+            ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
         ),
         lifecycle_events AS (
             SELECT
@@ -169,10 +172,32 @@ export function buildPositiveRepliesCountSql(periodFloorSql) {
             FROM lifecycle_events
             WHERE lifecycle_state IS NOT NULL
             ORDER BY contact_id, event_timestamp DESC NULLS LAST, id DESC
-        )
+        ),
+        qualified_contacts AS (
+            SELECT
+                pic.contact_id,
+                pic.interested_at
+            FROM period_interested_contacts pic
+            INNER JOIN last_lifecycle ll ON ll.contact_id = pic.contact_id
+            WHERE ll.lifecycle_state = 1
+        )`;
+}
+
+export function buildPositiveRepliesCountSql(periodFloorSql) {
+    return `
+        WITH ${buildPositiveRepliesLifecycleCtesSql(periodFloorSql)}
         SELECT COUNT(*)::int AS positive_replies
-        FROM period_interested_contacts pic
-        INNER JOIN last_lifecycle ll ON ll.contact_id = pic.contact_id
-        WHERE ll.lifecycle_state = 1
+        FROM qualified_contacts
+    `;
+}
+
+export function buildPositiveRepliesByBucketSql(periodFloorSql, bucketUnit) {
+    return `
+        WITH ${buildPositiveRepliesLifecycleCtesSql(periodFloorSql)}
+        SELECT
+            TO_CHAR(DATE_TRUNC('${bucketUnit}', qc.interested_at), 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
+            COUNT(*)::int AS count
+        FROM qualified_contacts qc
+        GROUP BY 1
     `;
 }

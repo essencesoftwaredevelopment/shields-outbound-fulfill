@@ -3,21 +3,7 @@
  * req.agencyId = legacy agency_id from agency_auth_map when mapped, else Supabase user id.
  */
 
-import { getSupabaseAdmin } from '../config/supabase.js';
-import { env } from '../config/env.js';
-import { resolveLegacyAgencyId } from '../services/db/agencyAuthMap.js';
-
-let supabaseAdmin = null;
-
-function getAdmin() {
-    if (!supabaseAdmin) {
-        if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
-            throw new Error('Supabase auth is not configured (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)');
-        }
-        supabaseAdmin = getSupabaseAdmin();
-    }
-    return supabaseAdmin;
-}
+import { resolveAuthFromBearerToken } from '../utils/authCache.js';
 
 export async function verifySupabaseToken(req, res, next) {
     try {
@@ -27,26 +13,20 @@ export async function verifySupabaseToken(req, res, next) {
         }
 
         const token = authHeader.slice(7);
-        const { data, error } = await getAdmin().auth.getUser(token);
-
-        if (error || !data?.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
-
-        const user = data.user;
-        const agencyId = await resolveLegacyAgencyId(user.id);
+        const auth = await resolveAuthFromBearerToken(token);
         req.auth = {
-            agencyId,
-            supabaseUserId: user.id,
-            uid: agencyId,
-            email: user.email,
-            emailVerified: !!user.email_confirmed_at
+            agencyId: auth.agencyId,
+            supabaseUserId: auth.supabaseUserId,
+            uid: auth.agencyId,
+            email: auth.email,
+            emailVerified: auth.emailVerified
         };
-        req.agencyId = agencyId;
+        req.agencyId = auth.agencyId;
         next();
     } catch (error) {
         console.error('Supabase token verification failed:', error.message);
-        res.status(401).json({ error: 'Unauthorized' });
+        const statusCode = Number(error?.statusCode || 401);
+        res.status(statusCode).json({ error: error?.message || 'Unauthorized' });
     }
 }
 
