@@ -130,11 +130,11 @@ export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql) {
                 cie.contact_id,
                 cie.event_timestamp AS interested_at
             FROM contact_instantly_events cie
-            WHERE cie.agency_id = $1
-              AND cie.client_id = $2
-              AND cie.contact_id IS NOT NULL
+            WHERE cie.client_id = $2
               AND LOWER(TRIM(COALESCE(cie.event_type, ''))) = '${INTERESTED_EVENT_TYPE}'
               AND cie.event_timestamp >= ${periodFloorSql}
+              AND cie.agency_id = $1
+              AND cie.contact_id IS NOT NULL
             ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
         ),
         lifecycle_events AS (
@@ -161,8 +161,8 @@ export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql) {
                     ELSE NULL
                 END AS lifecycle_state
             FROM contact_instantly_events cie
-            WHERE cie.agency_id = $1
-              AND cie.client_id = $2
+            WHERE cie.client_id = $2
+              AND cie.agency_id = $1
               AND cie.contact_id IN (SELECT contact_id FROM period_interested_contacts)
         ),
         last_lifecycle AS (

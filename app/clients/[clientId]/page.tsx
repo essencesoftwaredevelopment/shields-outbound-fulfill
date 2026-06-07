@@ -8074,9 +8074,26 @@ export default function ClientPage() {
                                                     ?? extractNumberFrom(summary, ["Found", "found"])
                                                     ?? throughputNum
                                                     ?? 0;
-                                                const attempted = typeof stage?.progress?.processed === "number"
-                                                    ? stage.progress.processed
-                                                    : total ?? 0;
+                                                // `stage.progress.processed` is job-wide: it includes the offset for
+                                                // founders that had no name (or were already done) and were never
+                                                // actually email-checked. Using it as the denominator inflates "checked"
+                                                // and crushes the hit rate. The lookup outcomes (Found / Not Found /
+                                                // errors) are scoped to THIS run — the same scope as `found` — so they
+                                                // give the true number of emails checked this run.
+                                                const notFound =
+                                                    extractNumberFrom(stats, ["Not Found", "not_found", "notFound"])
+                                                    ?? extractNumberFrom(summary, ["Not Found", "not_found", "notFound"])
+                                                    ?? 0;
+                                                const errored =
+                                                    extractNumberFrom(stats, ["errors", "Errors"])
+                                                    ?? extractNumberFrom(summary, ["errors", "Errors"])
+                                                    ?? 0;
+                                                const checkedThisRun = found + notFound + errored;
+                                                const attempted = checkedThisRun > 0
+                                                    ? checkedThisRun
+                                                    : (typeof stage?.progress?.processed === "number"
+                                                        ? stage.progress.processed
+                                                        : total ?? 0);
                                                 heroNumber = found;
                                                 heroLabel = "Emails Found";
                                                 subtext = attempted > 0
