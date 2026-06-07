@@ -42,6 +42,9 @@ export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilter
             COUNT(*) FILTER (
                 WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
             )::int AS emails_sent,
+            COUNT(DISTINCT cie.contact_id) FILTER (
+                WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
+            )::int AS contacts_emailed,
             COUNT(*) FILTER (
                 WHERE LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
             )::int AS meetings_booked,

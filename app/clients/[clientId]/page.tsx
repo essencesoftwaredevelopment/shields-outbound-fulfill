@@ -203,6 +203,7 @@ type InstantlyEventAnalyticsSummary = {
     unique_contacts: number;
     unique_campaigns: number;
     emails_sent: number;
+    contacts_emailed: number;
     positive_replies: number;
     meetings_booked: number;
     reply_events: number;
@@ -7024,8 +7025,8 @@ export default function ClientPage() {
                                 const showAnalyticsLoading = instantlyEventAnalyticsLoading || !analyticsMatchesFilters;
                                 const positiveReplyRateLabel = displayAnalytics
                                     ? `${(
-                                        displayAnalytics.summary.emails_sent > 0
-                                            ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.emails_sent) * 100
+                                        displayAnalytics.summary.contacts_emailed > 0
+                                            ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.contacts_emailed) * 100
                                             : 0
                                     ).toFixed(2)}% PRR`
                                     : undefined;
@@ -7081,6 +7082,20 @@ export default function ClientPage() {
                                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                                                     <path d="M4 6h16v12H4z" />
                                                     <path d="m22 7-10 7L2 7" />
+                                                </svg>
+                                            )
+                                        },
+                                        {
+                                            key: "contacts_emailed",
+                                            label: "Contacts emailed",
+                                            value: summary?.contacts_emailed ?? 0,
+                                            border: "var(--app-border-mid)",
+                                            icon: (
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                                                    <circle cx="9" cy="7" r="4" />
+                                                    <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
                                                 </svg>
                                             )
                                         },

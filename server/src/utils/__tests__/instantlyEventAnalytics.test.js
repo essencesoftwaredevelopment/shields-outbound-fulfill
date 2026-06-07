@@ -40,6 +40,7 @@ test('summary query scans the base table directly without analytics CTE bundle',
     assert.doesNotMatch(sql, /filtered_events/);
     assert.doesNotMatch(sql, /InitPlan/);
     assert.match(sql, /COUNT\(DISTINCT cie\.contact_id\)/);
+    assert.match(sql, /COUNT\(DISTINCT cie\.contact_id\) FILTER \(\s*WHERE LOWER\(COALESCE\(cie\.event_type, ''\)\) = 'email_sent'\s*\)::int AS contacts_emailed/);
 });
 
 test('bucket and event-type queries use direct grouped scans', () => {
