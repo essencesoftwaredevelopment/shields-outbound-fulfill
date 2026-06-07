@@ -1693,6 +1693,8 @@ export default function ClientPage() {
     const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
     const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>([]);
     const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string; joinOp: 'AND' | 'OR' }>>([]);
+    // Bumped on each "Run Query" press so the query re-runs even when filters are unchanged (underlying data is dynamic)
+    const [leadQueryNonce, setLeadQueryNonce] = useState(0);
     const [checkingKlaviyo, setCheckingKlaviyo] = useState(false);
     const [exportingCsv, setExportingCsv] = useState(false);
     const [leadExportModalOpen, setLeadExportModalOpen] = useState(false);
@@ -2338,6 +2340,8 @@ export default function ClientPage() {
 
     const applyLeadFilters = useCallback(() => {
         setAppliedLeadFilters(normalizedLeadFilters);
+        // Force a refetch even when the filters haven't changed
+        setLeadQueryNonce((nonce) => nonce + 1);
     }, [normalizedLeadFilters]);
 
     const leadFilterContent = useMemo(() => {
@@ -2713,7 +2717,7 @@ export default function ClientPage() {
             fetchLeadTotal();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user?.id, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters]);
+    }, [user?.id, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters, leadQueryNonce]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -6524,7 +6528,7 @@ export default function ClientPage() {
                                 type="button"
                                 className="primary-button"
                                 onClick={applyLeadFilters}
-                                disabled={leadsLoading || !leadFiltersDirty}
+                                disabled={leadsLoading}
                             >
                                 Run Query
                             </button>
