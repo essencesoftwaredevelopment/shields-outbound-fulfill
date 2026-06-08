@@ -7,6 +7,7 @@ import {
     buildInstantlyEventSummaryQuery,
     buildInstantlyEventTypesQuery,
     buildInstantlyRecentEventsQuery,
+    buildEmailsSentByBucketQuery,
     buildMeetingsBookedByBucketQuery,
     generateBucketSeries,
     mergeAnalyticsBuckets
@@ -64,6 +65,15 @@ test('meetings booked bucket query filters by period and event type', () => {
     assert.match(sql, /GROUP BY 1/);
 });
 
+test('emails sent bucket query filters by period and event type', () => {
+    const sql = buildEmailsSentByBucketQuery(PERIOD_CONFIG_7D);
+
+    assert.match(sql, /FROM contact_instantly_events cie/);
+    assert.match(sql, /cie\.client_id = \$2/);
+    assert.match(sql, /email_sent/);
+    assert.match(sql, /GROUP BY 1/);
+});
+
 test('follow-up stats query filters by selected window and sent status', () => {
     const sql = buildFollowUpStatsQuery(`NOW() - INTERVAL '7 days'`);
 
@@ -98,6 +108,7 @@ test('mergeAnalyticsBuckets fills missing buckets with zero counts', () => {
     const merged = mergeAnalyticsBuckets({
         periodConfig,
         eventBucketRows: [{ bucket: firstBucket.bucket, count: 12 }],
+        emailsSentBucketRows: [{ bucket: firstBucket.bucket, count: 9 }],
         positiveReplyBucketRows: [{ bucket: secondBucket.bucket, count: 3 }],
         meetingsBookedBucketRows: [{ bucket: secondBucket.bucket, count: 2 }]
     });
@@ -105,9 +116,11 @@ test('mergeAnalyticsBuckets fills missing buckets with zero counts', () => {
     assert.equal(merged.length, 7);
     assert.equal(merged[0].bucket, firstBucket.bucket);
     assert.equal(merged[0].count, 12);
+    assert.equal(merged[0].emails_sent, 9);
     assert.equal(merged[0].positive_replies, 0);
     assert.equal(merged[0].meetings_booked, 0);
     assert.equal(merged[1].positive_replies, 3);
     assert.equal(merged[1].meetings_booked, 2);
     assert.equal(merged[1].count, 0);
+    assert.equal(merged[1].emails_sent, 0);
 });

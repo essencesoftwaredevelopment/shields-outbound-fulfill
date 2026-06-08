@@ -77,6 +77,22 @@ export function buildMeetingsBookedByBucketQuery(periodConfig) {
     `;
 }
 
+export function buildEmailsSentByBucketQuery(periodConfig) {
+    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
+    const bucketTruncSql = periodConfig.bucketTruncSql;
+
+    return `
+        SELECT
+            TO_CHAR(${bucketTruncSql}, 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
+            COUNT(*)::int AS count
+        FROM contact_instantly_events cie
+        WHERE ${periodFilterSql}
+          AND LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
+        GROUP BY 1
+        ORDER BY 1 ASC
+    `;
+}
+
 export function buildInstantlyEventBucketCountsQuery(periodConfig, periodFilterSql, eventTypeFilterClause) {
     const bucketTruncSql = periodConfig.bucketTruncSql;
 
@@ -202,11 +218,15 @@ export function generateBucketSeries(periodConfig, now = new Date()) {
 export function mergeAnalyticsBuckets({
     periodConfig,
     eventBucketRows,
+    emailsSentBucketRows,
     positiveReplyBucketRows,
     meetingsBookedBucketRows
 }) {
     const eventCounts = new Map(
         (eventBucketRows || []).map((row) => [row.bucket, Number(row.count) || 0])
+    );
+    const emailsSentCounts = new Map(
+        (emailsSentBucketRows || []).map((row) => [row.bucket, Number(row.count) || 0])
     );
     const positiveReplyCounts = new Map(
         (positiveReplyBucketRows || []).map((row) => [row.bucket, Number(row.count) || 0])
@@ -219,6 +239,7 @@ export function mergeAnalyticsBuckets({
         bucket,
         label,
         count: eventCounts.get(bucket) ?? 0,
+        emails_sent: emailsSentCounts.get(bucket) ?? 0,
         positive_replies: positiveReplyCounts.get(bucket) ?? 0,
         meetings_booked: meetingsBookedCounts.get(bucket) ?? 0
     }));
@@ -263,6 +284,7 @@ export async function loadInstantlyEventAnalytics({
             positiveRepliesResult,
             positiveRepliesByBucketResult,
             meetingsBookedByBucketResult,
+            emailsSentByBucketResult,
             recentEventsResult,
             followUpStatsResult
         ] = await Promise.all([
@@ -295,6 +317,10 @@ export async function loadInstantlyEventAnalytics({
                 lifecycleParams
             ),
             pool.query(
+                buildEmailsSentByBucketQuery(periodConfig),
+                lifecycleParams
+            ),
+            pool.query(
                 buildInstantlyRecentEventsQuery(periodConfig.eventFloorSql, eventTypeFilter.clause),
                 analyticsParams
             ),
@@ -318,6 +344,7 @@ export async function loadInstantlyEventAnalytics({
             byHour: mergeAnalyticsBuckets({
                 periodConfig,
                 eventBucketRows: bucketCountsResult.rows,
+                emailsSentBucketRows: emailsSentByBucketResult.rows,
                 positiveReplyBucketRows: positiveRepliesByBucketResult.rows,
                 meetingsBookedBucketRows: meetingsBookedByBucketResult.rows
             }),

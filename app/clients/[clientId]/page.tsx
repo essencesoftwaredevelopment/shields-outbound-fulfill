@@ -16,6 +16,7 @@ import { apiFetch, apiJson } from "@/lib/api/http";
 import { createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
+import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
     PipelineJob,
     PipelineStageKey,
@@ -26,6 +27,39 @@ import {
 /** HTTP fallback for upload / discovery — not for live pipeline progress (useJobRealtime). */
 const ACTIVE_JOB_POLL_MS = 10_000;
 const ACTIVE_JOB_POLL_MIN_GAP_MS = 5_000;
+
+const PRR_COLOR_MIN = 0.1;
+const PRR_COLOR_MAX = 1;
+
+function interpolateRgb(
+    from: [number, number, number],
+    to: [number, number, number],
+    t: number
+) {
+    const r = Math.round(from[0] + (to[0] - from[0]) * t);
+    const g = Math.round(from[1] + (to[1] - from[1]) * t);
+    const b = Math.round(from[2] + (to[2] - from[2]) * t);
+    return `rgb(${r}, ${g}, ${b})`;
+}
+
+function getPositiveReplyRateColor(percent: number) {
+    const red: [number, number, number] = [239, 68, 68];
+    const orange: [number, number, number] = [249, 115, 22];
+    const green: [number, number, number] = [34, 197, 94];
+
+    if (percent <= PRR_COLOR_MIN) {
+        return `rgb(${red.join(", ")})`;
+    }
+    if (percent >= PRR_COLOR_MAX) {
+        return `rgb(${green.join(", ")})`;
+    }
+
+    const t = (percent - PRR_COLOR_MIN) / (PRR_COLOR_MAX - PRR_COLOR_MIN);
+    if (t <= 0.5) {
+        return interpolateRgb(red, orange, t / 0.5);
+    }
+    return interpolateRgb(orange, green, (t - 0.5) / 0.5);
+}
 
 // Helper function to retry fetch on connection errors
 async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
@@ -217,6 +251,7 @@ type InstantlyEventAnalyticsByHourRow = {
     bucket: string;
     label: string;
     count: number;
+    emails_sent?: number;
     positive_replies?: number;
     meetings_booked?: number;
 };
@@ -7016,6 +7051,9 @@ export default function ClientPage() {
                                     border: string;
                                     icon: ReactNode;
                                     subLabel?: string;
+                                    secondaryValue?: number;
+                                    secondaryLabel?: string;
+                                    ratePercent?: number;
                                 };
 
                                 const analyticsMatchesFilters = instantlyEventAnalytics
@@ -7028,13 +7066,9 @@ export default function ClientPage() {
                                     || displayAnalytics?.eventType?.label
                                     || "Events";
                                 const showAnalyticsLoading = instantlyEventAnalyticsLoading || !analyticsMatchesFilters;
-                                const positiveReplyRateLabel = displayAnalytics
-                                    ? `${(
-                                        displayAnalytics.summary.contacts_emailed > 0
-                                            ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.contacts_emailed) * 100
-                                            : 0
-                                    ).toFixed(2)}% PRR`
-                                    : undefined;
+                                const positiveReplyRatePercent = displayAnalytics && (displayAnalytics.summary.contacts_emailed ?? 0) > 0
+                                    ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.contacts_emailed) * 100
+                                    : 0;
                                 const analyticsStatCards: AnalyticsStatCard[] = isFiltered
                                     ? [
                                         {
@@ -7082,54 +7116,25 @@ export default function ClientPage() {
                                             key: "emails_sent",
                                             label: "Emails sent",
                                             value: summary?.emails_sent ?? 0,
+                                            secondaryValue: summary?.contacts_emailed ?? 0,
+                                            secondaryLabel: "Contacts emailed",
                                             border: "var(--app-border-mid)",
-                                            icon: (
-                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                    <path d="M4 6h16v12H4z" />
-                                                    <path d="m22 7-10 7L2 7" />
-                                                </svg>
-                                            )
-                                        },
-                                        {
-                                            key: "contacts_emailed",
-                                            label: "Contacts emailed",
-                                            value: summary?.contacts_emailed ?? 0,
-                                            border: "var(--app-border-mid)",
-                                            icon: (
-                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-                                                    <circle cx="9" cy="7" r="4" />
-                                                    <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-                                                </svg>
-                                            )
+                                            icon: <SendHorizontal width={18} height={18} strokeWidth={1.8} />
                                         },
                                         {
                                             key: "positive_replies",
                                             label: "Positive replies",
                                             value: summary?.positive_replies ?? 0,
-                                            subLabel: positiveReplyRateLabel,
+                                            ratePercent: positiveReplyRatePercent,
                                             border: "var(--app-border-mid)",
-                                            icon: (
-                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                                                    <path d="m9 10 2 2 4-4" />
-                                                </svg>
-                                            )
+                                            icon: <MessageCircleCheck width={18} height={18} strokeWidth={1.8} />
                                         },
                                         {
                                             key: "meetings_booked",
                                             label: "Meetings booked",
                                             value: summary?.meetings_booked ?? 0,
                                             border: "var(--app-border-mid)",
-                                            icon: (
-                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                                    <rect x="3" y="4" width="18" height="18" rx="2" />
-                                                    <path d="M16 2v4" />
-                                                    <path d="M8 2v4" />
-                                                    <path d="M3 10h18" />
-                                                </svg>
-                                            )
+                                            icon: <CalendarCheck width={18} height={18} strokeWidth={1.8} />
                                         }
                                     ];
 
@@ -7139,12 +7144,7 @@ export default function ClientPage() {
                                     value: summary?.follow_up_sent ?? 0,
                                     subLabel: displayAnalytics?.window?.label,
                                     border: "rgba(234, 179, 8, 0.28)",
-                                    icon: (
-                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" />
-                                            <path d="M8 12.5l2.5 2.5L16 9" />
-                                        </svg>
-                                    )
+                                    icon: <MessageCircleReply width={18} height={18} strokeWidth={1.8} />
                                 };
 
                                 return (
@@ -7157,7 +7157,7 @@ export default function ClientPage() {
                                     <div
                                         key={card.key}
                                         style={{
-                                            padding: "1.15rem 1.2rem",
+                                            padding: card.secondaryValue !== undefined ? "1.35rem 1.2rem" : "1.15rem 1.2rem",
                                             borderRadius: "16px",
                                             background: "transparent",
                                             border: `1px solid ${card.border}`,
@@ -7169,7 +7169,17 @@ export default function ClientPage() {
                                         <div>
                                             {showAnalyticsLoading ? (
                                                 <>
-                                                    <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
+                                                    {card.ratePercent !== undefined ? (
+                                                        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "0.75rem" }}>
+                                                            <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
+                                                            <div className="analytics-skeleton" style={{ width: "88px", height: "28px", marginBottom: "0.3rem" }} />
+                                                        </div>
+                                                    ) : (
+                                                        <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
+                                                    )}
+                                                    {card.secondaryValue !== undefined && (
+                                                        <div className="analytics-skeleton" style={{ width: "56px", height: "22px", marginTop: "0.45rem" }} />
+                                                    )}
                                                     <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
                                                         <div className="analytics-skeleton" style={{ width: "18px", height: "18px", borderRadius: "999px", flexShrink: 0 }} />
                                                         <div className="analytics-skeleton" style={{ width: "112px", height: "14px" }} />
@@ -7180,9 +7190,37 @@ export default function ClientPage() {
                                                 </>
                                             ) : (
                                                 <>
-                                                    <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
-                                                        {card.value.toLocaleString()}
-                                                    </p>
+                                                    {card.ratePercent !== undefined ? (
+                                                        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "0.75rem" }}>
+                                                            <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
+                                                                {card.value.toLocaleString()}
+                                                            </p>
+                                                            <p style={{
+                                                                margin: 0,
+                                                                paddingBottom: "0.3rem",
+                                                                fontSize: "1.45rem",
+                                                                lineHeight: 1,
+                                                                fontWeight: 700,
+                                                                color: getPositiveReplyRateColor(card.ratePercent),
+                                                                whiteSpace: "nowrap",
+                                                                fontVariantNumeric: "tabular-nums"
+                                                            }}>
+                                                                {card.ratePercent.toFixed(2)}% PRR
+                                                            </p>
+                                                        </div>
+                                                    ) : (
+                                                        <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
+                                                            {card.value.toLocaleString()}
+                                                        </p>
+                                                    )}
+                                                    {card.secondaryValue !== undefined && (
+                                                        <p style={{ margin: "0.45rem 0 0", fontSize: "1.2rem", lineHeight: 1.1, fontWeight: 600, color: "var(--app-text-muted)" }}>
+                                                            {card.secondaryValue.toLocaleString()}
+                                                            <span style={{ marginLeft: "0.3rem", fontSize: "0.78rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
+                                                                {card.secondaryLabel?.toLowerCase()}
+                                                            </span>
+                                                        </p>
+                                                    )}
                                                     <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
                                                         <div style={{
                                                             display: "inline-flex",
