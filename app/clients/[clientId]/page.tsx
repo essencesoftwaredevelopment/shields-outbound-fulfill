@@ -7051,9 +7051,11 @@ export default function ClientPage() {
                                     border: string;
                                     icon: ReactNode;
                                     subLabel?: string;
-                                    secondaryValue?: number;
-                                    secondaryLabel?: string;
-                                    ratePercent?: number;
+                                    secondaryLine?: {
+                                        value: string;
+                                        label: string;
+                                        color?: string;
+                                    };
                                 };
 
                                 const analyticsMatchesFilters = instantlyEventAnalytics
@@ -7068,6 +7070,9 @@ export default function ClientPage() {
                                 const showAnalyticsLoading = instantlyEventAnalyticsLoading || !analyticsMatchesFilters;
                                 const positiveReplyRatePercent = displayAnalytics && (displayAnalytics.summary.contacts_emailed ?? 0) > 0
                                     ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.contacts_emailed) * 100
+                                    : 0;
+                                const bookingRatePercent = displayAnalytics && (displayAnalytics.summary.positive_replies ?? 0) > 0
+                                    ? ((displayAnalytics.summary.meetings_booked ?? 0) / displayAnalytics.summary.positive_replies) * 100
                                     : 0;
                                 const analyticsStatCards: AnalyticsStatCard[] = isFiltered
                                     ? [
@@ -7116,8 +7121,10 @@ export default function ClientPage() {
                                             key: "emails_sent",
                                             label: "Emails sent",
                                             value: summary?.emails_sent ?? 0,
-                                            secondaryValue: summary?.contacts_emailed ?? 0,
-                                            secondaryLabel: "Contacts emailed",
+                                            secondaryLine: {
+                                                value: (summary?.contacts_emailed ?? 0).toLocaleString(),
+                                                label: "contacts emailed",
+                                            },
                                             border: "var(--app-border-mid)",
                                             icon: <SendHorizontal width={18} height={18} strokeWidth={1.8} />
                                         },
@@ -7125,7 +7132,11 @@ export default function ClientPage() {
                                             key: "positive_replies",
                                             label: "Positive replies",
                                             value: summary?.positive_replies ?? 0,
-                                            ratePercent: positiveReplyRatePercent,
+                                            secondaryLine: {
+                                                value: `${positiveReplyRatePercent.toFixed(2)}%`,
+                                                label: "prr",
+                                                color: getPositiveReplyRateColor(positiveReplyRatePercent),
+                                            },
                                             border: "var(--app-border-mid)",
                                             icon: <MessageCircleCheck width={18} height={18} strokeWidth={1.8} />
                                         },
@@ -7133,6 +7144,10 @@ export default function ClientPage() {
                                             key: "meetings_booked",
                                             label: "Meetings booked",
                                             value: summary?.meetings_booked ?? 0,
+                                            secondaryLine: {
+                                                value: `${bookingRatePercent.toFixed(2)}%`,
+                                                label: "booking rate",
+                                            },
                                             border: "var(--app-border-mid)",
                                             icon: <CalendarCheck width={18} height={18} strokeWidth={1.8} />
                                         }
@@ -7157,7 +7172,7 @@ export default function ClientPage() {
                                     <div
                                         key={card.key}
                                         style={{
-                                            padding: card.secondaryValue !== undefined ? "1.35rem 1.2rem" : "1.15rem 1.2rem",
+                                            padding: card.secondaryLine ? "1.35rem 1.2rem" : "1.15rem 1.2rem",
                                             borderRadius: "16px",
                                             background: "transparent",
                                             border: `1px solid ${card.border}`,
@@ -7169,16 +7184,9 @@ export default function ClientPage() {
                                         <div>
                                             {showAnalyticsLoading ? (
                                                 <>
-                                                    {card.ratePercent !== undefined ? (
-                                                        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "0.75rem" }}>
-                                                            <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
-                                                            <div className="analytics-skeleton" style={{ width: "88px", height: "28px", marginBottom: "0.3rem" }} />
-                                                        </div>
-                                                    ) : (
-                                                        <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
-                                                    )}
-                                                    {card.secondaryValue !== undefined && (
-                                                        <div className="analytics-skeleton" style={{ width: "56px", height: "22px", marginTop: "0.45rem" }} />
+                                                    <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
+                                                    {card.secondaryLine && (
+                                                        <div className="analytics-skeleton" style={{ width: "88px", height: "22px", marginTop: "0.45rem" }} />
                                                     )}
                                                     <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
                                                         <div className="analytics-skeleton" style={{ width: "18px", height: "18px", borderRadius: "999px", flexShrink: 0 }} />
@@ -7190,34 +7198,21 @@ export default function ClientPage() {
                                                 </>
                                             ) : (
                                                 <>
-                                                    {card.ratePercent !== undefined ? (
-                                                        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "0.75rem" }}>
-                                                            <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
-                                                                {card.value.toLocaleString()}
-                                                            </p>
-                                                            <p style={{
-                                                                margin: 0,
-                                                                paddingBottom: "0.3rem",
-                                                                fontSize: "1.45rem",
-                                                                lineHeight: 1,
-                                                                fontWeight: 700,
-                                                                color: getPositiveReplyRateColor(card.ratePercent),
-                                                                whiteSpace: "nowrap",
-                                                                fontVariantNumeric: "tabular-nums"
-                                                            }}>
-                                                                {card.ratePercent.toFixed(2)}% PRR
-                                                            </p>
-                                                        </div>
-                                                    ) : (
-                                                        <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
-                                                            {card.value.toLocaleString()}
-                                                        </p>
-                                                    )}
-                                                    {card.secondaryValue !== undefined && (
-                                                        <p style={{ margin: "0.45rem 0 0", fontSize: "1.2rem", lineHeight: 1.1, fontWeight: 600, color: "var(--app-text-muted)" }}>
-                                                            {card.secondaryValue.toLocaleString()}
+                                                    <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
+                                                        {card.value.toLocaleString()}
+                                                    </p>
+                                                    {card.secondaryLine && (
+                                                        <p style={{
+                                                            margin: "0.45rem 0 0",
+                                                            fontSize: "1.2rem",
+                                                            lineHeight: 1.1,
+                                                            fontWeight: 600,
+                                                            color: card.secondaryLine.color || "var(--app-text-muted)",
+                                                            fontVariantNumeric: "tabular-nums",
+                                                        }}>
+                                                            {card.secondaryLine.value}
                                                             <span style={{ marginLeft: "0.3rem", fontSize: "0.78rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
-                                                                {card.secondaryLabel?.toLowerCase()}
+                                                                {card.secondaryLine.label}
                                                             </span>
                                                         </p>
                                                     )}
