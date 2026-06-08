@@ -21,6 +21,9 @@ export default function InterestedAutoResponderReviewPage() {
     const [loading, setLoading] = useState(true);
     const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
     const [sending, setSending] = useState(false);
+    const [archiving, setArchiving] = useState(false);
+    const [archived, setArchived] = useState(false);
+    const [archiveModalOpen, setArchiveModalOpen] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [sendSuccess, setSendSuccess] = useState(false);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -89,6 +92,7 @@ export default function InterestedAutoResponderReviewPage() {
 
     // Debounced auto-save
     useEffect(() => {
+        if (archived || !draft) return;
         if (renderedText === lastSavedTextRef.current) return;
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
         saveTimerRef.current = setTimeout(async () => {
@@ -117,7 +121,17 @@ export default function InterestedAutoResponderReviewPage() {
             }
         }, 1500);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-    }, [renderedText, token]);
+    }, [renderedText, token, archived, draft]);
+
+    // Close archive modal on Escape
+    useEffect(() => {
+        if (!archiveModalOpen) return;
+        const handler = (e: KeyboardEvent) => {
+            if (e.key === "Escape" && !archiving) setArchiveModalOpen(false);
+        };
+        document.addEventListener("keydown", handler);
+        return () => document.removeEventListener("keydown", handler);
+    }, [archiveModalOpen, archiving]);
 
     const handleEditorInput = useCallback(() => {
         if (editorRef.current) setRenderedText(editorRef.current.innerHTML);
@@ -256,6 +270,32 @@ export default function InterestedAutoResponderReviewPage() {
         }
     };
 
+    const handleArchiveDraft = async () => {
+        setArchiving(true);
+        setError(null);
+        try {
+            if (saveTimerRef.current) {
+                clearTimeout(saveTimerRef.current);
+                saveTimerRef.current = null;
+            }
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}`,
+                { method: "DELETE" }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to archive draft (${response.status})`);
+            }
+            setArchived(true);
+            setArchiveModalOpen(false);
+            setDraft(null);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to archive draft");
+        } finally {
+            setArchiving(false);
+        }
+    };
+
     return (
         <main style={{ minHeight: "100vh", background: "#0b1020", color: "#fff", padding: "1rem 0.25rem" }}>
             <style>{`
@@ -309,7 +349,99 @@ export default function InterestedAutoResponderReviewPage() {
                 .link-popup .btn-apply:hover { background: #1d4ed8; }
                 .link-popup .btn-remove { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
                 .link-popup .btn-remove:hover { background: rgba(239,68,68,0.25); }
+                .ar-modal-overlay {
+                    position: fixed;
+                    inset: 0;
+                    z-index: 10000;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 1rem;
+                    background: rgba(0,0,0,0.65);
+                }
+                .ar-modal {
+                    width: 100%;
+                    max-width: 420px;
+                    padding: 1.25rem;
+                    border-radius: 16px;
+                    background: #151b2e;
+                    border: 1px solid rgba(255,255,255,0.12);
+                    box-shadow: 0 24px 64px rgba(0,0,0,0.45);
+                }
+                .ar-modal__title {
+                    margin: 0 0 0.5rem;
+                    font-size: 1.1rem;
+                    font-weight: 600;
+                }
+                .ar-modal__body {
+                    margin: 0 0 1.25rem;
+                    color: rgba(255,255,255,0.72);
+                    font-size: 0.9rem;
+                    line-height: 1.55;
+                }
+                .ar-modal__actions {
+                    display: flex;
+                    justify-content: flex-end;
+                    gap: 0.65rem;
+                }
+                .ar-btn-secondary {
+                    padding: 0.65rem 1rem;
+                    border-radius: 8px;
+                    border: 1px solid rgba(255,255,255,0.15);
+                    background: rgba(255,255,255,0.04);
+                    color: #fff;
+                    font-weight: 600;
+                    font-size: 0.9rem;
+                    cursor: pointer;
+                }
+                .ar-btn-secondary:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
+                .ar-btn-destructive {
+                    padding: 0.65rem 1rem;
+                    border-radius: 8px;
+                    border: 1px solid rgba(239,68,68,0.45);
+                    background: rgba(239,68,68,0.18);
+                    color: #fca5a5;
+                    font-weight: 600;
+                    font-size: 0.9rem;
+                    cursor: pointer;
+                }
+                .ar-btn-destructive:hover:not(:disabled) { background: rgba(239,68,68,0.28); }
+                .ar-btn-secondary:disabled, .ar-btn-destructive:disabled { opacity: 0.55; cursor: default; }
             `}</style>
+            {archiveModalOpen && (
+                <div
+                    className="ar-modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="archive-draft-title"
+                    onClick={() => { if (!archiving) setArchiveModalOpen(false); }}
+                >
+                    <div className="ar-modal" onClick={(e) => e.stopPropagation()}>
+                        <h2 id="archive-draft-title" className="ar-modal__title">Archive Draft?</h2>
+                        <p className="ar-modal__body">
+                            This will cancel the draft and invalidate this review link. You will not be able to send this reply from here.
+                        </p>
+                        <div className="ar-modal__actions">
+                            <button
+                                type="button"
+                                className="ar-btn-secondary"
+                                onClick={() => setArchiveModalOpen(false)}
+                                disabled={archiving}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="ar-btn-destructive"
+                                onClick={handleArchiveDraft}
+                                disabled={archiving}
+                            >
+                                {archiving ? "Archiving…" : "Archive Draft"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
             {linkPopup && (
                 <div
                     ref={linkPopupRef}
@@ -345,6 +477,10 @@ export default function InterestedAutoResponderReviewPage() {
                     <div style={{ marginTop: "1.5rem", padding: "1rem", borderRadius: "12px", background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.35)", color: "#fca5a5" }}>
                         {error}
                     </div>
+                ) : archived ? (
+                    <div style={{ marginTop: "1.5rem", padding: "1rem", borderRadius: "12px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", color: "rgba(255,255,255,0.82)" }}>
+                        This draft has been archived and is no longer available.
+                    </div>
                 ) : draft ? (
                     <div style={{ marginTop: "1.5rem", display: "flex", flexDirection: "column", gap: "1.25rem" }}>
                         <div style={{ display: "grid", gap: "0.35rem", fontSize: "0.9rem" }}>
@@ -366,7 +502,7 @@ export default function InterestedAutoResponderReviewPage() {
                             </div>
                             <div
                                 ref={editorRef}
-                                contentEditable
+                                contentEditable={!sendSuccess}
                                 suppressContentEditableWarning
                                 onInput={handleEditorInput}
                                 onKeyDown={handleEditorKeyDown}
@@ -381,22 +517,46 @@ export default function InterestedAutoResponderReviewPage() {
                                     outline: "none",
                                     lineHeight: 1.65,
                                     fontSize: "0.9rem",
-                                    cursor: "text",
+                                    cursor: sendSuccess ? "default" : "text",
                                     wordBreak: "break-word",
                                     transition: "box-shadow 0.15s",
+                                    opacity: sendSuccess ? 0.7 : 1,
                                 }}
                             />
                             <p style={{ margin: 0, fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
                                 Click to edit — changes are saved automatically. Press <kbd style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "4px", padding: "0 4px", fontSize: "0.72rem" }}>⌘K</kbd> to edit a link.
                             </p>
-                            <button
-                                type="button"
-                                onClick={handleSendReply}
-                                disabled={sending || !renderedText.trim() || sendSuccess}
-                                style={{ width: "100%", padding: "0.9rem", borderRadius: "10px", border: "none", background: sendSuccess ? "rgba(34,197,94,0.25)" : "#16a34a", color: "#fff", cursor: sending || sendSuccess ? "default" : "pointer", fontWeight: 600, fontSize: "1rem" }}
-                            >
-                                {sending ? "Sending…" : sendSuccess ? "Sent ✓" : "Send Reply"}
-                            </button>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "0.65rem" }}>
+                                <button
+                                    type="button"
+                                    onClick={handleSendReply}
+                                    disabled={sending || !renderedText.trim() || sendSuccess}
+                                    style={{ width: "100%", padding: "0.9rem", borderRadius: "10px", border: "none", background: sendSuccess ? "rgba(34,197,94,0.25)" : "#16a34a", color: "#fff", cursor: sending || sendSuccess ? "default" : "pointer", fontWeight: 600, fontSize: "1rem" }}
+                                >
+                                    {sending ? "Sending…" : sendSuccess ? "Sent ✓" : "Send Reply"}
+                                </button>
+                                {!sendSuccess && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setArchiveModalOpen(true)}
+                                        disabled={sending || archiving}
+                                        style={{
+                                            width: "100%",
+                                            padding: "0.75rem",
+                                            borderRadius: "10px",
+                                            border: "1px solid rgba(239,68,68,0.45)",
+                                            background: "rgba(239,68,68,0.12)",
+                                            color: "#fca5a5",
+                                            cursor: sending || archiving ? "default" : "pointer",
+                                            fontWeight: 600,
+                                            fontSize: "0.95rem",
+                                            opacity: sending || archiving ? 0.55 : 1,
+                                        }}
+                                    >
+                                        Archive Draft
+                                    </button>
+                                )}
+                            </div>
                         </section>
 
                         {/* Previous Lead Message — shown below the reply */}

@@ -210,9 +210,7 @@ type InstantlyEventAnalyticsSummary = {
     bounce_events: number;
     first_event_at: string | null;
     last_event_at: string | null;
-    follow_up_sent_today: number;
-    follow_up_sent_yesterday: number;
-    follow_up_sent_7d: number;
+    follow_up_sent: number;
 };
 
 type InstantlyEventAnalyticsByHourRow = {
@@ -7133,12 +7131,10 @@ export default function ClientPage() {
                                     ];
 
                                 const followUpCard: AnalyticsStatCard = {
-                                    key: "follow_up_sent_today",
+                                    key: "follow_up_sent",
                                     label: "Warm Follow-ups",
-                                    value: summary?.follow_up_sent_today ?? 0,
-                                    subLabel: displayAnalytics
-                                        ? `${displayAnalytics.summary.follow_up_sent_yesterday} yesterday · ${displayAnalytics.summary.follow_up_sent_7d} last 7d`
-                                        : undefined,
+                                    value: summary?.follow_up_sent ?? 0,
+                                    subLabel: displayAnalytics?.window?.label,
                                     border: "rgba(234, 179, 8, 0.28)",
                                     icon: (
                                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">

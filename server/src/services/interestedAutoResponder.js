@@ -989,3 +989,17 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         client.release();
     }
 }
+
+export async function cancelInterestedAutoResponderDraftByToken({ token }) {
+    const draft = await loadPendingReviewDraft(token);
+    await pool.query(
+        `UPDATE interested_autoresponder_drafts
+         SET status = 'cancelled',
+             review_token = NULL,
+             review_token_expires_at = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [draft.id]
+    );
+    return { cancelled: true, id: draft.id };
+}

@@ -85,6 +85,16 @@ export function buildInstantlyEventTypesQuery(periodFilterSql, eventTypeFilterCl
     `;
 }
 
+export function buildFollowUpStatsQuery(eventFloorSql) {
+    return `
+        SELECT COUNT(*)::int AS follow_up_sent
+        FROM follow_up_sends fus
+        WHERE fus.client_id = $1
+          AND fus.status = 'sent'
+          AND fus.updated_at >= ${eventFloorSql}
+    `;
+}
+
 export function buildInstantlyRecentEventsQuery(eventFloorSql, eventTypeFilterClause) {
     const periodFilterSql = buildInstantlyEventPeriodFilterSql(eventFloorSql);
 
@@ -259,19 +269,7 @@ export async function loadInstantlyEventAnalytics({
                 analyticsParams
             ),
             pool.query(
-                `SELECT
-                    COUNT(*) FILTER (
-                        WHERE fus.sent_for_date = CURRENT_DATE
-                    )::int AS follow_up_sent_today,
-                    COUNT(*) FILTER (
-                        WHERE fus.sent_for_date = CURRENT_DATE - INTERVAL '1 day'
-                    )::int AS follow_up_sent_yesterday,
-                    COUNT(*) FILTER (
-                        WHERE fus.sent_for_date >= CURRENT_DATE - INTERVAL '6 days'
-                    )::int AS follow_up_sent_7d
-                FROM follow_up_sends fus
-                WHERE fus.client_id = $1
-                  AND fus.status = 'sent'`,
+                buildFollowUpStatsQuery(periodConfig.eventFloorSql),
                 [sqlClientId]
             )
         ]);
@@ -279,9 +277,7 @@ export async function loadInstantlyEventAnalytics({
         const summaryRow = summaryResult.rows[0] || {};
         const positiveReplies = positiveRepliesResult.rows[0]?.positive_replies ?? 0;
         const followUpStats = followUpStatsResult.rows[0] || {
-            follow_up_sent_today: 0,
-            follow_up_sent_yesterday: 0,
-            follow_up_sent_7d: 0
+            follow_up_sent: 0
         };
 
         const value = {

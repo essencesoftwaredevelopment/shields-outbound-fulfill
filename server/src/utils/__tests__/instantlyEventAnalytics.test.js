@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    buildFollowUpStatsQuery,
     buildInstantlyEventBucketCountsQuery,
     buildInstantlyEventPeriodFilterSql,
     buildInstantlyEventSummaryQuery,
@@ -51,6 +52,15 @@ test('bucket and event-type queries use direct grouped scans', () => {
     assert.match(bucketSql, /GROUP BY 1/);
     assert.doesNotMatch(eventTypeSql, /SELECT DISTINCT/);
     assert.match(eventTypeSql, /GROUP BY 1/);
+});
+
+test('follow-up stats query filters by selected window and sent status', () => {
+    const sql = buildFollowUpStatsQuery(`NOW() - INTERVAL '7 days'`);
+
+    assert.match(sql, /FROM follow_up_sends fus/);
+    assert.match(sql, /fus\.client_id = \$1/);
+    assert.match(sql, /fus\.status = 'sent'/);
+    assert.match(sql, /fus\.updated_at >= NOW\(\) - INTERVAL '7 days'/);
 });
 
 test('recent events query keeps client_id-first filter and limit', () => {
