@@ -302,6 +302,24 @@ test('eligibility: empty event list is not eligible', () => {
     assert.equal(isEligible([]), false);
 });
 
+/**
+ * Returns true when at least one active follow-up script remains for the
+ * prospect. Mirrors the sequence-exhaustion clause in getEligibleProspects.
+ */
+function hasRemainingScripts(sentCount, activeScriptCount) {
+    return sentCount < activeScriptCount;
+}
+
+test('eligibility: not eligible when follow-up sequence is exhausted', () => {
+    assert.equal(hasRemainingScripts(4, 4), false);
+    assert.equal(hasRemainingScripts(5, 4), false);
+});
+
+test('eligibility: eligible when follow-up scripts remain in sequence', () => {
+    assert.equal(hasRemainingScripts(0, 4), true);
+    assert.equal(hasRemainingScripts(3, 4), true);
+});
+
 // ─── Idempotency logic simulation ─────────────────────────────────────────────
 
 test('idempotency: second successful send for same contact+campaign+date is blocked', () => {

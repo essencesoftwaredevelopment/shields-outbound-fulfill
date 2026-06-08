@@ -260,6 +260,8 @@ async function getNextScriptForProspect(db, clientId, contactId, campaignId) {
  *   3. No blocking event appears AFTER the latest Warm Follow Up anchor.
  *      (email_sent is explicitly excluded from blockers.)
  *   4. No successful follow_up_send exists for today.
+ *   5. At least one active follow_up_script remains in the sequence
+ *      (sent count < active script count).
  */
 async function getEligibleProspects(db, clientId, sentForDate) {
     const result = await db.query(
@@ -344,6 +346,20 @@ async function getEligibleProspects(db, clientId, sentForDate) {
                  AND fus.campaign_id = cic.campaign_id
                  AND fus.status = 'sent'
                  AND fus.sent_for_date = $4::date
+           )
+           -- Sequence not exhausted: fewer successful sends than active scripts
+           AND (
+               SELECT COUNT(*)::int
+               FROM follow_up_sends fus_seq
+               WHERE fus_seq.client_id = $1
+                 AND fus_seq.contact_id = cic.contact_id
+                 AND fus_seq.campaign_id = cic.campaign_id
+                 AND fus_seq.status = 'sent'
+           ) < (
+               SELECT COUNT(*)::int
+               FROM follow_up_scripts fsc
+               WHERE fsc.client_id = $1
+                 AND fsc.active = TRUE
            )`,
         [clientId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES, sentForDate]
     );
