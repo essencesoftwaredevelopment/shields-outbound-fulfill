@@ -32,7 +32,6 @@ type InstantlyEventAnalyticsChartProps = {
 type ChartDataPoint = {
     bucket: string;
     label: string;
-    timestamp: number;
     count: number;
     emails_sent: number;
     positive_replies: number;
@@ -68,46 +67,15 @@ function formatAxisTick(value: number) {
     return value.toLocaleString();
 }
 
-function formatXAxisTick(timestamp: number, bucketUnit: "hour" | "day") {
-    const date = new Date(timestamp);
-    if (bucketUnit === "hour") {
-        return `${String(date.getUTCHours()).padStart(2, "0")}:00`;
-    }
-
-    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    return `${monthNames[date.getUTCMonth()]} ${String(date.getUTCDate()).padStart(2, "0")}`;
-}
-
 function buildChartData(rows: ChartRow[]): ChartDataPoint[] {
-    if (rows.length === 0) {
-        return [];
-    }
-
-    const historical = rows.length >= 2 ? rows.slice(0, -1) : rows;
-    const data = historical.map((row) => ({
+    return rows.map((row) => ({
         bucket: row.bucket,
         label: row.label,
-        timestamp: new Date(row.bucket).getTime(),
         count: row.count,
         emails_sent: row.emails_sent ?? 0,
         positive_replies: row.positive_replies ?? 0,
         meetings_booked: row.meetings_booked ?? 0,
     }));
-
-    if (rows.length >= 2) {
-        const partial = rows[rows.length - 1];
-        data.push({
-            bucket: `${partial.bucket}-now`,
-            label: "Now",
-            timestamp: Date.now(),
-            count: partial.count,
-            emails_sent: partial.emails_sent ?? 0,
-            positive_replies: partial.positive_replies ?? 0,
-            meetings_booked: partial.meetings_booked ?? 0,
-        });
-    }
-
-    return data;
 }
 
 export default function InstantlyEventAnalyticsChart({
@@ -146,12 +114,13 @@ export default function InstantlyEventAnalyticsChart({
 
     const chartMargin = {
         top: 8,
-        right: useOutreachView ? 4 : 8,
-        left: 0,
+        right: useOutreachView ? 8 : 12,
+        left: 4,
         bottom: 0,
     };
 
     const primaryTotalLabel = useOutreachView ? "total emails" : "total events";
+    const xAxisInterval = bucketUnit === "hour" && chartData.length > 12 ? "preserveStartEnd" : 0;
 
     return (
         <div style={{
@@ -255,15 +224,14 @@ export default function InstantlyEventAnalyticsChart({
                             <CartesianGrid vertical={false} stroke="rgba(148, 163, 184, 0.1)" />
 
                             <XAxis
-                                dataKey="timestamp"
-                                type="number"
-                                scale="time"
-                                domain={["dataMin", "dataMax"]}
+                                dataKey="label"
+                                type="category"
                                 tickLine={false}
                                 axisLine={false}
                                 tickMargin={8}
-                                minTickGap={28}
-                                tickFormatter={(value) => formatXAxisTick(value, bucketUnit)}
+                                interval={xAxisInterval}
+                                minTickGap={24}
+                                padding={{ left: 0, right: 0 }}
                             />
 
                             <YAxis

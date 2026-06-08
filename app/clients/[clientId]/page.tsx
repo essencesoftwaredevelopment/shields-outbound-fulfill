@@ -28,39 +28,6 @@ import {
 const ACTIVE_JOB_POLL_MS = 10_000;
 const ACTIVE_JOB_POLL_MIN_GAP_MS = 5_000;
 
-const PRR_COLOR_MIN = 0.1;
-const PRR_COLOR_MAX = 1;
-
-function interpolateRgb(
-    from: [number, number, number],
-    to: [number, number, number],
-    t: number
-) {
-    const r = Math.round(from[0] + (to[0] - from[0]) * t);
-    const g = Math.round(from[1] + (to[1] - from[1]) * t);
-    const b = Math.round(from[2] + (to[2] - from[2]) * t);
-    return `rgb(${r}, ${g}, ${b})`;
-}
-
-function getPositiveReplyRateColor(percent: number) {
-    const red: [number, number, number] = [239, 68, 68];
-    const orange: [number, number, number] = [249, 115, 22];
-    const green: [number, number, number] = [34, 197, 94];
-
-    if (percent <= PRR_COLOR_MIN) {
-        return `rgb(${red.join(", ")})`;
-    }
-    if (percent >= PRR_COLOR_MAX) {
-        return `rgb(${green.join(", ")})`;
-    }
-
-    const t = (percent - PRR_COLOR_MIN) / (PRR_COLOR_MAX - PRR_COLOR_MIN);
-    if (t <= 0.5) {
-        return interpolateRgb(red, orange, t / 0.5);
-    }
-    return interpolateRgb(orange, green, (t - 0.5) / 0.5);
-}
-
 // Helper function to retry fetch on connection errors
 async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
     const startTime = Date.now();
@@ -7050,11 +7017,9 @@ export default function ClientPage() {
                                     value: number;
                                     border: string;
                                     icon: ReactNode;
-                                    subLabel?: string;
                                     secondaryLine?: {
                                         value: string;
                                         label: string;
-                                        color?: string;
                                     };
                                 };
 
@@ -7123,7 +7088,7 @@ export default function ClientPage() {
                                             value: summary?.emails_sent ?? 0,
                                             secondaryLine: {
                                                 value: (summary?.contacts_emailed ?? 0).toLocaleString(),
-                                                label: "contacts emailed",
+                                                label: "Contacts Emailed",
                                             },
                                             border: "var(--app-border-mid)",
                                             icon: <SendHorizontal width={18} height={18} strokeWidth={1.8} />
@@ -7134,8 +7099,7 @@ export default function ClientPage() {
                                             value: summary?.positive_replies ?? 0,
                                             secondaryLine: {
                                                 value: `${positiveReplyRatePercent.toFixed(2)}%`,
-                                                label: "prr",
-                                                color: getPositiveReplyRateColor(positiveReplyRatePercent),
+                                                label: "PRR",
                                             },
                                             border: "var(--app-border-mid)",
                                             icon: <MessageCircleCheck width={18} height={18} strokeWidth={1.8} />
@@ -7146,7 +7110,7 @@ export default function ClientPage() {
                                             value: summary?.meetings_booked ?? 0,
                                             secondaryLine: {
                                                 value: `${bookingRatePercent.toFixed(2)}%`,
-                                                label: "booking rate",
+                                                label: "Booking Rate",
                                             },
                                             border: "var(--app-border-mid)",
                                             icon: <CalendarCheck width={18} height={18} strokeWidth={1.8} />
@@ -7157,10 +7121,19 @@ export default function ClientPage() {
                                     key: "follow_up_sent",
                                     label: "Warm Follow-ups",
                                     value: summary?.follow_up_sent ?? 0,
-                                    subLabel: displayAnalytics?.window?.label,
+                                    secondaryLine: displayAnalytics?.window?.label
+                                        ? { value: displayAnalytics.window.label, label: "" }
+                                        : undefined,
                                     border: "rgba(234, 179, 8, 0.28)",
                                     icon: <MessageCircleReply width={18} height={18} strokeWidth={1.8} />
                                 };
+
+                                const statCardPadding = "1.35rem 1.2rem";
+                                const statCardSecondarySlotStyle = {
+                                    margin: "0.45rem 0 0",
+                                    minHeight: "1.32rem",
+                                    lineHeight: 1.1,
+                                } as const;
 
                                 return (
                             <div style={{
@@ -7172,7 +7145,7 @@ export default function ClientPage() {
                                     <div
                                         key={card.key}
                                         style={{
-                                            padding: card.secondaryLine ? "1.35rem 1.2rem" : "1.15rem 1.2rem",
+                                            padding: statCardPadding,
                                             borderRadius: "16px",
                                             background: "transparent",
                                             border: `1px solid ${card.border}`,
@@ -7185,37 +7158,35 @@ export default function ClientPage() {
                                             {showAnalyticsLoading ? (
                                                 <>
                                                     <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
-                                                    {card.secondaryLine && (
-                                                        <div className="analytics-skeleton" style={{ width: "88px", height: "22px", marginTop: "0.45rem" }} />
-                                                    )}
+                                                    <div className="analytics-skeleton" style={{ width: "88px", height: "22px", marginTop: "0.45rem" }} />
                                                     <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
                                                         <div className="analytics-skeleton" style={{ width: "18px", height: "18px", borderRadius: "999px", flexShrink: 0 }} />
                                                         <div className="analytics-skeleton" style={{ width: "112px", height: "14px" }} />
                                                     </div>
-                                                    {card.subLabel !== undefined && (
-                                                        <div className="analytics-skeleton" style={{ width: "148px", height: "10px", marginTop: "0.45rem" }} />
-                                                    )}
                                                 </>
                                             ) : (
                                                 <>
                                                     <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>
                                                         {card.value.toLocaleString()}
                                                     </p>
-                                                    {card.secondaryLine && (
-                                                        <p style={{
-                                                            margin: "0.45rem 0 0",
-                                                            fontSize: "1.2rem",
-                                                            lineHeight: 1.1,
-                                                            fontWeight: 600,
-                                                            color: card.secondaryLine.color || "var(--app-text-muted)",
-                                                            fontVariantNumeric: "tabular-nums",
-                                                        }}>
-                                                            {card.secondaryLine.value}
-                                                            <span style={{ marginLeft: "0.3rem", fontSize: "0.78rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
-                                                                {card.secondaryLine.label}
-                                                            </span>
-                                                        </p>
-                                                    )}
+                                                    <div style={statCardSecondarySlotStyle}>
+                                                        {card.secondaryLine && (
+                                                            <p style={{
+                                                                margin: 0,
+                                                                fontSize: card.secondaryLine.label ? "1.2rem" : "0.75rem",
+                                                                fontWeight: card.secondaryLine.label ? 300 : 500,
+                                                                color: card.secondaryLine.label ? "var(--app-text-muted)" : "var(--app-text-ghost)",
+                                                                fontVariantNumeric: "tabular-nums",
+                                                            }}>
+                                                                {card.secondaryLine.value}
+                                                                {card.secondaryLine.label ? (
+                                                                    <span style={{ marginLeft: "0.3rem", fontSize: "0.78rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
+                                                                        {card.secondaryLine.label}
+                                                                    </span>
+                                                                ) : null}
+                                                            </p>
+                                                        )}
+                                                    </div>
                                                     <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: "0.45rem", marginTop: "0.55rem" }}>
                                                         <div style={{
                                                             display: "inline-flex",
@@ -7230,11 +7201,6 @@ export default function ClientPage() {
                                                             {card.label}
                                                         </p>
                                                     </div>
-                                                    {card.subLabel && (
-                                                        <p style={{ margin: "0.45rem 0 0", fontSize: "0.75rem", color: "var(--app-text-ghost)" }}>
-                                                            {card.subLabel}
-                                                        </p>
-                                                    )}
                                                 </>
                                             )}
                                         </div>
