@@ -7,6 +7,7 @@ type ChartRow = {
     label: string;
     count: number;
     positive_replies?: number;
+    meetings_booked?: number;
 };
 
 type InstantlyEventAnalyticsChartProps = {
@@ -16,6 +17,7 @@ type InstantlyEventAnalyticsChartProps = {
     eventTypeLabel: string;
     loading?: boolean;
     showPositiveReplies?: boolean;
+    showMeetingsBooked?: boolean;
 };
 
 type ChartPoint = {
@@ -25,11 +27,43 @@ type ChartPoint = {
     index: number;
 };
 
+type SeriesPathParts = {
+    solid: string;
+    dotted: string;
+    solidPoints: ChartPoint[];
+    nowPoint: ChartPoint | null;
+};
+
 const CHART_WIDTH = 1000;
 const CHART_HEIGHT = 220;
 const PADDING = { top: 16, right: 40, bottom: 30, left: 40 };
 
-function buildSmoothPath(points: ChartPoint[]) {
+function bucketTimestampMs(bucket: string) {
+    return new Date(bucket).getTime();
+}
+
+function isAtFloor(point: ChartPoint, floorY: number | null) {
+    return floorY !== null && Math.abs(point.y - floorY) < 0.5;
+}
+
+function clampControlY(
+    controlY: number,
+    currentY: number,
+    nextY: number,
+    floorY: number | null
+) {
+    if (floorY === null) return controlY;
+
+    const segmentHighY = Math.min(currentY, nextY);
+    const segmentLowY = Math.max(currentY, nextY);
+    return Math.max(segmentHighY, Math.min(segmentLowY, controlY));
+}
+
+function buildSmoothPath(
+    points: ChartPoint[],
+    floorY: number | null = null,
+    trailingPoint: ChartPoint | null = null
+) {
     if (points.length === 0) return "";
     if (points.length === 1) {
         return `M ${points[0].x} ${points[0].y}`;
@@ -40,12 +74,29 @@ function buildSmoothPath(points: ChartPoint[]) {
         const previous = points[index - 1] || points[index];
         const current = points[index];
         const next = points[index + 1];
-        const afterNext = points[index + 2] || next;
+        const afterNext = index + 2 < points.length
+            ? points[index + 2]
+            : (trailingPoint || next);
+
+        if (floorY !== null && (isAtFloor(current, floorY) || isAtFloor(next, floorY))) {
+            path += ` L ${next.x} ${next.y}`;
+            continue;
+        }
 
         const control1X = current.x + (next.x - previous.x) / 6;
-        const control1Y = current.y + (next.y - previous.y) / 6;
+        const control1Y = clampControlY(
+            current.y + (next.y - previous.y) / 6,
+            current.y,
+            next.y,
+            floorY
+        );
         const control2X = next.x - (afterNext.x - current.x) / 6;
-        const control2Y = next.y - (afterNext.y - current.y) / 6;
+        const control2Y = clampControlY(
+            next.y - (afterNext.y - current.y) / 6,
+            current.y,
+            next.y,
+            floorY
+        );
 
         path += ` C ${control1X} ${control1Y}, ${control2X} ${control2Y}, ${next.x} ${next.y}`;
     }
@@ -53,11 +104,97 @@ function buildSmoothPath(points: ChartPoint[]) {
     return path;
 }
 
-function buildAreaPath(linePath: string, points: ChartPoint[], baselineY: number) {
-    if (!linePath || points.length === 0) return "";
-    const first = points[0];
-    const last = points[points.length - 1];
-    return `${linePath} L ${last.x} ${baselineY} L ${first.x} ${baselineY} Z`;
+function buildDottedPath(from: ChartPoint, to: ChartPoint) {
+    return `M ${from.x} ${from.y} L ${to.x} ${to.y}`;
+}
+
+function buildSeriesPaths(
+    points: ChartPoint[],
+    nowPoint: ChartPoint | null,
+    floorY: number | null
+): SeriesPathParts {
+    if (points.length === 0) {
+        return { solid: "", dotted: "", solidPoints: [], nowPoint: null };
+    }
+
+    const solid = buildSmoothPath(points, floorY, nowPoint);
+    const dottedAnchor = points[points.length - 1];
+    const dotted = nowPoint && dottedAnchor.x < nowPoint.x - 0.5
+        ? buildDottedPath(dottedAnchor, nowPoint)
+        : "";
+
+    return { solid, dotted, solidPoints: points, nowPoint };
+}
+
+function buildAreaPath(
+    solidPath: string,
+    solidPoints: ChartPoint[],
+    nowPoint: ChartPoint | null,
+    baselineY: number
+) {
+    if (!solidPath || solidPoints.length === 0) return "";
+    const first = solidPoints[0];
+    const last = solidPoints[solidPoints.length - 1];
+
+    if (nowPoint) {
+        return `${solidPath} L ${nowPoint.x} ${nowPoint.y} L ${nowPoint.x} ${baselineY} L ${first.x} ${baselineY} Z`;
+    }
+
+    return `${solidPath} L ${last.x} ${baselineY} L ${first.x} ${baselineY} Z`;
+}
+
+function valueToY(value: number, maxValue: number, plotHeight: number, baselineY: number) {
+    return baselineY - (value / maxValue) * plotHeight;
+}
+
+function buildTimedChartPoints({
+    rows,
+    nowMs,
+    nowX,
+    plotHeight,
+    baselineY,
+    maxValue,
+    getValue
+}: {
+    rows: ChartRow[];
+    nowMs: number;
+    nowX: number;
+    plotHeight: number;
+    baselineY: number;
+    maxValue: number;
+    getValue: (row: ChartRow) => number;
+}): { points: ChartPoint[]; nowPoint: ChartPoint | null } {
+    if (rows.length === 0) {
+        return { points: [], nowPoint: null };
+    }
+
+    const firstMs = bucketTimestampMs(rows[0].bucket);
+    const spanMs = Math.max(1, nowMs - firstMs);
+    const xForMs = (ms: number) => PADDING.left + ((ms - firstMs) / spanMs) * (nowX - PADDING.left);
+
+    const completeRows = rows.length >= 2 ? rows.slice(0, -1) : rows;
+    const partialRow = rows[rows.length - 1];
+
+    const points = completeRows.map((row, index) => {
+        const value = getValue(row);
+        return {
+            x: xForMs(bucketTimestampMs(row.bucket)),
+            y: valueToY(value, maxValue, plotHeight, baselineY),
+            row,
+            index
+        };
+    });
+
+    const nowPoint = rows.length >= 2
+        ? {
+            x: nowX,
+            y: valueToY(getValue(partialRow), maxValue, plotHeight, baselineY),
+            row: partialRow,
+            index: rows.length - 1
+        }
+        : null;
+
+    return { points, nowPoint };
 }
 
 function formatAxisTick(value: number) {
@@ -73,7 +210,8 @@ export default function InstantlyEventAnalyticsChart({
     windowLabel,
     eventTypeLabel,
     loading = false,
-    showPositiveReplies = false
+    showPositiveReplies = false,
+    showMeetingsBooked = false
 }: InstantlyEventAnalyticsChartProps) {
     const chartId = useId().replace(/:/g, "");
     const containerRef = useRef<HTMLDivElement>(null);
@@ -91,42 +229,99 @@ export default function InstantlyEventAnalyticsChart({
         () => Math.max(1, ...rows.map((row) => row.positive_replies ?? 0)),
         [rows]
     );
+    const maxMeetingsBookedCount = useMemo(
+        () => Math.max(1, ...rows.map((row) => row.meetings_booked ?? 0)),
+        [rows]
+    );
 
-    const points = useMemo<ChartPoint[]>(() => {
-        if (rows.length === 0) return [];
+    const nowX = PADDING.left + plotWidth;
+    const nowMs = Date.now();
+    const eventsFloorY = rows.some((row) => row.count < 0) ? null : baselineY;
+    const positiveFloorY = rows.some((row) => (row.positive_replies ?? 0) < 0) ? null : baselineY;
+    const meetingsFloorY = rows.some((row) => (row.meetings_booked ?? 0) < 0) ? null : baselineY;
 
-        const stepX = rows.length > 1 ? plotWidth / (rows.length - 1) : 0;
+    const eventSeries = useMemo(
+        () => buildTimedChartPoints({
+            rows,
+            nowMs,
+            nowX,
+            plotHeight,
+            baselineY,
+            maxValue: maxEventCount,
+            getValue: (row) => row.count
+        }),
+        [baselineY, maxEventCount, nowMs, nowX, plotHeight, rows]
+    );
 
-        return rows.map((row, index) => ({
-            x: PADDING.left + stepX * index,
-            y: PADDING.top + plotHeight - (row.count / maxEventCount) * plotHeight,
-            row,
-            index
-        }));
-    }, [maxEventCount, rows, plotHeight, plotWidth]);
+    const positiveSeries = useMemo(
+        () => (showPositiveReplies
+            ? buildTimedChartPoints({
+                rows,
+                nowMs,
+                nowX,
+                plotHeight,
+                baselineY,
+                maxValue: maxPositiveCount,
+                getValue: (row) => row.positive_replies ?? 0
+            })
+            : { points: [], nowPoint: null }),
+        [baselineY, maxPositiveCount, nowMs, nowX, plotHeight, rows, showPositiveReplies]
+    );
 
-    const positivePoints = useMemo<ChartPoint[]>(() => {
-        if (!showPositiveReplies || rows.length === 0) return [];
+    const meetingsSeries = useMemo(
+        () => (showMeetingsBooked
+            ? buildTimedChartPoints({
+                rows,
+                nowMs,
+                nowX,
+                plotHeight,
+                baselineY,
+                maxValue: maxMeetingsBookedCount,
+                getValue: (row) => row.meetings_booked ?? 0
+            })
+            : { points: [], nowPoint: null }),
+        [baselineY, maxMeetingsBookedCount, nowMs, nowX, plotHeight, rows, showMeetingsBooked]
+    );
 
-        const stepX = rows.length > 1 ? plotWidth / (rows.length - 1) : 0;
+    const points = eventSeries.points;
+    const positivePoints = positiveSeries.points;
+    const meetingsBookedPoints = meetingsSeries.points;
+    const nowPoint = eventSeries.nowPoint;
 
-        return rows.map((row, index) => ({
-            x: PADDING.left + stepX * index,
-            y: PADDING.top + plotHeight - ((row.positive_replies ?? 0) / maxPositiveCount) * plotHeight,
-            row,
-            index
-        }));
-    }, [maxPositiveCount, plotHeight, plotWidth, rows, showPositiveReplies]);
+    const eventPaths = useMemo(
+        () => buildSeriesPaths(points, nowPoint, eventsFloorY),
+        [eventsFloorY, nowPoint, points]
+    );
+    const positivePaths = useMemo(
+        () => buildSeriesPaths(positivePoints, positiveSeries.nowPoint, positiveFloorY),
+        [positiveFloorY, positivePoints, positiveSeries.nowPoint]
+    );
+    const meetingsPaths = useMemo(
+        () => buildSeriesPaths(meetingsBookedPoints, meetingsSeries.nowPoint, meetingsFloorY),
+        [meetingsBookedPoints, meetingsFloorY, meetingsSeries.nowPoint]
+    );
 
-    const linePath = useMemo(() => buildSmoothPath(points), [points]);
-    const positiveLinePath = useMemo(() => buildSmoothPath(positivePoints), [positivePoints]);
-    const areaPath = useMemo(() => buildAreaPath(linePath, points, baselineY), [baselineY, linePath, points]);
+    const linePath = eventPaths.solid;
+    const lineDottedPath = eventPaths.dotted;
+    const positiveLinePath = positivePaths.solid;
+    const positiveDottedPath = positivePaths.dotted;
+    const meetingsBookedLinePath = meetingsPaths.solid;
+    const meetingsDottedPath = meetingsPaths.dotted;
+    const areaPath = useMemo(
+        () => buildAreaPath(linePath, eventPaths.solidPoints, nowPoint, baselineY),
+        [baselineY, eventPaths.solidPoints, linePath, nowPoint]
+    );
     const totalCount = useMemo(() => rows.reduce((sum, row) => sum + row.count, 0), [rows]);
     const totalPositiveCount = useMemo(
         () => rows.reduce((sum, row) => sum + (row.positive_replies ?? 0), 0),
         [rows]
     );
-    const showEveryNthLabel = rows.length > 18 ? Math.ceil(rows.length / 12) : rows.length > 10 ? 2 : 1;
+    const totalMeetingsBookedCount = useMemo(
+        () => rows.reduce((sum, row) => sum + (row.meetings_booked ?? 0), 0),
+        [rows]
+    );
+    const labelCount = points.length + (nowPoint ? 1 : 0);
+    const showEveryNthLabel = labelCount > 18 ? Math.ceil(labelCount / 12) : labelCount > 10 ? 2 : 1;
     const axisTicks = [0, 0.5, 1];
 
     const handlePointerMove = useCallback((clientX: number) => {
@@ -135,11 +330,12 @@ export default function InstantlyEventAnalyticsChart({
 
         const rect = container.getBoundingClientRect();
         const relativeX = ((clientX - rect.left) / rect.width) * CHART_WIDTH;
-        const clampedX = Math.max(PADDING.left, Math.min(PADDING.left + plotWidth, relativeX));
+        const clampedX = Math.max(PADDING.left, Math.min(nowX, relativeX));
 
+        const hoverCandidates = nowPoint ? [...points, nowPoint] : points;
         let nearestIndex = 0;
         let nearestDistance = Number.POSITIVE_INFINITY;
-        for (const point of points) {
+        for (const point of hoverCandidates) {
             const distance = Math.abs(point.x - clampedX);
             if (distance < nearestDistance) {
                 nearestDistance = distance;
@@ -148,19 +344,33 @@ export default function InstantlyEventAnalyticsChart({
         }
 
         setHoverState({ mouseX: clampedX, activeIndex: nearestIndex });
-    }, [plotWidth, points]);
+    }, [nowPoint, nowX, points]);
 
     const clearHover = useCallback(() => {
         setHoverState(null);
     }, []);
 
-    const activePoint = hoverState ? points[hoverState.activeIndex] : null;
-    const activePositivePoint = hoverState && showPositiveReplies ? positivePoints[hoverState.activeIndex] : null;
+    const activePoint = hoverState
+        ? (hoverState.activeIndex === nowPoint?.index ? nowPoint : points[hoverState.activeIndex])
+        : null;
+    const activePositivePoint = hoverState && showPositiveReplies
+        ? (hoverState.activeIndex === positiveSeries.nowPoint?.index
+            ? positiveSeries.nowPoint
+            : positivePoints[hoverState.activeIndex])
+        : null;
+    const activeMeetingsBookedPoint = hoverState && showMeetingsBooked
+        ? (hoverState.activeIndex === meetingsSeries.nowPoint?.index
+            ? meetingsSeries.nowPoint
+            : meetingsBookedPoints[hoverState.activeIndex])
+        : null;
     const crosshairLeftPct = hoverState ? (hoverState.mouseX / CHART_WIDTH) * 100 : 0;
     const activePointLeftPct = activePoint ? (activePoint.x / CHART_WIDTH) * 100 : 0;
+    const activePositivePointLeftPct = activePositivePoint ? (activePositivePoint.x / CHART_WIDTH) * 100 : 0;
+    const activeMeetingsBookedPointLeftPct = activeMeetingsBookedPoint ? (activeMeetingsBookedPoint.x / CHART_WIDTH) * 100 : 0;
     const activePointTopPct = activePoint ? (activePoint.y / CHART_HEIGHT) * 100 : 0;
     const activePositivePointTopPct = activePositivePoint ? (activePositivePoint.y / CHART_HEIGHT) * 100 : 0;
-    const chartSeriesKey = rows.map((row) => `${row.bucket}:${row.count}:${row.positive_replies ?? 0}`).join("|");
+    const activeMeetingsBookedPointTopPct = activeMeetingsBookedPoint ? (activeMeetingsBookedPoint.y / CHART_HEIGHT) * 100 : 0;
+    const chartSeriesKey = rows.map((row) => `${row.bucket}:${row.count}:${row.positive_replies ?? 0}:${row.meetings_booked ?? 0}`).join("|");
 
     return (
         <div style={{
@@ -175,16 +385,24 @@ export default function InstantlyEventAnalyticsChart({
                     <p style={{ margin: "0.35rem 0 0", fontSize: "0.82rem", color: "var(--app-text-muted)" }}>
                         {windowLabel} · {eventTypeLabel}
                     </p>
-                    {showPositiveReplies && !loading && rows.length > 0 && (
+                    {(showPositiveReplies || showMeetingsBooked) && !loading && rows.length > 0 && (
                         <div style={{ display: "flex", gap: "1rem", marginTop: "0.65rem", flexWrap: "wrap" }}>
                             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
                                 <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #93c5fd, #3b82f6)" }} />
                                 Events
                             </div>
-                            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
-                                <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #86efac, #22c55e)" }} />
-                                Positive replies
-                            </div>
+                            {showPositiveReplies && (
+                                <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
+                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #86efac, #22c55e)" }} />
+                                    Positive replies
+                                </div>
+                            )}
+                            {showMeetingsBooked && (
+                                <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
+                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #c4b5fd, #a855f7)" }} />
+                                    Meetings booked
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>
@@ -207,6 +425,14 @@ export default function InstantlyEventAnalyticsChart({
                                     {totalPositiveCount.toLocaleString()}
                                     <span style={{ marginLeft: "0.25rem", fontSize: "0.72rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
                                         positive
+                                    </span>
+                                </p>
+                            )}
+                            {showMeetingsBooked && (
+                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "#a855f7" }}>
+                                    {totalMeetingsBookedCount.toLocaleString()}
+                                    <span style={{ marginLeft: "0.25rem", fontSize: "0.72rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
+                                        meetings
                                     </span>
                                 </p>
                             )}
@@ -247,7 +473,7 @@ export default function InstantlyEventAnalyticsChart({
                         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
                         preserveAspectRatio="none"
                         role="img"
-                        aria-label={`Line chart of ${totalCount} events${showPositiveReplies ? ` and ${totalPositiveCount} positive replies` : ""} across ${rows.length} ${bucketUnit === "hour" ? "hours" : "days"}`}
+                        aria-label={`Line chart of ${totalCount} events${showPositiveReplies ? `, ${totalPositiveCount} positive replies` : ""}${showMeetingsBooked ? `, and ${totalMeetingsBookedCount} meetings booked` : ""} across ${rows.length} ${bucketUnit === "hour" ? "hours" : "days"}`}
                         style={{ display: "block", width: "100%", height: "100%", overflow: "visible" }}
                     >
                         <defs>
@@ -264,6 +490,13 @@ export default function InstantlyEventAnalyticsChart({
                                 <stop offset="0%" stopColor="#86efac" />
                                 <stop offset="100%" stopColor="#22c55e" />
                             </linearGradient>
+                            <linearGradient id={`${chartId}-meetings-line`} x1="0" y1="0" x2="1" y2="0">
+                                <stop offset="0%" stopColor="#c4b5fd" />
+                                <stop offset="100%" stopColor="#a855f7" />
+                            </linearGradient>
+                            <clipPath id={`${chartId}-plot`}>
+                                <rect x={PADDING.left} y={PADDING.top} width={plotWidth} height={plotHeight} />
+                            </clipPath>
                         </defs>
 
                         {Array.from({ length: 4 }).map((_, index) => {
@@ -314,6 +547,7 @@ export default function InstantlyEventAnalyticsChart({
                             );
                         })}
 
+                        <g clipPath={`url(#${chartId}-plot)`}>
                         {areaPath && (
                             <path
                                 d={areaPath}
@@ -336,6 +570,19 @@ export default function InstantlyEventAnalyticsChart({
                             />
                         )}
 
+                        {lineDottedPath && (
+                            <path
+                                d={lineDottedPath}
+                                fill="none"
+                                stroke="#3b82f6"
+                                strokeWidth="2.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                className="analytics-chart-line--projected"
+                                vectorEffect="non-scaling-stroke"
+                            />
+                        )}
+
                         {positiveLinePath && (
                             <path
                                 d={positiveLinePath}
@@ -349,6 +596,47 @@ export default function InstantlyEventAnalyticsChart({
                                 vectorEffect="non-scaling-stroke"
                             />
                         )}
+
+                        {positiveDottedPath && (
+                            <path
+                                d={positiveDottedPath}
+                                fill="none"
+                                stroke="#22c55e"
+                                strokeWidth="2.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                className="analytics-chart-line--projected analytics-chart-line--projected-secondary"
+                                vectorEffect="non-scaling-stroke"
+                            />
+                        )}
+
+                        {meetingsBookedLinePath && (
+                            <path
+                                d={meetingsBookedLinePath}
+                                fill="none"
+                                stroke={`url(#${chartId}-meetings-line)`}
+                                strokeWidth="2.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                pathLength={1}
+                                className="analytics-chart-line analytics-chart-line--tertiary"
+                                vectorEffect="non-scaling-stroke"
+                            />
+                        )}
+
+                        {meetingsDottedPath && (
+                            <path
+                                d={meetingsDottedPath}
+                                fill="none"
+                                stroke="#a855f7"
+                                strokeWidth="2.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                className="analytics-chart-line--projected analytics-chart-line--projected-tertiary"
+                                vectorEffect="non-scaling-stroke"
+                            />
+                        )}
+                        </g>
 
                     </svg>
 
@@ -369,7 +657,44 @@ export default function InstantlyEventAnalyticsChart({
                         />
                     )}
 
-                    {hoverState && activePoint && (
+                    {hoverState && activePoint && nowPoint && hoverState.activeIndex === nowPoint.index && (
+                        <>
+                            <div
+                                aria-hidden
+                                style={{
+                                    position: "absolute",
+                                    top: `${activePointTopPct}%`,
+                                    left: `${(nowPoint.x / CHART_WIDTH) * 100}%`,
+                                    width: "20px",
+                                    height: "20px",
+                                    transform: "translate(-50%, -50%)",
+                                    borderRadius: "999px",
+                                    background: "rgba(59, 130, 246, 0.18)",
+                                    pointerEvents: "none",
+                                    zIndex: 2
+                                }}
+                            />
+                            <div
+                                aria-hidden
+                                style={{
+                                    position: "absolute",
+                                    top: `${activePointTopPct}%`,
+                                    left: `${(nowPoint.x / CHART_WIDTH) * 100}%`,
+                                    width: "10px",
+                                    height: "10px",
+                                    transform: "translate(-50%, -50%)",
+                                    borderRadius: "999px",
+                                    background: "#3b82f6",
+                                    border: "2px solid rgba(255, 255, 255, 0.9)",
+                                    boxShadow: "0 0 0 1px rgba(59, 130, 246, 0.35)",
+                                    pointerEvents: "none",
+                                    zIndex: 3
+                                }}
+                            />
+                        </>
+                    )}
+
+                    {hoverState && activePoint && hoverState.activeIndex !== nowPoint?.index && (
                         <>
                             <div
                                 aria-hidden
@@ -413,7 +738,7 @@ export default function InstantlyEventAnalyticsChart({
                                 style={{
                                     position: "absolute",
                                     top: `${activePositivePointTopPct}%`,
-                                    left: `${activePointLeftPct}%`,
+                                    left: `${activePositivePointLeftPct}%`,
                                     width: "20px",
                                     height: "20px",
                                     transform: "translate(-50%, -50%)",
@@ -428,7 +753,7 @@ export default function InstantlyEventAnalyticsChart({
                                 style={{
                                     position: "absolute",
                                     top: `${activePositivePointTopPct}%`,
-                                    left: `${activePointLeftPct}%`,
+                                    left: `${activePositivePointLeftPct}%`,
                                     width: "10px",
                                     height: "10px",
                                     transform: "translate(-50%, -50%)",
@@ -436,6 +761,43 @@ export default function InstantlyEventAnalyticsChart({
                                     background: "#22c55e",
                                     border: "2px solid rgba(255, 255, 255, 0.9)",
                                     boxShadow: "0 0 0 1px rgba(34, 197, 94, 0.35)",
+                                    pointerEvents: "none",
+                                    zIndex: 3
+                                }}
+                            />
+                        </>
+                    )}
+
+                    {hoverState && activeMeetingsBookedPoint && (
+                        <>
+                            <div
+                                aria-hidden
+                                style={{
+                                    position: "absolute",
+                                    top: `${activeMeetingsBookedPointTopPct}%`,
+                                    left: `${activeMeetingsBookedPointLeftPct}%`,
+                                    width: "20px",
+                                    height: "20px",
+                                    transform: "translate(-50%, -50%)",
+                                    borderRadius: "999px",
+                                    background: "rgba(168, 85, 247, 0.16)",
+                                    pointerEvents: "none",
+                                    zIndex: 2
+                                }}
+                            />
+                            <div
+                                aria-hidden
+                                style={{
+                                    position: "absolute",
+                                    top: `${activeMeetingsBookedPointTopPct}%`,
+                                    left: `${activeMeetingsBookedPointLeftPct}%`,
+                                    width: "10px",
+                                    height: "10px",
+                                    transform: "translate(-50%, -50%)",
+                                    borderRadius: "999px",
+                                    background: "#a855f7",
+                                    border: "2px solid rgba(255, 255, 255, 0.9)",
+                                    boxShadow: "0 0 0 1px rgba(168, 85, 247, 0.35)",
                                     pointerEvents: "none",
                                     zIndex: 3
                                 }}
@@ -461,7 +823,7 @@ export default function InstantlyEventAnalyticsChart({
                             }}
                         >
                             <p style={{ margin: 0, fontSize: "0.68rem", color: "var(--app-text-ghost)", whiteSpace: "nowrap" }}>
-                                {activePoint.row.label}
+                                {hoverState.activeIndex === nowPoint?.index ? "Now" : activePoint.row.label}
                             </p>
                             <p style={{ margin: "0.15rem 0 0", fontSize: "0.92rem", fontWeight: 700, color: "#f8fafc", lineHeight: 1.2 }}>
                                 {activePoint.row.count.toLocaleString()}
@@ -477,35 +839,65 @@ export default function InstantlyEventAnalyticsChart({
                                     </span>
                                 </p>
                             )}
+                            {showMeetingsBooked && (
+                                <p style={{ margin: "0.35rem 0 0", fontSize: "0.82rem", fontWeight: 600, color: "#c4b5fd", lineHeight: 1.2 }}>
+                                    {(activePoint.row.meetings_booked ?? 0).toLocaleString()}
+                                    <span style={{ marginLeft: "0.25rem", fontSize: "0.68rem", fontWeight: 500, color: "rgba(196, 181, 253, 0.72)" }}>
+                                        meetings
+                                    </span>
+                                </p>
+                            )}
                         </div>
                     )}
                     </div>
 
                     <div style={{
-                        display: "flex",
-                        gap: "6px",
+                        position: "relative",
                         marginTop: "0.55rem",
-                        padding: "0 2px"
+                        height: "14px"
                     }}>
-                        {rows.map((row, index) => (
+                        {points.map((point, index) => {
+                            const leftPct = (point.x / CHART_WIDTH) * 100;
+                            const showLabel = index % showEveryNthLabel === 0 || index === points.length - 1;
+
+                            return (
+                                <div
+                                    key={`${point.row.bucket}-label`}
+                                    style={{
+                                        position: "absolute",
+                                        left: `${leftPct}%`,
+                                        transform: "translateX(-50%)",
+                                        minWidth: 0,
+                                        maxWidth: "72px",
+                                        fontSize: "0.62rem",
+                                        color: hoverState?.activeIndex === point.index ? "#93c5fd" : "var(--app-text-ghost)",
+                                        textAlign: "center",
+                                        whiteSpace: "nowrap",
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        visibility: showLabel ? "visible" : "hidden",
+                                        transition: "color 0.15s ease"
+                                    }}
+                                >
+                                    {point.row.label}
+                                </div>
+                            );
+                        })}
+                        {nowPoint && (
                             <div
-                                key={`${row.bucket}-label`}
                                 style={{
-                                    flex: "1 1 0",
-                                    minWidth: 0,
+                                    position: "absolute",
+                                    left: `${(nowX / CHART_WIDTH) * 100}%`,
+                                    transform: "translateX(-50%)",
                                     fontSize: "0.62rem",
-                                    color: hoverState?.activeIndex === index ? "#93c5fd" : "var(--app-text-ghost)",
-                                    textAlign: "center",
+                                    color: hoverState?.activeIndex === nowPoint.index ? "#93c5fd" : "var(--app-text-ghost)",
                                     whiteSpace: "nowrap",
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    visibility: index % showEveryNthLabel === 0 || index === rows.length - 1 ? "visible" : "hidden",
                                     transition: "color 0.15s ease"
                                 }}
                             >
-                                {row.label}
+                                Now
                             </div>
-                        ))}
+                        )}
                     </div>
                 </div>
             )}

@@ -218,6 +218,7 @@ type InstantlyEventAnalyticsByHourRow = {
     label: string;
     count: number;
     positive_replies?: number;
+    meetings_booked?: number;
 };
 
 type InstantlyEventAnalyticsPeriod = "24h" | "7d" | "30d" | "90d";
@@ -398,6 +399,8 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
     if (normalized === "lead unsubscribed") return "Unsubscribed";
     if (normalized === "lead interested") return "Interested";
     if (normalized === "lead meeting booked") return "Meeting booked";
+    if (normalized === "meeting booked") return "Meeting booked";
+    if (normalized === "meeting canceled" || normalized === "meeting cancelled") return "Meeting canceled";
     if (normalized === "lead meeting completed") return "Meeting completed";
     if (normalized === "lead closed") return "Closed won";
     if (normalized === "lead out of office") return "Out of office";
@@ -431,7 +434,7 @@ function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | n
     if (normalized === "email_opened") return "var(--app-event-email-opened)";
     if (normalized === "email_link_clicked") return "var(--app-event-link-clicked)";
     if (normalized === "warm follow up" || normalized === "warm_follow_up" || displayTone === "manual") return "var(--app-event-warm-followup)";
-    if (normalized === "reply_received" || normalized === "lead_interested" || normalized === "lead_meeting_booked" || normalized === "lead_meeting_completed" || normalized === "lead_closed") {
+    if (normalized === "reply_received" || normalized === "lead_interested" || normalized === "lead_meeting_booked" || normalized === "lead_meeting_completed" || normalized === "lead_closed" || normalized === "meeting_booked") {
         return "var(--app-event-positive)";
     }
     if (normalized === "email_bounced" || normalized === "lead_not_interested" || normalized === "lead_wrong_person" || normalized === "lead_no_show") {
@@ -7228,6 +7231,7 @@ export default function ClientPage() {
                                     || "All event types"
                                 }
                                 showPositiveReplies={instantlyEventAnalyticsEventType === "all"}
+                                showMeetingsBooked={instantlyEventAnalyticsEventType === "all"}
                                 loading={instantlyEventAnalyticsLoading || !(
                                     instantlyEventAnalytics
                                     && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType

@@ -23,6 +23,7 @@ import webhooksRouter from './routes/webhooks.js';
 import domainsRouter from './routes/domains.js';
 import microserviceRouter from './routes/microservice.js';
 import interestedAutoResponderRouter from './routes/interestedAutoResponder.js';
+import calendlyWebhookRouter from './routes/calendlyWebhook.js';
 import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobPipeline.js';
 import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/jobRunner.js';
 
@@ -40,6 +41,8 @@ app.use('/api', (_req, res, next) => {
     res.set('Pragma', 'no-cache');
     next();
 });
+// Calendly webhooks require raw body for signature verification — mount before express.json().
+app.use('/webhooks/calendly', express.raw({ type: 'application/json', limit: '1mb' }), calendlyWebhookRouter);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 

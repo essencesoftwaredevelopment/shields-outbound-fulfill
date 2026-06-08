@@ -796,6 +796,17 @@ body {
   animation-delay: 0.25s;
 }
 
+.analytics-chart-line--tertiary {
+  animation-delay: 0.4s;
+}
+
+.analytics-chart-line--projected {
+  stroke-dasharray: 6 5;
+  stroke-dashoffset: 0;
+  opacity: 0.88;
+  animation: none;
+}
+
 .analytics-chart-area {
   opacity: 0;
   animation: analyticsChartAreaFade 0.8s ease 0.35s forwards;
