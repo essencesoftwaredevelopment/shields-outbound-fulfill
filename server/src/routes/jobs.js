@@ -17,6 +17,7 @@ import {
     jobRowToState,
     setActiveJob,
     updateJobControl,
+    updateActiveJobStatus,
     listJobsForClient,
     getActiveJobForClient,
     deleteJobFromDb,

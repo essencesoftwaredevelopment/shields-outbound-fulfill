@@ -5,7 +5,7 @@ import { getAgencySettings } from './db/agencySettings.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import { resolveTemplateVars, renderTemplate } from './followUpSender.js';
 
-const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.3-chat-latest').trim() || 'gpt-5.3-chat-latest';
+const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const POPUP_FORM_GENERATE_URL = 'https://essence-retention-ai-popup-demo.vercel.app/api/popup-form/generate';
 const POPUP_FORM_API_KEY = 'CNl6iVR6YwmlPU9iw6gOW1LAF4roUxxPNB9YrI2kdIeMmbcfUKh4Rgdl0gdmZBQo';
