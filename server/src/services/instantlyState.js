@@ -13,6 +13,7 @@ const INSTANTLY_RATE_LIMIT_PER_SECOND = Math.max(parseInt(process.env.INSTANTLY_
 const INSTANTLY_MAX_RETRIES = Math.max(parseInt(process.env.INSTANTLY_MAX_RETRIES || '4', 10) || 4, 0);
 const INSTANTLY_RETRY_BASE_DELAY_MS = Math.max(parseInt(process.env.INSTANTLY_RETRY_BASE_DELAY_MS || '1000', 10) || 1000, 100);
 const INSTANTLY_SYNC_PROGRESS_BATCH_SIZE = Math.max(parseInt(process.env.INSTANTLY_SYNC_PROGRESS_BATCH_SIZE || '25', 10) || 25, 1);
+const INSTANTLY_REPLY_INTEREST_RECONCILE_ENABLED = false;
 const INSTANTLY_REPLY_INTEREST_RECONCILE_DELAY_MS = 10_000;
 const INSTANTLY_REPLY_INTEREST_RECONCILE_WINDOW_MS = 10_000;
 const INSTANTLY_INTEREST_STATUS_WEBHOOK_EVENT_TYPES = [
@@ -2558,6 +2559,7 @@ function scheduleReplyInterestStatusReconcile({
     replyEventTimestamp,
     logger = () => {}
 }) {
+    if (!INSTANTLY_REPLY_INTEREST_RECONCILE_ENABLED) return;
     if (!clientId || !contactId || !campaignId || !instantlyCampaignId) return;
 
     const timerKey = replyInterestReconcileTimerKey(clientId, contactId, campaignId);
