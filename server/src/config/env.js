@@ -56,7 +56,7 @@ export const env = {
     STRIPE_SUCCESS_URL: process.env.STRIPE_SUCCESS_URL || 'http://localhost:3000/account?checkout=success',
     STRIPE_CANCEL_URL: process.env.STRIPE_CANCEL_URL || 'http://localhost:3000/account?checkout=cancelled',
     STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || '',
-    CALENDLY_PAT: process.env.CALENDLY_PAT || '',
+    CALENDLY_PAT: process.env.CALENDLY_PAT || process.env.CALENDLY_API_KEY || '',
     CALENDLY_WEBHOOK_SECRET: process.env.CALENDLY_WEBHOOK_SECRET || '',
     PERSONALIZATION_FILTER_B2B: process.env.PERSONALIZATION_FILTER_B2B
 };
