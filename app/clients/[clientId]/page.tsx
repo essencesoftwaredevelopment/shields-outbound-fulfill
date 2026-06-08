@@ -2785,6 +2785,10 @@ export default function ClientPage() {
                         const params = new URLSearchParams();
                         params.append('clientId', clientId);
                         params.append('limit', '1');
+                        // Count-only: skips row hydration + campaign JSON aggregation and
+                        // returns the matching total directly (the row payload omits it).
+                        params.append('countOnly', 'true');
+                        params.append('includeTotal', 'true');
 
                         if (segment.filters.fullName) params.append('fullName', segment.filters.fullName);
                         if (segment.filters.email === 'found') params.append('emailFilter', 'exists');

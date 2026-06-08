@@ -1737,7 +1737,23 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     cic.contact_id,
                     COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
                     COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
-                    MAX(cic.added_at) AS last_campaign_added_at
+                    MAX(cic.added_at) AS last_campaign_added_at,
+                    json_agg(
+                        json_build_object(
+                            'campaignId', sc_scope.instantly_campaign_id,
+                            'campaignName', sc_scope.name,
+                            'addedAt', cic.added_at,
+                            'active', cic.active,
+                            'lastReplyAt', cic.timestamp_last_reply,
+                            'lastReplyCategory', cic.last_reply_category,
+                            'leadStatus', cic.lead_status_label,
+                            'interestStatus', cic.interest_status_label,
+                            'lastSyncedAt', cic.last_synced_at,
+                            'lastBounceAt', cic.last_bounce_at,
+                            'timestampLastInterestChange', cic.timestamp_last_interest_change
+                        )
+                        ORDER BY COALESCE(cic.last_synced_at, cic.added_at) DESC NULLS LAST, cic.added_at DESC NULLS LAST
+                    ) FILTER (WHERE cic.active = TRUE) AS campaigns_data
                 FROM contact_instantly_campaigns cic
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 JOIN paged_contacts pc_scope ON pc_scope.id = cic.contact_id
@@ -1807,28 +1823,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pcs.campaign_count_active,
                 pcs.last_campaign_added_at,
                 ${latestEventSelect}
-                (
-                    SELECT json_agg(
-                        json_build_object(
-                            'campaignId', sc.instantly_campaign_id,
-                            'campaignName', sc.name,
-                            'addedAt', cic.added_at,
-                            'active', cic.active,
-                            'lastReplyAt', cic.timestamp_last_reply,
-                            'lastReplyCategory', cic.last_reply_category,
-                            'leadStatus', cic.lead_status_label,
-                            'interestStatus', cic.interest_status_label,
-                            'lastSyncedAt', cic.last_synced_at,
-                            'lastBounceAt', cic.last_bounce_at,
-                            'timestampLastInterestChange', cic.timestamp_last_interest_change
-                        )
-                        ORDER BY COALESCE(cic.last_synced_at, cic.added_at) DESC NULLS LAST, cic.added_at DESC NULLS LAST
-                    )
-                    FROM contact_instantly_campaigns cic
-                    JOIN scoped_campaigns sc ON sc.id = cic.campaign_id
-                    WHERE cic.contact_id = pc.id
-                    AND cic.active = TRUE
-                ) as campaigns_data
+                pcs.campaigns_data
             FROM paged_contacts pc
             LEFT JOIN paged_campaign_stats pcs ON pcs.contact_id = pc.id
             LEFT JOIN contact_insights ci ON ci.contact_id = pc.id

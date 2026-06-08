@@ -124,6 +124,20 @@ export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql) {
         .map((eventType) => `'${eventType}'`)
         .join(',\n                        ');
 
+    // Every event_type that can yield a non-null lifecycle_state below. Pushing
+    // this set into the lifecycle_events WHERE lets Postgres skip the (often very
+    // large) tail of email_opened/reply/bounce rows for interested contacts.
+    // 'email_sent' is included because warm follow-up sends qualify via `source`.
+    const lifecycleEventTypesSql = Array.from(
+        new Set([
+            ...QUALIFYING_EVENT_TYPES,
+            ...DISQUALIFYING_EVENT_TYPES,
+            'email_sent'
+        ])
+    )
+        .map((eventType) => `'${eventType}'`)
+        .join(',\n                        ');
+
     return `
         period_interested_contacts AS (
             SELECT DISTINCT ON (cie.contact_id)
@@ -164,6 +178,9 @@ export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql) {
             WHERE cie.client_id = $2
               AND cie.agency_id = $1
               AND cie.contact_id IN (SELECT contact_id FROM period_interested_contacts)
+              AND LOWER(TRIM(COALESCE(cie.event_type, ''))) IN (
+                        ${lifecycleEventTypesSql}
+              )
         ),
         last_lifecycle AS (
             SELECT DISTINCT ON (contact_id)

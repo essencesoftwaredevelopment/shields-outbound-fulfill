@@ -42,6 +42,12 @@ const baseEnv = {
   INSTANTLY_RETRY_BASE_DELAY_MS: process.env.INSTANTLY_RETRY_BASE_DELAY_MS || 1000
 };
 
+// Pool sizing is per-process. The API server fans out several reads in parallel
+// (e.g. the analytics tab issues ~7 concurrent queries), so it needs more
+// connections than the background workers, which run mostly sequential writes.
+const SERVER_PGPOOL_MAX = process.env.SERVER_PGPOOL_MAX || process.env.PGPOOL_MAX || 15;
+const WORKER_PGPOOL_MAX = process.env.WORKER_PGPOOL_MAX || process.env.PGPOOL_MAX || 5;
+
 module.exports = {
   apps: [
     {
@@ -49,7 +55,8 @@ module.exports = {
       script: 'src/index.js',
       cwd: '/root/shields-outbound/server',
       env: {
-        ...baseEnv
+        ...baseEnv,
+        PGPOOL_MAX: SERVER_PGPOOL_MAX
       },
       autorestart: true
     },
@@ -60,7 +67,8 @@ module.exports = {
       instances: 1,
       exec_mode: 'fork',
       env: {
-        ...baseEnv
+        ...baseEnv,
+        PGPOOL_MAX: WORKER_PGPOOL_MAX
       },
       autorestart: true
     },
@@ -73,6 +81,7 @@ module.exports = {
       exec_mode: 'fork',
       env: {
         ...baseEnv,
+        PGPOOL_MAX: WORKER_PGPOOL_MAX,
         FOLLOWUP_SCHEDULE_TIMES: process.env.FOLLOWUP_SCHEDULE_TIMES || '09:00,14:00',
         FOLLOWUP_TIMEZONE: process.env.FOLLOWUP_TIMEZONE || 'UTC',
         FOLLOWUP_BATCH_SIZE: process.env.FOLLOWUP_BATCH_SIZE || 50,
