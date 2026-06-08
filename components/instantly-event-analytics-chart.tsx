@@ -38,10 +38,6 @@ const CHART_WIDTH = 1000;
 const CHART_HEIGHT = 220;
 const PADDING = { top: 16, right: 40, bottom: 30, left: 40 };
 
-function bucketTimestampMs(bucket: string) {
-    return new Date(bucket).getTime();
-}
-
 function isAtFloor(point: ChartPoint, floorY: number | null) {
     return floorY !== null && Math.abs(point.y - floorY) < 0.5;
 }
@@ -59,11 +55,7 @@ function clampControlY(
     return Math.max(segmentHighY, Math.min(segmentLowY, controlY));
 }
 
-function buildSmoothPath(
-    points: ChartPoint[],
-    floorY: number | null = null,
-    trailingPoint: ChartPoint | null = null
-) {
+function buildSmoothPath(points: ChartPoint[], floorY: number | null = null) {
     if (points.length === 0) return "";
     if (points.length === 1) {
         return `M ${points[0].x} ${points[0].y}`;
@@ -74,9 +66,7 @@ function buildSmoothPath(
         const previous = points[index - 1] || points[index];
         const current = points[index];
         const next = points[index + 1];
-        const afterNext = index + 2 < points.length
-            ? points[index + 2]
-            : (trailingPoint || next);
+        const afterNext = points[index + 2] || next;
 
         if (floorY !== null && (isAtFloor(current, floorY) || isAtFloor(next, floorY))) {
             path += ` L ${next.x} ${next.y}`;
@@ -117,7 +107,7 @@ function buildSeriesPaths(
         return { solid: "", dotted: "", solidPoints: [], nowPoint: null };
     }
 
-    const solid = buildSmoothPath(points, floorY, nowPoint);
+    const solid = buildSmoothPath(points, floorY);
     const dottedAnchor = points[points.length - 1];
     const dotted = nowPoint && dottedAnchor.x < nowPoint.x - 0.5
         ? buildDottedPath(dottedAnchor, nowPoint)
@@ -126,20 +116,10 @@ function buildSeriesPaths(
     return { solid, dotted, solidPoints: points, nowPoint };
 }
 
-function buildAreaPath(
-    solidPath: string,
-    solidPoints: ChartPoint[],
-    nowPoint: ChartPoint | null,
-    baselineY: number
-) {
+function buildAreaPath(solidPath: string, solidPoints: ChartPoint[], baselineY: number) {
     if (!solidPath || solidPoints.length === 0) return "";
     const first = solidPoints[0];
     const last = solidPoints[solidPoints.length - 1];
-
-    if (nowPoint) {
-        return `${solidPath} L ${nowPoint.x} ${nowPoint.y} L ${nowPoint.x} ${baselineY} L ${first.x} ${baselineY} Z`;
-    }
-
     return `${solidPath} L ${last.x} ${baselineY} L ${first.x} ${baselineY} Z`;
 }
 
@@ -147,18 +127,18 @@ function valueToY(value: number, maxValue: number, plotHeight: number, baselineY
     return baselineY - (value / maxValue) * plotHeight;
 }
 
-function buildTimedChartPoints({
+function buildChartPoints({
     rows,
-    nowMs,
     nowX,
+    plotWidth,
     plotHeight,
     baselineY,
     maxValue,
     getValue
 }: {
     rows: ChartRow[];
-    nowMs: number;
     nowX: number;
+    plotWidth: number;
     plotHeight: number;
     baselineY: number;
     maxValue: number;
@@ -168,29 +148,29 @@ function buildTimedChartPoints({
         return { points: [], nowPoint: null };
     }
 
-    const firstMs = bucketTimestampMs(rows[0].bucket);
-    const spanMs = Math.max(1, nowMs - firstMs);
-    const xForMs = (ms: number) => PADDING.left + ((ms - firstMs) / spanMs) * (nowX - PADDING.left);
-
-    const completeRows = rows.length >= 2 ? rows.slice(0, -1) : rows;
-    const partialRow = rows[rows.length - 1];
+    const bucketCount = rows.length;
+    const completeRows = bucketCount >= 2 ? rows.slice(0, -1) : rows;
+    const partialRow = rows[bucketCount - 1];
+    const slotCount = Math.max(1, bucketCount - 1);
+    const stepX = plotWidth / slotCount;
+    const xForIndex = (index: number) => PADDING.left + stepX * index;
 
     const points = completeRows.map((row, index) => {
         const value = getValue(row);
         return {
-            x: xForMs(bucketTimestampMs(row.bucket)),
+            x: xForIndex(index),
             y: valueToY(value, maxValue, plotHeight, baselineY),
             row,
             index
         };
     });
 
-    const nowPoint = rows.length >= 2
+    const nowPoint = bucketCount >= 2
         ? {
             x: nowX,
             y: valueToY(getValue(partialRow), maxValue, plotHeight, baselineY),
             row: partialRow,
-            index: rows.length - 1
+            index: bucketCount - 1
         }
         : null;
 
@@ -235,52 +215,51 @@ export default function InstantlyEventAnalyticsChart({
     );
 
     const nowX = PADDING.left + plotWidth;
-    const nowMs = Date.now();
     const eventsFloorY = rows.some((row) => row.count < 0) ? null : baselineY;
     const positiveFloorY = rows.some((row) => (row.positive_replies ?? 0) < 0) ? null : baselineY;
     const meetingsFloorY = rows.some((row) => (row.meetings_booked ?? 0) < 0) ? null : baselineY;
 
     const eventSeries = useMemo(
-        () => buildTimedChartPoints({
+        () => buildChartPoints({
             rows,
-            nowMs,
             nowX,
+            plotWidth,
             plotHeight,
             baselineY,
             maxValue: maxEventCount,
             getValue: (row) => row.count
         }),
-        [baselineY, maxEventCount, nowMs, nowX, plotHeight, rows]
+        [baselineY, maxEventCount, nowX, plotHeight, plotWidth, rows]
     );
 
     const positiveSeries = useMemo(
         () => (showPositiveReplies
-            ? buildTimedChartPoints({
+            ? buildChartPoints({
                 rows,
-                nowMs,
                 nowX,
+                plotWidth,
                 plotHeight,
                 baselineY,
                 maxValue: maxPositiveCount,
                 getValue: (row) => row.positive_replies ?? 0
             })
             : { points: [], nowPoint: null }),
-        [baselineY, maxPositiveCount, nowMs, nowX, plotHeight, rows, showPositiveReplies]
+        [baselineY, maxPositiveCount, nowX, plotHeight, plotWidth, rows, showPositiveReplies]
     );
 
     const meetingsSeries = useMemo(
         () => (showMeetingsBooked
-            ? buildTimedChartPoints({
+            ? buildChartPoints({
                 rows,
-                nowMs,
                 nowX,
+                plotWidth,
                 plotHeight,
                 baselineY,
                 maxValue: maxMeetingsBookedCount,
                 getValue: (row) => row.meetings_booked ?? 0
             })
             : { points: [], nowPoint: null }),
-        [baselineY, maxMeetingsBookedCount, nowMs, nowX, plotHeight, rows, showMeetingsBooked]
+        [baselineY, maxMeetingsBookedCount, nowX, plotHeight, plotWidth, rows, showMeetingsBooked]
     );
 
     const points = eventSeries.points;
@@ -308,8 +287,8 @@ export default function InstantlyEventAnalyticsChart({
     const meetingsBookedLinePath = meetingsPaths.solid;
     const meetingsDottedPath = meetingsPaths.dotted;
     const areaPath = useMemo(
-        () => buildAreaPath(linePath, eventPaths.solidPoints, nowPoint, baselineY),
-        [baselineY, eventPaths.solidPoints, linePath, nowPoint]
+        () => buildAreaPath(linePath, eventPaths.solidPoints, baselineY),
+        [baselineY, eventPaths.solidPoints, linePath]
     );
     const totalCount = useMemo(() => rows.reduce((sum, row) => sum + row.count, 0), [rows]);
     const totalPositiveCount = useMemo(
@@ -471,7 +450,7 @@ export default function InstantlyEventAnalyticsChart({
                     >
                     <svg
                         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
-                        preserveAspectRatio="none"
+                        preserveAspectRatio="xMidYMid meet"
                         role="img"
                         aria-label={`Line chart of ${totalCount} events${showPositiveReplies ? `, ${totalPositiveCount} positive replies` : ""}${showMeetingsBooked ? `, and ${totalMeetingsBookedCount} meetings booked` : ""} across ${rows.length} ${bucketUnit === "hour" ? "hours" : "days"}`}
                         style={{ display: "block", width: "100%", height: "100%", overflow: "visible" }}
@@ -531,7 +510,7 @@ export default function InstantlyEventAnalyticsChart({
                                     >
                                         {formatAxisTick(eventValue)}
                                     </text>
-                                    {showPositiveReplies && (
+                                    {showPositiveReplies && maxPositiveCount > 1 && (
                                         <text
                                             x={CHART_WIDTH - PADDING.right + 8}
                                             y={y + 4}
