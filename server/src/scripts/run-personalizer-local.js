@@ -32,6 +32,7 @@ Options:
   --remove-b2b                  Filter B2B-style products before personalization
   --product-prompt-version <v>  ecom.js mode: old | new_gpt5mini. Default: new_gpt5mini
   --product-prompt-products <n> Number of Shopify products to include in the new prompt path. Default: 3
+  --skip-shopify-detection      Skip DNS Shopify checks; treat every domain as a Shopify store
   --openai-key <key>            OpenAI API key. Falls back to OPENAI_API_KEY env var
   --help                        Show this message
 `);
@@ -47,6 +48,7 @@ function parseArgs(argv) {
         removeB2B: false,
         productPromptVersion: 'new_gpt5mini',
         productPromptProducts: 3,
+        skipShopifyDetection: false,
         openaiKey: process.env.OPENAI_API_KEY || ''
     };
 
@@ -58,6 +60,10 @@ function parseArgs(argv) {
         }
         if (arg === '--remove-b2b') {
             args.removeB2B = true;
+            continue;
+        }
+        if (arg === '--skip-shopify-detection') {
+            args.skipShopifyDetection = true;
             continue;
         }
         if (arg === '--input') {
@@ -177,6 +183,9 @@ async function main() {
     console.log(`Working dir: ${runDir}`);
     console.log(`Output: ${outputCsv}`);
     console.log(`Strategy: ecom.js (${args.productPromptVersion})`);
+    if (args.skipShopifyDetection) {
+        console.log('Shopify DNS detection: skipped');
+    }
     if (Number.isFinite(args.concurrency)) {
         console.log(`Concurrency override: ${args.concurrency}`);
     }
@@ -203,7 +212,9 @@ async function main() {
         if (typeof message === 'string') {
             if (message.startsWith('Starting Shopify detection')) {
                 phaseStarts.set('shopify_detection', Date.now());
-            } else if (message.startsWith('Shopify detection complete')) {
+            } else if (message.startsWith('Skipping Shopify DNS detection')) {
+                phaseStarts.set('shopify_detection', Date.now());
+            } else if (message.startsWith('Shopify detection complete') || message.startsWith('Shopify detection bypassed')) {
                 const start = phaseStarts.get('shopify_detection');
                 if (start) phaseDurations.set('Shopify detection', Date.now() - start);
             } else if (message.startsWith('Fetching products for')) {
@@ -241,7 +252,8 @@ async function main() {
         concurrency: args.concurrency,
         removeB2B: args.removeB2B,
         productPromptVersion: args.productPromptVersion,
-        productPromptProducts: args.productPromptProducts
+        productPromptProducts: args.productPromptProducts,
+        skipShopifyDetection: args.skipShopifyDetection
     });
 
     const totalMs = Date.now() - runStartMs;

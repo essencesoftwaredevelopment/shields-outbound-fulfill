@@ -38,6 +38,136 @@ const BLOCKER_EVENT_TYPES = [
 
 const BATCH_SIZE_DEFAULT = parseInt(process.env.FOLLOWUP_BATCH_SIZE || '50', 10) || 50;
 
+/** Sources whose reply_to_uuid is our outbound message id, not a lead-thread anchor. */
+const SYNTHETIC_OUTBOUND_EVENT_SOURCES = ['server_follow_up', 'interested_autoresponder'];
+
+/**
+ * Choose the Instantly reply anchor from thread events (newest-first).
+ * server_follow_up and interested_reply_sent rows store the sent message id in
+ * reply_to_uuid; replying to those delivers back to the sending account.
+ */
+export function resolveThreadReplyAnchor(events = []) {
+    const sorted = [...events].sort((a, b) => {
+        const tsA = new Date(a.event_timestamp || a.ts || 0).getTime();
+        const tsB = new Date(b.event_timestamp || b.ts || 0).getTime();
+        return tsB - tsA;
+    });
+
+    for (const event of sorted) {
+        if (event.event_type === 'reply_received' && event.reply_to_uuid) {
+            return {
+                reply_to_uuid: event.reply_to_uuid,
+                eaccount: event.email_account || null
+            };
+        }
+    }
+
+    for (const event of sorted) {
+        const parent = event.payload?.parent_reply_to_uuid;
+        if (event.event_type === 'interested_reply_sent' && parent) {
+            return {
+                reply_to_uuid: parent,
+                eaccount: event.email_account || null
+            };
+        }
+    }
+
+    for (const event of sorted) {
+        if (SYNTHETIC_OUTBOUND_EVENT_SOURCES.includes(event.source)) continue;
+        if (event.event_type === 'interested_reply_sent') continue;
+        if (event.reply_to_uuid) {
+            return {
+                reply_to_uuid: event.reply_to_uuid,
+                eaccount: event.email_account || null
+            };
+        }
+    }
+
+    return { reply_to_uuid: null, eaccount: null };
+}
+
+function threadReplyToUuidSql(contactIdSql, campaignIdSql) {
+    return `COALESCE(
+        (
+            SELECT e.reply_to_uuid
+            FROM contact_instantly_events e
+            WHERE e.contact_id = ${contactIdSql}
+              AND e.campaign_id = ${campaignIdSql}
+              AND e.event_type = 'reply_received'
+              AND e.reply_to_uuid IS NOT NULL
+            ORDER BY e.event_timestamp DESC
+            LIMIT 1
+        ),
+        (
+            SELECT e.payload->>'parent_reply_to_uuid'
+            FROM contact_instantly_events e
+            WHERE e.contact_id = ${contactIdSql}
+              AND e.campaign_id = ${campaignIdSql}
+              AND e.event_type = 'interested_reply_sent'
+              AND e.payload->>'parent_reply_to_uuid' IS NOT NULL
+            ORDER BY e.event_timestamp DESC
+            LIMIT 1
+        ),
+        (
+            SELECT e.reply_to_uuid
+            FROM contact_instantly_events e
+            WHERE e.contact_id = ${contactIdSql}
+              AND e.campaign_id = ${campaignIdSql}
+              AND e.reply_to_uuid IS NOT NULL
+              AND e.source NOT IN ('server_follow_up', 'interested_autoresponder')
+              AND e.event_type NOT IN ('interested_reply_sent')
+            ORDER BY e.event_timestamp DESC
+            LIMIT 1
+        )
+    )`;
+}
+
+function threadEaccountSql(contactIdSql, campaignIdSql) {
+    return `COALESCE(
+        (
+            SELECT e.email_account
+            FROM contact_instantly_events e
+            WHERE e.contact_id = ${contactIdSql}
+              AND e.campaign_id = ${campaignIdSql}
+              AND e.event_type = 'reply_received'
+              AND e.email_account IS NOT NULL
+            ORDER BY e.event_timestamp DESC
+            LIMIT 1
+        ),
+        (
+            SELECT e.email_account
+            FROM contact_instantly_events e
+            WHERE e.contact_id = ${contactIdSql}
+              AND e.campaign_id = ${campaignIdSql}
+              AND e.event_type = 'interested_reply_sent'
+              AND e.email_account IS NOT NULL
+            ORDER BY e.event_timestamp DESC
+            LIMIT 1
+        ),
+        (
+            SELECT e.email_account
+            FROM contact_instantly_events e
+            WHERE e.contact_id = ${contactIdSql}
+              AND e.campaign_id = ${campaignIdSql}
+              AND e.email_account IS NOT NULL
+              AND e.source NOT IN ('server_follow_up', 'interested_autoresponder')
+            ORDER BY e.event_timestamp DESC
+            LIMIT 1
+        )
+    )`;
+}
+
+/** Fetch thread reply metadata for a contact+campaign pair. */
+export async function fetchThreadReplyMetadata(db, contactId, campaignId) {
+    const result = await db.query(
+        `SELECT
+            ${threadReplyToUuidSql('$1', '$2')} AS reply_to_uuid,
+            ${threadEaccountSql('$1', '$2')} AS eaccount`,
+        [contactId, campaignId]
+    );
+    return result.rows[0] || { reply_to_uuid: null, eaccount: null };
+}
+
 // ─── Template rendering ───────────────────────────────────────────────────────
 
 /**
@@ -289,26 +419,9 @@ async function getEligibleProspects(db, clientId, sentForDate) {
                 ORDER BY e.event_timestamp DESC
                 LIMIT 1
             ) AS thread_subject,
-            -- Latest reply_to_uuid from any event in this contact+campaign
-            (
-                SELECT e.reply_to_uuid
-                FROM contact_instantly_events e
-                WHERE e.contact_id = cic.contact_id
-                  AND e.campaign_id = cic.campaign_id
-                  AND e.reply_to_uuid IS NOT NULL
-                ORDER BY e.event_timestamp DESC
-                LIMIT 1
-            ) AS reply_to_uuid,
-            -- Latest sending account from any event
-            (
-                SELECT e.email_account
-                FROM contact_instantly_events e
-                WHERE e.contact_id = cic.contact_id
-                  AND e.campaign_id = cic.campaign_id
-                  AND e.email_account IS NOT NULL
-                ORDER BY e.event_timestamp DESC
-                LIMIT 1
-            ) AS eaccount
+            -- Inbound thread anchor (exclude our own outbound follow-up/autoresponder ids)
+            ${threadReplyToUuidSql('cic.contact_id', 'cic.campaign_id')} AS reply_to_uuid,
+            ${threadEaccountSql('cic.contact_id', 'cic.campaign_id')} AS eaccount
          FROM contact_instantly_campaigns cic
          JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
          JOIN contacts c ON c.id = cic.contact_id

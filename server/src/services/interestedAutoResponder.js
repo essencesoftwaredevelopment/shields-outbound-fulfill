@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 import { pool } from '../config/db.js';
 import { getAgencySettings } from './db/agencySettings.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
-import { resolveTemplateVars, renderTemplate } from './followUpSender.js';
+import { fetchThreadReplyMetadata, resolveTemplateVars, renderTemplate } from './followUpSender.js';
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -383,46 +383,33 @@ async function resolvePreviousLeadMessageForDraft(db, {
 }
 
 async function fetchLatestThreadMetadata(db, contactId, campaignId) {
-    const result = await db.query(
-        `SELECT
-            (
-                SELECT COALESCE(
-                    e.payload->>'subject',
-                    e.payload->>'email_subject',
-                    e.payload->>'thread_subject'
-                )
-                FROM contact_instantly_events e
-                WHERE e.contact_id = $1
-                  AND e.campaign_id = $2
-                  AND COALESCE(
-                      e.payload->>'subject',
-                      e.payload->>'email_subject',
-                      e.payload->>'thread_subject'
-                  ) IS NOT NULL
-                ORDER BY e.event_timestamp DESC NULLS LAST, e.created_at DESC NULLS LAST
-                LIMIT 1
-            ) AS thread_subject,
-            (
-                SELECT e.reply_to_uuid
-                FROM contact_instantly_events e
-                WHERE e.contact_id = $1
-                  AND e.campaign_id = $2
-                  AND e.reply_to_uuid IS NOT NULL
-                ORDER BY e.event_timestamp DESC NULLS LAST, e.created_at DESC NULLS LAST
-                LIMIT 1
-            ) AS reply_to_uuid,
-            (
-                SELECT e.email_account
-                FROM contact_instantly_events e
-                WHERE e.contact_id = $1
-                  AND e.campaign_id = $2
-                  AND e.email_account IS NOT NULL
-                ORDER BY e.event_timestamp DESC NULLS LAST, e.created_at DESC NULLS LAST
-                LIMIT 1
-            ) AS eaccount`,
-        [contactId, campaignId]
-    );
-    return result.rows[0] || {};
+    const [subjectResult, threadReply] = await Promise.all([
+        db.query(
+            `SELECT COALESCE(
+                e.payload->>'subject',
+                e.payload->>'email_subject',
+                e.payload->>'thread_subject'
+            ) AS thread_subject
+             FROM contact_instantly_events e
+             WHERE e.contact_id = $1
+               AND e.campaign_id = $2
+               AND COALESCE(
+                   e.payload->>'subject',
+                   e.payload->>'email_subject',
+                   e.payload->>'thread_subject'
+               ) IS NOT NULL
+             ORDER BY e.event_timestamp DESC NULLS LAST, e.created_at DESC NULLS LAST
+             LIMIT 1`,
+            [contactId, campaignId]
+        ),
+        fetchThreadReplyMetadata(db, contactId, campaignId)
+    ]);
+
+    return {
+        thread_subject: subjectResult.rows[0]?.thread_subject || null,
+        reply_to_uuid: threadReply.reply_to_uuid || null,
+        eaccount: threadReply.eaccount || null
+    };
 }
 
 export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {

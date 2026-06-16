@@ -176,6 +176,54 @@ async function runShopifyDetection({ inputCsv, outputCsv, log, concurrency = 200
     return { total: rows.length, shopifyStores: shopifyCount };
 }
 
+async function writeAllDomainsAsShopify({ inputCsv, outputCsv, log }) {
+    log?.('Skipping Shopify DNS detection; treating all domains as Shopify stores');
+
+    const rows = [];
+    await new Promise((resolve, reject) => {
+        fs.createReadStream(inputCsv)
+            .pipe(csvParse({ columns: true, trim: true }))
+            .on('data', (row) => {
+                const email = (row.email || '').trim();
+                if (email) {
+                    rows.push(row);
+                }
+            })
+            .on('end', resolve)
+            .on('error', reject);
+    });
+
+    if (rows.length === 0) {
+        log?.('No emails found, skipping personalization');
+        fs.writeFileSync(outputCsv, 'domain,shopify,founder_name,email,email_status\n');
+        return { total: 0, shopifyStores: 0 };
+    }
+
+    const results = rows
+        .map((row) => {
+            const domain = normalizeHostname(row.domain || '');
+            if (!domain) return null;
+            return {
+                domain,
+                shopify: 'Yes',
+                founder_name: row.founder_name || '',
+                email: row.email || '',
+                email_status: row.email_status || ''
+            };
+        })
+        .filter(Boolean);
+
+    const writeStream = fs.createWriteStream(outputCsv);
+    const stringifier = csvStringify({ header: true, columns: ['domain', 'shopify', 'founder_name', 'email', 'email_status'] });
+    stringifier.pipe(writeStream);
+    results.forEach((row) => stringifier.write(row));
+    stringifier.end();
+    await new Promise((resolve) => writeStream.on('finish', resolve));
+
+    log?.(`Shopify detection bypassed: ${results.length} domains marked as Shopify`);
+    return { total: rows.length, shopifyStores: results.length };
+}
+
 function fetchUrl(url, timeout = 3000) {
     return new Promise((resolve, reject) => {
         const protocol = url.startsWith('https') ? https : http;
@@ -1047,6 +1095,7 @@ export async function runPersonalization({
     removeB2B = true,
     productPromptVersion = 'old',
     productPromptProducts = 3,
+    skipShopifyDetection = false,
     onBatch = null,
     checkpoint = null
 }) {
@@ -1056,13 +1105,15 @@ export async function runPersonalization({
     const productFailuresCsv = path.join(jobDir, 'product-failures.csv');
     const cleanedProductsCsv = path.join(jobDir, 'products-cleaned.csv');
 
-    // Step 1: Shopify Detection
-    const shopifyStats = await runShopifyDetection({
-        inputCsv,
-        outputCsv: shopifyDetectionCsv,
-        log,
-        concurrency: 200
-    });
+    // Step 1: Shopify Detection (optional DNS bypass for local runs)
+    const shopifyStats = skipShopifyDetection
+        ? await writeAllDomainsAsShopify({ inputCsv, outputCsv: shopifyDetectionCsv, log })
+        : await runShopifyDetection({
+            inputCsv,
+            outputCsv: shopifyDetectionCsv,
+            log,
+            concurrency: 200
+        });
 
     // If no Shopify stores found, skip remaining steps
     if (shopifyStats.shopifyStores === 0) {

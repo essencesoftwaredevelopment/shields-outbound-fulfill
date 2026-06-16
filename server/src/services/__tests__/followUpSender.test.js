@@ -18,6 +18,7 @@ import {
     renderTemplate,
     sanitizeHtml,
     htmlToPlainText,
+    resolveThreadReplyAnchor,
 } from '../followUpSender.js';
 
 // ─── Template rendering ───────────────────────────────────────────────────────
@@ -414,5 +415,67 @@ test('missing thread metadata: status is blocked_missing_thread, non-retryable',
     });
     assert.deepEqual(determineOutcome('uuid-abc', 'sender@example.com'), {
         status: 'sent', retryable: false
+    });
+});
+
+// ─── Thread reply anchor selection ───────────────────────────────────────────
+
+test('resolveThreadReplyAnchor prefers latest inbound reply over outbound follow-up', () => {
+    const events = [
+        {
+            event_type: 'email_sent',
+            source: 'server_follow_up',
+            reply_to_uuid: 'outbound-follow-up-uuid',
+            email_account: 'sender@example.com',
+            event_timestamp: '2026-06-16T09:00:00Z'
+        },
+        {
+            event_type: 'reply_received',
+            source: 'webhook',
+            reply_to_uuid: 'inbound-reply-uuid',
+            email_account: 'sender@example.com',
+            event_timestamp: '2026-06-08T15:59:00Z'
+        }
+    ];
+
+    assert.deepEqual(resolveThreadReplyAnchor(events), {
+        reply_to_uuid: 'inbound-reply-uuid',
+        eaccount: 'sender@example.com'
+    });
+});
+
+test('resolveThreadReplyAnchor uses autoresponder parent anchor when no inbound reply exists', () => {
+    const events = [
+        {
+            event_type: 'interested_reply_sent',
+            source: 'interested_autoresponder',
+            reply_to_uuid: 'autoresponder-outbound-uuid',
+            email_account: 'sender@example.com',
+            payload: { parent_reply_to_uuid: 'inbound-reply-uuid' },
+            event_timestamp: '2026-06-08T16:00:00Z'
+        }
+    ];
+
+    assert.deepEqual(resolveThreadReplyAnchor(events), {
+        reply_to_uuid: 'inbound-reply-uuid',
+        eaccount: 'sender@example.com'
+    });
+});
+
+test('resolveThreadReplyAnchor ignores synthetic outbound follow-up events', () => {
+    const events = [
+        {
+            event_type: 'email_sent',
+            source: 'server_follow_up',
+            reply_to_uuid: 'follow-up-outbound-uuid',
+            email_account: 'sender@example.com',
+            payload: { parent_reply_to_uuid: 'autoresponder-outbound-uuid' },
+            event_timestamp: '2026-06-16T09:00:00Z'
+        }
+    ];
+
+    assert.deepEqual(resolveThreadReplyAnchor(events), {
+        reply_to_uuid: null,
+        eaccount: null
     });
 });
