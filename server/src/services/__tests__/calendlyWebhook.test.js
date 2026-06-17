@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
-import { verifyCalendlySignature, parseWebhookPayload } from '../calendlyWebhook.js';
+import {
+    verifyCalendlySignature,
+    parseWebhookPayload,
+    resolveTimelineEventTimestamp
+} from '../calendlyWebhook.js';
 
 test('verifyCalendlySignature: valid signature passes', () => {
     const secret = 'test-signing-key';
@@ -48,4 +52,65 @@ test('parseWebhookPayload: extracts invitee email and scheduled event uri', () =
     assert.equal(parsed.inviteeName, 'Jane Doe');
     assert.equal(parsed.scheduledEventUri, 'https://api.calendly.com/scheduled_events/EVT123');
     assert.equal(parsed.inviteeUri, 'https://api.calendly.com/scheduled_events/EVT123/invitees/INV456');
+});
+
+test('resolveTimelineEventTimestamp: invitee.created uses booking time, not meeting start', () => {
+    const body = {
+        event: 'invitee.created',
+        created_at: '2026-06-17T09:16:52.663Z',
+        payload: {
+            created_at: '2026-06-17T09:16:51.441028Z',
+            scheduled_event: {
+                start_time: '2026-06-18T10:30:00.000000Z'
+            }
+        }
+    };
+
+    const parsed = parseWebhookPayload(body);
+    const timestamp = resolveTimelineEventTimestamp({
+        eventType: parsed.eventType,
+        invitee: parsed.invitee,
+        payload: parsed.payload,
+        body
+    });
+
+    assert.equal(timestamp.toISOString(), '2026-06-17T09:16:51.441Z');
+});
+
+test('resolveTimelineEventTimestamp: invitee.canceled uses cancellation time', () => {
+    const body = {
+        event: 'invitee.canceled',
+        created_at: '2026-06-17T11:00:00.000Z',
+        payload: {
+            created_at: '2026-06-17T09:16:51.441028Z',
+            updated_at: '2026-06-17T11:00:00.000Z',
+            scheduled_event: {
+                start_time: '2026-06-18T10:30:00.000000Z'
+            }
+        }
+    };
+
+    const parsed = parseWebhookPayload(body);
+    const timestamp = resolveTimelineEventTimestamp({
+        eventType: parsed.eventType,
+        invitee: parsed.invitee,
+        payload: parsed.payload,
+        body
+    });
+
+    assert.equal(timestamp.toISOString(), '2026-06-17T11:00:00.000Z');
+});
+
+test('resolveTimelineEventTimestamp: prefers enriched invitee created_at', () => {
+    const timestamp = resolveTimelineEventTimestamp({
+        eventType: 'invitee.created',
+        invitee: { created_at: '2026-06-17T09:16:51.441028Z' },
+        payload: {
+            scheduled_event: { start_time: '2026-06-18T10:30:00.000000Z' }
+        },
+        body: { created_at: '2026-06-17T09:16:52.663Z' },
+        enrichedInvitee: { created_at: '2026-06-17T09:16:50.000000Z' }
+    });
+
+    assert.equal(timestamp.toISOString(), '2026-06-17T09:16:50.000Z');
 });

@@ -329,10 +329,30 @@ async function upsertCalendlyBooking({
     return result.rows[0] || null;
 }
 
-function resolveEventTimestamp(startTime) {
-    if (!startTime) return new Date();
-    const parsed = new Date(startTime);
+function resolveEventTimestamp(value) {
+    if (!value) return new Date();
+    const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function resolveTimelineEventTimestamp({ eventType, invitee, payload, body, enrichedInvitee = null }) {
+    const source = enrichedInvitee || invitee;
+
+    if (eventType === 'invitee.canceled') {
+        return resolveEventTimestamp(
+            source?.updated_at
+            || invitee?.updated_at
+            || payload?.updated_at
+            || body?.created_at
+        );
+    }
+
+    return resolveEventTimestamp(
+        source?.created_at
+        || invitee?.created_at
+        || payload?.created_at
+        || body?.created_at
+    );
 }
 
 function extractLocation(scheduledEvent) {
@@ -400,20 +420,19 @@ export async function processCalendlyWebhook({
     }
 
     let scheduledEvent = payload.scheduled_event || null;
-    let enrichedInvitees = [];
+    let enrichedInvitee = null;
     let questionsAndAnswers = invitee.questions_and_answers || payload.questions_and_answers || [];
 
     if (eventType === 'invitee.created' && scheduledEventUri && pat) {
         try {
             const details = await fetchCalendlyEventDetails(scheduledEventUri, pat);
             scheduledEvent = details.scheduledEvent || scheduledEvent;
-            enrichedInvitees = details.invitees;
 
-            const matchedInvitee = enrichedInvitees.find(i => normalizeEmail(i.email) === email)
-                || enrichedInvitees[0]
+            enrichedInvitee = details.invitees.find(i => normalizeEmail(i.email) === email)
+                || details.invitees[0]
                 || null;
-            if (matchedInvitee?.questions_and_answers?.length) {
-                questionsAndAnswers = matchedInvitee.questions_and_answers;
+            if (enrichedInvitee?.questions_and_answers?.length) {
+                questionsAndAnswers = enrichedInvitee.questions_and_answers;
             }
         } catch (error) {
             console.warn('[calendly-webhook] failed to fetch event details:', error?.message || error);
@@ -427,13 +446,19 @@ export async function processCalendlyWebhook({
     const location = extractLocation(scheduledEvent) || payload.location || null;
 
     const bookingStatus = eventType === 'invitee.canceled' ? 'canceled' : 'active';
-    const timelineEventType = eventType === 'invitee.canceled' ? 'meeting_canceled' : 'meeting_booked';
+    const timelineEventType = eventType === 'invitee.canceled' ? 'meeting_canceled' : 'lead_meeting_booked';
 
     const contact = await findContactByEmail(email, scope);
     let timelineAdded = false;
 
     if (contact) {
-        const eventTimestamp = resolveEventTimestamp(startTime);
+        const eventTimestamp = resolveTimelineEventTimestamp({
+            eventType,
+            invitee,
+            payload,
+            body,
+            enrichedInvitee
+        });
         const fingerprint = buildTimelineFingerprint({
             inviteeUri,
             email,
@@ -522,5 +547,6 @@ export async function processCalendlyWebhookForClient({ body, agencyId, clientId
 export {
     normalizeEmail,
     parseWebhookPayload,
+    resolveTimelineEventTimestamp,
     verifyCalendlySignature as verifySignature
 };
