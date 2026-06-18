@@ -6,6 +6,9 @@ import { supabase } from "@/lib/supabase/client";
 
 type ThemeMode = "dark" | "light" | "auto";
 
+const SIDEBAR_WIDTH_EXPANDED = "260px";
+const SIDEBAR_WIDTH_COLLAPSED = "64px";
+
 function getEffectiveTheme(): ThemeMode {
     const stored = localStorage.getItem("theme") as ThemeMode | null;
     return stored ?? "auto";
@@ -29,11 +32,16 @@ export default function AppShell({ children }: { children: ReactNode }) {
     const pathname = usePathname();
     const [today, setToday] = useState<string>("");
     const [themeMode, setThemeMode] = useState<ThemeMode>("auto");
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
     const isActive = (path: string) => pathname === path || pathname.startsWith(`${path}/`);
 
     useEffect(() => {
         setToday(new Date().toLocaleDateString());
         setThemeMode(getEffectiveTheme());
+        const stored = localStorage.getItem("sidebar-collapsed");
+        if (stored === "true") {
+            setSidebarCollapsed(true);
+        }
     }, []);
 
     function cycleTheme() {
@@ -42,83 +50,124 @@ export default function AppShell({ children }: { children: ReactNode }) {
         setThemeMode(next);
     }
 
+    function toggleSidebar() {
+        setSidebarCollapsed((prev) => {
+            const next = !prev;
+            localStorage.setItem("sidebar-collapsed", String(next));
+            return next;
+        });
+    }
+
     const themeIcon = themeMode === "dark" ? "🌙" : themeMode === "light" ? "☀️" : "🖥️";
     const themeLabel = themeMode === "dark" ? "Dark" : themeMode === "light" ? "Light" : "Auto";
+    const sidebarWidth = sidebarCollapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED;
 
     return (
-        <div className="dashboard">
+        <div
+            className="dashboard"
+            style={{ "--app-sidebar-width": sidebarWidth } as React.CSSProperties}
+        >
             <aside
-                className="sidebar"
+                className={`sidebar${sidebarCollapsed ? " sidebar--collapsed" : ""}`}
                 style={{
-                    position: 'fixed',
+                    position: "fixed",
                     top: 0,
                     left: 0,
-                    height: '100vh',
-                    overflow: 'hidden',
+                    height: "100vh",
+                    overflow: "hidden",
                 }}
             >
+                <button
+                    type="button"
+                    className="sidebar__toggle"
+                    onClick={toggleSidebar}
+                    aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                >
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        {sidebarCollapsed ? (
+                            <path d="M6 4L10 8L6 12" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+                        ) : (
+                            <path d="M10 4L6 8L10 12" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+                        )}
+                    </svg>
+                </button>
+
                 <div className="sidebar__brand">
                     <span className="sidebar__tag">{today}</span>
                 </div>
+
                 <div
                     className="sidebar__nav"
                     style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        height: 'calc(100vh - 64px)',
-                        gap: '0.5rem',
-                    justifyContent: 'space-between',
-                }}
-            >
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    <button
-                        type="button"
-                        className={`sidebar__btn${isActive('/') ? ' sidebar__btn--active' : ''}`}
-                        onClick={() => router.push('/')}
-                    >
-                        🏠  Home
-                    </button>
-                    <button
-                        type="button"
-                        className={`sidebar__btn${isActive('/account') ? ' sidebar__btn--active' : ''}`}
-                        onClick={() => router.push('/account')}
-                    >
-                        👤  Account
-                    </button>
-                </div>
-                <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    <button
-                        type="button"
-                        className="sidebar__btn"                        onClick={cycleTheme}
-                        title={`Theme: ${themeLabel} — click to cycle`}
-                    >
-                        {themeIcon}  {themeLabel}
-                    </button>
-                    <button
-                        type="button"
-                        className="sidebar__btn"                            onClick={() => router.push('/?showKeys=1')}
+                        display: "flex",
+                        flexDirection: "column",
+                        height: "calc(100vh - 96px)",
+                        gap: "0.5rem",
+                        justifyContent: "space-between",
+                    }}
+                >
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                        <button
+                            type="button"
+                            className={`sidebar__btn${isActive("/") ? " sidebar__btn--active" : ""}`}
+                            onClick={() => router.push("/")}
+                            title="Home"
                         >
-                            🔑  Keys
+                            <span className="sidebar__btn-icon" aria-hidden="true">🏠</span>
+                            <span className="sidebar__btn-label">Home</span>
+                        </button>
+                        <button
+                            type="button"
+                            className={`sidebar__btn${isActive("/account") ? " sidebar__btn--active" : ""}`}
+                            onClick={() => router.push("/account")}
+                            title="Account"
+                        >
+                            <span className="sidebar__btn-icon" aria-hidden="true">👤</span>
+                            <span className="sidebar__btn-label">Account</span>
+                        </button>
+                    </div>
+
+                    <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                        <button
+                            type="button"
+                            className="sidebar__btn"
+                            onClick={cycleTheme}
+                            title={`Theme: ${themeLabel} — click to cycle`}
+                        >
+                            <span className="sidebar__btn-icon" aria-hidden="true">{themeIcon}</span>
+                            <span className="sidebar__btn-label">{themeLabel}</span>
                         </button>
                         <button
                             type="button"
                             className="sidebar__btn"
+                            onClick={() => router.push("/?showKeys=1")}
+                            title="Keys"
+                        >
+                            <span className="sidebar__btn-icon" aria-hidden="true">🔑</span>
+                            <span className="sidebar__btn-label">Keys</span>
+                        </button>
+                        <button
+                            type="button"
+                            className="sidebar__btn"
+                            title="Logout"
                             onClick={async () => {
                                 try {
                                     await supabase.auth.signOut();
-                                    router.replace('/auth');
+                                    router.replace("/auth");
                                 } catch (err) {
-                                    console.warn('Logout failed', err);
+                                    console.warn("Logout failed", err);
                                 }
                             }}
                         >
-                            🚪  Logout
+                            <span className="sidebar__btn-icon" aria-hidden="true">🚪</span>
+                            <span className="sidebar__btn-label">Logout</span>
                         </button>
                     </div>
                 </div>
             </aside>
 
-            <div className="dashboard__inner" style={{ marginLeft: '260px' }}>
+            <div className="dashboard__inner">
                 <div className="dashboard__content">{children}</div>
             </div>
         </div>

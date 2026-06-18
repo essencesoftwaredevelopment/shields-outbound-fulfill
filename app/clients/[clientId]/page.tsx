@@ -2442,8 +2442,8 @@ export default function ClientPage() {
                                 padding: '0 0.9rem',
                                 borderRadius: '10px',
                                 border: '1px solid var(--app-border)',
-                                background: 'var(--app-surface-3)',
-                                color: 'var(--app-text-faint)',
+                                background: 'var(--app-surface-2)',
+                                color: 'var(--app-text-muted)',
                                 fontSize: '0.9rem'
                             }}>
                                 No value needed
@@ -2516,14 +2516,7 @@ export default function ClientPage() {
         // Pill toggle for the connector after a clause (AND / OR)
         const renderConnector = (afterClause: LeadFilterClause, label: 'AND' | 'OR') => (
             <div style={{ display: 'flex', alignItems: 'center', padding: '0.15rem 0' }}>
-                <div style={{
-                    display: 'inline-flex',
-                    background: 'var(--app-surface-2)',
-                    border: '1px solid var(--app-border-mid)',
-                    borderRadius: '6px',
-                    padding: '2px',
-                    gap: '2px'
-                }}>
+                <div className="logic-toggle">
                     {(['AND', 'OR'] as const).map((opt) => {
                         const selected = afterClause.joinOp === opt;
                         return (
@@ -2531,21 +2524,7 @@ export default function ClientPage() {
                                 key={opt}
                                 type="button"
                                 onClick={() => updateLeadFilter(afterClause.id, { joinOp: opt })}
-                                style={{
-                                    padding: '2px 10px',
-                                    fontSize: '0.7rem',
-                                    fontWeight: selected ? 600 : 400,
-                                    letterSpacing: '0.04em',
-                                    lineHeight: 1,
-                                    height: '22px',
-                                    border: 'none',
-                                    borderRadius: '4px',
-                                    cursor: 'pointer',
-                                    transition: 'background 0.15s, color 0.15s',
-                                    background: selected ? 'var(--app-surface-hover)' : 'transparent',
-                                    color: selected ? 'var(--app-text)' : 'var(--app-text-ghost)',
-                                    boxShadow: selected ? '0 1px 3px rgba(0,0,0,0.3)' : 'none',
-                                }}
+                                className={`logic-toggle__btn${selected ? ' logic-toggle__btn--active' : ''}`}
                             >
                                 {opt}
                             </button>
@@ -6638,7 +6617,7 @@ export default function ClientPage() {
                                 onScroll={handleLeadsScroll}
                                 style={{ maxHeight: '520px', overflowY: 'auto' }}
                             >
-                                <table style={{
+                                <table className="leads-table" style={{
                                     width: '100%',
                                     borderCollapse: 'separate',
                                     borderSpacing: 0,
@@ -6860,30 +6839,21 @@ export default function ClientPage() {
         <>
             <AppShell>
                 <section className="hero-panel">
-                    <div className="hero-panel__layout">
-                        <div className="hero-panel__content">
-                            <button
-                                onClick={() => router.back()}
-                                className="secondary-button secondary-button--active"
-                                style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: '0.5rem',
-                                    width: 'fit-content',
-                                    marginBottom: '1rem'
-                                }}
-                            >
-                                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                                    <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                </svg>
-                                Back
-                            </button>
-                            <h1 className="hero-panel__title">{clientName}</h1>
-                            <p className="hero-panel__description">Manage campaigns and view leads for this client.</p>
-                        </div>
-                    </div>
+                    <header className="client-page-header">
+                        <button
+                            type="button"
+                            onClick={() => router.back()}
+                            className="page-back"
+                        >
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                            Back
+                        </button>
+                        <h1 className="client-page-header__title">{clientName}</h1>
+                        <p className="client-page-header__description">Manage campaigns and view leads for this client.</p>
+                    </header>
 
-                    {/* Tab Navigation */}
                     <div className="tab-nav">
                         <button
                             className={`tab-nav__button ${activeTab === "analytics" ? "tab-nav__button--active" : ""}`}
@@ -7885,14 +7855,14 @@ export default function ClientPage() {
                                                                     <>
                                                                         {jobState.paused ? (
                                                                             <>
-                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
                                                                                     <polygon points="5 3 19 12 5 21 5 3"/>
                                                                                 </svg>
                                                                                 Resume
                                                                             </>
                                                                         ) : (
                                                                             <>
-                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="black" stroke="none">
+                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
                                                                                     <rect x="6" y="4" width="4" height="16"/>
                                                                                     <rect x="14" y="4" width="4" height="16"/>
                                                                                 </svg>
@@ -9437,16 +9407,7 @@ export default function ClientPage() {
                                                         }}>
                                                             {prompt.version}
                                                         </span>
-                                                        <span style={{
-                                                            fontSize: '0.72rem',
-                                                            fontWeight: 600,
-                                                            textTransform: 'uppercase',
-                                                            letterSpacing: '0.04em',
-                                                            padding: '0.15rem 0.5rem',
-                                                            borderRadius: '4px',
-                                                            background: prompt.active ? 'rgba(34,197,94,0.15)' : 'var(--app-surface-3)',
-                                                            color: prompt.active ? '#86efac' : 'var(--app-text-ghost)',
-                                                        }}>
+                                                        <span className={`status-badge ${prompt.active ? 'status-badge--active' : 'status-badge--inactive'}`}>
                                                             {prompt.active ? 'Active' : 'Inactive'}
                                                         </span>
                                                     </div>
@@ -9559,17 +9520,7 @@ export default function ClientPage() {
                                                         type="button"
                                                         onClick={() => toggleDay(dow)}
                                                         disabled={savingFollowUpSchedule}
-                                                        style={{
-                                                            padding: '0.3rem 0.65rem',
-                                                            borderRadius: '6px',
-                                                            fontSize: '0.78rem',
-                                                            fontWeight: 600,
-                                                            cursor: 'pointer',
-                                                            border: active ? '1px solid rgba(234,179,8,0.5)' : '1px solid var(--app-border)',
-                                                            background: active ? 'rgba(234,179,8,0.15)' : 'transparent',
-                                                            color: active ? '#fde68a' : 'var(--app-text-ghost)',
-                                                            transition: 'all 0.15s'
-                                                        }}
+                                                        className={`send-day-btn${active ? ' send-day-btn--active' : ''}`}
                                                     >
                                                         {label}
                                                     </button>
@@ -9578,8 +9529,8 @@ export default function ClientPage() {
                                         </div>
                                         <button
                                             type="button"
-                                            className="secondary-button"
-                                            style={{ padding: '0.3rem 0.75rem', fontSize: '0.8rem', marginLeft: 'auto', flexShrink: 0 }}
+                                            className="action-button"
+                                            style={{ marginLeft: 'auto', flexShrink: 0 }}
                                             onClick={() => handleSaveFollowUpSchedule(followUpSendDays)}
                                             disabled={savingFollowUpSchedule}
                                         >
@@ -9622,31 +9573,12 @@ export default function ClientPage() {
                                                     <span style={{ fontWeight: 600, fontSize: '0.95rem' }}>
                                                         #{script.script_order}
                                                     </span>
-                                                    <span style={{
-                                                        fontSize: '0.72rem',
-                                                        fontWeight: 600,
-                                                        textTransform: 'uppercase',
-                                                        letterSpacing: '0.04em',
-                                                        padding: '0.15rem 0.5rem',
-                                                        borderRadius: '4px',
-                                                        background: script.active ? 'rgba(34,197,94,0.15)' : 'var(--app-surface-3)',
-                                                        color: script.active ? '#86efac' : 'var(--app-text-ghost)',
-                                                    }}>
+                                                    <span className={`status-badge ${script.active ? 'status-badge--active' : 'status-badge--inactive'}`}>
                                                         {script.active ? 'Active' : 'Inactive'}
                                                     </span>
                                                 </div>
                                                 <div
                                                     className="fu-script-preview"
-                                                    style={{
-                                                        marginTop: '0.65rem',
-                                                        padding: '0.85rem 0.95rem',
-                                                        borderRadius: '8px',
-                                                        border: '1px solid var(--app-border)',
-                                                        background: 'rgba(0,0,0,0.18)',
-                                                        color: 'var(--app-text-high)',
-                                                        fontSize: '0.82rem',
-                                                        lineHeight: 1.5,
-                                                    }}
                                                     dangerouslySetInnerHTML={{ __html: script.html_template }}
                                                 />
                                             </div>
@@ -9676,8 +9608,7 @@ export default function ClientPage() {
                                                 </label>
                                                 <button
                                                     type="button"
-                                                    className="secondary-button"
-                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                    className="action-button"
                                                     onClick={() => openFollowUpPreviewModal(script)}
                                                     disabled={updatingFollowUpScriptId === script.id}
                                                 >
@@ -9685,8 +9616,7 @@ export default function ClientPage() {
                                                 </button>
                                                 <button
                                                     type="button"
-                                                    className="secondary-button"
-                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                    className="action-button"
                                                     onClick={() => openFollowUpScriptModal(script)}
                                                     disabled={updatingFollowUpScriptId === script.id}
                                                 >
@@ -9695,7 +9625,7 @@ export default function ClientPage() {
                                                 <button
                                                     type="button"
                                                     className="destructive-button"
-                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem', minHeight: 0, height: 'auto', flex: '0 0 auto' }}
                                                     onClick={() => handleDeleteFollowUpScript(script.id)}
                                                     disabled={deletingFollowUpScriptId === script.id || updatingFollowUpScriptId === script.id}
                                                 >
@@ -12214,7 +12144,7 @@ export default function ClientPage() {
                                 </div>
                             )}
 
-                            <div className="tab-nav" style={{ marginTop: 0, marginBottom: '1rem' }}>
+                            <div className="tab-nav tab-nav--flush" style={{ marginBottom: '1rem' }}>
                                 {([
                                     { key: 'detail', label: 'Detail' },
                                     { key: 'insights', label: 'Insights' }
