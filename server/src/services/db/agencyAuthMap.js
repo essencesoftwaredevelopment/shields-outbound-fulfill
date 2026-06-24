@@ -27,3 +27,24 @@ export async function resolveLegacyAgencyId(supabaseUserId) {
     });
     return agencyId;
 }
+
+export async function upsertAgencyAuthMap(supabaseUserId, agencyId, note = null) {
+    await pool.query(
+        `INSERT INTO agency_auth_map (supabase_user_id, agency_id, note)
+         VALUES ($1::uuid, $2, $3)
+         ON CONFLICT (supabase_user_id) DO UPDATE SET
+             agency_id = EXCLUDED.agency_id,
+             note = EXCLUDED.note`,
+        [supabaseUserId, agencyId, note]
+    );
+    agencyIdCache.delete(supabaseUserId);
+}
+
+export async function listAgencyAuthMaps() {
+    const result = await pool.query(
+        `SELECT supabase_user_id, agency_id, note, created_at
+         FROM agency_auth_map
+         ORDER BY created_at DESC`
+    );
+    return result.rows;
+}

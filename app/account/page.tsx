@@ -1,6 +1,12 @@
 "use client";
 
 import AppShell from "@/components/app-shell";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Separator } from "@/components/ui/separator";
 import { useAuth } from "@/hooks/use-auth";
 import { apiJson } from "@/lib/api/http";
 import { getAccessToken } from "@/lib/supabase/session";
@@ -106,111 +112,106 @@ export default function AccountPage() {
 
     return (
         <AppShell>
-            <section className="hero-panel" style={{ alignItems: "flex-start", textAlign: "left" }}>
-                <div className="hero-panel__layout" style={{ alignItems: "flex-start", justifyContent: "flex-start" }}>
-                    <div className="hero-panel__content" style={{ textAlign: "left", maxWidth: "720px" }}>
-                        <p className="eyebrow">Account</p>
-                        <h1 className="hero-panel__title">Profile & Billing</h1>
-                        <p className="hero-panel__description">
-                            View your login details and manage your session.
+            <div className="flex max-w-2xl flex-col gap-8">
+                <div className="flex flex-col gap-2">
+                    <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Account</p>
+                    <h1 className="text-3xl font-semibold tracking-tight">Profile & Billing</h1>
+                    <p className="text-muted-foreground">
+                        View your login details and manage your session.
+                    </p>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-3">
+                    <Card size="sm">
+                        <CardHeader>
+                            <CardDescription>Signed in as</CardDescription>
+                            <CardTitle className="truncate text-sm font-normal">{user?.email || "—"}</CardTitle>
+                        </CardHeader>
+                    </Card>
+                    <Card size="sm">
+                        <CardHeader>
+                            <CardDescription>User ID</CardDescription>
+                            <CardTitle className="truncate text-sm font-normal">{user?.id || "—"}</CardTitle>
+                        </CardHeader>
+                    </Card>
+                    <Card size="sm">
+                        <CardHeader>
+                            <CardDescription>Email confirmed</CardDescription>
+                            <CardTitle className="text-sm font-normal">
+                                {user?.email_confirmed_at ? "Yes" : "No — check your inbox"}
+                            </CardTitle>
+                        </CardHeader>
+                    </Card>
+                </div>
+
+                {checkoutError && (
+                    <Alert variant="destructive">
+                        <AlertDescription>{checkoutError}</AlertDescription>
+                    </Alert>
+                )}
+
+                <Separator />
+
+                <div className="flex flex-col gap-4">
+                    <div>
+                        <h2 className="text-lg font-semibold">Email Verification Provider</h2>
+                        <p className="text-sm text-muted-foreground">
+                            Choose which service to use for email verification during pipeline runs.
                         </p>
-                        <div className="account-metric-grid">
-                            <div className="account-metric-chip">
-                                <span className="account-metric-chip__label">Signed in as</span>
-                                <span className="account-metric-chip__value">{user?.email || "—"}</span>
+                    </div>
+
+                    <RadioGroup
+                        value={emailProvider}
+                        onValueChange={setEmailProvider}
+                        className="max-w-lg gap-3"
+                    >
+                        <Label
+                            htmlFor="trykitt"
+                            className="flex cursor-pointer items-start gap-3 rounded-lg border p-4 font-normal has-data-[state=checked]:border-primary has-data-[state=checked]:bg-primary/5"
+                        >
+                            <RadioGroupItem value="trykitt" id="trykitt" className="mt-0.5" />
+                            <div className="grid gap-1">
+                                <span className="font-medium">TryKitt</span>
+                                <span className="text-sm text-muted-foreground">
+                                    Cloud-based email verification service (requires API key in vault)
+                                </span>
                             </div>
-                            <div className="account-metric-chip">
-                                <span className="account-metric-chip__label">User ID</span>
-                                <span className="account-metric-chip__value">{user?.id || "—"}</span>
+                        </Label>
+
+                        <Label
+                            htmlFor="self_hosted"
+                            className="flex cursor-pointer items-start gap-3 rounded-lg border p-4 font-normal has-data-[state=checked]:border-primary has-data-[state=checked]:bg-primary/5"
+                        >
+                            <RadioGroupItem value="self_hosted" id="self_hosted" className="mt-0.5" />
+                            <div className="grid gap-1">
+                                <span className="font-medium">Self-Hosted Verifier</span>
+                                <span className="text-sm text-muted-foreground">
+                                    Use the self-hosted email verification service (no API key required)
+                                </span>
                             </div>
-                        </div>
+                        </Label>
+                    </RadioGroup>
 
-                        <div style={{ marginTop: "3rem", paddingTop: "2rem", borderTop: "1px solid var(--app-border-mid)" }}>
-                            <h2 style={{ fontSize: "1.5rem", fontWeight: "600", marginBottom: "0.5rem" }}>
-                                Email Verification Provider
-                            </h2>
-                            <p style={{ color: "var(--app-text-muted)", marginBottom: "1.5rem" }}>
-                                Choose which service to use for email verification during pipeline runs.
-                            </p>
+                    <div className="flex flex-col gap-3">
+                        <Button
+                            type="button"
+                            className="w-fit"
+                            onClick={handleSaveProvider}
+                            disabled={providerLoading}
+                        >
+                            {providerLoading ? "Saving..." : "Save Preference"}
+                        </Button>
 
-                            <div style={{ display: "flex", flexDirection: "column", gap: "1rem", maxWidth: "520px" }}>
-                                <label style={{ display: "flex", alignItems: "center", gap: "0.75rem", cursor: "pointer" }}>
-                                    <input
-                                        type="radio"
-                                        name="emailProvider"
-                                        value="trykitt"
-                                        checked={emailProvider === "trykitt"}
-                                        onChange={(e) => setEmailProvider(e.target.value)}
-                                        style={{ width: "18px", height: "18px" }}
-                                    />
-                                    <div>
-                                        <div style={{ fontWeight: "500" }}>TryKitt</div>
-                                        <div style={{ fontSize: "0.875rem", color: "var(--app-text-muted)" }}>
-                                            Cloud-based email verification service (requires API key in vault)
-                                        </div>
-                                    </div>
-                                </label>
-
-                                <label style={{ display: "flex", alignItems: "center", gap: "0.75rem", cursor: "pointer" }}>
-                                    <input
-                                        type="radio"
-                                        name="emailProvider"
-                                        value="self_hosted"
-                                        checked={emailProvider === "self_hosted"}
-                                        onChange={(e) => setEmailProvider(e.target.value)}
-                                        style={{ width: "18px", height: "18px" }}
-                                    />
-                                    <div>
-                                        <div style={{ fontWeight: "500" }}>Self-Hosted Verifier</div>
-                                        <div style={{ fontSize: "0.875rem", color: "var(--app-text-muted)" }}>
-                                            Use the self-hosted email verification service (no API key required)
-                                        </div>
-                                    </div>
-                                </label>
-
-                                <button
-                                    type="button"
-                                    className="primary-button"
-                                    onClick={handleSaveProvider}
-                                    disabled={providerLoading}
-                                    style={{ alignSelf: "flex-start", marginTop: "0.5rem" }}
-                                >
-                                    {providerLoading ? "Saving..." : "Save Preference"}
-                                </button>
-
-                                {providerSaved && (
-                                    <p className="vault-status vault-status--success" aria-live="polite">
-                                        ✓ Email verification provider saved successfully
-                                    </p>
-                                )}
-                            </div>
-                        </div>
-
-                        <div style={{ marginTop: "1.5rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-                            <button
-                                type="button"
-                                className="primary-button"
-                                onClick={handleSubscribe}
-                                disabled={checkoutLoading}
-                                aria-busy={checkoutLoading}
-                                style={{ alignSelf: "flex-start" }}
-                            >
-                                {checkoutLoading ? "Redirecting..." : "Subscribe with Stripe"}
-                            </button>
-                            {checkoutError && (
-                                <p className="vault-status vault-status--error" aria-live="polite" style={{ maxWidth: "520px" }}>
-                                    {checkoutError}
-                                </p>
-                            )}
-                            {!checkoutError && (
-                                <p className="hero-panel__subtitle" style={{ maxWidth: "520px" }}>
-                                    Start a subscription to unlock full access. You will be redirected to Stripe Checkout.
-                                </p>
-                            )}
-                        </div>
+                        {providerSaved && (
+                            <Alert>
+                                <AlertDescription>
+                                    Email verification provider saved successfully.
+                                </AlertDescription>
+                            </Alert>
+                        )}
                     </div>
                 </div>
-            </section>
+            </div>
         </AppShell>
     );
 }

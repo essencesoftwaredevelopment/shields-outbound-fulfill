@@ -3,6 +3,7 @@
 import { ReactNode, useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { supabase } from "@/lib/supabase/client";
+import { usePlatformAdmin } from "@/lib/hooks/usePlatformAdmin";
 
 type ThemeMode = "dark" | "light" | "auto";
 
@@ -30,6 +31,7 @@ function applyTheme(mode: ThemeMode) {
 export default function AppShell({ children }: { children: ReactNode }) {
     const router = useRouter();
     const pathname = usePathname();
+    const { isAdmin } = usePlatformAdmin();
     const [today, setToday] = useState<string>("");
     const [themeMode, setThemeMode] = useState<ThemeMode>("auto");
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -126,6 +128,17 @@ export default function AppShell({ children }: { children: ReactNode }) {
                             <span className="sidebar__btn-icon" aria-hidden="true">👤</span>
                             <span className="sidebar__btn-label">Account</span>
                         </button>
+                        {isAdmin && (
+                            <button
+                                type="button"
+                                className={`sidebar__btn${isActive("/admin") ? " sidebar__btn--active" : ""}`}
+                                onClick={() => router.push("/admin")}
+                                title="Admin"
+                            >
+                                <span className="sidebar__btn-icon" aria-hidden="true">🛡️</span>
+                                <span className="sidebar__btn-label">Admin</span>
+                            </button>
+                        )}
                     </div>
 
                     <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: "0.5rem" }}>

@@ -17,6 +17,7 @@ import { env } from './config/env.js';
 import { testConnection, pool } from './config/db.js';
 import jobsRouter from './routes/jobs.js';
 import agencyRouter from './routes/agency.js';
+import adminRouter from './routes/admin.js';
 import clientsRouter from './routes/clients.js';
 import leadsRouter from './routes/leads.js';
 import webhooksRouter from './routes/webhooks.js';
@@ -92,6 +93,7 @@ app.use((err, req, res, next) => {
 
 app.use('/api', jobsRouter);
 app.use('/api', agencyRouter);
+app.use('/api', adminRouter);
 app.use('/api', clientsRouter);
 app.use('/api', leadsRouter);
 app.use('/api', domainsRouter);

@@ -1,18 +1,41 @@
 "use client";
 
-import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
-import { createPortal } from "react-dom";
+import { ArrowRight, Plus, User } from "lucide-react";
 import { useAuth } from "@/hooks/use-auth";
 import { getAccessToken } from "@/lib/supabase/session";
 import { createClient as createClientApi, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import {
-  PipelineJob,
-  PipelineStageKey,
-  PipelineStageState,
-  PipelineStageStatus,
-} from "@/lib/pipeline/types";
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { PipelineJob } from "@/lib/pipeline/types";
 
 type Niche = {
   id: string;
@@ -109,17 +132,10 @@ function HomeContent() {
   const [jobState, setJobState] = useState<PipelineJob | null>(null);
   const [jobClientName, setJobClientName] = useState<string>("");
   const [jobClientId, setJobClientId] = useState<string>("");
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [toastVisible, setToastVisible] = useState(false);
   const [clients, setClients] = useState<Array<{ id: string; name: string }>>([]);
   const [companyCountsByClient, setCompanyCountsByClient] = useState<Record<string, number>>({});
   const [companyCountsLoadingByClient, setCompanyCountsLoadingByClient] = useState<Record<string, boolean>>({});
   const shouldShowKeys = searchParams?.get("showKeys") === "1";
-
-  const showToast = useCallback((message: string) => {
-    setToastMessage(message);
-    setToastVisible(true);
-  }, [setToastMessage, setToastVisible]);
 
   useEffect(() => {
     setVaultModalOpen(shouldShowKeys);
@@ -148,17 +164,6 @@ function HomeContent() {
       [key]: event.target.value,
     }));
   };
-
-  useEffect(() => {
-    if (!toastVisible || !toastMessage) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setToastVisible(false);
-      setTimeout(() => setToastMessage(null), 300);
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, [toastVisible, toastMessage]);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -417,92 +422,95 @@ function HomeContent() {
   const vaultStatusTone = vaultLoading ? "idle" : vaultMessage.tone;
   const vaultStatusText = vaultLoading ? "Loading saved keys..." : vaultMessage.text;
   const hasVaultChanges = API_KEY_FIELDS.some((key) => apiKeys[key] !== lastSavedKeys[key]);
-  const vaultButtonClass = `secondary-button${hasVaultChanges ? " secondary-button--active" : ""}`;
+
+  const openClientModal = () => {
+    setClientMessage({ tone: "idle", text: "" });
+    setNewClientName("");
+    setNewClientIndustry("ecom");
+    setNewClientInstantlyKey("");
+    setClientModalOpen(true);
+  };
 
   if (loading || !user) {
     return (
-      <div className="auth-gate">
-        <p className="eyebrow">Shield&apos;s Outbound</p>
-        <h2>Checking access...</h2>
-        <p className="auth-card__subtitle">Hang tight while we confirm your session.</p>
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 text-center">
+        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Shield&apos;s Outbound
+        </p>
+        <h2 className="text-lg font-semibold">Checking access...</h2>
+        <p className="text-sm text-muted-foreground">Hang tight while we confirm your session.</p>
       </div>
     );
   }
 
   return (
     <AppShell>
-      <section className="hero-panel">
-        <div className="hero-panel__layout">
-          <div className="hero-panel__content">
-            <p className="eyebrow">Good evening</p>
-            <h1 className="hero-panel__title">ESSENCE Outbound</h1>
-            <p className="hero-panel__description">
-              Kick off a fresh outbound motion.
-              Pick a niche preset, drop your CSV, and we&apos;ll do the rest.
-            </p>
-            <div className="modal__actions" style={{ marginTop: "1rem" }}>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => {
-                  setClientMessage({ tone: "idle", text: "" });
-                  setNewClientName("");
-                  setNewClientIndustry("ecom");
-                  setNewClientInstantlyKey("");
-                  setClientModalOpen(true);
-                }}
-              >
-                Create Client
-              </button>
-            </div>
-          </div>
+      <div className="flex flex-col gap-8">
+        <div className="flex flex-col gap-2">
+          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            Good evening
+          </p>
+          <h1 className="text-3xl font-semibold tracking-tight">ESSENCE Outbound</h1>
+          <p className="max-w-xl text-muted-foreground">
+            Kick off a fresh outbound motion. Pick a niche preset, drop your CSV, and we&apos;ll do
+            the rest.
+          </p>
+          <Button className="mt-2 w-fit" onClick={openClientModal}>
+            <Plus data-icon="inline-start" />
+            Create Client
+          </Button>
         </div>
 
-
-        <div className="niche-grid">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {clients.length === 0 ? (
-            <div className="pipeline-panel__empty">
-              <p>No clients yet.</p>
-              <p className="pipeline-panel__subtitle">Use Create Client to add one.</p>
-            </div>
+            <Card className="col-span-full">
+              <CardContent className="flex flex-col items-center justify-center gap-1 py-12 text-center">
+                <p className="font-medium">No clients yet</p>
+                <CardDescription>Use Create Client to add one.</CardDescription>
+              </CardContent>
+            </Card>
           ) : (
             clients.map((client) => (
-              <div key={client.id} className="niche-card" style={{ position: 'relative' }}>
-                <button
-                  type="button"
-                  onClick={() => router.push(`/clients/${client.id}`)}
-                  style={{ border: 'none', background: 'none', padding: 0, width: '100%', textAlign: 'left', cursor: 'pointer' }}
-                >
-                  <span className="niche-card__icon" aria-hidden>
-                    👤
-                  </span>
-                  <div className="niche-card__text">
-                    <p className="niche-card__label">{client.name}</p>
-                    <p className="niche-card__detail">
-                      {companyCountsLoadingByClient[client.id] ? (
-                        <span
-                          className="card-big-data card-big-data--loading spinner"
-                          aria-label="Loading company count"
-                          role="status"
-                        />
-                      ) : (
-                        <strong className="card-big-data">{(companyCountsByClient[client.id] || 0).toLocaleString()}</strong>
-                      )}
-                      <br />
-                      companies in database
-                    </p>
+              <Card
+                key={client.id}
+                className="cursor-pointer transition-colors hover:bg-muted/40"
+                onClick={() => router.push(`/clients/${client.id}`)}
+              >
+                <CardHeader>
+                  <div className="flex items-start gap-3">
+                    <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
+                      <User className="size-4 text-muted-foreground" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <CardTitle className="truncate">{client.name}</CardTitle>
+                      <CardDescription className="mt-2">
+                        {companyCountsLoadingByClient[client.id] ? (
+                          <Skeleton className="h-7 w-16" aria-label="Loading company count" />
+                        ) : (
+                          <span className="text-2xl font-semibold text-foreground">
+                            {(companyCountsByClient[client.id] || 0).toLocaleString()}
+                          </span>
+                        )}
+                        <span className="mt-0.5 block text-sm">companies in database</span>
+                      </CardDescription>
+                    </div>
                   </div>
-                  <span className="niche-card__cta">View leads →</span>
-                </button>
-              </div>
+                </CardHeader>
+                <CardFooter className="border-0 bg-transparent pt-0">
+                  <Button variant="ghost" size="sm" className="px-0" tabIndex={-1}>
+                    View leads
+                    <ArrowRight data-icon="inline-end" />
+                  </Button>
+                </CardFooter>
+              </Card>
             ))
           )}
         </div>
-      </section>
+      </div>
 
       {/* Metrics grid hidden for now */}
 
-      <section className="pipeline-panel">
+      {/* <section className="pipeline-panel">
         <div className="pipeline-panel__header">
           <div>
             <p className="eyebrow eyebrow--muted">
@@ -525,203 +533,176 @@ function HomeContent() {
             )}
           </div>
         </div>
-      </section>
+      </section> */}
 
-      {
-        vaultModalOpen && (
-          <div
-            className="modal-overlay"
-            role="dialog"
-            aria-modal="true"
-            onClick={closeVaultModal}
-          >
-            <div className="modal modal--vault" onClick={(event) => event.stopPropagation()}>
-              <div className="modal__header">
-                <div>
-                  <p className="eyebrow eyebrow--muted">API Vault</p>
-                  <h2 className="modal__title">Connect Data Providers</h2>
-                  <p className="modal__description">
-                    Store the keys that power scraping, enrichment, and verification. Keys stay local for now—wire up the
-                    secure vault service when you are ready.
-                  </p>
-                </div>
-              </div>
+      <Dialog
+        open={vaultModalOpen}
+        onOpenChange={(open) => {
+          if (!open) closeVaultModal();
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              API Vault
+            </p>
+            <DialogTitle>Connect Data Providers</DialogTitle>
+            <DialogDescription>
+              Store the keys that power scraping, enrichment, and verification.
+            </DialogDescription>
+          </DialogHeader>
 
-              <form className="modal__body" onSubmit={handleVaultSubmit}>
-                <label className="settings-field">
-                  <span className="settings-field__label">OpenAI API Key</span>
-                  <input
-                    type="password"
-                    placeholder="sk-..."
-                    value={apiKeys.openai}
-                    onChange={(event) => handleKeyChange(event, "openai")}
-                  />
-                  <span className="settings-field__hint">Founders + first-line inference.</span>
-                  {/* <span className="settings-field__meta">{fingerprintLabel("openai")}</span> */}
-                </label>
-                <label className="settings-field">
-                  <span className="settings-field__label">Serper API Key</span>
-                  <input
-                    type="password"
-                    placeholder="serper_..."
-                    value={apiKeys.serper}
-                    onChange={(event) => handleKeyChange(event, "serper")}
-                  />
-                  <span className="settings-field__hint">Automating Google searches at scale</span>
-                  {/* <span className="settings-field__meta">{fingerprintLabel("serper")}</span> */}
-                </label>
-                <label className="settings-field">
-                  <span className="settings-field__label">Kitt API Key</span>
-                  <input
-                    type="password"
-                    placeholder="kitt_..."
-                    value={apiKeys.kitt}
-                    onChange={(event) => handleKeyChange(event, "kitt")}
-                  />
-                  <span className="settings-field__hint">Email finding + verification.</span>
-                  {/* <span className="settings-field__meta">{fingerprintLabel("kitt")}</span> */}
-                </label>
-                {showVaultStatus && (
-                  <p className={`vault-status vault-status--${vaultStatusTone}`} aria-live="polite">
-                    {vaultStatusText}
-                  </p>
-                )}
-                <div className="modal__actions modal__actions--end">
-                  <button
-                    type="submit"
-                    className={vaultButtonClass}
-                    disabled={vaultSaving || vaultLoading}
-                    aria-busy={vaultSaving}
-                  >
-                    {vaultSaving ? "Saving..." : "Save to Vault"}
-                  </button>
-                </div>
-              </form>
+          <form className="grid gap-4" onSubmit={handleVaultSubmit}>
+            <div className="grid gap-2">
+              <Label htmlFor="openai-key">OpenAI API Key</Label>
+              <Input
+                id="openai-key"
+                type="password"
+                placeholder="sk-..."
+                value={apiKeys.openai}
+                onChange={(event) => handleKeyChange(event, "openai")}
+              />
+              <p className="text-xs text-muted-foreground">Founders + first-line inference.</p>
             </div>
-          </div>
-        )
-      }
-
-      {
-        clientModalOpen && (
-          <div
-            className="modal-overlay"
-            role="dialog"
-            aria-modal="true"
-            onClick={() => setClientModalOpen(false)}
-          >
-            <div className="modal" onClick={(event) => event.stopPropagation()}>
-              <div className="modal__header">
-                <div>
-                  <p className="eyebrow eyebrow--muted">Client</p>
-                  <h2 className="modal__title">Create Client</h2>
-                  <p className="modal__description">Enter client name, Instantly API key, and industry.</p>
-                </div>
-              </div>
-
-              <div className="modal__body">
-                <label className="settings-field">
-                  <span className="settings-field__label">Client Name</span>
-                  <input
-                    type="text"
-                    placeholder="Acme Co"
-                    value={newClientName}
-                    onChange={(e) => setNewClientName(e.target.value)}
-                    autoComplete="off"
-                    autoCorrect="off"
-                    autoCapitalize="none"
-                    spellCheck={false}
-                  />
-                </label>
-
-                <label className="settings-field">
-                  <span className="settings-field__label">Industry</span>
-                  <select
-                    value={newClientIndustry}
-                    onChange={(e) => setNewClientIndustry(e.target.value as Niche["id"])}
-                  >
-                    <option value="ecom">E-commerce</option>
-                    <option value="saas">SaaS</option>
-                    <option value="agency">Agency</option>
-                    <option value="local">Local Biz</option>
-                  </select>
-                </label>
-
-                <label className="settings-field">
-                  <span className="settings-field__label">Instantly API Key</span>
-                  <input
-                    type="password"
-                    placeholder="instantly_..."
-                    value={newClientInstantlyKey}
-                    onChange={(e) => setNewClientInstantlyKey(e.target.value)}
-                    autoComplete="off"
-                    autoCorrect="off"
-                    autoCapitalize="none"
-                    spellCheck={false}
-                  />
-                  <span className="settings-field__hint">Used to route leads into Instantly.</span>
-                </label>
-
-                {clientMessage.text && (
-                  <p className={`vault-status vault-status--${clientMessage.tone}`} aria-live="polite">
-                    {clientMessage.text}
-                  </p>
-                )}
-
-                <div className="modal__actions modal__actions--end">
-                  <button
-                    type="button"
-                    className="secondary-button secondary-button--active"
-                    disabled={clientSaving}
-                    aria-busy={clientSaving}
-                    onClick={handleClientSave}
-                  >
-                    {clientSaving ? "Saving..." : "Save Client"}
-                  </button>
-                </div>
-              </div>
+            <div className="grid gap-2">
+              <Label htmlFor="serper-key">Serper API Key</Label>
+              <Input
+                id="serper-key"
+                type="password"
+                placeholder="serper_..."
+                value={apiKeys.serper}
+                onChange={(event) => handleKeyChange(event, "serper")}
+              />
+              <p className="text-xs text-muted-foreground">Automating Google searches at scale</p>
             </div>
-          </div>
-        )
-      }
+            <div className="grid gap-2">
+              <Label htmlFor="kitt-key">Kitt API Key</Label>
+              <Input
+                id="kitt-key"
+                type="password"
+                placeholder="kitt_..."
+                value={apiKeys.kitt}
+                onChange={(event) => handleKeyChange(event, "kitt")}
+              />
+              <p className="text-xs text-muted-foreground">Email finding + verification.</p>
+            </div>
+            {showVaultStatus && (
+              <Alert variant={vaultStatusTone === "error" ? "destructive" : "default"}>
+                <AlertDescription>{vaultStatusText}</AlertDescription>
+              </Alert>
+            )}
+            <DialogFooter className="border-0 bg-transparent p-0 sm:justify-end">
+              <Button
+                type="submit"
+                variant={hasVaultChanges ? "default" : "secondary"}
+                disabled={vaultSaving || vaultLoading}
+                aria-busy={vaultSaving}
+              >
+                {vaultSaving ? "Saving..." : "Save to Vault"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
 
-      {toastVisible && toastMessage && (
-        <div
-          className="toast"
-          role="status"
-          aria-live="polite"
-          style={{
-            position: 'fixed',
-            bottom: '24px',
-            right: '24px',
-            background: '#1f2937',
-            color: '#f9fafb',
-            padding: '16px 20px',
-            borderRadius: '8px',
-            boxShadow: '0 10px 25px rgba(0, 0, 0, 0.3)',
-            maxWidth: '420px',
-            zIndex: 10000,
-            fontSize: '14px',
-            lineHeight: '1.5',
-            animation: 'slideIn 0.3s ease-out',
-          }}
-        >
-          {toastMessage}
-        </div>
-      )}
+      <Dialog open={clientModalOpen} onOpenChange={setClientModalOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Client
+            </p>
+            <DialogTitle>Create Client</DialogTitle>
+            <DialogDescription>
+              Enter client name, Instantly API key, and industry.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="client-name">Client Name</Label>
+              <Input
+                id="client-name"
+                type="text"
+                placeholder="Acme Co"
+                value={newClientName}
+                onChange={(e) => setNewClientName(e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="grid gap-2">
+              <Label htmlFor="client-industry">Industry</Label>
+              <Select
+                value={newClientIndustry}
+                onValueChange={(value) => setNewClientIndustry(value as Niche["id"])}
+              >
+                <SelectTrigger id="client-industry" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ecom">E-commerce</SelectItem>
+                  <SelectItem value="saas">SaaS</SelectItem>
+                  <SelectItem value="agency">Agency</SelectItem>
+                  <SelectItem value="local">Local Biz</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="grid gap-2">
+              <Label htmlFor="instantly-key">Instantly API Key</Label>
+              <Input
+                id="instantly-key"
+                type="password"
+                placeholder="instantly_..."
+                value={newClientInstantlyKey}
+                onChange={(e) => setNewClientInstantlyKey(e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+              />
+              <p className="text-xs text-muted-foreground">Used to route leads into Instantly.</p>
+            </div>
+
+            {clientMessage.text && (
+              <Alert variant={clientMessage.tone === "error" ? "destructive" : "default"}>
+                <AlertDescription>{clientMessage.text}</AlertDescription>
+              </Alert>
+            )}
+
+            <DialogFooter className="border-0 bg-transparent p-0 sm:justify-end">
+              <Button
+                type="button"
+                disabled={clientSaving}
+                aria-busy={clientSaving}
+                onClick={handleClientSave}
+              >
+                {clientSaving ? "Saving..." : "Save Client"}
+              </Button>
+            </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
     </AppShell>
   );
 }
 
 export default function Home() {
   return (
-    <Suspense fallback={
-      <div className="auth-gate">
-        <p className="eyebrow">Shields Outbound</p>
-        <h2>Loading...</h2>
-        <p className="auth-card__subtitle">Preparing your workspace.</p>
-      </div>
-    }>
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen flex-col items-center justify-center gap-3 text-center">
+          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            Shields Outbound
+          </p>
+          <h2 className="text-lg font-semibold">Loading...</h2>
+          <p className="text-sm text-muted-foreground">Preparing your workspace.</p>
+        </div>
+      }
+    >
       <HomeContent />
     </Suspense>
   );
