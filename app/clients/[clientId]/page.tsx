@@ -2064,23 +2064,52 @@ export default function ClientPage() {
                 if (!token || cancelled) {
                     return;
                 }
-                const response = await fetch(`${getPipelineBaseUrl()}/api/agency/settings`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (!response.ok || cancelled) {
-                    return;
+
+                const headers = { Authorization: `Bearer ${token}` };
+
+                // Prefer Next internal route — production Express may not expose features yet.
+                let features: { shoppingAudit?: boolean } | undefined;
+                try {
+                    const internal = await fetch('/internal/agency/features', { headers });
+                    if (internal.ok) {
+                        const payload = (await internal.json()) as {
+                            features?: { shoppingAudit?: boolean };
+                            shoppingAudit?: boolean;
+                        };
+                        features = payload.features;
+                        if (payload.shoppingAudit === true) {
+                            features = { ...features, shoppingAudit: true };
+                        }
+                    }
+                } catch {
+                    // fall through to Express API
                 }
-                const data = (await response.json()) as {
-                    email_verification_provider?: string;
-                    features?: { shoppingAudit?: boolean };
-                };
-                setEmailProvider(
-                    data.email_verification_provider === "self_hosted" ? "self_hosted" : "trykitt",
-                );
-                setShoppingAuditEnabled(
-                    data.features?.shoppingAudit === true
-                    || process.env.NEXT_PUBLIC_SHOPPING_AUDIT_ENABLED === 'true'
-                );
+
+                if (!features) {
+                    const response = await fetch(`${getPipelineBaseUrl()}/api/agency/settings`, {
+                        headers,
+                    });
+                    if (!response.ok || cancelled) {
+                        return;
+                    }
+                    const data = (await response.json()) as {
+                        email_verification_provider?: string;
+                        features?: { shoppingAudit?: boolean };
+                    };
+                    features = data.features;
+                    if (!cancelled) {
+                        setEmailProvider(
+                            data.email_verification_provider === "self_hosted" ? "self_hosted" : "trykitt",
+                        );
+                    }
+                }
+
+                if (!cancelled) {
+                    setShoppingAuditEnabled(
+                        features?.shoppingAudit === true
+                        || process.env.NEXT_PUBLIC_SHOPPING_AUDIT_ENABLED === 'true'
+                    );
+                }
             } catch {
                 /* keep default */
             }
