@@ -2077,7 +2077,10 @@ export default function ClientPage() {
                 setEmailProvider(
                     data.email_verification_provider === "self_hosted" ? "self_hosted" : "trykitt",
                 );
-                setShoppingAuditEnabled(data.features?.shoppingAudit === true);
+                setShoppingAuditEnabled(
+                    data.features?.shoppingAudit === true
+                    || process.env.NEXT_PUBLIC_SHOPPING_AUDIT_ENABLED === 'true'
+                );
             } catch {
                 /* keep default */
             }

@@ -15,6 +15,10 @@ router.get('/me', verifySupabaseToken, async (req, res) => {
 router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
     try {
         const settings = await getAgencySettings(req.agencyId);
+        const features = agencyFeaturesFromSettings(settings);
+        if (String(process.env.SHOPPING_AUDIT_ENABLED || '').toLowerCase() === 'true') {
+            features.shoppingAudit = true;
+        }
         res.json({
             openai_key: settings?.openai_key || '',
             serper_key: settings?.serper_key || '',
@@ -22,7 +26,7 @@ router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
             openai_founder_model: settings?.openai_founder_model || '',
             email_verification_provider: settings?.email_verification_provider || 'trykitt',
             vault_updated_at: settings?.vault_updated_at || null,
-            features: agencyFeaturesFromSettings(settings)
+            features
         });
     } catch (error) {
         console.error('GET agency settings error:', error);

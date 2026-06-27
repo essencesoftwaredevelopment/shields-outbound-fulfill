@@ -57,6 +57,9 @@ export function agencyFeaturesFromSettings(settings) {
 }
 
 export function hasShoppingAuditFeature(settings) {
+    if (String(process.env.SHOPPING_AUDIT_ENABLED || '').toLowerCase() === 'true') {
+        return true;
+    }
     return agencyFeaturesFromSettings(settings).shoppingAudit === true;
 }
 
