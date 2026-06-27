@@ -1,7 +1,6 @@
 import dotenv from 'dotenv';
 import fs from 'fs';
 import { parse } from 'csv-parse';
-import fetch from 'node-fetch';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
