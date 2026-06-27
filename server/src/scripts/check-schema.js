@@ -18,7 +18,7 @@ async function checkSchema() {
       ORDER BY ordinal_position
     `);
     
-    console.log('=== COLUMNS ===');
+    console.log('=== COLUMNS ==='); 
     columnsResult.rows.forEach(row => {
       console.log(`  ${row.column_name}: ${row.data_type} ${row.is_nullable === 'NO' ? 'NOT NULL' : 'NULL'} ${row.column_default || ''}`);
     });
