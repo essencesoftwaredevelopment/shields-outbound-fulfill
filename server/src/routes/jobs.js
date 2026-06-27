@@ -10,6 +10,7 @@ import multer from 'multer';
 import fs from 'fs';
 import {
     buildUnifiedRowsFromDb,
+    listUnifiedRowsFromDb,
     countUnifiedRowsByEmailStatus,
     filterUnifiedRowsByEmailStatus,
     getJobById,
@@ -23,7 +24,7 @@ import {
     deleteJobFromDb,
     clearActiveJobForClient,
 } from '../services/db/jobs.js';
-import { getAgencySettings, apiKeysFromSettings } from '../services/db/agencySettings.js';
+import { getAgencySettings, apiKeysFromSettings, hasShoppingAuditFeature } from '../services/db/agencySettings.js';
 import { resolveAgencyId } from '../utils/bearerAuth.js';
 import { agencyFromRequest, clientContextFromRequest } from '../utils/requestContext.js';
 import { writeJobControl } from '../services/jobControl.js';
@@ -36,6 +37,8 @@ import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, getRunnerRecord, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
+import { dispatchEnrichmentJob } from '../enrichment/dispatch.js';
+import { resolveExecutionRunner } from '../enrichment/executionRunner.js';
 
 async function enrichJobWithQueueRuntime(jobState, jobId) {
     if (!jobState || !jobId) return jobState;
@@ -282,6 +285,7 @@ function buildQueuePayload(job) {
         fileName: job.fileName,
         createdAt: job.createdAt,
         dedupeStrategy: job.dedupeStrategy,
+        pipelineMode: job.pipelineMode || 'standard',
         sqlClientId: job.sqlClientId,
         skipFounderFinder: !!job.skipFounderFinder,
         skipEmailFinder: !!job.skipEmailFinder,
@@ -299,7 +303,8 @@ function buildQueuePayload(job) {
         dedupeStats: job.dedupeStats || null,
         cost: typeof job.cost === 'number' ? job.cost : 0,
         stages: job.stages || null,
-        filteredPath: job.paths?.filtered || null
+        filteredPath: job.paths?.filtered || null,
+        executionRunner: job.executionRunner || job.options?.executionRunner || 'pm2'
     };
 }
 
@@ -413,6 +418,37 @@ router.post('/jobs/:id/csv-preview', async (req, res) => {
     }
 });
 
+router.get('/jobs/:id/leads-preview', async (req, res) => {
+    try {
+        const jobId = req.params.id;
+        const clientSlug = (req.query.clientId || '').toString().trim();
+        const scopeParam = (req.query.scope || 'all').toString();
+        const scope = scopeParam === 'valid' ? 'valid' : 'all';
+        const limit = req.query.limit;
+        const offset = req.query.offset;
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId parameter is required' });
+        }
+
+        const agencyId = await agencyFromRequest(req);
+        const row = await getJobById(jobId, agencyId);
+        if (!row) {
+            return res.status(404).json({ error: 'Job not found' });
+        }
+
+        const includeValid = req.query.includeValid !== 'false';
+        const includeRisky = req.query.includeRisky !== 'false';
+        const options = scope === 'valid' ? { includeValid, includeRisky } : {};
+        const result = await listUnifiedRowsFromDb(jobId, { scope, limit, offset, ...options });
+
+        res.json(result);
+    } catch (error) {
+        console.error('Job leads preview error:', error);
+        res.status(500).json({ error: 'Failed to load job leads preview.' });
+    }
+});
+
 router.post('/jobs', uploadFields, async (req, res) => {
     try {
         if (!req.files?.file || !req.files.file[0]) {
@@ -454,6 +490,11 @@ router.post('/jobs', uploadFields, async (req, res) => {
         if (emailVerificationProvider === 'self_hosted') skipVerification = true;
         const skipEmailFinder = String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
         const skipDomainCheck = String(req.body.skipDomainCheck || '').toLowerCase() === 'true';
+        const pipelineModeRaw = String(req.body.pipelineMode || 'standard').trim().toLowerCase();
+        const pipelineMode = pipelineModeRaw === 'shopping_audit' ? 'shopping_audit' : 'standard';
+        if (pipelineMode === 'shopping_audit' && !hasShoppingAuditFeature(settings)) {
+            return res.status(403).json({ error: 'Shopping audit pipeline is not enabled for this agency.' });
+        }
 
         const job = await createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientSlug, dedupeStrategy, {
             skipFounderFinder,
@@ -461,13 +502,14 @@ router.post('/jobs', uploadFields, async (req, res) => {
             skipVerification,
             skipDomainCheck,
             findFounder: rawFindFounder,
-            industry,
-            nicheId,
-            nicheLabel,
+            industry: pipelineMode === 'shopping_audit' ? 'shopping_audit' : industry,
+            nicheId: pipelineMode === 'shopping_audit' ? 'shopping_audit' : nicheId,
+            nicheLabel: pipelineMode === 'shopping_audit' ? (nicheLabel || 'Shopping Audit') : nicheLabel,
             personalizeFirstLine,
             productPromptVersion,
             productPromptProducts,
             emailVerificationProvider,
+            pipelineMode,
             sqlClientId,
             columnMapping: {
                 domain: (req.body.domainColumn || 'domain').toString().trim(),
@@ -480,11 +522,13 @@ router.post('/jobs', uploadFields, async (req, res) => {
         await updateJobControl(job.id, { paused: false, cancelled: false });
         logJob(job, `Job queued with file ${job.fileName}`);
 
-        await enqueuePipelineJob({
+        const queuePayload = buildQueuePayload(job);
+        await dispatchEnrichmentJob({
             jobId: job.id,
             uid,
             clientId: job.clientId,
-            payload: buildQueuePayload(job)
+            payload: queuePayload,
+            settings
         });
         jobs.delete(job.id);
 
@@ -753,9 +797,19 @@ router.post('/jobs/:id/resume', async (req, res) => {
         }
 
         const payload = buildQueuePayload(jobRowToState(row));
-        await enqueuePipelineJob({ jobId, uid, clientId, payload });
-        await setQueueStatus(jobId, 'queued', { error: null });
-        const resumedStatus = 'queued';
+        const settings = await getAgencySettings(uid);
+        const runner = resolveExecutionRunner({ settings, jobOptions: payload });
+        await dispatchEnrichmentJob({
+            jobId,
+            uid,
+            clientId,
+            payload,
+            settings
+        });
+        if (runner === 'pm2') {
+            await setQueueStatus(jobId, 'queued', { error: null });
+        }
+        const resumedStatus = runner === 'vercel' ? 'running' : 'queued';
 
         await pool.query(
             `UPDATE jobs SET status = $2, paused = false, resumed_at = NOW(), updated_at = NOW() WHERE id = $1`,

@@ -7,7 +7,7 @@ import path from 'path';
 import { parse as csvParse } from 'csv-parse';
 import { stringify as csvStringify } from 'csv-stringify';
 import OpenAI from 'openai';
-import pLimit from 'p-limit';
+import { createConcurrencyLimit } from '../../../lib/concurrency.js';
 
 const dnsResolve4 = promisify(dns.resolve4);
 const dnsResolveCname = promisify(dns.resolveCname);
@@ -622,7 +622,7 @@ async function personalizeWithNewPromptFromShopify({
 
     // domain -> { products: Product[] } | { fetchError: string } | { empty: true }
     const productCache = new Map();
-    const fetchLimit = pLimit(fetchConcurrency);
+    const fetchLimit = createConcurrencyLimit(fetchConcurrency);
     let fetchProcessed = 0;
     let fetchFailed = 0;
 
@@ -669,7 +669,7 @@ async function personalizeWithNewPromptFromShopify({
     log?.(`Generating first lines with OpenAI (concurrency ${concurrency})...`);
     reportPersonalizationProgress(log, 0, rows.length, { phase: 'generating', productsFetched });
 
-    const llmLimit = pLimit(concurrency);
+    const llmLimit = createConcurrencyLimit(concurrency);
 
     const runRow = async (row) => {
         if (checkpoint) await checkpoint();

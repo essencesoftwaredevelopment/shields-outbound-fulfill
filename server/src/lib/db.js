@@ -570,20 +570,36 @@ export async function writeCheckpoint(txClient, agencyId, clientId, jobId, stage
  * @param {Array} domains - Domains to check
  * @returns {Promise<Set<string>>} Set of domains that already exist
  */
-export async function getExistingDomainsSet(clientId, domains) {
+export async function getExistingDomainsSet(clientId, domains, { reauditMonths = null } = {}) {
     if (!domains.length) return new Set();
     if (!clientId) throw new Error('clientId is required');
 
     const normalizedDomains = domains.map((d) => normalizeDomain(d)).filter(Boolean);
     if (!normalizedDomains.length) return new Set();
 
-    const query = `
+    const months = Number(reauditMonths);
+    const useReaudit = Number.isFinite(months) && months > 0;
+
+    const query = useReaudit
+        ? `
+        SELECT domain_normalized
+        FROM companies
+        WHERE client_id = $1
+          AND domain_normalized = ANY($2::text[])
+          AND last_audit_at IS NOT NULL
+          AND last_audit_at > NOW() - ($3::text || ' months')::interval
+    `
+        : `
         SELECT domain_normalized
         FROM companies
         WHERE client_id = $1 AND domain_normalized = ANY($2::text[])
     `;
 
-    const result = await pool.query(query, [clientId, normalizedDomains]);
+    const params = useReaudit
+        ? [clientId, normalizedDomains, String(months)]
+        : [clientId, normalizedDomains];
+
+    const result = await pool.query(query, params);
     return new Set(result.rows.map((r) => r.domain_normalized));
 }
 

@@ -57,6 +57,7 @@ export async function claimNextQueuedJob(workerId = `${os.hostname()}-${process.
             `SELECT job_id, agency_id, client_slug, control, payload, attempts
              FROM job_queue
              WHERE status = 'queued'
+               AND COALESCE(payload->>'executionRunner', 'pm2') <> 'vercel'
              ORDER BY enqueued_at ASC
              FOR UPDATE SKIP LOCKED
              LIMIT 1`

@@ -41,7 +41,7 @@ function isPopupFormGenerateRetryableError(error) {
     return error?.name === 'AbortError' || error instanceof TypeError;
 }
 
-export async function callPopupFormGenerate(leadEmail) {
+export async function callPopupFormGenerate(leadEmail, options = {}) {
     const atIndex = String(leadEmail || '').indexOf('@');
     const domain = atIndex !== -1 ? String(leadEmail).slice(atIndex + 1).trim() : '';
     if (!domain) {
@@ -49,7 +49,14 @@ export async function callPopupFormGenerate(leadEmail) {
         return null;
     }
 
-    const previewUrl = `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
+    const signalEmissionId = options.signalEmissionId || null;
+    const signalType = options.signalType || null;
+    const previewBase = signalEmissionId
+        ? `https://essence-ai.app/shopping-preview?domain=${encodeURIComponent(domain)}&signalId=${encodeURIComponent(String(signalEmissionId))}`
+        : `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
+    const previewUrl = signalType
+        ? `${previewBase}&signalType=${encodeURIComponent(String(signalType))}`
+        : previewBase;
     const start = Date.now();
 
     for (let attempt = 0; attempt < POPUP_FORM_GENERATE_MAX_ATTEMPTS; attempt += 1) {
@@ -59,13 +66,20 @@ export async function callPopupFormGenerate(leadEmail) {
             console.log(
                 `[popup-form/generate] calling for domain=${domain} attempt=${attempt + 1}/${POPUP_FORM_GENERATE_MAX_ATTEMPTS} timeoutMs=${POPUP_FORM_GENERATE_TIMEOUT_MS}`
             );
+            const bodyPayload = {
+                domain,
+                ...(options.signalEmissionId ? { signalEmissionId: options.signalEmissionId } : {}),
+                ...(options.signalType ? { signalType: options.signalType } : {}),
+                ...(options.observed ? { observed: options.observed } : {}),
+                ...(options.expected ? { expected: options.expected } : {})
+            };
             const response = await fetch(POPUP_FORM_GENERATE_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'X-API-Key': POPUP_FORM_API_KEY
                 },
-                body: JSON.stringify({ domain }),
+                body: JSON.stringify(bodyPayload),
                 signal: controller.signal
             });
             const elapsed = Date.now() - start;
@@ -674,8 +688,26 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
         let generation;
         try {
+            let signalRow = {};
+            try {
+                const contactSignalResult = await client.query(
+                    `SELECT c.signal_emission_id, se.signal_type, se.observed, se.expected
+                     FROM contacts c
+                     LEFT JOIN signal_emissions se ON se.id = c.signal_emission_id
+                     WHERE c.id = $1`,
+                    [contactId]
+                );
+                signalRow = contactSignalResult.rows[0] || {};
+            } catch (signalErr) {
+                console.warn('[interested-autoresponder] signal lookup skipped:', signalErr?.message || signalErr);
+            }
             const [essenceAiPreviewUrl, templateVars] = await Promise.all([
-                callPopupFormGenerate(normalizedLeadEmail),
+                callPopupFormGenerate(normalizedLeadEmail, {
+                    signalEmissionId: signalRow.signal_emission_id || null,
+                    signalType: signalRow.signal_type || null,
+                    observed: signalRow.observed || null,
+                    expected: signalRow.expected || null
+                }),
                 resolveTemplateVars(client, contactId, campaignId, {
                     clientId,
                     emailAccount: eaccount

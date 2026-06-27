@@ -411,6 +411,115 @@ export async function markContactsAsSent(agencyId, contactIds) {
 }
 
 /**
+ * Delete contacts for a client and remove orphaned companies.
+ *
+ * @param {string} agencyId
+ * @param {number} clientId
+ * @param {number[]} contactIds
+ */
+export async function deleteContactsByIds(agencyId, clientId, contactIds) {
+    const normalizedIds = [...new Set(
+        contactIds
+            .map((id) => Number.parseInt(String(id), 10))
+            .filter((id) => Number.isInteger(id) && id > 0)
+    )];
+    if (!normalizedIds.length) {
+        return { deletedCount: 0, deletedIds: [], deletedCompanyCount: 0 };
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const deleteResult = await client.query(
+            `DELETE FROM contacts
+             WHERE agency_id = $1 AND client_id = $2 AND id = ANY($3::bigint[])
+             RETURNING id, company_id`,
+            [agencyId, clientId, normalizedIds]
+        );
+        const companyIds = [...new Set(deleteResult.rows.map((row) => row.company_id).filter(Boolean))];
+        let deletedCompanyCount = 0;
+        if (companyIds.length > 0) {
+            const companyDeleteResult = await client.query(
+                `DELETE FROM companies co
+                 WHERE co.agency_id = $1 AND co.client_id = $2
+                 AND co.id = ANY($3::bigint[])
+                 AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.company_id = co.id)`,
+                [agencyId, clientId, companyIds]
+            );
+            deletedCompanyCount = companyDeleteResult.rowCount || 0;
+        }
+        await client.query('COMMIT');
+        return {
+            deletedCount: deleteResult.rowCount || 0,
+            deletedIds: deleteResult.rows.map((row) => row.id),
+            deletedCompanyCount
+        };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Delete contacts matching a lead list filter context.
+ *
+ * @param {string} agencyId
+ * @param {number} clientId
+ * @param {object} filterContext
+ */
+export async function deleteContactsByFilter(agencyId, clientId, filterContext) {
+    const { whereClause, filterParams, baseWithClause, filterJoins } = filterContext;
+    const deleteQuery = `
+        ${baseWithClause},
+        matching_contacts AS (
+            SELECT c.id, c.company_id
+            FROM contacts c
+            JOIN scoped_companies co ON c.company_id = co.id
+            ${filterJoins}
+            WHERE ${whereClause}
+        ),
+        deleted AS (
+            DELETE FROM contacts c
+            USING matching_contacts mc
+            WHERE c.id = mc.id
+            RETURNING c.id, c.company_id
+        )
+        SELECT id, company_id FROM deleted
+    `;
+
+    const dbClient = await pool.connect();
+    try {
+        await dbClient.query('BEGIN');
+        const deleteResult = await dbClient.query(deleteQuery, filterParams);
+        const companyIds = [...new Set(deleteResult.rows.map((row) => row.company_id).filter(Boolean))];
+        let deletedCompanyCount = 0;
+        if (companyIds.length > 0) {
+            const companyDeleteResult = await dbClient.query(
+                `DELETE FROM companies co
+                 WHERE co.agency_id = $1 AND co.client_id = $2
+                 AND co.id = ANY($3::bigint[])
+                 AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.company_id = co.id)`,
+                [agencyId, clientId, companyIds]
+            );
+            deletedCompanyCount = companyDeleteResult.rowCount || 0;
+        }
+        await dbClient.query('COMMIT');
+        return {
+            deletedCount: deleteResult.rowCount || 0,
+            deletedIds: deleteResult.rows.map((row) => row.id),
+            deletedCompanyCount
+        };
+    } catch (error) {
+        await dbClient.query('ROLLBACK');
+        throw error;
+    } finally {
+        dbClient.release();
+    }
+}
+
+/**
  * Get or create a job stage checkpoint, scoped to an agency
  *
  * @param {string} agencyId - The Firebase uid

@@ -1,0 +1,34 @@
+# Phase 0 spike — one domain per line. Mix of categories and ad styles.
+# Original set
+sweatband.com
+gymshark.com
+allbirds.com
+brooklinen.com
+mvmt.com
+colourpop.com
+skims.com
+awaytravel.com
+# Apparel & footwear
+bombas.com
+vuoriclothing.com
+rothys.com
+outdoorvoices.com
+alphaleteathletics.com
+trueclassictees.com
+chubbiesshorts.com
+princesspolly.com
+# Home & kitchen
+hexclad.com
+carawayhome.com
+burrow.com
+# Accessories & lifestyle
+ridge.com
+peakdesign.com
+liquiddeath.com
+owala.com
+# Beauty & wellness
+glossier.com
+drunkelephant.com
+# Sports & outdoor
+tennis-point.com
+cutsclothing.com

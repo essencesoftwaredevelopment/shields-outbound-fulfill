@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
-import pLimit from 'p-limit';
+import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
 
@@ -133,7 +133,7 @@ function extractEmail(payload) {
     return null;
 }
 
-async function lookupEmail(fullName, domain, apiKey) {
+async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
     let attempt = 0;
     let rateLimitHits = 0;
     let backoff = INITIAL_BACKOFF_MS;
@@ -150,6 +150,7 @@ async function lookupEmail(fullName, domain, apiKey) {
     while (attempt < maxAttempts) {
         attempt += 1;
         try {
+            if (rateLimitHooks?.trykitt) await rateLimitHooks.trykitt();
             const res = await fetch('https://api.trykitt.ai/job/find_email', {
                 method: 'POST',
                 headers: {
@@ -361,7 +362,8 @@ export async function runEmailFinder({
     /** Job-wide progress: already-finished lookups before this run segment. */
     progressOffset = 0,
     /** Job-wide progress: total eligible founders for the job. */
-    progressTotal = null
+    progressTotal = null,
+    rateLimitHooks = null
 } = {}) {
     const API_KEY = apiKeys.kitt;
     const requestCost = Number(pricing?.request_cost) || 0;
@@ -394,7 +396,7 @@ export async function runEmailFinder({
                 : `Emails: ${eligibleTotal} eligible for lookup (${totalRows - eligibleTotal} skipped in batch).`
     );
 
-    const limit = pLimit(CONCURRENCY);
+    const limit = createConcurrencyLimit(CONCURRENCY);
     let completedEligible = 0;
     let stageCost = 0;
     const stats = { Found: 0, 'Not Found': 0, Skipped: 0, errors: 0 };
@@ -517,7 +519,7 @@ export async function runEmailFinder({
                     lookup = await findEmailSelfHosted(founderName, domain);
                     console.log(`[EMAIL_FINDER] Self-hosted lookup completed for ${founderName} @ ${domain} in ${Date.now() - lookupStart}ms, result: ${lookup.status}`);
                 } else {
-                    lookup = await lookupEmail(founderName, domain, API_KEY);
+                    lookup = await lookupEmail(founderName, domain, API_KEY, rateLimitHooks);
                 }
                 
                 email = lookup.email || '';

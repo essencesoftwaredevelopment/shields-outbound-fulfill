@@ -1,4 +1,4 @@
-import { CreateJobResponse } from "./types";
+import { CreateJobResponse, PipelineMode } from "./types";
 
 const DEFAULT_PIPELINE_URL = "http://localhost:4000";
 const pipelineBaseUrl = (process.env.NEXT_PUBLIC_PIPELINE_URL || DEFAULT_PIPELINE_URL).replace(/\/$/, "");
@@ -59,6 +59,7 @@ export interface CreatePipelineJobOptions {
     clientId?: string;
     nicheId?: string;
     nicheLabel?: string;
+    pipelineMode?: PipelineMode;
     dedupeStrategy?: 'skip' | 'include';
     campaignId?: string;
     findFounder?: boolean;
@@ -107,6 +108,7 @@ export async function createPipelineJob({
     founderColumn,
     emailColumn,
     dedupeStrategy,
+    pipelineMode,
     signal,
 }: CreatePipelineJobOptions) {
     const formData = new FormData();
@@ -166,6 +168,9 @@ export async function createPipelineJob({
     }
     if (typeof dedupeStrategy === 'string') {
         formData.append("dedupeStrategy", dedupeStrategy);
+    }
+    if (pipelineMode) {
+        formData.append("pipelineMode", pipelineMode);
     }
 
     const response = await fetchWithRetry(`${pipelineBaseUrl}/api/jobs`, {

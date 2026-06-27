@@ -63,7 +63,7 @@ export default function InterestedAutoResponderReviewPage() {
                     setDraft(data.draft || null);
                     setRenderedText(initialText);
                     // console.log("Loaded draft:", data.draft);
-                    const preview = initialText.match(/https:\/\/essence-ai\.app\/preview\?[^\s"'<>]+/)?.[0] || null;
+                    const preview = initialText.match(/https:\/\/essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+/)?.[0] || null;
                     // console.log("Extracted preview URL:", preview);
                     setPreviewUrl(preview);
                    

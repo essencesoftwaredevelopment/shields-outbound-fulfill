@@ -433,6 +433,43 @@ body {
   flex-wrap: wrap;
 }
 
+.pipeline-toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.pipeline-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.leads-filter-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.pipeline-toolbar .primary-button,
+.pipeline-toolbar .secondary-button,
+.pipeline-toolbar .secondary-button--active,
+.pipeline-actions .primary-button,
+.pipeline-actions .secondary-button,
+.pipeline-actions .secondary-button--active,
+.pipeline-actions .destructive-button,
+.leads-filter-actions .primary-button,
+.leads-filter-actions .secondary-button,
+.leads-filter-actions .secondary-button--active {
+  flex: none;
+  width: auto;
+  white-space: nowrap;
+}
+
 .pipeline-panel__title {
   margin: 0.25rem 0 0;
   font-size: 1.5rem;

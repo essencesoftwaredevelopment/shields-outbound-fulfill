@@ -781,6 +781,307 @@ function parseLeadFiltersQuery(rawFilters) {
     throw error;
 }
 
+function parseLeadFiltersInput(rawFilters) {
+    if (typeof rawFilters === 'string') {
+        return parseLeadFiltersQuery(rawFilters);
+    }
+    if (Array.isArray(rawFilters)) {
+        return { clauses: rawFilters.slice(0, 25).map((c) => ({ ...c, joinOp: 'AND' })) };
+    }
+    if (rawFilters && typeof rawFilters === 'object' && Array.isArray(rawFilters.clauses)) {
+        return {
+            clauses: rawFilters.clauses.slice(0, 25).map((c) => ({
+                ...c,
+                joinOp: String(c.joinOp || rawFilters.logic || 'AND').toUpperCase() === 'OR' ? 'OR' : 'AND'
+            }))
+        };
+    }
+    return { clauses: [] };
+}
+
+function buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilterInsights) {
+    return `
+            WITH scoped_companies AS (
+                SELECT
+                    id,
+                    domain_normalized
+                FROM companies
+                WHERE agency_id = $1
+                AND client_id = $2
+            ),
+            scoped_campaigns AS (
+                SELECT
+                    id,
+                    instantly_campaign_id,
+                    name
+                FROM instantly_campaigns
+                WHERE agency_id = $1
+                AND client_id = $2
+            )
+            ${requiresFilterCampaignStats ? `,
+            filter_campaign_stats AS (
+                SELECT
+                    cic.contact_id,
+                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
+                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    MAX(cic.added_at) AS last_campaign_added_at,
+                    MAX(cic.timestamp_last_reply) AS last_reply_at,
+                    BOOL_OR(cic.email_reply_count > 0) AS has_replied,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT LOWER(cic.lead_status_label)) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.lead_status_label IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_lead_status_labels,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT LOWER(cic.interest_status_label)) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.interest_status_label IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_interest_status_labels
+                FROM contact_instantly_campaigns cic
+                JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
+                GROUP BY cic.contact_id
+            )` : ''}
+            ${requiresFilterInsights ? `,
+            filter_insights AS (
+                SELECT
+                    contact_id,
+                    uses_klaviyo,
+                    uses_shopify,
+                    discovery_call_held,
+                    annual_revenue_min,
+                    annual_revenue_max
+                FROM contact_insights
+                WHERE agency_id = $1
+                AND client_id = $2
+            )` : ''}
+        `;
+}
+
+async function buildLeadListFilterContext(agencyId, clientId, queryInput = {}) {
+    const {
+        emailStatus,
+        emailStatusMulti,
+        roleType,
+        search,
+        fullName,
+        founderFilter,
+        emailFilter,
+        instantlyStatus,
+        filters: rawFilters,
+        jobId,
+        createdAfter,
+        createdBefore,
+        instantlyCampaignId,
+        searchField: explicitSearchFieldRaw
+    } = queryInput;
+
+    const { clauses: dynamicFilters } = parseLeadFiltersInput(rawFilters);
+    const rawSearchTerm = typeof search === 'string' ? search.trim() : '';
+    const searchClassification = classifyLeadSearch(rawSearchTerm);
+    const explicitSearchField = typeof explicitSearchFieldRaw === 'string'
+        ? explicitSearchFieldRaw.trim().toLowerCase()
+        : '';
+    let searchKind = searchClassification.kind;
+    const searchValue = searchClassification.value;
+    if (explicitSearchField === 'email' && searchValue) searchKind = 'email';
+    else if (explicitSearchField === 'domain' && searchValue) searchKind = 'domain';
+    else if (explicitSearchField === 'text' && searchValue) searchKind = 'text';
+    const searchTerm = searchValue;
+    const requiresFilterCampaignStats = leadFiltersRequireCampaignStats(dynamicFilters);
+    const requiresFilterInsights = leadFiltersRequireInsights(dynamicFilters);
+    const hasAnyLeadFilters = Boolean(
+        emailStatus
+        || emailStatusMulti
+        || roleType
+        || searchTerm
+        || (typeof fullName === 'string' && fullName.trim())
+        || founderFilter
+        || emailFilter
+        || instantlyStatus
+        || (typeof jobId === 'string' && jobId.trim())
+        || createdAfter
+        || createdBefore
+        || instantlyCampaignId
+        || dynamicFilters.length > 0
+    );
+
+    let whereClause = 'c.agency_id = $1 AND c.client_id = $2';
+    const paramsState = {
+        params: [agencyId, clientId],
+        paramIndex: 3
+    };
+    const params = paramsState.params;
+    let paramIndex = paramsState.paramIndex;
+
+    if (emailStatus) {
+        if (emailStatus === 'not_run') {
+            whereClause += ` AND (c.email_status IS NULL OR c.email_status = '')`;
+        } else {
+            whereClause += ` AND c.email_status = $${paramIndex}`;
+            params.push(emailStatus);
+            paramIndex++;
+        }
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (emailStatusMulti) {
+        const statuses = String(emailStatusMulti).split(',').filter((s) => s.trim());
+        if (statuses.length > 0) {
+            const placeholders = statuses.map((_, i) => `$${paramIndex + i}`).join(',');
+            whereClause += ` AND c.email_status IN (${placeholders})`;
+            params.push(...statuses);
+            paramIndex += statuses.length;
+            paramsState.paramIndex = paramIndex;
+        }
+    }
+
+    if (roleType) {
+        whereClause += ` AND c.role_type = $${paramIndex}`;
+        params.push(roleType);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (searchTerm) {
+        if (searchKind === 'email') {
+            whereClause += ` AND LOWER(c.email) = $${paramIndex}`;
+            params.push(searchTerm);
+            paramIndex++;
+        } else if (searchKind === 'domain') {
+            whereClause += ` AND co.domain_normalized = $${paramIndex}`;
+            params.push(searchTerm);
+            paramIndex++;
+        } else {
+            whereClause += ` AND (
+                    LOWER(c.full_name) LIKE $${paramIndex}
+                    OR LOWER(c.email) LIKE $${paramIndex}
+                )`;
+            params.push(`%${searchTerm}%`);
+            paramIndex++;
+        }
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (fullName) {
+        const nameTerm = `%${String(fullName).toLowerCase()}%`;
+        whereClause += ` AND LOWER(c.full_name) LIKE $${paramIndex}`;
+        params.push(nameTerm);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (founderFilter === 'exists') {
+        whereClause += ` AND c.full_name IS NOT NULL AND c.full_name != '' AND LOWER(c.full_name) NOT LIKE '%not found%' AND LOWER(c.full_name) != 'not_found'`;
+    } else if (founderFilter === 'not_found') {
+        whereClause += ` AND (c.full_name IS NULL OR c.full_name = '' OR LOWER(c.full_name) LIKE '%not found%' OR LOWER(c.full_name) = 'not_found')`;
+    }
+
+    if (emailFilter === 'exists' || emailFilter === 'found') {
+        const findClause = sqlEmailFindStateClause('found');
+        if (findClause) whereClause += ` AND ${findClause}`;
+    } else if (emailFilter === 'not_found') {
+        const findClause = sqlEmailFindStateClause('not_found');
+        if (findClause) whereClause += ` AND ${findClause}`;
+    } else if (emailFilter === 'not_run') {
+        const findClause = sqlEmailFindStateClause('not_run');
+        if (findClause) whereClause += ` AND ${findClause}`;
+    }
+
+    if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
+        const normalizedInstantlyStatus = instantlyStatus.trim().toLowerCase();
+        whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM contact_instantly_campaigns cic_status
+                WHERE cic_status.contact_id = c.id
+                AND cic_status.active = TRUE
+                AND (
+                    LOWER(COALESCE(cic_status.interest_status_label, '')) = $${paramIndex}
+                    OR LOWER(COALESCE(cic_status.lead_status_label, '')) = $${paramIndex}
+                )
+            )`;
+        params.push(normalizedInstantlyStatus);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (typeof jobId === 'string' && jobId.trim()) {
+        whereClause += ` AND c.job_id = $${paramIndex}`;
+        params.push(jobId.trim());
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (createdAfter) {
+        whereClause += ` AND c.created_at >= $${paramIndex}::timestamp`;
+        params.push(createdAfter);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (createdBefore) {
+        whereClause += ` AND c.created_at <= $${paramIndex}::timestamp`;
+        params.push(createdBefore);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    if (instantlyCampaignId) {
+        const campaignResult = await pool.query(
+            `SELECT id
+                 FROM instantly_campaigns
+                 WHERE agency_id = $1
+                 AND client_id = $2
+                 AND instantly_campaign_id = $3
+                 LIMIT 1`,
+            [agencyId, clientId, instantlyCampaignId]
+        );
+
+        const sqlInstantlyCampaignId = campaignResult.rows[0]?.id || null;
+        if (!sqlInstantlyCampaignId) {
+            return { emptyResult: true, hasAnyLeadFilters, requiresFilterCampaignStats, requiresFilterInsights };
+        }
+
+        whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM contact_instantly_campaigns cic_filter
+                WHERE cic_filter.contact_id = c.id
+                AND cic_filter.campaign_id = $${paramIndex}
+                AND cic_filter.active = TRUE
+            )`;
+        params.push(sqlInstantlyCampaignId);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
+    const dynamicWhere = joinDynamicClauses(dynamicClauses, dynamicFilters);
+    if (dynamicWhere) {
+        whereClause += ` AND ${dynamicWhere}`;
+    }
+    paramIndex = paramsState.paramIndex;
+
+    const filterParams = [...params];
+    const baseWithClause = buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilterInsights);
+    const filterJoins = `
+            ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
+            ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}`;
+
+    return {
+        emptyResult: false,
+        whereClause,
+        filterParams,
+        baseWithClause,
+        filterJoins,
+        requiresFilterCampaignStats,
+        requiresFilterInsights,
+        hasAnyLeadFilters
+    };
+}
+
 const CAMPAIGN_STATS_FILTER_FIELDS = new Set([
     'added_to_campaign_at', 'instantly_status', 'campaign_count_all_time',
     'campaign_count_active', 'last_reply_at', 'has_replied'
@@ -1351,19 +1652,6 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         const agencyId = req.agencyId;
         const {
             clientId: clientSlug,
-            emailStatus,
-            emailStatusMulti,
-            roleType,
-            search,
-            fullName,
-            founderFilter,
-            emailFilter,
-            instantlyStatus,
-            filters: rawFilters,
-            jobId,
-            createdAfter,
-            createdBefore,
-            instantlyCampaignId,
             includeLatestEvent,
             includeTotal,
             countOnly,
@@ -1390,276 +1678,28 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         const shouldIncludeTotal = includeTotal === 'true' || includeTotal === '1';
         const isCountOnly = countOnly === 'true' || countOnly === '1';
 
-        const { clauses: dynamicFilters } = parseLeadFiltersQuery(rawFilters);
-        const rawSearchTerm = typeof search === 'string' ? search.trim() : '';
-        const searchClassification = classifyLeadSearch(rawSearchTerm);
-        // Honour an explicit override from the client (?searchField=email|domain|text)
-        // but otherwise trust the classifier above.
-        const explicitSearchField = typeof req.query.searchField === 'string'
-            ? req.query.searchField.trim().toLowerCase()
-            : '';
-        let searchKind = searchClassification.kind;
-        const searchValue = searchClassification.value;
-        if (explicitSearchField === 'email' && searchValue) searchKind = 'email';
-        else if (explicitSearchField === 'domain' && searchValue) searchKind = 'domain';
-        else if (explicitSearchField === 'text' && searchValue) searchKind = 'text';
-        const searchTerm = searchValue;
-        const requiresFilterCampaignStats = leadFiltersRequireCampaignStats(dynamicFilters);
-        const requiresFilterInsights = leadFiltersRequireInsights(dynamicFilters);
-        const hasAnyLeadFilters = Boolean(
-            emailStatus
-            || emailStatusMulti
-            || roleType
-            || searchTerm
-            || (typeof fullName === 'string' && fullName.trim())
-            || founderFilter
-            || emailFilter
-            || instantlyStatus
-            || (typeof jobId === 'string' && jobId.trim())
-            || createdAfter
-            || createdBefore
-            || instantlyCampaignId
-            || dynamicFilters.length > 0
-        );
-
-        // Build WHERE clause with filters
-        let whereClause = 'c.agency_id = $1 AND c.client_id = $2';
-        const paramsState = {
-            params: [agencyId, clientId],
-            paramIndex: 3
-        };
-        const params = paramsState.params;
-        let paramIndex = paramsState.paramIndex;
-
-        // Single email status filter
-        if (emailStatus) {
-            if (emailStatus === 'not_run') {
-                whereClause += ` AND (c.email_status IS NULL OR c.email_status = '')`;
-            } else {
-                whereClause += ` AND c.email_status = $${paramIndex}`;
-                params.push(emailStatus);
-                paramIndex++;
-            }
-            paramsState.paramIndex = paramIndex;
+        const filterContext = await buildLeadListFilterContext(agencyId, clientId, req.query);
+        if (filterContext.emptyResult) {
+            return res.json({
+                leads: [],
+                total: 0,
+                limit: parsedLimit,
+                offset: parsedOffset,
+                hasMore: false
+            });
         }
 
-        // Multi-select email status filter (for segments)
-        if (emailStatusMulti) {
-            const statuses = emailStatusMulti.split(',').filter(s => s.trim());
-            if (statuses.length > 0) {
-                const placeholders = statuses.map((_, i) => `$${paramIndex + i}`).join(',');
-                whereClause += ` AND c.email_status IN (${placeholders})`;
-                params.push(...statuses);
-                paramIndex += statuses.length;
-                paramsState.paramIndex = paramIndex;
-            }
-        }
+        const {
+            whereClause,
+            filterParams,
+            baseWithClause,
+            requiresFilterCampaignStats,
+            requiresFilterInsights,
+            hasAnyLeadFilters
+        } = filterContext;
 
-        if (roleType) {
-            whereClause += ` AND c.role_type = $${paramIndex}`;
-            params.push(roleType);
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        // General search filter. Routed to the most selective index based on
-        // classifyLeadSearch() above:
-        //   - email  -> (client_id, LOWER(email))      [idx_contacts_client_email_lower]
-        //   - domain -> (client_id, domain_normalized) [idx_companies_client_domain]
-        //   - text   -> trigram GIN on full_name + email
-        if (searchTerm) {
-            if (searchKind === 'email') {
-                whereClause += ` AND LOWER(c.email) = $${paramIndex}`;
-                params.push(searchTerm);
-                paramIndex++;
-            } else if (searchKind === 'domain') {
-                whereClause += ` AND co.domain_normalized = $${paramIndex}`;
-                params.push(searchTerm);
-                paramIndex++;
-            } else {
-                // Free-text: use trigram-indexable LIKE on the columns most
-                // likely to contain the token. We intentionally drop the
-                // domain_normalized branch here — domain searches should be
-                // routed via the domain classifier (or ?searchField=domain).
-                whereClause += ` AND (
-                    LOWER(c.full_name) LIKE $${paramIndex}
-                    OR LOWER(c.email) LIKE $${paramIndex}
-                )`;
-                params.push(`%${searchTerm}%`);
-                paramIndex++;
-            }
-            paramsState.paramIndex = paramIndex;
-        }
-
-        // Specific full name search (for segments)
-        if (fullName) {
-            const nameTerm = `%${fullName.toLowerCase()}%`;
-            whereClause += ` AND LOWER(c.full_name) LIKE $${paramIndex}`;
-            params.push(nameTerm);
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        // Filter by founder existence
-        if (founderFilter === 'exists') {
-            whereClause += ` AND c.full_name IS NOT NULL AND c.full_name != '' AND LOWER(c.full_name) NOT LIKE '%not found%' AND LOWER(c.full_name) != 'not_found'`;
-        } else if (founderFilter === 'not_found') {
-            whereClause += ` AND (c.full_name IS NULL OR c.full_name = '' OR LOWER(c.full_name) LIKE '%not found%' OR LOWER(c.full_name) = 'not_found')`;
-        }
-
-        // Filter by email discovery (not SMTP status)
-        if (emailFilter === 'exists' || emailFilter === 'found') {
-            const findClause = sqlEmailFindStateClause('found');
-            if (findClause) whereClause += ` AND ${findClause}`;
-        } else if (emailFilter === 'not_found') {
-            const findClause = sqlEmailFindStateClause('not_found');
-            if (findClause) whereClause += ` AND ${findClause}`;
-        } else if (emailFilter === 'not_run') {
-            const findClause = sqlEmailFindStateClause('not_run');
-            if (findClause) whereClause += ` AND ${findClause}`;
-        }
-
-        if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
-            const normalizedInstantlyStatus = instantlyStatus.trim().toLowerCase();
-            whereClause += ` AND EXISTS (
-                SELECT 1
-                FROM contact_instantly_campaigns cic_status
-                WHERE cic_status.contact_id = c.id
-                AND cic_status.active = TRUE
-                AND (
-                    LOWER(COALESCE(cic_status.interest_status_label, '')) = $${paramIndex}
-                    OR LOWER(COALESCE(cic_status.lead_status_label, '')) = $${paramIndex}
-                )
-            )`;
-            params.push(normalizedInstantlyStatus);
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        if (typeof jobId === 'string' && jobId.trim()) {
-            whereClause += ` AND c.job_id = $${paramIndex}`;
-            params.push(jobId.trim());
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        // Date filters
-        if (createdAfter) {
-            whereClause += ` AND c.created_at >= $${paramIndex}::timestamp`;
-            params.push(createdAfter);
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        if (createdBefore) {
-            whereClause += ` AND c.created_at <= $${paramIndex}::timestamp`;
-            params.push(createdBefore);
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        let sqlInstantlyCampaignId = null;
-        if (instantlyCampaignId) {
-            const campaignResult = await pool.query(
-                `SELECT id
-                 FROM instantly_campaigns
-                 WHERE agency_id = $1
-                 AND client_id = $2
-                 AND instantly_campaign_id = $3
-                 LIMIT 1`,
-                [agencyId, clientId, instantlyCampaignId]
-            );
-
-            sqlInstantlyCampaignId = campaignResult.rows[0]?.id || null;
-            if (!sqlInstantlyCampaignId) {
-                return res.json({
-                    leads: [],
-                    total: 0,
-                    limit: parsedLimit,
-                    offset: parsedOffset,
-                    hasMore: false
-                });
-            }
-
-            whereClause += ` AND EXISTS (
-                SELECT 1
-                FROM contact_instantly_campaigns cic_filter
-                WHERE cic_filter.contact_id = c.id
-                AND cic_filter.campaign_id = $${paramIndex}
-                AND cic_filter.active = TRUE
-            )`;
-            params.push(sqlInstantlyCampaignId);
-            paramIndex++;
-            paramsState.paramIndex = paramIndex;
-        }
-
-        const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
-        const dynamicWhere = joinDynamicClauses(dynamicClauses, dynamicFilters);
-        if (dynamicWhere) {
-            whereClause += ` AND ${dynamicWhere}`;
-        }
-        paramIndex = paramsState.paramIndex;
-
-        const filterParams = [...params];
-        const baseWithClause = `
-            WITH scoped_companies AS (
-                SELECT
-                    id,
-                    domain_normalized
-                FROM companies
-                WHERE agency_id = $1
-                AND client_id = $2
-            ),
-            scoped_campaigns AS (
-                SELECT
-                    id,
-                    instantly_campaign_id,
-                    name
-                FROM instantly_campaigns
-                WHERE agency_id = $1
-                AND client_id = $2
-            )
-            ${requiresFilterCampaignStats ? `,
-            filter_campaign_stats AS (
-                SELECT
-                    cic.contact_id,
-                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
-                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
-                    MAX(cic.added_at) AS last_campaign_added_at,
-                    MAX(cic.timestamp_last_reply) AS last_reply_at,
-                    BOOL_OR(cic.email_reply_count > 0) AS has_replied,
-                    ARRAY_REMOVE(
-                        ARRAY_AGG(DISTINCT LOWER(cic.lead_status_label)) FILTER (
-                            WHERE cic.active = TRUE
-                            AND cic.lead_status_label IS NOT NULL
-                        ),
-                        NULL
-                    ) AS active_lead_status_labels,
-                    ARRAY_REMOVE(
-                        ARRAY_AGG(DISTINCT LOWER(cic.interest_status_label)) FILTER (
-                            WHERE cic.active = TRUE
-                            AND cic.interest_status_label IS NOT NULL
-                        ),
-                        NULL
-                    ) AS active_interest_status_labels
-                FROM contact_instantly_campaigns cic
-                JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
-                GROUP BY cic.contact_id
-            )` : ''}
-            ${requiresFilterInsights ? `,
-            filter_insights AS (
-                SELECT
-                    contact_id,
-                    uses_klaviyo,
-                    uses_shopify,
-                    discovery_call_held,
-                    annual_revenue_min,
-                    annual_revenue_max
-                FROM contact_insights
-                WHERE agency_id = $1
-                AND client_id = $2
-            )` : ''}
-        `;
+        let paramIndex = filterParams.length + 1;
+        const params = [...filterParams];
         const countQuery = `
             ${baseWithClause}
             SELECT COUNT(*) as count
@@ -3177,6 +3217,77 @@ router.post('/leads/verification-import', verifyFirebaseToken, uploadVerificatio
     } catch (error) {
         console.error('Error running verification import:', error);
         return res.status(500).json({ error: error?.message || 'Failed to import verification CSV.' });
+    }
+});
+
+/**
+ * POST /leads/delete
+ *
+ * Delete contacts (leads) for a client, either by explicit IDs or by current list filters.
+ *
+ * Request body:
+ *   - clientId: Client slug (required)
+ *   - contactIds: Array of contact IDs to delete
+ *   - selectAllMatching: When true, delete all contacts matching `query`
+ *   - query: Same filter shape as GET /leads query params / Klaviyo query body
+ *
+ * Authorization: Bearer <idToken> (required)
+ */
+router.post('/leads/delete', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        const selectAllMatching = req.body?.selectAllMatching === true;
+        const contactIds = Array.isArray(req.body?.contactIds) ? req.body.contactIds : [];
+        const queryInput = req.body?.query && typeof req.body.query === 'object' ? req.body.query : {};
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+
+        if (!selectAllMatching && contactIds.length === 0) {
+            return res.status(400).json({ error: 'contactIds or selectAllMatching is required.' });
+        }
+
+        if (selectAllMatching && contactIds.length > 0) {
+            return res.status(400).json({ error: 'Provide either contactIds or selectAllMatching, not both.' });
+        }
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+
+        if (selectAllMatching) {
+            const filterContext = await buildLeadListFilterContext(agencyId, clientId, queryInput);
+            if (filterContext.emptyResult) {
+                return res.json({
+                    deletedCount: 0,
+                    deletedIds: [],
+                    deletedCompanyCount: 0,
+                    method: 'query'
+                });
+            }
+
+            const result = await leadsService.deleteContactsForClient(agencyId, clientId, {
+                filterContext
+            });
+            return res.json({
+                ...result,
+                method: 'query'
+            });
+        }
+
+        const MAX_IDS = 5000;
+        if (contactIds.length > MAX_IDS) {
+            return res.status(400).json({ error: `Cannot delete more than ${MAX_IDS.toLocaleString()} leads at once.` });
+        }
+
+        const result = await leadsService.deleteContactsForClient(agencyId, clientId, { contactIds });
+        return res.json({
+            ...result,
+            method: 'contact_ids'
+        });
+    } catch (error) {
+        console.error('Error deleting leads:', error);
+        res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to delete leads' });
     }
 });
 

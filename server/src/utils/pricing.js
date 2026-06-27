@@ -13,7 +13,9 @@ export const DEFAULT_PRICING = {
         personalization: {
             openai_per_million_input: 0.25,
             openai_per_million_output: 2.0
-        }
+        },
+        serperShopping: { request_cost: 0.001 },
+        headlessRescue: { request_cost: 0.05 }
     },
     currency: 'USD'
 };
@@ -42,6 +44,8 @@ export async function loadPricing(uid) {
     pricing.stages.emailDiscovery = pricing.stages.emailDiscovery || DEFAULT_PRICING.stages.emailDiscovery;
     pricing.stages.verification = pricing.stages.verification || DEFAULT_PRICING.stages.verification;
     pricing.stages.personalization = pricing.stages.personalization || DEFAULT_PRICING.stages.personalization;
+    pricing.stages.serperShopping = pricing.stages.serperShopping || DEFAULT_PRICING.stages.serperShopping;
+    pricing.stages.headlessRescue = pricing.stages.headlessRescue || DEFAULT_PRICING.stages.headlessRescue;
     return pricing;
 }
 

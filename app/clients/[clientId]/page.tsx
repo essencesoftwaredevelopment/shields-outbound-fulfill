@@ -18,6 +18,8 @@ import AppShell from "@/components/app-shell";
 import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
 import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
+    ALL_PIPELINE_STAGE_KEYS,
+    isShoppingAuditPipelineJob,
     PipelineJob,
     PipelineStageKey,
     PipelineStageState,
@@ -361,7 +363,7 @@ const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
     { key: 'last_discovery_call_at', label: 'Last Discovery Call At', group: 'Insights' },
     { key: 'insight_source', label: 'Insight Source', group: 'Insights' },
     { key: 'insight_notes', label: 'Insight Notes', group: 'Insights' },
-    { key: 'campaign_names', label: 'Campaign Names', group: 'Campaigns', defaultSelected: true },
+    { key: 'campaign_names', label: 'Campaign Names', group: 'Campaigns' },
     { key: 'campaign_count_all_time', label: 'Campaign Count All Time', group: 'Campaigns' },
     { key: 'campaign_count_active', label: 'Active Campaign Count', group: 'Campaigns' },
     { key: 'added_to_campaign_at', label: 'Added To Campaign', group: 'Campaigns' },
@@ -764,11 +766,46 @@ type InstantlyCsvMergeResult = {    summary: {
 type JobStatus = PipelineJob["status"];
 type StageStatus = PipelineStageStatus;
 
-const STAGE_ORDER: PipelineStageKey[] = ["domainPrep", "founders", "emailDiscovery", "verification", "personalization"];
+const STANDARD_STAGE_ORDER: PipelineStageKey[] = ["domainPrep", "founders", "emailDiscovery", "verification", "personalization"];
+const SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
+    "domainPrep",
+    "shopifyCatalog",
+    "heroSelection",
+    "serperShopping",
+    "signalWaterfall",
+    "founders",
+    "emailDiscovery",
+    "verification",
+    "personalization",
+];
+
+function resolveStageOrder(job?: PipelineJob | null): PipelineStageKey[] {
+    if (isShoppingAuditPipelineJob(job)) {
+        return SHOPPING_AUDIT_STAGE_ORDER;
+    }
+    return STANDARD_STAGE_ORDER;
+}
+
 const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }> = {
     domainPrep: {
         title: "Domain Prep",
         detail: "Normalize, dedupe, optional DNS checks",
+    },
+    shopifyCatalog: {
+        title: "Shopify Catalog",
+        detail: "Detect Shopify stores and pull product feeds",
+    },
+    heroSelection: {
+        title: "Hero Product",
+        detail: "Select one product per store to audit",
+    },
+    serperShopping: {
+        title: "Serper Shopping",
+        detail: "Confirm Google Shopping ad for hero product",
+    },
+    signalWaterfall: {
+        title: "Signal Waterfall",
+        detail: "Compare ad vs feed and emit strongest hook",
     },
     founders: {
         title: "Founder Finder",
@@ -1038,9 +1075,10 @@ const calculateJobProgress = (job: PipelineJob): { processed: number; total: num
     let total = dedupedTotal ?? 0;
 
     // Prefer the active stage; otherwise the last stage with progress in pipeline order.
+    const stageOrder = resolveStageOrder(job);
     const activeKey =
-        STAGE_ORDER.find((key) => job.stages?.[key]?.status === "running")
-        ?? [...STAGE_ORDER].reverse().find((key) => {
+        stageOrder.find((key) => job.stages?.[key]?.status === "running")
+        ?? [...stageOrder].reverse().find((key) => {
             const stage = job.stages?.[key];
             return (
                 stage
@@ -1181,6 +1219,8 @@ export default function ClientPage() {
     // Step 3: Personalization options
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
     const [personalizeFirstLine, setPersonalizeFirstLine] = useState(false);
+    const [shoppingAuditEnabled, setShoppingAuditEnabled] = useState(false);
+    const [useShoppingAuditPipeline, setUseShoppingAuditPipeline] = useState(false);
     const [productPromptUseNew, setProductPromptUseNew] = useState(false);
     const [productPromptUseOld, setProductPromptUseOld] = useState(true);
     const [productPromptProducts, setProductPromptProducts] = useState(3);
@@ -1314,14 +1354,10 @@ export default function ClientPage() {
 
     const normalizeStages = useCallback((raw: unknown): Record<PipelineStageKey, PipelineStageState> => {
         const source = (raw && typeof raw === "object") ? raw as Record<string, Partial<PipelineStageState>> : {};
-        const stages: Record<PipelineStageKey, PipelineStageState> = {
-            domainPrep: createEmptyStageState(),
-            founders: createEmptyStageState(),
-            emailDiscovery: createEmptyStageState(),
-            verification: createEmptyStageState(),
-            personalization: createEmptyStageState(),
-        };
-        STAGE_ORDER.forEach((key) => {
+        const stages = Object.fromEntries(
+            ALL_PIPELINE_STAGE_KEYS.map((key) => [key, createEmptyStageState()])
+        ) as Record<PipelineStageKey, PipelineStageState>;
+        ALL_PIPELINE_STAGE_KEYS.forEach((key) => {
             const value = source[key];
             if (value && typeof value === "object") {
                 stages[key] = {
@@ -1459,7 +1495,7 @@ export default function ClientPage() {
         (prev: PipelineJob | null, incoming: Partial<PipelineJob> & { id: string }): PipelineJob => {
             const stages = normalizeStages(incoming.stages ?? prev?.stages);
             if (prev?.stages) {
-                for (const key of STAGE_ORDER) {
+                for (const key of ALL_PIPELINE_STAGE_KEYS) {
                     const prior = prev.stages[key];
                     const next = stages[key];
                     const status = pickStageStatus(prior?.status, next?.status);
@@ -1486,7 +1522,7 @@ export default function ClientPage() {
                 }
             }
 
-            const runningWithProgress = STAGE_ORDER.find((key) => {
+            const runningWithProgress = ALL_PIPELINE_STAGE_KEYS.find((key) => {
                 const stage = stages[key];
                 return (
                     stage?.status === "running"
@@ -1654,6 +1690,26 @@ export default function ClientPage() {
     const [includeRiskyEmails, setIncludeRiskyEmails] = useState<boolean>(true);
     const [uploadEmailStatusCounts, setUploadEmailStatusCounts] = useState<{ valid: number; risky: number } | null>(null);
 
+    type JobPreviewLead = {
+        domain: string;
+        founder_name: string;
+        email: string;
+        email_status: string;
+        first_name: string;
+        last_name: string;
+        personalization: string;
+    };
+    const [jobPreviewModalOpen, setJobPreviewModalOpen] = useState(false);
+    const [jobPreviewLeads, setJobPreviewLeads] = useState<JobPreviewLead[]>([]);
+    const [jobPreviewLoading, setJobPreviewLoading] = useState(false);
+    const [jobPreviewHasMore, setJobPreviewHasMore] = useState(true);
+    const [jobPreviewTotal, setJobPreviewTotal] = useState<number | null>(null);
+    const jobPreviewScrollRef = useRef<HTMLDivElement | null>(null);
+    const lastJobPreviewScrollLoadRef = useRef(0);
+    const jobPreviewOffsetRef = useRef(0);
+    const jobPreviewHasMoreRef = useRef(true);
+    const jobPreviewLoadingRef = useRef(false);
+
     // Leads state
     const [leads, setLeads] = useState<Lead[]>([]);
     const [allLeadsCached, setAllLeadsCached] = useState(false); // Track if we've fetched all leads for filtering
@@ -1684,6 +1740,9 @@ export default function ClientPage() {
     const [selectedLeadExportFields, setSelectedLeadExportFields] = useState<string[]>(DEFAULT_LEAD_EXPORT_FIELD_KEYS);
     const [leadExportLimitEnabled, setLeadExportLimitEnabled] = useState(false);
     const [leadExportMaxRows, setLeadExportMaxRows] = useState(DEFAULT_LEAD_EXPORT_MAX_ROWS);
+    const [selectedLeadIds, setSelectedLeadIds] = useState<string[]>([]);
+    const [selectAllMatchingLeadResults, setSelectAllMatchingLeadResults] = useState(false);
+    const [deletingLeads, setDeletingLeads] = useState(false);
 
     useEffect(() => {
         setLeadModalTab('detail');
@@ -1783,8 +1842,6 @@ export default function ClientPage() {
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
-    const [syncingCampaigns, setSyncingCampaigns] = useState(false);
-    const [campaignSyncMessage, setCampaignSyncMessage] = useState("");
     const [instantlyCampaigns, setInstantlyCampaigns] = useState<Array<{ id: string; name: string }>>([]);
     const [instantlyCampaignsLoading, setInstantlyCampaignsLoading] = useState(false);
 
@@ -1815,7 +1872,7 @@ export default function ClientPage() {
             return jobState.cost;
         }
         let sum = 0;
-        for (const key of STAGE_ORDER) {
+        for (const key of resolveStageOrder(jobState)) {
             const stageCost = stageCostFromStage(jobState.stages[key]);
             if (stageCost !== null) sum += stageCost;
         }
@@ -1873,9 +1930,10 @@ export default function ClientPage() {
 
     const stageCompletionPercent = useMemo(() => {
         if (!jobState) return 0;
-        const stageWeight = 100 / STAGE_ORDER.length;
+        const stageOrder = resolveStageOrder(jobState);
+        const stageWeight = 100 / stageOrder.length;
         let percent = 0;
-        for (const key of STAGE_ORDER) {
+        for (const key of stageOrder) {
             const stage = jobState.stages[key];
             if (stage?.status === "completed" || stage?.status === "error") {
                 percent += stageWeight;
@@ -1904,7 +1962,8 @@ export default function ClientPage() {
         if (!jobState) return null;
         if (jobState.paused) return 'Job paused';
         if (jobState.status === 'running' || jobState.status === 'queued') {
-            const runningStage = STAGE_ORDER.find(k => jobState.stages[k]?.status === 'running');
+            const stageOrder = resolveStageOrder(jobState);
+            const runningStage = stageOrder.find(k => jobState.stages[k]?.status === 'running');
             if (runningStage) {
                 const stage = jobState.stages[runningStage];
                 const processed = stage?.progress?.processed;
@@ -1918,7 +1977,7 @@ export default function ClientPage() {
             if (jobState.activityMessage) {
                 return jobState.activityMessage;
             }
-            const nextPending = STAGE_ORDER.find(k => jobState.stages[k]?.status === 'pending');
+            const nextPending = stageOrder.find(k => jobState.stages[k]?.status === 'pending');
             if (nextPending) {
                 return `Preparing ${STAGE_METADATA[nextPending]?.title || nextPending}…`;
             }
@@ -2011,10 +2070,14 @@ export default function ClientPage() {
                 if (!response.ok || cancelled) {
                     return;
                 }
-                const data = (await response.json()) as { email_verification_provider?: string };
+                const data = (await response.json()) as {
+                    email_verification_provider?: string;
+                    features?: { shoppingAudit?: boolean };
+                };
                 setEmailProvider(
                     data.email_verification_provider === "self_hosted" ? "self_hosted" : "trykitt",
                 );
+                setShoppingAuditEnabled(data.features?.shoppingAudit === true);
             } catch {
                 /* keep default */
             }
@@ -2825,6 +2888,14 @@ export default function ClientPage() {
         const skippedVal = Number(dedupe?.skipped ?? 0);
         const newVal = Number(dedupe?.new ?? 0);
 
+        const stages = normalizeStages(data.stages);
+        const pipelineMode =
+            data.pipelineMode === "shopping_audit"
+                ? "shopping_audit"
+                : isShoppingAuditPipelineJob({ stages })
+                    ? "shopping_audit"
+                    : "standard";
+
         return {
             id,
             status: (data.status as PipelineJob["status"]) || "queued",
@@ -2832,7 +2903,9 @@ export default function ClientPage() {
             fileName: (data.fileName as string) || String(data.file_name || id),
             createdAt: toIso(data.createdAt),
             completedAt: data.completedAt == null ? null : toIso(data.completedAt),
-            stages: normalizeStages(data.stages),
+            stages,
+            pipelineMode,
+            cost: typeof data.cost === "number" ? data.cost : undefined,
             activityMessage: typeof data.activityMessage === 'string' ? data.activityMessage : null,
             activityUpdatedAt: typeof data.activityUpdatedAt === 'string' ? data.activityUpdatedAt : null,
             dedupeStats: dedupe
@@ -2923,6 +2996,21 @@ export default function ClientPage() {
 
         return params;
     }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch]);
+
+    const buildLeadDeleteQuery = useCallback(() => ({
+        search: debouncedLeadSearch.trim() || undefined,
+        instantlyCampaignId: campaignFilterId || undefined,
+        filters: appliedLeadFilters.length > 0 ? { clauses: appliedLeadFilters } : undefined
+    }), [appliedLeadFilters, campaignFilterId, debouncedLeadSearch]);
+
+    const clearLeadSelection = useCallback(() => {
+        setSelectedLeadIds([]);
+        setSelectAllMatchingLeadResults(false);
+    }, []);
+
+    useEffect(() => {
+        clearLeadSelection();
+    }, [debouncedLeadSearch, campaignFilterId, appliedLeadFilters, leadQueryNonce, clearLeadSelection]);
 
     const mapApiLeadRow = useCallback((row: any): Lead => ({
         id: row.id,
@@ -4259,32 +4347,6 @@ export default function ClientPage() {
         }
     }, [jobState, stopJobWatch, user, clientId]);
 
-    const handleRefreshCampaigns = useCallback(async () => {
-        if (!user || !clientId) return;
-        setSyncingCampaigns(true);
-        setCampaignSyncMessage("");
-        try {
-            const idToken = await getAccessToken();
-            if (!idToken) return;
-            const resp = await fetchWithRetry(`/api/clients/${encodeURIComponent(clientId)}/campaigns`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ idToken })
-            });
-            if (!resp.ok) {
-                const data = await resp.json().catch(() => ({}));
-                throw new Error(data.error || `Refresh failed (${resp.status})`);
-            }
-            const data = await resp.json();
-            setCampaignSyncMessage(`Synced ${data.count ?? campaigns.length} campaigns.`);
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Failed to refresh campaigns';
-            setCampaignSyncMessage(message);
-        } finally {
-            setSyncingCampaigns(false);
-        }
-    }, [user, clientId, campaigns.length]);
-
     const guessColumn = (columns: string[], candidates: string[]) => {
         const lower = columns.map((c) => c.toLowerCase());
         for (const candidate of candidates) {
@@ -4408,30 +4470,46 @@ export default function ClientPage() {
         void fetchJobSnapshot(job.id);
     }, [stopJobWatch, startJobWatch, fetchJobSnapshot]);
 
+    const reportUploadError = useCallback((message: string) => {
+        setUploadError(message);
+        setToastMessage(message);
+        setToastVisible(true);
+    }, []);
+
     const handleUploadClick = async () => {
-        if (!selectedFile || !user) {
+        if (!user) {
+            reportUploadError("You must be signed in to upload leads.");
+            return;
+        }
+        if (!selectedFile) {
+            reportUploadError("Select a CSV file on step 1 before uploading.");
             return;
         }
         setUploadError("");
         setUploading(true);
         try {
             const idToken = await getAccessToken();
-            if (!idToken) return;
+            if (!idToken) {
+                reportUploadError("Session expired. Sign in again and retry.");
+                return;
+            }
             const activeNiche = niches.find(n => n.id === clientIndustry);
+            const pipelineMode = useShoppingAuditPipeline ? 'shopping_audit' as const : 'standard' as const;
             const selectedProductPromptVersion: 'old' | 'new_gpt5mini' | undefined =
-                clientIndustry === 'ecom' && personalizeFirstLine
+                clientIndustry === 'ecom' && personalizeFirstLine && pipelineMode !== 'shopping_audit'
                     ? (productPromptUseNew ? 'new_gpt5mini' : 'old')
                     : undefined;
             const selectedProductPromptProducts =
-                clientIndustry === 'ecom' && personalizeFirstLine && productPromptUseNew
+                clientIndustry === 'ecom' && personalizeFirstLine && productPromptUseNew && pipelineMode !== 'shopping_audit'
                     ? productPromptProducts
                     : undefined;
             const response = await createPipelineJob({
                 file: selectedFile,
                 idToken,
                 clientId: clientId,
-                nicheId: activeNiche?.id,
-                nicheLabel: activeNiche?.label,
+                nicheId: pipelineMode === 'shopping_audit' ? 'shopping_audit' : activeNiche?.id,
+                nicheLabel: pipelineMode === 'shopping_audit' ? 'Shopping Audit' : activeNiche?.label,
+                pipelineMode,
                 dedupeStrategy,
                 campaignId: selectedCampaignId || undefined,
                 findFounder,
@@ -4441,7 +4519,7 @@ export default function ClientPage() {
                 verifyEmail,
                 skipVerification: !verifyEmail, // Invert: unchecked verifyEmail means skip verification
                 skipDomainCheck: !runDomainCheck,
-                personalizeFirstLine,
+                personalizeFirstLine: pipelineMode === 'shopping_audit' ? true : personalizeFirstLine,
                 productPromptVersion: selectedProductPromptVersion,
                 productPromptProducts: selectedProductPromptProducts,
                 domainColumn,
@@ -4504,7 +4582,7 @@ export default function ClientPage() {
             setSelectedFile(null);
             setSelectedCampaignId("");
         } catch (error) {
-            setUploadError(error instanceof Error ? error.message : "Unable to start pipeline.");
+            reportUploadError(error instanceof Error ? error.message : "Unable to start pipeline.");
         } finally {
             setUploading(false);
         }
@@ -5543,6 +5621,90 @@ export default function ClientPage() {
         return total;
     }, [includeValidEmails, includeRiskyEmails, uploadEmailStatusCounts]);
 
+    const fetchJobPreviewLeads = useCallback(async (reset = false) => {
+        const currentJobId = jobState?.id || jobPendingUpload;
+        if (!currentJobId || !user || !clientId) return;
+        if (jobPreviewLoadingRef.current) return;
+        if (!reset && !jobPreviewHasMoreRef.current) return;
+
+        const offset = reset ? 0 : jobPreviewOffsetRef.current;
+        jobPreviewLoadingRef.current = true;
+        setJobPreviewLoading(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+
+            const params = new URLSearchParams({
+                clientId,
+                scope: 'all',
+                limit: '100',
+                offset: String(offset),
+            });
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/jobs/${encodeURIComponent(currentJobId)}/leads-preview?${params.toString()}`,
+                {
+                    headers: { Authorization: `Bearer ${idToken}` },
+                }
+            );
+            if (!response.ok) {
+                let message = 'Failed to load leads preview';
+                try {
+                    const payload = await response.json();
+                    if (payload?.error) message = String(payload.error);
+                } catch {
+                    /* noop */
+                }
+                throw new Error(message);
+            }
+
+            const data = await response.json();
+            const rows = Array.isArray(data.rows) ? data.rows as JobPreviewLead[] : [];
+            setJobPreviewLeads((prev) => {
+                if (reset) return rows;
+                const existingDomains = new Set(prev.map((row) => `${row.domain}:${row.email}`));
+                const newRows = rows.filter((row) => !existingDomains.has(`${row.domain}:${row.email}`));
+                return [...prev, ...newRows];
+            });
+            const nextOffset = offset + rows.length;
+            jobPreviewOffsetRef.current = nextOffset;
+            const hasMore = Boolean(data.hasMore);
+            jobPreviewHasMoreRef.current = hasMore;
+            setJobPreviewHasMore(hasMore);
+            setJobPreviewTotal(typeof data.total === 'number' ? data.total : null);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to load leads preview');
+            setToastVisible(true);
+        } finally {
+            jobPreviewLoadingRef.current = false;
+            setJobPreviewLoading(false);
+            if (jobPreviewScrollRef.current && jobPreviewHasMoreRef.current) {
+                const el = jobPreviewScrollRef.current;
+                if (el.scrollHeight <= el.clientHeight + 80) {
+                    void fetchJobPreviewLeads(false);
+                }
+            }
+        }
+    }, [clientId, jobPendingUpload, jobState?.id, user]);
+
+    const handleOpenJobPreviewLeads = () => {
+        jobPreviewOffsetRef.current = 0;
+        jobPreviewHasMoreRef.current = true;
+        setJobPreviewLeads([]);
+        setJobPreviewHasMore(true);
+        setJobPreviewTotal(null);
+        setJobPreviewModalOpen(true);
+        void fetchJobPreviewLeads(true);
+    };
+
+    const handleJobPreviewScroll = (event: UIEvent<HTMLDivElement>) => {
+        const target = event.currentTarget;
+        if (target.scrollTop + target.clientHeight < target.scrollHeight - 80) return;
+        const now = Date.now();
+        if (now - lastJobPreviewScrollLoadRef.current < 400) return;
+        lastJobPreviewScrollLoadRef.current = now;
+        fetchJobPreviewLeads(false);
+    };
+
     const handleUploadToInstantly = async () => {
         const currentJobId = jobState?.id || jobPendingUpload;
         if (!currentJobId || !user) {
@@ -6133,6 +6295,129 @@ export default function ClientPage() {
         }
     }, [buildLeadQueryParams, clientName, leadExportLimitEnabled, leadExportMaxRows, mapApiLeadRow, selectedLeadExportFields, user]);
 
+    const visibleLeadIds = useMemo(
+        () => filteredLeads.map((lead) => String(lead.id)),
+        [filteredLeads]
+    );
+
+    const allVisibleLeadsSelected = useMemo(
+        () => visibleLeadIds.length > 0 && visibleLeadIds.every((id) => selectedLeadIds.includes(id)),
+        [selectedLeadIds, visibleLeadIds]
+    );
+
+    const someVisibleLeadsSelected = useMemo(
+        () => visibleLeadIds.some((id) => selectedLeadIds.includes(id)),
+        [selectedLeadIds, visibleLeadIds]
+    );
+
+    const selectedLeadDeleteCount = selectAllMatchingLeadResults
+        ? (displayedLeadTotal ?? 0)
+        : selectedLeadIds.length;
+
+    const canSelectAllMatchingResults = Boolean(
+        allVisibleLeadsSelected
+        && !selectAllMatchingLeadResults
+        && displayedLeadTotal !== null
+        && displayedLeadTotal > filteredLeads.length
+    );
+
+    const toggleLeadSelection = useCallback((leadId: string, checked: boolean) => {
+        setSelectAllMatchingLeadResults(false);
+        setSelectedLeadIds((prev) => {
+            const normalizedId = String(leadId);
+            if (checked) {
+                return prev.includes(normalizedId) ? prev : [...prev, normalizedId];
+            }
+            return prev.filter((id) => id !== normalizedId);
+        });
+    }, []);
+
+    const toggleVisibleLeadSelection = useCallback((checked: boolean) => {
+        if (!checked) {
+            clearLeadSelection();
+            return;
+        }
+
+        setSelectAllMatchingLeadResults(false);
+        setSelectedLeadIds((prev) => {
+            const merged = new Set(prev);
+            visibleLeadIds.forEach((id) => merged.add(id));
+            return Array.from(merged);
+        });
+    }, [clearLeadSelection, visibleLeadIds]);
+
+    const handleDeleteSelectedLeads = useCallback(async () => {
+        if (!user || !clientId) return;
+        if (selectedLeadDeleteCount <= 0) return;
+
+        const countLabel = selectedLeadDeleteCount.toLocaleString();
+        const confirmed = window.confirm(
+            selectAllMatchingLeadResults
+                ? `Delete all ${countLabel} matching leads? This cannot be undone.`
+                : `Delete ${countLabel} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'}? This cannot be undone.`
+        );
+        if (!confirmed) return;
+
+        setDeletingLeads(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/delete`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${idToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(
+                    selectAllMatchingLeadResults
+                        ? {
+                            clientId,
+                            selectAllMatching: true,
+                            query: buildLeadDeleteQuery()
+                        }
+                        : {
+                            clientId,
+                            contactIds: selectedLeadIds
+                        }
+                )
+            });
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || `Failed to delete leads (${response.status})`);
+            }
+
+            const deletedCount = Number(data?.deletedCount || 0);
+            if (selectedLead && (selectAllMatchingLeadResults || selectedLeadIds.includes(String(selectedLead.id)))) {
+                setSelectedLead(null);
+            }
+
+            clearLeadSelection();
+            await fetchLeads(true);
+            await fetchLeadTotal();
+            setToastMessage(`Deleted ${deletedCount.toLocaleString()} lead${deletedCount === 1 ? '' : 's'}.`);
+            setToastVisible(true);
+        } catch (error) {
+            console.error('Failed to delete leads:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to delete leads');
+            setToastVisible(true);
+        } finally {
+            setDeletingLeads(false);
+        }
+    }, [
+        buildLeadDeleteQuery,
+        clearLeadSelection,
+        clientId,
+        fetchLeadTotal,
+        fetchLeads,
+        selectAllMatchingLeadResults,
+        selectedLead,
+        selectedLeadDeleteCount,
+        selectedLeadIds,
+        user
+    ]);
+
     const uploadDisabled = !selectedFile || uploading;
 
     const leadTabContent = (
@@ -6209,7 +6494,7 @@ export default function ClientPage() {
                         className="primary-button"
                         onClick={() => setLeadExportModalOpen(true)}
                         style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading || exportingCsv || checkingKlaviyo}
+                        disabled={leadsLoading || exportingCsv || checkingKlaviyo || deletingLeads}
                     >
                         {exportingCsv ? (
                             <>
@@ -6266,7 +6551,7 @@ export default function ClientPage() {
                                 Build lead filters locally, then run the query when you are ready.
                             </div>
                         </div>
-                        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <div className="leads-filter-actions">
                             {leadFiltersDirty && (
                                 <span style={{ fontSize: '0.82rem', color: '#fbbf24', fontWeight: 600 }}>
                                     Unapplied changes
@@ -6319,6 +6604,56 @@ export default function ClientPage() {
                 </div>
 
                 <div style={{ marginTop: '1.5rem', position: 'relative' }}>
+                    {(selectedLeadDeleteCount > 0 || selectAllMatchingLeadResults || deletingLeads) && (
+                        <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.75rem',
+                            flexWrap: 'wrap',
+                            marginBottom: '0.75rem'
+                        }}>
+                            <span style={{ fontSize: '0.875rem', color: 'var(--app-text-high)' }}>
+                                {selectAllMatchingLeadResults
+                                    ? `All ${displayedLeadTotalLabel} matching results selected`
+                                    : `${selectedLeadDeleteCount.toLocaleString()} selected`}
+                            </span>
+                            <button
+                                type="button"
+                                onClick={handleDeleteSelectedLeads}
+                                disabled={leadsLoading || deletingLeads || selectedLeadDeleteCount <= 0}
+                                style={{
+                                    padding: '0.4rem 0.85rem',
+                                    fontSize: '0.82rem',
+                                    fontWeight: 600,
+                                    flex: '0 0 auto',
+                                    width: 'auto',
+                                    height: 'auto',
+                                    minHeight: 0,
+                                    background: '#dc2626',
+                                    border: '1px solid #dc2626',
+                                    borderRadius: '20px',
+                                    color: '#ffffff',
+                                    cursor: leadsLoading || deletingLeads || selectedLeadDeleteCount <= 0 ? 'not-allowed' : 'pointer',
+                                    opacity: leadsLoading || deletingLeads || selectedLeadDeleteCount <= 0 ? 0.65 : 1
+                                }}
+                            >
+                                {deletingLeads
+                                    ? 'Deleting...'
+                                    : `Delete (${selectAllMatchingLeadResults ? displayedLeadTotalLabel : selectedLeadDeleteCount.toLocaleString()})`}
+                            </button>
+                            {canSelectAllMatchingResults && (
+                                <button
+                                    type="button"
+                                    className="secondary-button secondary-button--active"
+                                    onClick={() => setSelectAllMatchingLeadResults(true)}
+                                    disabled={deletingLeads}
+                                    style={{ padding: '0.35rem 0.65rem', fontSize: '0.82rem', flex: '0 0 auto', height: 'auto', minHeight: 0 }}
+                                >
+                                    Select all {displayedLeadTotalLabel} search results
+                                </button>
+                            )}
+                        </div>
+                    )}
                     {leadsLoading && filteredLeads.length === 0 ? (
                         <div className="pipeline-panel__empty">
                             <div style={{
@@ -6402,6 +6737,34 @@ export default function ClientPage() {
                                                 top: 0,
                                                 zIndex: 2,
                                                 backgroundColor: 'var(--app-bg)',
+                                                textAlign: 'center',
+                                                padding: '0.75rem 0.75rem',
+                                                fontWeight: 600,
+                                                color: 'var(--app-text-high)',
+                                                borderBottom: '1px solid var(--app-border)',
+                                                width: '44px'
+                                            }}>
+                                                <input
+                                                    type="checkbox"
+                                                    aria-label="Select all leads in view"
+                                                    checked={selectAllMatchingLeadResults || allVisibleLeadsSelected}
+                                                    ref={(input) => {
+                                                        if (input) {
+                                                            input.indeterminate = !selectAllMatchingLeadResults
+                                                                && someVisibleLeadsSelected
+                                                                && !allVisibleLeadsSelected;
+                                                        }
+                                                    }}
+                                                    onChange={(e) => toggleVisibleLeadSelection(e.target.checked)}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                    disabled={deletingLeads || filteredLeads.length === 0}
+                                                />
+                                            </th>
+                                            <th style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 2,
+                                                backgroundColor: 'var(--app-bg)',
                                                 textAlign: 'left',
                                                 padding: '0.75rem 1rem',
                                                 fontWeight: 600,
@@ -6479,6 +6842,22 @@ export default function ClientPage() {
                                                 onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--app-surface-2)'}
                                                 onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'var(--app-surface-3)'}
                                             >
+                                                <td
+                                                    style={{
+                                                        padding: '0.75rem 0.75rem',
+                                                        textAlign: 'center',
+                                                        width: '44px'
+                                                    }}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                >
+                                                    <input
+                                                        type="checkbox"
+                                                        aria-label={`Select ${lead.founderName || lead.email || lead.domain || 'lead'}`}
+                                                        checked={selectAllMatchingLeadResults || selectedLeadIds.includes(String(lead.id))}
+                                                        onChange={(e) => toggleLeadSelection(String(lead.id), e.target.checked)}
+                                                        disabled={deletingLeads || selectAllMatchingLeadResults}
+                                                    />
+                                                </td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
                                                     maxWidth: '220px',
@@ -7432,7 +7811,7 @@ export default function ClientPage() {
                     {activeTab === "campaigns" && (
                         <>
                             <div style={{ marginTop: '2rem' }}>
-                                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                                <div className="pipeline-toolbar">
                                     <button
                                         type="button"
                                         className="primary-button"
@@ -7447,26 +7826,13 @@ export default function ClientPage() {
                                             setRunDomainCheck(true);
                                             setSkipEmailFinder(false);
                                             setPersonalizeFirstLine(false);
+                                            setUseShoppingAuditPipeline(false);
                                             setSelectedCampaignId("");
                                             setUploadError("");
                                         }}
                                     >
                                         📤 Upload Leads
                                     </button>
-                                    <button
-                                        type="button"
-                                        className="secondary-button secondary-button--active"
-                                        onClick={handleRefreshCampaigns}
-                                        disabled={syncingCampaigns}
-                                        style={{ minWidth: '180px' }}
-                                    >
-                                        {syncingCampaigns ? 'Refreshing...' : 'Refresh campaigns'}
-                                    </button>
-                                    {campaignSyncMessage && (
-                                        <span style={{ color: 'var(--app-text-muted)', fontSize: '0.9rem' }}>
-                                            {campaignSyncMessage}
-                                        </span>
-                                    )}
                                 </div>
                             </div>
 
@@ -7675,7 +8041,7 @@ export default function ClientPage() {
                                         )}
                                     </div>
                                     {(jobState?.status === 'completed' || canUploadToInstantly) && (
-                                        <div style={{ display: 'flex', gap: '0.75rem', width: '100%' }}>
+                                        <div className="pipeline-actions">
                                             <button
                                                 type="button"
                                                 className="secondary-button secondary-button--active"
@@ -7713,6 +8079,15 @@ export default function ClientPage() {
                                                     {uploadedSummary}
                                                 </span>
                                             ) : null}
+                                            {jobState?.status === 'completed' && (
+                                                <button
+                                                    type="button"
+                                                    className="secondary-button secondary-button--active"
+                                                    onClick={handleOpenJobPreviewLeads}
+                                                >
+                                                    Preview Leads
+                                                </button>
+                                            )}
                                             {canDiscardJob && (
                                                 <button
                                                     type="button"
@@ -7783,7 +8158,7 @@ export default function ClientPage() {
                                         )}
                                         
                                         <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
-                                        {[...STAGE_ORDER].map((stageKey) => {
+                                        {[...resolveStageOrder(jobState)].map((stageKey) => {
                                             const stage = jobState.stages[stageKey];
                                             const meta = STAGE_METADATA[stageKey];
                                             const { throughputNum, total } = deriveStageTotals(stage);
@@ -7810,6 +8185,42 @@ export default function ClientPage() {
                                                     : checked > 0
                                                     ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
                                                     : "Awaiting...";
+                                            } else if (stageKey === "shopifyCatalog") {
+                                                const shopify = (summary?.shopify as number) ?? (stats?.shopify as number) ?? throughputNum ?? 0;
+                                                const nonShopify = (summary?.nonShopify as number) ?? 0;
+                                                const processed = (summary?.processed as number) ?? total ?? shopify + nonShopify;
+                                                heroNumber = shopify;
+                                                heroLabel = "Shopify";
+                                                subtext = processed > 0
+                                                    ? `${processed.toLocaleString()} scanned • ${nonShopify.toLocaleString()} non-Shopify`
+                                                    : "Awaiting...";
+                                            } else if (stageKey === "heroSelection") {
+                                                const heroes = (summary?.processed as number) ?? throughputNum ?? total ?? 0;
+                                                heroNumber = heroes;
+                                                heroLabel = "Heroes";
+                                                subtext = heroes > 0 ? `${heroes.toLocaleString()} products selected` : "Awaiting...";
+                                            } else if (stageKey === "serperShopping") {
+                                                const clean = (summary?.clean as number) ?? 0;
+                                                const none = (summary?.none as number) ?? 0;
+                                                const ambiguous = (summary?.ambiguous as number) ?? 0;
+                                                const processed = (summary?.processed as number) ?? total ?? clean + none + ambiguous;
+                                                heroNumber = clean;
+                                                heroLabel = "Ads Matched";
+                                                subtext = processed > 0
+                                                    ? `${processed.toLocaleString()} queried • ${none.toLocaleString()} no match${ambiguous > 0 ? ` • ${ambiguous.toLocaleString()} ambiguous` : ""}`
+                                                    : "Awaiting...";
+                                                const serperCost = stageCostFromStage(stage);
+                                                if (serperCost !== null && serperCost > 0) costFooter = `Cost $${serperCost.toFixed(2)}`;
+                                            } else if (stageKey === "signalWaterfall") {
+                                                const signals = (summary?.processed as number) ?? throughputNum ?? 0;
+                                                const candidates = (summary?.totalCandidates as number) ?? total ?? 0;
+                                                heroNumber = signals;
+                                                heroLabel = "Signals";
+                                                subtext = candidates > 0
+                                                    ? `${signals.toLocaleString()} emitted • ${candidates.toLocaleString()} candidates`
+                                                    : signals > 0
+                                                    ? `${signals.toLocaleString()} emitted`
+                                                    : "Awaiting...";
                                             } else if (stageKey === "founders") {
                                                 const dedupedTotal = deriveDedupedDomainBaseline(jobState);
                                                 const processedRaw = total ?? 0;
@@ -7821,14 +8232,15 @@ export default function ClientPage() {
                                                 subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
                                                 if (cost !== null && cost > 0) costFooter = `Cost $${cost.toFixed(2)}`;
                                             } else if (stageKey === "emailDiscovery") {
-                                                const found =
-                                                    extractNumberFrom(stats, ["Found", "found"])
+                                                const imported =
+                                                    extractNumberFrom(stats, ["imported", "Found", "found"])
                                                     ?? (typeof stage?.progress?.found === "number"
                                                         ? stage.progress.found
                                                         : null)
-                                                    ?? extractNumberFrom(summary, ["Found", "found"])
+                                                    ?? extractNumberFrom(summary, ["Found", "found", "imported"])
                                                     ?? throughputNum
                                                     ?? 0;
+                                                const found = imported;
                                                 // `stage.progress.processed` is job-wide: it includes the offset for
                                                 // founders that had no name (or were already done) and were never
                                                 // actually email-checked. Using it as the denominator inflates "checked"
@@ -7850,9 +8262,13 @@ export default function ClientPage() {
                                                         ? stage.progress.processed
                                                         : total ?? 0);
                                                 heroNumber = found;
-                                                heroLabel = "Emails Found";
+                                                heroLabel = found > 0 && checkedThisRun === 0 && attempted > 0
+                                                    ? "Emails Imported"
+                                                    : "Emails Found";
                                                 subtext = attempted > 0
-                                                    ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
+                                                    ? checkedThisRun > 0
+                                                        ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
+                                                        : `${attempted.toLocaleString()} imported from CSV`
                                                     : "Awaiting...";
                                                 const emailCost = stageCostFromStage(stage);
                                                 if (emailCost !== null && emailCost > 0) {
@@ -10029,7 +10445,38 @@ export default function ClientPage() {
                                         borderRadius: '8px',
                                         border: '1px solid var(--app-border)'
                                     }}>
-                                        {clientIndustry === 'ecom' && (
+                                        {shoppingAuditEnabled && (
+                                            <label style={{
+                                                display: 'flex',
+                                                alignItems: 'flex-start',
+                                                gap: '0.75rem',
+                                                cursor: 'pointer',
+                                                padding: '0.5rem',
+                                                marginBottom: '0.75rem'
+                                            }}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={useShoppingAuditPipeline}
+                                                    onChange={(e) => {
+                                                        const checked = e.target.checked;
+                                                        setUseShoppingAuditPipeline(checked);
+                                                        if (checked) {
+                                                            setPersonalizeFirstLine(true);
+                                                        }
+                                                    }}
+                                                    style={{ width: '18px', height: '18px', cursor: 'pointer', marginTop: '0.15rem' }}
+                                                />
+                                                <div style={{ flex: 1 }}>
+                                                    <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
+                                                        Shopping Ad Audit pipeline
+                                                    </div>
+                                                    <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
+                                                        Shopify catalog → Serper confirm → signal waterfall → enrichment
+                                                    </div>
+                                                </div>
+                                            </label>
+                                        )}
+                                        {clientIndustry === 'ecom' && !useShoppingAuditPipeline && (
                                             <label style={{
                                                 display: 'flex',
                                                 alignItems: 'flex-start',
@@ -10204,7 +10651,13 @@ export default function ClientPage() {
                             )}
 
                             {/* Navigation Buttons */}
-                            <div className="modal__actions" style={{ marginTop: '1.5rem' }}>
+                            <div className="modal__actions" style={{ marginTop: '1.5rem', flexDirection: 'column', alignItems: 'stretch' }}>
+                                {uploadError && wizardStep > 1 && (
+                                    <p className="form-error" role="alert" style={{ margin: '0 0 0.75rem' }}>
+                                        {uploadError}
+                                    </p>
+                                )}
+                                <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
                                 {wizardStep > 1 && (
                                     <button
                                         type="button"
@@ -10236,6 +10689,7 @@ export default function ClientPage() {
                                         {uploading ? "Processing..." : "Upload Leads"}
                                     </button>
                                 )}
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -10852,6 +11306,121 @@ export default function ClientPage() {
                                     : leadExportLimitEnabled
                                         ? `Export CSV (${selectedLeadExportFields.length} fields, up to ${Math.max(1, Math.floor(leadExportMaxRows) || 1).toLocaleString()} rows)`
                                         : `Export CSV (${selectedLeadExportFields.length} fields, all matching)`}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Job leads preview modal */}
+            {jobPreviewModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => setJobPreviewModalOpen(false)}
+                >
+                    <div
+                        className="modal"
+                        onClick={(event) => event.stopPropagation()}
+                        style={{ maxWidth: 'min(96vw, 1440px)', width: '96vw', maxHeight: '92vh', display: 'flex', flexDirection: 'column' }}
+                    >
+                        <div className="modal__header">
+                            <div>
+                                <h2 className="modal__title">Preview Leads</h2>
+                                <p className="modal__description">
+                                    {jobPreviewTotal !== null
+                                        ? `${jobPreviewLeads.length.toLocaleString()} of ${jobPreviewTotal.toLocaleString()} leads loaded`
+                                        : 'Scroll to load more leads'}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div
+                            ref={jobPreviewScrollRef}
+                            className="modal__body"
+                            onScroll={handleJobPreviewScroll}
+                            style={{ overflowY: 'auto', padding: 0 }}
+                        >
+                            {jobPreviewLoading && jobPreviewLeads.length === 0 ? (
+                                <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--app-text-muted)' }}>
+                                    Loading leads...
+                                </div>
+                            ) : jobPreviewLeads.length === 0 ? (
+                                <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--app-text-muted)' }}>
+                                    No leads available for this job.
+                                </div>
+                            ) : (
+                                <table className="leads-table" style={{ width: '100%', tableLayout: 'fixed', borderCollapse: 'separate', borderSpacing: 0, fontSize: '0.875rem' }}>
+                                    <colgroup>
+                                        <col style={{ width: '14%' }} />
+                                        <col style={{ width: '12%' }} />
+                                        <col style={{ width: '150px' }} />
+                                        <col style={{ width: '90px' }} />
+                                        <col />
+                                    </colgroup>
+                                    <thead>
+                                        <tr style={{ backgroundColor: 'var(--app-surface-2)', borderBottom: '1px solid var(--app-border)' }}>
+                                            {['Domain', 'Founder', 'Email', 'Status', 'First line'].map((label) => (
+                                                <th
+                                                    key={label}
+                                                    style={{
+                                                        position: 'sticky',
+                                                        top: 0,
+                                                        zIndex: 2,
+                                                        backgroundColor: 'var(--app-bg)',
+                                                        textAlign: 'left',
+                                                        padding: '0.75rem 1rem',
+                                                        fontWeight: 600,
+                                                        color: 'var(--app-text-high)',
+                                                        borderBottom: '1px solid var(--app-border)',
+                                                        overflow: 'hidden',
+                                                        textOverflow: 'ellipsis',
+                                                        whiteSpace: 'nowrap',
+                                                    }}
+                                                >
+                                                    {label}
+                                                </th>
+                                            ))}
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {jobPreviewLeads.map((lead, index) => {
+                                            const emailDisplay = formatRawEmailValue(lead.email);
+                                            return (
+                                            <tr key={`${lead.domain}-${lead.email}-${index}`}>
+                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={lead.domain || undefined}>{lead.domain || '—'}</td>
+                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={lead.founder_name || undefined}>{lead.founder_name || '—'}</td>
+                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={emailDisplay !== '—' ? emailDisplay : undefined}>{emailDisplay}</td>
+                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{lead.email_status || '—'}</td>
+                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', whiteSpace: 'normal', lineHeight: 1.45, wordBreak: 'break-word' }}>
+                                                    {lead.personalization || '—'}
+                                                </td>
+                                            </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            )}
+                            {jobPreviewLoading && jobPreviewLeads.length > 0 && (
+                                <div style={{ padding: '1rem', textAlign: 'center', color: 'var(--app-text-muted)', fontSize: '0.875rem' }}>
+                                    Loading more...
+                                </div>
+                            )}
+                            {!jobPreviewHasMore && jobPreviewLeads.length > 0 && (
+                                <div style={{ padding: '1rem', textAlign: 'center', color: 'var(--app-text-muted)', fontSize: '0.875rem' }}>
+                                    All leads loaded
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="modal__actions">
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => setJobPreviewModalOpen(false)}
+                            >
+                                Close
                             </button>
                         </div>
                     </div>

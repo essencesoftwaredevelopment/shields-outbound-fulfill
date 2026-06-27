@@ -38,10 +38,33 @@ Key files:
 - server/src/services/db/queries.js
 - server/src/lib/db.js
 
-## Execution model (queue-only)
+## Execution model (PM2 queue + Vercel Workflows)
+
+Enrichment jobs can run on **PM2** (default) or **Vercel Workflows** (opt-in). Instantly sync, follow-ups, and webhooks always stay on PM2.
+
+| Runner | Trigger | Worker |
+|--------|---------|--------|
+| `pm2` (default) | `POST /api/jobs` → `job_queue` | `src/worker/queueWorker.js` → `runJobChild.js` |
+| `vercel` | `POST /api/jobs` → `POST /internal/enrichment/start` | `workflows/enrichment-parent.ts` → child batches |
+
+**Routing:** `executionRunner` is resolved from (in order) job `options.executionRunner`, env `ENRICHMENT_RUNNER=vercel`, or agency feature `features.enrichmentRunner: 'vercel'`. See `server/src/enrichment/executionRunner.js`.
+
+**Parallel period:** PM2 worker skips Vercel jobs (`claimNextQueuedJob` filters `executionRunner != 'vercel'`). Workflow start refuses double-run when `jobs.status = running` and `workflowRunId` is set.
+
+**Vercel path layout:**
+- `server/src/enrichment/` — shared context, hydrate, stage batch runners, rate limits
+- `workflows/enrichment-parent.ts` — domain prep → batch fan-out (100 domains, wave 15) → finalize
+- `workflows/enrichment-child.ts` — shopping audit (if applicable) → founders → emails → verify → personalization
+- `app/internal/enrichment/start/route.ts` — secured trigger (`WORKFLOW_TRIGGER_SECRET`)
+
+**Required env (Vercel + Express):** Postgres vars, `APP_URL`, `WORKFLOW_TRIGGER_SECRET`, optional `UPSTASH_REDIS_REST_URL/TOKEN` for tenant rate limits.
+
+**Shadow validation:** Run the same fixture job with `executionRunner: pm2` vs `vercel` and compare `contacts` + shopping audit tables before flipping the default.
+
+### PM2-only queue worker (legacy default)
 
 - The API **never** runs `processJob` inline. Upload and resume always enqueue `job_queue`.
-- A dedicated worker process (`src/worker/queueWorker.js`) claims jobs and runs `runJobChild.js`.
+- A dedicated worker process (`src/worker/queueWorker.js`) claims PM2 enrichment jobs and runs `runJobChild.js`.
 - Child PID is stored on `job_queue.runner_pid` for hybrid stop (cooperative cancel, then SIGTERM/SIGKILL).
 - Local dev: `npm run dev:all` in `server/` (API + worker), or run `npm run dev` and `npm run worker` in two terminals.
 - Production: PM2 must run **both** `shields-outbound-server` and `shields-outbound-worker` (see `ecosystem.config.cjs`).

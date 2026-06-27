@@ -12,9 +12,24 @@ const COHORT_ELIGIBLE_SQL = `
     AND COALESCE(jd.raw_row->'_enrichment'->>'founderExcluded', 'false') <> 'true'
     AND COALESCE(jd.raw_row->'_enrichment'->>'inEmailCohort', 'true') = 'true'`;
 
+/** When dedupe strategy is skip, job_domains marked `skipped` must not re-enter enrichment queues. */
+function skippedJobDomainSql(reprocessInclude) {
+    return reprocessInclude ? '' : `AND jd.status <> 'skipped'`;
+}
+
+function resolvePipelineMode(options = {}, stages = {}) {
+    if (options.pipelineMode === 'shopping_audit') return 'shopping_audit';
+    if (options.nicheId === 'shopping_audit' || options.industry === 'shopping_audit') {
+        return 'shopping_audit';
+    }
+    if (stages?.shopifyCatalog) return 'shopping_audit';
+    return options.pipelineMode || 'standard';
+}
+
 export function jobRowToState(row) {
     if (!row) return null;
     const options = row.options || {};
+    const stages = row.stages || {};
     return {
         id: row.id,
         status: row.status,
@@ -29,8 +44,13 @@ export function jobRowToState(row) {
         stages: row.stages || {},
         activityMessage: options.activityMessage || null,
         activityUpdatedAt: options.activityUpdatedAt || null,
+        timingLog: Array.isArray(options.timingLog) ? options.timingLog : [],
+        timingTotals: options.timingTotals && typeof options.timingTotals === 'object'
+            ? options.timingTotals
+            : {},
         dedupeStats: row.dedupe_stats || null,
         dedupeStrategy: options.dedupeStrategy || 'skip',
+        pipelineMode: resolvePipelineMode(options, stages),
         sqlClientId: row.client_id,
         clientId: row.client_slug,
         uid: row.agency_id,
@@ -49,7 +69,8 @@ export function jobRowToState(row) {
         skipDomainCheck: !!options.skipDomainCheck,
         cost: Number(row.cost) || 0,
         uploadStatus: row.upload_status,
-        isActive: !!row.is_active
+        isActive: !!row.is_active,
+        executionRunner: options.executionRunner || 'pm2'
     };
 }
 
@@ -57,8 +78,15 @@ export function inMemoryJobFromRow(row, apiKeys = {}) {
     const base = jobRowToState(row);
     if (!base) return null;
     const options = row.options || {};
+    const timing = {
+        timingLog: Array.isArray(options.timingLog) ? options.timingLog : [],
+        timingTotals: options.timingTotals && typeof options.timingTotals === 'object'
+            ? options.timingTotals
+            : {}
+    };
     return {
         ...base,
+        ...timing,
         apiKeys,
         pricing: null,
         tmpDir: null,
@@ -67,6 +95,7 @@ export function inMemoryJobFromRow(row, apiKeys = {}) {
         __updateCounter: 0,
         __lastStatus: base.status,
         dedupeStrategy: options.dedupeStrategy || 'skip',
+        pipelineMode: resolvePipelineMode(options, row.stages || {}),
         skipFounderFinder: !!options.skipFounderFinder,
         skipEmailFinder: !!options.skipEmailFinder,
         skipVerification: !!options.skipVerification,
@@ -270,25 +299,34 @@ export async function upsertSerperCacheBatch(jobId, entries) {
     );
 }
 
-export async function persistJobState(job) {
-    const options = {
-        dedupeStrategy: job.dedupeStrategy,
-        skipFounderFinder: job.skipFounderFinder,
-        skipEmailFinder: job.skipEmailFinder,
-        skipVerification: job.skipVerification,
-        skipDomainCheck: job.skipDomainCheck,
-        findFounder: job.findFounder,
-        emailVerificationProvider: job.emailVerificationProvider,
-        columnMapping: job.columnMapping,
-        industry: job.industry,
-        nicheId: job.nicheId,
-        nicheLabel: job.nicheLabel,
-        personalizeFirstLine: job.personalizeFirstLine,
-        productPromptVersion: job.productPromptVersion,
-        productPromptProducts: job.productPromptProducts,
+export async function persistJobState(job, { includeTiming = true } = {}) {
+    const activityFields = {
         activityMessage: job.activity?.message || null,
         activityUpdatedAt: job.activity?.updatedAt || null
     };
+
+    const optionsPatch = includeTiming
+        ? {
+            dedupeStrategy: job.dedupeStrategy,
+            pipelineMode: job.pipelineMode || 'standard',
+            skipFounderFinder: job.skipFounderFinder,
+            skipEmailFinder: job.skipEmailFinder,
+            skipVerification: job.skipVerification,
+            skipDomainCheck: job.skipDomainCheck,
+            findFounder: job.findFounder,
+            emailVerificationProvider: job.emailVerificationProvider,
+            columnMapping: job.columnMapping,
+            industry: job.industry,
+            nicheId: job.nicheId,
+            nicheLabel: job.nicheLabel,
+            personalizeFirstLine: job.personalizeFirstLine,
+            productPromptVersion: job.productPromptVersion,
+            productPromptProducts: job.productPromptProducts,
+            ...activityFields,
+            timingLog: Array.isArray(job.timingLog) ? job.timingLog : [],
+            timingTotals: job.timingTotals && typeof job.timingTotals === 'object' ? job.timingTotals : {}
+        }
+        : activityFields;
 
     await pool.query(
         `UPDATE jobs SET
@@ -299,7 +337,7 @@ export async function persistJobState(job) {
             cost = $6,
             stages = $7::jsonb,
             dedupe_stats = $8::jsonb,
-            options = $9::jsonb,
+            options = COALESCE(options, '{}'::jsonb) || $9::jsonb,
             updated_at = NOW(),
             completed_at = CASE WHEN $10::timestamptz IS NOT NULL THEN $10::timestamptz ELSE completed_at END,
             paused_at = CASE WHEN $11::timestamptz IS NOT NULL THEN $11::timestamptz ELSE paused_at END,
@@ -314,7 +352,7 @@ export async function persistJobState(job) {
             typeof job.cost === 'number' ? job.cost : 0,
             JSON.stringify(job.stages || {}),
             job.dedupeStats ? JSON.stringify(job.dedupeStats) : null,
-            JSON.stringify(options),
+            JSON.stringify(optionsPatch),
             job.completedAt || null,
             job.pausedAt || null,
             job.resumedAt || null
@@ -465,15 +503,16 @@ export async function markJobDomainFounderExcluded(jobId, domainNormalized) {
     await markJobDomainsFounderExcluded(jobId, [domainNormalized]);
 }
 
-export async function listJobDomainsForJob(jobId, { emailCohortOnly = false } = {}) {
+export async function listJobDomainsForJob(jobId, { emailCohortOnly = false, excludeSkipped = false } = {}) {
     const cohortFilter = emailCohortOnly
         ? `AND COALESCE(raw_row->'_enrichment'->>'inEmailCohort', 'true') = 'true'
            AND COALESCE(raw_row->'_enrichment'->>'founderExcluded', 'false') <> 'true'`
         : '';
+    const skippedFilter = excludeSkipped ? `AND status <> 'skipped'` : '';
     const result = await pool.query(
         `SELECT domain_normalized, raw_row, status
          FROM job_domains
-         WHERE job_id = $1 ${cohortFilter}
+         WHERE job_id = $1 ${cohortFilter} ${skippedFilter}
          ORDER BY sort_order ASC`,
         [jobId]
     );
@@ -584,6 +623,7 @@ export async function getEmailFindQueue(
            AND (c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '' AND LOWER(BTRIM(c.full_name)) <> 'not found')
            AND COALESCE(jd.raw_row->'_enrichment'->>'inFounderCohort', 'true') = 'true'
            ${COHORT_ELIGIBLE_SQL}
+           ${skippedJobDomainSql(reprocessInclude)}
          ORDER BY c.id ASC
          LIMIT $4`,
         params
@@ -627,6 +667,7 @@ export async function getVerifyQueue(
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
            ${freshnessConstraint}
            ${COHORT_ELIGIBLE_SQL}
+           ${skippedJobDomainSql(reprocessInclude)}
          ORDER BY c.id ASC
          LIMIT $4`,
         params
@@ -670,6 +711,7 @@ export async function getPersonalizeQueue(
            ${personalizationFilter}
            ${emailStatusFilter}
            ${COHORT_ELIGIBLE_SQL}
+           ${skippedJobDomainSql(reprocessInclude)}
          ORDER BY c.id ASC
          LIMIT $4`,
         [agencyId, clientId, jobId, limit]
@@ -728,45 +770,92 @@ function buildUploadEmailStatusFilter({ includeValid = true, includeRisky = true
     return `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN (${statuses.map((status) => `'${status}'`).join(', ')})`;
 }
 
-export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {}) {
-    let statusFilter = '';
+function buildUnifiedScopeFilter(scope, options = {}) {
     if (scope === 'valid') {
-        statusFilter = buildUploadEmailStatusFilter(options);
-    } else if (scope === 'complete') {
-        statusFilter = `AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+        return buildUploadEmailStatusFilter(options);
+    }
+    if (scope === 'complete') {
+        return `AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
             AND c.personalization_first_line IS NOT NULL AND BTRIM(c.personalization_first_line) <> ''`;
     }
+    return '';
+}
 
+const UNIFIED_ROW_SELECT = `
+    SELECT
+        co.domain_normalized AS domain,
+        c.full_name AS founder_name,
+        c.email,
+        c.email_status,
+        c.personalization_first_line AS personalization,
+        c.personalization_first_line AS first_line`;
+
+const UNIFIED_ROW_FROM = `
+    FROM contacts c
+    JOIN companies co ON co.id = c.company_id
+    WHERE c.job_id = $1 AND c.role_type = 'founder'`;
+
+function mapUnifiedContactRow(row) {
+    const parts = String(row.founder_name || '').trim().split(/\s+/);
+    const firstName = parts[0] || '';
+    const lastName = parts.length > 1 ? parts.slice(1).join(' ') : '';
+    return {
+        domain: row.domain,
+        founder_name: row.founder_name || '',
+        email: row.email || '',
+        email_status: row.email_status || '',
+        first_name: firstName,
+        last_name: lastName,
+        personalization: row.personalization || row.first_line || ''
+    };
+}
+
+export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {}) {
+    const statusFilter = buildUnifiedScopeFilter(scope, options);
     const result = await pool.query(
-        `SELECT
-            co.domain_normalized AS domain,
-            c.full_name AS founder_name,
-            c.email,
-            c.email_status,
-            c.personalization_first_line AS personalization,
-            c.personalization_first_line AS first_line
-         FROM contacts c
-         JOIN companies co ON co.id = c.company_id
-         WHERE c.job_id = $1 AND c.role_type = 'founder'
+        `${UNIFIED_ROW_SELECT}
+         ${UNIFIED_ROW_FROM}
          ${statusFilter}
          ORDER BY co.domain_normalized ASC`,
         [jobId]
     );
 
-    return result.rows.map((row) => {
-        const parts = String(row.founder_name || '').trim().split(/\s+/);
-        const firstName = parts[0] || '';
-        const lastName = parts.length > 1 ? parts.slice(1).join(' ') : '';
-        return {
-            domain: row.domain,
-            founder_name: row.founder_name || '',
-            email: row.email || '',
-            email_status: row.email_status || '',
-            first_name: firstName,
-            last_name: lastName,
-            personalization: row.personalization || row.first_line || ''
-        };
-    });
+    return result.rows.map(mapUnifiedContactRow);
+}
+
+export async function listUnifiedRowsFromDb(jobId, {
+    scope = 'all',
+    limit = 100,
+    offset = 0,
+    ...options
+} = {}) {
+    const statusFilter = buildUnifiedScopeFilter(scope, options);
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const countResult = await pool.query(
+        `SELECT COUNT(*)::int AS total ${UNIFIED_ROW_FROM} ${statusFilter}`,
+        [jobId]
+    );
+    const total = countResult.rows[0]?.total ?? 0;
+
+    const result = await pool.query(
+        `${UNIFIED_ROW_SELECT}
+         ${UNIFIED_ROW_FROM}
+         ${statusFilter}
+         ORDER BY co.domain_normalized ASC
+         LIMIT $2 OFFSET $3`,
+        [jobId, parsedLimit, parsedOffset]
+    );
+
+    const rows = result.rows.map(mapUnifiedContactRow);
+    return {
+        rows,
+        total,
+        limit: parsedLimit,
+        offset: parsedOffset,
+        hasMore: parsedOffset + rows.length < total
+    };
 }
 
 export async function deleteJobFromDb(jobId, agencyId) {

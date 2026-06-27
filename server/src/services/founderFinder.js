@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import csv from 'csv-parser';
 import { OpenAI } from 'openai';
-import pLimit from 'p-limit';
+import { createConcurrencyLimit } from '../lib/concurrency.js';
 
 dotenv.config();
 
@@ -216,7 +216,7 @@ async function readDomains(filePath) {
     return domains;
 }
 
-async function aiFindFounder(searchResults, companyDomain, logger, openai, rateLimiter) {
+async function aiFindFounder(searchResults, companyDomain, logger, openai, rateLimiter, rateLimitHooks) {
     const slim = searchResults.slice(0, AI_TOP_ORGANIC).map(r => ({
         t: r.title || '',
         u: r.link || '',
@@ -250,6 +250,7 @@ John Smith
 Search results (compressed JSON): ${searchString}
 Company Domain: ${companyDomain}`;
 
+    if (rateLimitHooks?.openai) await rateLimitHooks.openai();
     await rateLimiter.acquire();
 
     let res;
@@ -332,7 +333,8 @@ export async function runFounderFinder({
     pricing,
     log = () => {},
     onBatch = null,
-    totalDomainCount = null
+    totalDomainCount = null,
+    rateLimitHooks = null
 }) {
     const OPENAI_API_KEY = apiKeys.openai;
     const SERPER_API_KEY = apiKeys.serper;
@@ -386,8 +388,8 @@ export async function runFounderFinder({
         };
     }
 
-    const serperLimit = pLimit(SERPER_CONCURRENCY);
-    const aiLimit = pLimit(AI_CONCURRENCY_LIMIT);
+    const serperLimit = createConcurrencyLimit(SERPER_CONCURRENCY);
+    const aiLimit = createConcurrencyLimit(AI_CONCURRENCY_LIMIT);
 
     const persistSerperBatch = async (batchEntries) => {
         if (!saveSerperCache || !batchEntries.length) return;
@@ -493,7 +495,10 @@ export async function runFounderFinder({
                 };
                 
                 const res = await withRetry(
-                    () => axios.request(fetchConfig),
+                    async () => {
+                        if (rateLimitHooks?.serper) await rateLimitHooks.serper();
+                        return axios.request(fetchConfig);
+                    },
                     `Serper batch ${batchIdx + 1}`,
                     status => status === 429 || (status >= 500 && status < 600),
                     log
@@ -556,7 +561,14 @@ export async function runFounderFinder({
                     if (searchResults.length > 0) {
                         try {
                             await assertNotStopped(control);
-                            const result = await aiFindFounder(searchResults, domain, log, openai, aiRateLimiter);
+                            const result = await aiFindFounder(
+                                searchResults,
+                                domain,
+                                log,
+                                openai,
+                                aiRateLimiter,
+                                rateLimitHooks
+                            );
                             await assertNotStopped(control);
                             name = result?.name || 'Not Found';
                             tokensIn = result?.tokensIn || 0;
@@ -616,7 +628,7 @@ export async function runFounderFinder({
                             }
                         }
                     };
-                    if (processed % 25 === 0 || processed <= 10) {
+                    if (processed % 5 === 0 || processed <= 10 || processed === totalDomains) {
                         const rate = foundCount + notFoundCount > 0 ? ((foundCount / (foundCount + notFoundCount)) * 100).toFixed(2) : '0.00';
                         log(`Founders: processed ${processed}/${totalDomains} | find rate ${rate}%`, progressPayload);
                     } else {

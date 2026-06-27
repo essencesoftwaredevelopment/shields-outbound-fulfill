@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import { parse } from 'csv-parse';
 import fetch from 'node-fetch';
-import pLimit from 'p-limit';
+import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
 
@@ -306,7 +306,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
         .map((row, index) => ({ row, index }))
         .filter(item => !!item.row.email);
 
-    const limit = pLimit(Math.min(CONCURRENCY, Math.max(1, toVerify.length)));
+    const limit = createConcurrencyLimit(Math.min(CONCURRENCY, Math.max(1, toVerify.length)));
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
     let stageCost = 0;

@@ -79,7 +79,15 @@ function buildContactPayload(row, type) {
     }
     if (type === 'personalization') {
         const firstLine = String(row.personalization_first_line || row.first_line || row.personalization || '').trim() || null;
-        return { domain, roleType: 'founder', fullName: founderName, email, personalizationFirstLine: firstLine };
+        return {
+            domain,
+            roleType: 'founder',
+            fullName: founderName,
+            email,
+            emailStatus: verificationStatus ? normalizeEmailStatus(verificationStatus) : null,
+            personalizationFirstLine: firstLine,
+            signalEmissionId: row.signal_emission_id ? Number(row.signal_emission_id) : null
+        };
     }
     return { domain, roleType: 'founder', fullName: founderName };
 }
@@ -87,15 +95,30 @@ function buildContactPayload(row, type) {
 /**
  * Upsert an in-memory batch of lead rows (no CSV needed)
  */
-export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobId = null, mergeMode = 'preserve' }) {
+export async function upsertLeadRowsBatch({
+    agencyId,
+    clientId,
+    rows,
+    type,
+    jobId = null,
+    mergeMode = 'preserve',
+    onTiming = null
+}) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     if (!agencyId || !clientId) return;
 
     const payloads = rows.map((r) => buildContactPayload(r, type)).filter(Boolean);
     if (!payloads.length) return;
 
+    const batchStart = Date.now();
+    let companiesMs = 0;
+    let contactsMs = 0;
+    let signalMs = 0;
+
     await withTx(async (client) => {
+        const companiesStart = Date.now();
         const domainMap = await batchUpsertCompanies(client, agencyId, clientId, payloads);
+        companiesMs = Date.now() - companiesStart;
 
         const contactRows = payloads.map((p) => {
             const company_id = domainMap.get(p.domain);
@@ -117,12 +140,40 @@ export async function upsertLeadRowsBatch({ agencyId, clientId, rows, type, jobI
         }).filter((r) => r.company_id);
 
         if (contactRows.length > 0) {
+            const contactsStart = Date.now();
             await batchUpsertContacts(client, agencyId, clientId, contactRows, {
                 mergeMode,
                 upsertType: type
             });
+            contactsMs = Date.now() - contactsStart;
+        }
+
+        if (type === 'personalization') {
+            const signalStart = Date.now();
+            for (const p of payloads) {
+                if (!p.signalEmissionId) continue;
+                const companyId = domainMap.get(p.domain);
+                if (!companyId) continue;
+                await client.query(
+                    `UPDATE contacts SET signal_emission_id = $1, updated_at = NOW()
+                     WHERE company_id = $2 AND role_type = 'founder' AND client_id = $3`,
+                    [p.signalEmissionId, companyId, clientId]
+                );
+            }
+            signalMs = Date.now() - signalStart;
         }
     });
+
+    if (typeof onTiming === 'function') {
+        onTiming({
+            type,
+            rows: rows.length,
+            companiesMs,
+            contactsMs,
+            signalMs,
+            totalMs: Date.now() - batchStart
+        });
+    }
 }
 
 /**
@@ -362,7 +413,13 @@ export async function processCsvWithCheckpoints({ agencyId, clientId, jobId, sta
 /**
  * Mark job_domains as skipped when company already exists (SQL queue mode).
  */
-export async function filterJobDomainsForDedupe({ agencyId, clientId, jobId, dedupeStrategy = 'skip' }) {
+export async function filterJobDomainsForDedupe({
+    agencyId,
+    clientId,
+    jobId,
+    dedupeStrategy = 'skip',
+    reauditMonths = null
+}) {
     const { pool } = await import('../config/db.js');
     const { markJobDomainsSkipped } = await import('./db/jobs.js');
 
@@ -381,7 +438,7 @@ export async function filterJobDomainsForDedupe({ agencyId, clientId, jobId, ded
     };
     if (!domains.length) return { stats };
 
-    const existingSet = await getExistingDomainsSet(clientId, domains);
+    const existingSet = await getExistingDomainsSet(clientId, domains, { reauditMonths });
     stats.existing = existingSet.size;
 
     if (dedupeStrategy === 'skip') {
@@ -399,7 +456,7 @@ export async function filterJobDomainsForDedupe({ agencyId, clientId, jobId, ded
     return { stats };
 }
 
-export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain' }) {
+export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId, domainsCsvPath, dedupeStrategy = 'skip', domainColumn = 'domain', reauditMonths = null }) {
     if (!agencyId || !clientId || !domainsCsvPath) {
         console.warn(`[${jobId}] Missing agencyId/clientId/domainsCsvPath`);
         return { filtered: domainsCsvPath, stats: { total: 0, skipped: 0, new: 0 } };
@@ -439,7 +496,7 @@ export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId
     if (uniqueDomains.length === 0) return { filtered: domainsCsvPath, stats };
 
     // Get existing domains from SQL (unique list only)
-    const existingSet = await getExistingDomainsSet(clientId, uniqueDomains);
+    const existingSet = await getExistingDomainsSet(clientId, uniqueDomains, { reauditMonths });
     stats.existing = existingSet.size;
 
     let filteredDomains = uniqueDomains;
@@ -471,6 +528,16 @@ export async function filterAndWriteProcessedDomains({ agencyId, clientId, jobId
 export async function markContactsAsSent(agencyId, contactIds) {
     if (!Array.isArray(contactIds) || contactIds.length === 0) return [];
     return queries.markContactsAsSent(agencyId, contactIds);
+}
+
+export async function deleteContactsForClient(agencyId, clientId, { contactIds, filterContext } = {}) {
+    if (filterContext) {
+        return queries.deleteContactsByFilter(agencyId, clientId, filterContext);
+    }
+    if (!Array.isArray(contactIds) || contactIds.length === 0) {
+        return { deletedCount: 0, deletedIds: [], deletedCompanyCount: 0 };
+    }
+    return queries.deleteContactsByIds(agencyId, clientId, contactIds);
 }
 
 /**
@@ -513,6 +580,7 @@ export default {
     filterAndWriteProcessedDomains,
     processCsvWithCheckpoints,
     markContactsAsSent,
+    deleteContactsForClient,
     markEmailsAsSent,
     attachCampaignToLeads,
     upsertLeadRowsBatch,

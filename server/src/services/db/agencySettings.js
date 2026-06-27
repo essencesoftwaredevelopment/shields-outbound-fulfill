@@ -9,11 +9,12 @@ export async function getAgencySettings(agencyId) {
 }
 
 export async function upsertAgencySettings(agencyId, patch = {}) {
+    const featuresJson = patch.features != null ? JSON.stringify(patch.features) : null;
     await pool.query(
         `INSERT INTO agency_settings (
             agency_id, openai_key, serper_key, trykitt_key, openai_founder_model,
-            email_verification_provider, pricing_overrides, vault_updated_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
+            email_verification_provider, pricing_overrides, features, vault_updated_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, COALESCE($8::jsonb, '{}'::jsonb), NOW(), NOW())
         ON CONFLICT (agency_id) DO UPDATE SET
             openai_key = COALESCE(EXCLUDED.openai_key, agency_settings.openai_key),
             serper_key = COALESCE(EXCLUDED.serper_key, agency_settings.serper_key),
@@ -21,6 +22,10 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             openai_founder_model = COALESCE(EXCLUDED.openai_founder_model, agency_settings.openai_founder_model),
             email_verification_provider = COALESCE(EXCLUDED.email_verification_provider, agency_settings.email_verification_provider),
             pricing_overrides = COALESCE(EXCLUDED.pricing_overrides, agency_settings.pricing_overrides),
+            features = CASE
+                WHEN $8::jsonb IS NOT NULL THEN EXCLUDED.features
+                ELSE agency_settings.features
+            END,
             vault_updated_at = NOW(),
             updated_at = NOW()`,
         [
@@ -30,7 +35,8 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             patch.trykitt_key ?? null,
             patch.openai_founder_model ?? null,
             patch.email_verification_provider ?? null,
-            JSON.stringify(patch.pricing_overrides ?? {})
+            JSON.stringify(patch.pricing_overrides ?? {}),
+            featuresJson
         ]
     );
 }
@@ -42,6 +48,20 @@ export function apiKeysFromSettings(settings) {
         serper: settings.serper_key || '',
         trykitt: settings.trykitt_key || ''
     };
+}
+
+export function agencyFeaturesFromSettings(settings) {
+    const raw = settings?.features;
+    if (!raw || typeof raw !== 'object') return {};
+    return raw;
+}
+
+export function hasShoppingAuditFeature(settings) {
+    return agencyFeaturesFromSettings(settings).shoppingAudit === true;
+}
+
+export function hasVercelEnrichmentRunner(settings) {
+    return agencyFeaturesFromSettings(settings).enrichmentRunner === 'vercel';
 }
 
 export async function getPricingDefaults() {

@@ -13,6 +13,8 @@
         "followups:worker": "node src/worker/followUpWorker.js",
         "followups:send-once": "node src/scripts/run-follow-ups-once.js",
         "personalizer:local": "node src/scripts/run-personalizer-local.js",
+        "shopping-audit:spike": "node src/scripts/serper-shopping-spike.js",
+        "shopping-audit:report": "node src/scripts/shopping-audit-batch-report.js",
         "db:ping": "node scripts/db-ping.js",
         "db:migrate:firestore-users-clients": "node src/scripts/migrate-firestore-to-sql/migrate-users-clients.js",
         "db:migration:capture-baseline": "bash scripts/migration/capture-cloudsql-baseline.sh",
@@ -20,10 +22,12 @@
         "db:migration:import-target": "bash scripts/migration/import-into-supabase.sh",
         "db:migration:compare-parity": "bash scripts/migration/compare-parity.sh",
         "db:migration:validate-target": "bash scripts/migration/validate-target.sh",
-        "test": "node --test \"src/utils/__tests__/*.test.js\""
+        "test": "node --test \"src/utils/__tests__/*.test.js\" \"src/services/**/__tests__/*.test.js\""
     },
     "dependencies": {
         "@supabase/supabase-js": "^2.106.2",
+        "@upstash/ratelimit": "^2.0.8",
+        "@upstash/redis": "^1.38.0",
         "axios": "^1.7.7",
         "cors": "^2.8.5",
         "csv-parse": "^5.5.4",
@@ -37,7 +41,8 @@
         "node-fetch": "^3.3.2",
         "openai": "^4.73.1",
         "p-limit": "^5.0.0",
-        "pg": "^8.11.5",
+        "pg": "^8.22.0",
+        "playwright": "^1.61.1",
         "stripe": "^14.24.0",
         "ws": "^8.21.0"
     }

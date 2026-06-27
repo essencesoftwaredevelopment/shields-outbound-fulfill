@@ -1,4 +1,5 @@
 import { DEFAULT_PRICING } from '../utils/pricing.js';
+import { logTimestamp } from '../utils/logTimestamp.js';
 import { jobs, processJob } from '../services/jobPipeline.js';
 import { getQueueJob, setQueueStatus, clearRunnerPid } from '../services/jobQueue.js';
 import { getJobById, inMemoryJobFromRow } from '../services/db/jobs.js';
@@ -24,6 +25,9 @@ function buildRuntimeJob(queueJob, apiKeys, row) {
     job.paused = !!queueJob?.control?.paused || !!row.paused;
     job.cancelled = !!queueJob?.control?.cancelled || !!row.cancelled;
     job.dedupeStats = row.dedupe_stats || payload.dedupeStats || null;
+    if (payload.pipelineMode === 'shopping_audit') {
+        job.pipelineMode = 'shopping_audit';
+    }
     job.__persistedOnce = true;
     return job;
 }
@@ -33,7 +37,7 @@ function installShutdownSignals(jobId) {
     const exitNow = (signal) => {
         if (exiting) return;
         exiting = true;
-        console.log(`[${jobId}] ${signal} received — child exiting`);
+        console.log(`[${jobId}] [${logTimestamp()}] ${signal} received — child exiting`);
         process.exit(signal === 'SIGINT' ? 130 : 143);
     };
     process.on('SIGINT', () => exitNow('SIGINT'));
@@ -47,7 +51,7 @@ async function main() {
         process.exit(1);
     }
     installShutdownSignals(jobId);
-    console.log(`[${jobId}] Child process starting (pid ${process.pid})`);
+    console.log(`[${jobId}] [${logTimestamp()}] Child process starting (pid ${process.pid})`);
 
     try {
         const queueJob = await getQueueJob(jobId);
@@ -69,7 +73,7 @@ async function main() {
 
         const terminalStatus = job.cancelled ? 'cancelled' : (job.paused ? 'paused' : 'completed');
         await setQueueStatus(jobId, terminalStatus);
-        console.log(`[${jobId}] Child process finished with status ${job.status} (queue ${terminalStatus})`);
+        console.log(`[${jobId}] [${logTimestamp()}] Child process finished with status ${job.status} (queue ${terminalStatus})`);
         process.exit(0);
     } catch (error) {
         console.error(`[${jobId}] Child process failed:`, error?.message || error);

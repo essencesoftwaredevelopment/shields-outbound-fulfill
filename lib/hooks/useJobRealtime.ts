@@ -31,12 +31,21 @@ export type JobRealtimeRow = {
 
 export function rowToJobState(row: JobRealtimeRow) {
     const options = row.options || {};
+    const stages = row.stages || {};
+    const pipelineMode =
+        options.pipelineMode === "shopping_audit"
+        || options.nicheId === "shopping_audit"
+        || options.industry === "shopping_audit"
+        || Boolean(stages.shopifyCatalog)
+            ? "shopping_audit"
+            : "standard";
     return {
         id: row.id,
         status: row.status,
         paused: row.paused,
         cancelled: row.cancelled,
-        stages: row.stages || {},
+        stages,
+        pipelineMode,
         activityMessage: typeof options.activityMessage === 'string' ? options.activityMessage : null,
         activityUpdatedAt: typeof options.activityUpdatedAt === 'string' ? options.activityUpdatedAt : null,
         error: row.error ?? null,
