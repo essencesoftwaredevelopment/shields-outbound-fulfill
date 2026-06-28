@@ -681,12 +681,19 @@ export async function getPersonalizeQueue(
     jobId,
     { reprocessInclude = false, requireValidEmail = false, limit = 5000, jobStartedAt = null } = {}
 ) {
-    // personalization_first_line has no completion timestamp; resume relies on the
-    // text being populated. `jobStartedAt` is unused here but accepted for symmetry.
-    void jobStartedAt;
-    const personalizationFilter = reprocessInclude
-        ? ''
-        : `AND (c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')`;
+    const params = [agencyId, clientId, jobId, limit];
+    let personalizationFilter;
+    if (reprocessInclude) {
+        if (jobStartedAt) {
+            // Skip rows already personalized in THIS run (resume), re-do prior-run rows.
+            params.push(jobStartedAt);
+            personalizationFilter = `AND (c.personalization_completed_at IS NULL OR c.personalization_completed_at < $${params.length}::timestamptz)`;
+        } else {
+            personalizationFilter = ''; // legacy full reprocess
+        }
+    } else {
+        personalizationFilter = `AND (c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')`;
+    }
     const emailStatusFilter = requireValidEmail
         // `contacts.email_status` is normalized to `risky` (see normalizeEmailStatus in `services/leads.js`),
         // but allow both labels defensively.
@@ -714,7 +721,7 @@ export async function getPersonalizeQueue(
            ${skippedJobDomainSql(reprocessInclude)}
          ORDER BY c.id ASC
          LIMIT $4`,
-        [agencyId, clientId, jobId, limit]
+        params
     );
     return result.rows;
 }
@@ -751,7 +758,12 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
         skipEmailFinder = false,
         skipVerification = false,
         personalizeFirstLine = false,
-        domainCheckSkipped = false
+        domainCheckSkipped = false,
+        // Count only completions stamped at/after this run started, so reprocess runs
+        // don't show prior-run emails/verifications/personalizations as this run's work.
+        // Null = legacy behaviour (count any completion). See getEmailQueue/getVerifyQueue
+        // which already scope eligibility by the same boundary (jobs.created_at).
+        runStartedAt = null
     } = options;
 
     const domainCounts = await countJobDomainsByStatus(jobId);
@@ -799,40 +811,51 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
         : `SELECT
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_find_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_find_completed_at >= $4::timestamptz)
             )::int AS processed,
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_find_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_find_completed_at >= $4::timestamptz)
                   AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
             )::int AS found,
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_find_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_find_completed_at >= $4::timestamptz)
                   AND (c.email IS NULL OR BTRIM(c.email) = '')
             )::int AS not_found,
             0::int AS errors
            ${EMAIL_DISCOVERY_COHORT_SQL}`;
 
-    const emailResult = await pool.query(emailSql, [agencyId, clientId, jobId]);
+    const emailResult = await pool.query(
+        emailSql,
+        skipEmailFinder ? [agencyId, clientId, jobId] : [agencyId, clientId, jobId, runStartedAt]
+    );
 
     const verificationSql = skipVerification
         ? `SELECT 0::int AS verified, 0::int AS valid, 0::int AS invalid, 0::int AS unknown, 0::int AS valid_risky`
         : `SELECT
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_verify_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_verify_completed_at >= $4::timestamptz)
             )::int AS verified,
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_verify_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_verify_completed_at >= $4::timestamptz)
                   AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'valid'
             )::int AS valid,
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_verify_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_verify_completed_at >= $4::timestamptz)
                   AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'invalid'
             )::int AS invalid,
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_verify_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_verify_completed_at >= $4::timestamptz)
                   AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'unknown'
             )::int AS unknown,
             COUNT(DISTINCT c.id) FILTER (
                 WHERE c.email_verify_completed_at IS NOT NULL
+                  AND ($4::timestamptz IS NULL OR c.email_verify_completed_at >= $4::timestamptz)
                   AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid-risky', 'risky')
             )::int AS valid_risky
            FROM contacts c
@@ -847,19 +870,21 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
 
     const verificationResult = skipVerification
         ? { rows: [{ verified: 0, valid: 0, invalid: 0, unknown: 0, valid_risky: 0 }] }
-        : await pool.query(verificationSql, [agencyId, clientId, jobId]);
+        : await pool.query(verificationSql, [agencyId, clientId, jobId, runStartedAt]);
 
     const personalizationResult = !personalizeFirstLine
         ? { rows: [{ processed: 0, personalized: 0 }] }
         : await pool.query(
             `SELECT
                 COUNT(DISTINCT c.id) FILTER (
-                    WHERE c.job_id = $4
+                    WHERE c.personalization_completed_at IS NOT NULL
+                      AND ($4::timestamptz IS NULL OR c.personalization_completed_at >= $4::timestamptz)
                       AND c.personalization_first_line IS NOT NULL
                       AND BTRIM(c.personalization_first_line) <> ''
                 )::int AS processed,
                 COUNT(DISTINCT c.id) FILTER (
-                    WHERE c.job_id = $4
+                    WHERE c.personalization_completed_at IS NOT NULL
+                      AND ($4::timestamptz IS NULL OR c.personalization_completed_at >= $4::timestamptz)
                       AND c.personalization_first_line IS NOT NULL
                       AND BTRIM(c.personalization_first_line) <> ''
                       AND c.personalization_first_line NOT IN ('[Generation failed]', 'invalid')
@@ -873,7 +898,7 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
                AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
                ${COHORT_ELIGIBLE_SQL}
                ${skippedJobDomainSql(false)}`,
-            [agencyId, clientId, jobId, jobId]
+            [agencyId, clientId, jobId, runStartedAt]
         );
 
     const foundersRow = foundersResult.rows[0] || {};

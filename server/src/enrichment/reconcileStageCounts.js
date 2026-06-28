@@ -276,14 +276,18 @@ function buildStagesFromStats(row, stats, ctx, { finalize = false } = {}) {
     return stages;
 }
 
-async function countStatsForJob(ctx) {
+async function countStatsForJob(ctx, runStartedAt = null) {
     const options = ctx.options || {};
     return countJobStageStats(ctx.agencyId, ctx.clientId, ctx.jobId, {
         skipFounderFinder: options.skipFounderFinder,
         skipEmailFinder: options.skipEmailFinder,
         skipVerification: options.skipVerification,
         personalizeFirstLine: options.personalizeFirstLine,
-        domainCheckSkipped: options.skipDomainCheck === true
+        domainCheckSkipped: options.skipDomainCheck === true,
+        // Scope email/verify/personalization counts to this run (jobs.created_at),
+        // matching the queue eligibility boundary, so reprocess runs don't show
+        // prior-run completions as this run's progress.
+        runStartedAt
     });
 }
 
@@ -295,7 +299,7 @@ export async function reconcileJobStagesLive(ctx) {
     const row = await getJobById(ctx.jobId, ctx.agencyId);
     if (!row) return {};
 
-    const stats = await countStatsForJob(ctx);
+    const stats = await countStatsForJob(ctx, row.created_at);
     const stages = buildStagesFromStats(row, stats, ctx, { finalize: false });
 
     await pool.query(
@@ -314,7 +318,7 @@ export async function reconcileJobStagesFromDb(ctx) {
     const row = await getJobById(ctx.jobId, ctx.agencyId);
     if (!row) return {};
 
-    const stats = await countStatsForJob(ctx);
+    const stats = await countStatsForJob(ctx, row.created_at);
     const stages = buildStagesFromStats(row, stats, ctx, { finalize: true });
 
     await pool.query(

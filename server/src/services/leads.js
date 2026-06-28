@@ -218,6 +218,27 @@ export async function upsertLeadRowsBatch({
                 );
             }
             signalMs = Date.now() - signalStart;
+
+            // Stamp completion time for contacts that just received a first line, so per-run
+            // stage counts (countJobStageStats) and resume (getPersonalizeQueue) can scope to
+            // THIS run instead of counting first lines left over from a previous run.
+            const personalizedDomains = payloads
+                .filter((p) => p.personalizationFirstLine && String(p.personalizationFirstLine).trim())
+                .map((p) => p.domain);
+            if (personalizedDomains.length) {
+                await client.query(
+                    `UPDATE contacts c
+                     SET personalization_completed_at = NOW()
+                     FROM companies co
+                     WHERE c.company_id = co.id
+                       AND co.agency_id = $1 AND co.client_id = $2
+                       AND co.domain_normalized = ANY($3::text[])
+                       AND c.role_type = 'founder'
+                       AND c.personalization_first_line IS NOT NULL
+                       AND BTRIM(c.personalization_first_line) <> ''`,
+                    [agencyId, clientId, personalizedDomains]
+                );
+            }
         }
     });
 
