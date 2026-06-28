@@ -411,6 +411,47 @@ function sqlEmailFindStateClause(state) {
     }
 }
 
+/** Matches UI founder-discovery state (valid full_name / founder_find_completed_at). */
+function sqlFounderHasValidName(alias = 'c') {
+    return `(
+        ${alias}.full_name IS NOT NULL
+        AND BTRIM(${alias}.full_name) <> ''
+        AND LOWER(BTRIM(${alias}.full_name)) <> 'not found'
+        AND LOWER(BTRIM(${alias}.full_name)) NOT LIKE '%not found%'
+        AND LOWER(BTRIM(${alias}.full_name)) <> 'not_found'
+    )`;
+}
+
+/** Legacy rows stored "Not Found" in full_name before founder_find_completed_at existed. */
+function sqlFounderHasLegacyNotFoundName(alias = 'c') {
+    return `(
+        ${alias}.full_name IS NOT NULL
+        AND BTRIM(${alias}.full_name) <> ''
+        AND (
+            LOWER(BTRIM(${alias}.full_name)) = 'not found'
+            OR LOWER(BTRIM(${alias}.full_name)) = 'not_found'
+            OR LOWER(BTRIM(${alias}.full_name)) LIKE '%not found%'
+        )
+    )`;
+}
+
+function sqlFounderFindCompleted(alias = 'c') {
+    return `(${alias}.founder_find_completed_at IS NOT NULL OR ${sqlFounderHasLegacyNotFoundName(alias)})`;
+}
+
+function sqlFounderFindStateClause(state) {
+    switch (state) {
+        case 'found':
+            return sqlFounderHasValidName();
+        case 'not_found':
+            return `(${sqlFounderFindCompleted()} AND NOT ${sqlFounderHasValidName()})`;
+        case 'not_run':
+            return `(NOT ${sqlFounderFindCompleted()} AND NOT ${sqlFounderHasValidName()})`;
+        default:
+            return null;
+    }
+}
+
 const LEAD_FILTER_FIELDS = [
     // ── Contact fields ──────────────────────────────────────────────────────
     {
@@ -424,7 +465,24 @@ const LEAD_FILTER_FIELDS = [
             { key: 'neq', label: 'Does Not Equal' },
             { key: 'starts_with', label: 'Starts With' },
             { key: 'is_empty', label: 'Is Empty' },
-            { key: 'not_empty', label: 'Is Not Empty' }
+            { key: 'not_empty', label: 'Is Not Empty' },
+            { key: 'found_and_valid', label: 'Found and Valid' }
+        ]
+    },
+    {
+        key: 'founder_find_state',
+        label: 'Founder Discovery',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' }
+        ],
+        options: [
+            { value: 'found', label: 'Found' },
+            { value: 'not_found', label: 'No Founder Found' },
+            { value: 'not_run', label: 'Not Searched' }
         ]
     },
     {
@@ -1116,7 +1174,8 @@ const NUMERIC_FILTER_FIELDS = new Set([
 function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     // Operators that need no value
     if (operatorKey === 'is_empty' || operatorKey === 'not_empty'
-        || operatorKey === 'is_true' || operatorKey === 'is_false') return null;
+        || operatorKey === 'is_true' || operatorKey === 'is_false'
+        || operatorKey === 'found_and_valid') return null;
 
     // Multi-value operators — value is a JSON array string
     if (operatorKey === 'in' || operatorKey === 'not_in' || operatorKey === 'between') {
@@ -1146,6 +1205,10 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     }
 
     if (fieldKey === 'email_find_state') {
+        return normalizedText.toLowerCase();
+    }
+
+    if (fieldKey === 'founder_find_state') {
         return normalizedText.toLowerCase();
     }
 
@@ -1198,7 +1261,7 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
     // Helper: bind each element of an array and return [ref, ref, ...]
     const bindArray = (arr) => arr.map((v) => bindParam(v));
 
-    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false']);
+    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid']);
 
     for (const rawFilter of rawFilters) {
         if (!rawFilter || typeof rawFilter !== 'object' || Array.isArray(rawFilter)) continue;
@@ -1236,6 +1299,35 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
                 clauses.push(`(c.full_name IS NULL OR BTRIM(c.full_name) = '')`);
             } else if (operatorKey === 'not_empty') {
                 clauses.push(`(c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '')`);
+            } else if (operatorKey === 'found_and_valid') {
+                clauses.push(`(c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '' AND LOWER(BTRIM(c.full_name)) <> 'not found')`);
+            }
+            continue;
+        }
+
+        // ── founder_find_state ─────────────────────────────────────────────
+        if (fieldKey === 'founder_find_state') {
+            const rawStates = operatorKey === 'in' || operatorKey === 'not_in'
+                ? (Array.isArray(normalizedValue) ? normalizedValue : [])
+                : [String(normalizedValue)];
+            const states = rawStates
+                .map((value) => String(value).toLowerCase())
+                .filter((value) => ['found', 'not_found', 'not_run'].includes(value));
+            if (!states.length) continue;
+
+            const stateClauses = states
+                .map((state) => sqlFounderFindStateClause(state))
+                .filter(Boolean);
+            if (!stateClauses.length) continue;
+
+            if (operatorKey === 'eq') {
+                clauses.push(stateClauses[0]);
+            } else if (operatorKey === 'neq') {
+                clauses.push(`NOT (${stateClauses[0]})`);
+            } else if (operatorKey === 'in') {
+                clauses.push(`(${stateClauses.join(' OR ')})`);
+            } else if (operatorKey === 'not_in') {
+                clauses.push(`NOT (${stateClauses.join(' OR ')})`);
             }
             continue;
         }
@@ -1753,6 +1845,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     c.email_status,
                     c.email_find_completed_at,
                     c.email_verify_completed_at,
+                    c.founder_find_completed_at,
                     c.last_contacted_at,
                     c.confidence,
                     c.personalization_first_line,
@@ -1842,6 +1935,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pc.email_status,
                 pc.email_find_completed_at,
                 pc.email_verify_completed_at,
+                pc.founder_find_completed_at,
                 pc.last_contacted_at,
                 pc.confidence,
                 pc.personalization_first_line,
@@ -1895,12 +1989,12 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             confidence: row.confidence,
             emailFindCompletedAt: row.email_find_completed_at,
             emailVerifyCompletedAt: row.email_verify_completed_at,
+            founderFindCompletedAt: row.founder_find_completed_at,
             lastContactedAt: row.last_contacted_at,
             firstLine: row.personalization_first_line,
             jobId: row.job_id,
             createdAt: row.created_at,
             updatedAt: row.updated_at,
-            lastContactedAt: row.last_contacted_at,
             campaignCountAllTime: row.campaign_count_all_time,
             campaignCountActive: row.campaign_count_active,
             lastCampaignAddedAt: row.last_campaign_added_at,
@@ -1985,6 +2079,7 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                 c.email_status,
                 c.email_find_completed_at,
                 c.email_verify_completed_at,
+                c.founder_find_completed_at,
                 c.last_contacted_at,
                 c.confidence,
                 c.personalization_first_line,
@@ -2078,6 +2173,7 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                 confidence: row.confidence,
                 emailFindCompletedAt: row.email_find_completed_at,
                 emailVerifyCompletedAt: row.email_verify_completed_at,
+                founderFindCompletedAt: row.founder_find_completed_at,
                 lastContactedAt: row.last_contacted_at,
                 firstLine: row.personalization_first_line,
                 jobId: row.job_id,

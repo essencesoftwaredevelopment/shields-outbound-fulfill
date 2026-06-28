@@ -11,9 +11,19 @@ import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js'
 import { contextToJob } from './context.js';
 import { assertJobActive, updateJobStage, setJobActivity } from './persist.js';
 import { isShoppingAuditJob } from '../services/shoppingAudit/index.js';
+import { createDebouncedAsync } from '../lib/singleFlight.js';
+import { env } from '../config/env.js';
+import {
+    DNS_QUERY_TIMEOUT_MS,
+    DNS_CHECK_CONCURRENCY
+} from './domainPrepConfig.js';
 
-const DNS_QUERY_TIMEOUT_MS = 2500;
-const DNS_CHECK_CONCURRENCY = 25;
+if (env.PGPOOL_MAX <= 10 && DNS_CHECK_CONCURRENCY > 50) {
+    console.warn(
+        `[domainPrep] PGPOOL_MAX=${env.PGPOOL_MAX} is low for workflow DNS at concurrency ${DNS_CHECK_CONCURRENCY} — set PGPOOL_MAX=10+ in env`
+    );
+}
+
 const PLACEHOLDER_CONTACT_MAX_DOMAINS = Math.max(
     0,
     parseInt(process.env.PLACEHOLDER_CONTACT_MAX_DOMAINS || '5000', 10)
@@ -64,15 +74,34 @@ async function dnsFilterDomains(jobId, agencyId, onProgress) {
         return { checked: 0, live: 0, dead: 0, unknown: 0, processable: 0 };
     }
 
+    // DNS is network-bound; DB checks must not run inside the concurrent worker loop
+    // (PGPOOL_MAX is often small in dev:app workflow — concurrent getJobById exhausts the pool).
+    const flushProgress = onProgress
+        ? createDebouncedAsync(async (processed, total) => {
+            try {
+                await assertJobActive(jobId, agencyId);
+                await onProgress(processed, total);
+            } catch (err) {
+                // Best-effort progress flush. It runs fire-and-forget (`void` below), so a
+                // pause/cancel mid-DNS must NOT escape as an unhandledRejection (which can
+                // crash the process). The DNS loop's own checkpoints handle the real stop.
+                if (err?.code !== 'JOB_PAUSED' && err?.code !== 'JOB_CANCELLED') {
+                    console.warn(`[domainPrep] progress flush failed: ${err?.message || err}`);
+                }
+            }
+        }, 750)
+        : null;
+
     let completed = 0;
     const checks = await mapWithConcurrency(
         uniqueDomains,
         DNS_CHECK_CONCURRENCY,
         async (domain) => {
-            await assertJobActive(jobId, agencyId);
             const result = await checkDomainDns(domain);
             completed += 1;
-            if (onProgress) onProgress(completed, uniqueDomains.length);
+            if (flushProgress) {
+                void flushProgress(completed, uniqueDomains.length);
+            }
             return result;
         }
     );
@@ -95,6 +124,10 @@ async function dnsFilterDomains(jobId, agencyId, onProgress) {
              WHERE job_id = $1 AND domain_normalized = ANY($2::text[])`,
             [jobId, deadDomains]
         );
+    }
+
+    if (flushProgress) {
+        await flushProgress(uniqueDomains.length, uniqueDomains.length);
     }
 
     const counts = await countJobDomainsByStatus(jobId);
@@ -165,15 +198,32 @@ export async function runDomainPrep(ctx) {
     });
 
     const domainCheckSkipped = ctx.options.skipDomainCheck === true;
+    const dnsCandidateCount = dedupeResult.stats.new || pendingBefore.length;
+    if (!domainCheckSkipped && dnsCandidateCount > 0) {
+        await setJobActivity(
+            ctx.jobId,
+            ctx.agencyId,
+            `Checking DNS for ${dnsCandidateCount.toLocaleString()} domains…`
+        );
+        await updateJobStage(ctx.jobId, ctx.agencyId, 'domainPrep', {
+            progress: { stage: 'domainPrep', processed: 0, total: dnsCandidateCount }
+        });
+    }
+
     const dnsStats = domainCheckSkipped
         ? { checked: 0, live: 0, dead: 0, unknown: 0, processable: dedupeResult.stats.new }
         : await dnsFilterDomains(ctx.jobId, ctx.agencyId, async (processed, total) => {
-            if (processed % 50 === 0 || processed === total) {
+            if (processed % 25 === 0 || processed === total) {
                 await setJobActivity(
                     ctx.jobId,
                     ctx.agencyId,
                     `Checking DNS… ${processed.toLocaleString()} / ${total.toLocaleString()}`
                 );
+                await updateJobStage(ctx.jobId, ctx.agencyId, 'domainPrep', {
+                    progress: { stage: 'domainPrep', processed, total }
+                });
+                const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
+                scheduleStageReconcile(ctx.jobId, ctx.agencyId);
             }
         });
 
@@ -210,17 +260,13 @@ export async function runDomainPrep(ctx) {
         domainCheckSkipped
     };
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'domainPrep', {
-        status: 'completed',
-        completedAt: new Date().toISOString(),
-        summary,
-        progress: { stage: 'domainPrep', processed: dnsStats.processable, total: cohortTotal }
-    });
-
     await pool.query(
         `UPDATE jobs SET dedupe_stats = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
         [ctx.jobId, ctx.agencyId, JSON.stringify(dedupeStats)]
     );
+
+    const { runStageReconcile } = await import('./stageReconcileScheduler.js');
+    await runStageReconcile(ctx.jobId, ctx.agencyId);
 
     return summary;
 }

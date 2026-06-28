@@ -8,6 +8,11 @@ import { parse as csvParse } from 'csv-parse';
 import { stringify as csvStringify } from 'csv-stringify';
 import OpenAI from 'openai';
 import { createConcurrencyLimit } from '../../../lib/concurrency.js';
+import {
+    PRODUCT_FETCH_TIMEOUT_MS,
+    PRODUCT_FETCH_CONCURRENCY,
+    PERSONALIZATION_LLM_CONCURRENCY
+} from '../productFetchConfig.js';
 
 const dnsResolve4 = promisify(dns.resolve4);
 const dnsResolveCname = promisify(dns.resolveCname);
@@ -224,7 +229,7 @@ async function writeAllDomainsAsShopify({ inputCsv, outputCsv, log }) {
     return { total: rows.length, shopifyStores: results.length };
 }
 
-function fetchUrl(url, timeout = 3000) {
+function fetchUrl(url, timeout = PRODUCT_FETCH_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
         const protocol = url.startsWith('https') ? https : http;
         const timeoutId = setTimeout(() => {
@@ -472,8 +477,8 @@ async function personalizeWithNewPromptFromShopify({
     apiKeys,
     log,
     productPromptProducts = 3,
-    concurrency = 100,
-    fetchConcurrency = 200,
+    concurrency = PERSONALIZATION_LLM_CONCURRENCY,
+    fetchConcurrency = PRODUCT_FETCH_CONCURRENCY,
     model = NEW_PROMPT_MODEL,
     removeB2B = true,
     onBatch = null,
@@ -510,6 +515,7 @@ async function personalizeWithNewPromptFromShopify({
     stringifier.pipe(writeStream);
 
     let processed = 0;
+    let personalizedSuccess = 0;
     let productsFetched = 0;
     let failed = 0;
     let totalInputTokens = 0;
@@ -766,8 +772,12 @@ async function personalizeWithNewPromptFromShopify({
 
         if (result) {
             processed += 1;
+            const isSuccess = result.first_line
+                && result.first_line !== '[Generation failed]'
+                && result.first_line !== 'invalid';
+            if (isSuccess) personalizedSuccess += 1;
             stringifier.write(result);
-            if (onBatch && result.first_line && result.first_line !== '[Generation failed]' && result.first_line !== 'invalid') {
+            if (onBatch && isSuccess) {
                 pendingBatch.push({
                     domain: result.domain,
                     personalization_first_line: result.first_line
@@ -783,6 +793,7 @@ async function personalizeWithNewPromptFromShopify({
                 (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
             reportPersonalizationProgress(log, processed, rows.length, {
                 phase: 'generating',
+                personalized: personalizedSuccess,
                 productsFetched,
                 failed,
                 cost: Number(runningCost.toFixed(6))
@@ -801,15 +812,17 @@ async function personalizeWithNewPromptFromShopify({
     const estimatedCost = (totalInputTokens * 0.00025) / 1000 + (totalOutputTokens * 0.002) / 1000;
     reportPersonalizationProgress(log, processed, rows.length, {
         phase: 'generating',
+        personalized: personalizedSuccess,
         productsFetched,
         failed,
         cost: Number(estimatedCost.toFixed(6))
     });
 
-    log?.(`New prompt personalization complete: ${processed} rows. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
+    log?.(`New prompt personalization complete: ${personalizedSuccess}/${processed} rows saved. Tokens in/out: ${totalInputTokens}/${totalOutputTokens} (~$${estimatedCost.toFixed(4)})${fallbackUsed ? `, fallback used: ${fallbackUsed}` : ''}`);
 
     return {
-        personalized: processed,
+        personalized: personalizedSuccess,
+        processed,
         productsFetched,
         failed,
         estimatedCost: Number(estimatedCost.toFixed(6))
@@ -1131,7 +1144,7 @@ export async function runPersonalization({
     const useNewPrompt = String(productPromptVersion || '').toLowerCase() === 'new_gpt5mini';
     const personalizationConcurrency = Number.isFinite(concurrency)
         ? Math.max(1, concurrency)
-        : (useNewPrompt ? 100 : 15);
+        : (useNewPrompt ? PERSONALIZATION_LLM_CONCURRENCY : 15);
     if (useNewPrompt) {
         const newPromptProducts = Number.isFinite(productPromptProducts)
             ? Math.max(1, Math.min(productPromptProducts, 5))

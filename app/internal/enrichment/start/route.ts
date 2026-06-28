@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { start } from 'workflow/api';
 import { enrichmentParentWorkflow } from '@/workflows/enrichment-parent';
@@ -34,20 +35,19 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'jobId and agencyId required' }, { status: 400 });
   }
 
-  const run = await start(enrichmentParentWorkflow, [{ jobId, agencyId }]);
+  const enrichment = await import('@server/enrichment/index.js');
+  await enrichment.clearWorkflowRunId(jobId);
 
-  try {
-    const enrichment = await import('@server/enrichment/index.js');
-    await enrichment.setWorkflowMeta(jobId, agencyId, {
-      workflowRunId: run.runId,
-    });
-  } catch (error) {
-    console.warn('[enrichment/start] failed to persist workflowRunId', error);
-  }
+  // Correlation id passed into the workflow input — persisted only after guardWorkflowStart passes.
+  const workflowRunId = randomUUID();
+  const run = await start(enrichmentParentWorkflow, [
+    { jobId, agencyId, workflowRunId },
+  ]);
 
   return NextResponse.json({
     status: 'started',
-    workflowRunId: run.runId,
+    workflowRunId,
+    vercelRunId: run.runId,
     jobId,
     agencyId,
   });

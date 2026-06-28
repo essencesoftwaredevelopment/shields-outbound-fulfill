@@ -4,6 +4,7 @@ import { parse } from 'csv-parse';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
+import { isCreditExhaustion, createCreditExhaustedError } from './trykittCredits.js';
 
 dotenv.config();
 
@@ -77,7 +78,7 @@ async function readEmailCandidates(filePath) {
 /**
  * Verify email using TryKitt API
  */
-async function verifyEmailWithTryKitt(email, apiKey) {
+async function verifyEmailWithTryKitt(email, apiKey, rateLimitHooks = null) {
     let attempt = 0;
     let rateLimitHits = 0;
     let backoff = INITIAL_BACKOFF_MS;
@@ -88,7 +89,9 @@ async function verifyEmailWithTryKitt(email, apiKey) {
         attempt += 1;
 
         try {
-            const res = await fetchWithTimeout('https://api.trykitt.ai/job/verify_email', {
+            // Acquire a TryKitt concurrency slot (shared with email finding) around the
+            // realtime call — TryKitt rate-limits by concurrency, returning 402 past it.
+            const doVerify = () => fetchWithTimeout('https://api.trykitt.ai/job/verify_email', {
                 method: 'POST',
                 headers: {
                     'x-api-key': apiKey,
@@ -99,6 +102,9 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                     realtime: true
                 })
             });
+            const res = rateLimitHooks?.trykitt
+                ? await rateLimitHooks.trykitt(doVerify)
+                : await doVerify();
 
             const text = await res.text();
             
@@ -110,19 +116,19 @@ async function verifyEmailWithTryKitt(email, apiKey) {
                 parsed = null;
             }
 
-            // Handle 402 (rate limit) with dedicated backoff
+            // 402 Payment Required — distinguish out-of-credits from a transient blip.
             if (res.status === 402) {
+                if (isCreditExhaustion(parsed)) {
+                    return { email, status: 'ERROR', validity: 'error: credit_exhausted', creditExhausted: true };
+                }
                 rateLimitHits += 1;
                 if (rateLimitHits >= RATE_LIMIT_MAX_RETRIES) {
-                    console.warn(`[EMAIL_VERIFIER] 402 rate-limited ${rateLimitHits} times for ${email}, giving up on this row`);
-                    return {
-                        email,
-                        status: 'ERROR',
-                        validity: 'error: rate_limited'
-                    };
+                    // A 402 that won't clear after repeated retries is payment-required, not transient.
+                    console.warn(`[EMAIL_VERIFIER] 402 persisted ${rateLimitHits}x for ${email} — treating as credit exhaustion`);
+                    return { email, status: 'ERROR', validity: 'error: credit_exhausted', creditExhausted: true };
                 }
                 const rlBackoff = RATE_LIMIT_BACKOFF_MS * rateLimitHits;
-                console.warn(`[EMAIL_VERIFIER] 402 rate-limited for ${email}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
+                console.warn(`[EMAIL_VERIFIER] 402 for ${email}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
                 await wait(rlBackoff);
                 continue;
             }
@@ -268,7 +274,7 @@ async function verifyEmailWithSelfHosted(email) {
 /**
  * Verify email using the selected provider
  */
-async function verifyEmail(email, provider, apiKey = null) {
+async function verifyEmail(email, provider, apiKey = null, rateLimitHooks = null) {
     if (provider === PROVIDERS.SELF_HOSTED) {
         return verifyEmailWithSelfHosted(email);
     } else {
@@ -276,7 +282,7 @@ async function verifyEmail(email, provider, apiKey = null) {
         if (!apiKey) {
             throw new Error('TryKitt API key required for trykitt provider');
         }
-        return verifyEmailWithTryKitt(email, apiKey);
+        return verifyEmailWithTryKitt(email, apiKey, rateLimitHooks);
     }
 }
 
@@ -284,7 +290,7 @@ function toCsvValue(value) {
     return `"${(value ?? '').toString().replace(/"/g, '""')}"`;
 }
 
-export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candidatesInput = null, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkpoint = null, checkPaused = null, refreshControl = null, onBatch = null, pricing = null } = {}) {
+export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candidatesInput = null, apiKeys, provider = PROVIDERS.TRYKITT, log = () => { }, job = null, checkpoint = null, checkPaused = null, refreshControl = null, onBatch = null, pricing = null, rateLimitHooks = null } = {}) {
     const API_KEY = apiKeys.kitt;
     const requestCost = Number(pricing?.request_cost) || 0;
 
@@ -308,6 +314,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
     const limit = createConcurrencyLimit(Math.min(CONCURRENCY, Math.max(1, toVerify.length)));
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
+    let creditExhausted = false;
     let stageCost = 0;
     const controller = new AbortController();
 
@@ -368,6 +375,11 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
             if (controller.signal.aborted) {
                 return;
             }
+            // Credits already known exhausted: skip the call AND the persist, so these
+            // emails stay unmarked (email_verify_completed_at NULL) and a resume retries them.
+            if (creditExhausted) {
+                return;
+            }
             // Check if paused and abort if so
             if (checkpoint) {
                 try {
@@ -386,7 +398,15 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
             }
 
             try {
-                const result = await verifyEmail(item.row.email, provider, API_KEY);
+                const result = await verifyEmail(item.row.email, provider, API_KEY, rateLimitHooks);
+
+                // Out of TryKitt credits: flag it and leave this row unpersisted so the
+                // job pauses (below) and a post-top-up resume re-verifies it.
+                if (result?.creditExhausted) {
+                    creditExhausted = true;
+                    return;
+                }
+
                 const status = result.validity || 'unknown';
                 rows[item.index].email_status = status;
 
@@ -457,6 +477,10 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
     try {
         await Promise.all(tasks);
         await flushAllPending();
+        // Partial successes are now persisted; pause the job for a credit top-up.
+        if (creditExhausted) {
+            throw createCreditExhaustedError('email verification');
+        }
         const stopped = await refreshJobControlFlags(job, refreshControl, checkPaused);
         if (stopped || controller.signal.aborted) {
             await flushAllPending();

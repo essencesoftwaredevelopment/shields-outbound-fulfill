@@ -22,12 +22,10 @@
         "db:migration:import-target": "bash scripts/migration/import-into-supabase.sh",
         "db:migration:compare-parity": "bash scripts/migration/compare-parity.sh",
         "db:migration:validate-target": "bash scripts/migration/validate-target.sh",
-        "test": "node --test \"src/utils/__tests__/*.test.js\" \"src/services/**/__tests__/*.test.js\""
+        "test": "node --test \"src/utils/__tests__/*.test.js\" \"src/services/**/__tests__/*.test.js\" \"src/enrichment/__tests__/*.test.js\""
     },
     "dependencies": {
         "@supabase/supabase-js": "^2.106.2",
-        "@upstash/ratelimit": "^2.0.8",
-        "@upstash/redis": "^1.38.0",
         "axios": "^1.7.7",
         "cors": "^2.8.5",
         "csv-parse": "^5.5.4",

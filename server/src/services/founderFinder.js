@@ -5,6 +5,8 @@ import path from 'path';
 import csv from 'csv-parser';
 import { OpenAI } from 'openai';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
+import { shouldRetryHttpOrNetwork } from '../utils/transientNetwork.js';
+import { startJobControlPoll, createStopGate } from '../enrichment/jobControlPoll.js';
 
 dotenv.config();
 
@@ -29,7 +31,7 @@ const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-4o-mini';
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
-const SERPER_CONCURRENCY = 8;
+const SERPER_CONCURRENCY = parsePositiveInt(process.env.FOUNDER_SERPER_CONCURRENCY, 4);
 
 const AI_CONCURRENCY_LIMIT = parsePositiveInt(process.env.FOUNDER_AI_CONCURRENCY, 15);
 const AI_MIN_RPM = parsePositiveInt(process.env.FOUNDER_AI_MIN_RPM, 120);
@@ -39,7 +41,8 @@ const AI_RESET_RPM_ON_RESUME = parseBoolean(process.env.FOUNDER_RESET_RPM_ON_RES
 const AI_TRUNCATE_CHARS = 900;
 const AI_TOP_ORGANIC = 10;
 
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 3;
+const SERPER_MAX_RETRIES = 4;
 const BASE_DELAY_MS = 500;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -60,6 +63,10 @@ function getHttpErrorStatus(err) {
 
 function isRecoverableLookupFailure(err) {
     const status = getHttpErrorStatus(err);
+    const msg = String(err?.message || err?.code || '');
+    if (msg.includes('EMAXCONNSESSION') || msg.includes('max clients reached') || err?.code === 'XX000') {
+        return false;
+    }
     if (status === 401 || status === 403) {
         return false;
     }
@@ -166,11 +173,14 @@ class AdaptiveRateLimiter {
     }
 }
 
-async function withRetry(fn, label, shouldBackoff = () => true, logger = () => { }) {
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+async function withRetry(fn, label, shouldBackoff = () => true, logger = () => { }, maxAttempts = MAX_RETRIES) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             return await fn();
         } catch (err) {
+            if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || err?.code === 'JOB_PAUSED' || err?.code === 'JOB_CANCELLED') {
+                throw err;
+            }
             const status = getHttpErrorStatus(err);
             const payload = err?.response?.data;
             const payloadErr = payload?.error || err?.error;
@@ -187,7 +197,7 @@ async function withRetry(fn, label, shouldBackoff = () => true, logger = () => {
                 throw err;
             }
 
-            if (attempt === MAX_RETRIES || !shouldBackoff(status, err)) {
+            if (attempt === maxAttempts || !shouldBackoff(status, err)) {
                 const detailed = formatRequestError(err);
                 logger(`${label} failed after ${attempt} attempts: ${detailed}`);
                 err.message = `${label} failed: ${formatRequestError(err, { includePayload: false })}`;
@@ -250,13 +260,12 @@ John Smith
 Search results (compressed JSON): ${searchString}
 Company Domain: ${companyDomain}`;
 
-    if (rateLimitHooks?.openai) await rateLimitHooks.openai();
     await rateLimiter.acquire();
 
     let res;
     let hit429 = false;
-    try {
-        res = await withRetry(
+    const callOpenAi = () =>
+        withRetry(
             () =>
                 openai.responses.create({
                     model: FOUNDER_MODEL,
@@ -267,6 +276,11 @@ Company Domain: ${companyDomain}`;
             status => status === 429 || (status >= 500 && status < 600),
             logger
         );
+
+    try {
+        res = rateLimitHooks?.openai
+            ? await rateLimitHooks.openai(callOpenAi)
+            : await callOpenAi();
     } catch (err) {
         // Check if we hit a 429 rate limit
         const status = err?.response?.status ?? err?.status ?? err?.statusCode;
@@ -305,9 +319,11 @@ function computeFounderCost({ tokensIn = 0, tokensOut = 0, pricing }) {
     return { serperCost, openaiCost, leadCost };
 }
 
-async function assertNotStopped({ checkpoint, checkPaused }) {
+async function assertNotStopped({ checkpoint, checkPaused, stopGate }) {
+    stopGate?.throwIfStopped();
     if (checkpoint) {
         await checkpoint();
+        stopGate?.throwIfStopped();
         return;
     }
     if (checkPaused && checkPaused()) {
@@ -329,6 +345,8 @@ export async function runFounderFinder({
     markDomainsDone = null,
     checkpoint = null,
     checkPaused = null,
+    jobId = null,
+    agencyId = null,
     apiKeys,
     pricing,
     log = () => {},
@@ -442,26 +460,27 @@ export async function runFounderFinder({
         log(`Founders: upserted ${batch.length} contacts to database`);
     };
 
-    const control = { checkpoint, checkPaused };
+    const stopGate = createStopGate();
+    const abortController = new AbortController();
+    const stopPoll = startJobControlPoll(jobId, agencyId, {
+        onPaused: () => {
+            stopGate.requestStop('JOB_PAUSED');
+            abortController.abort();
+        },
+        onCancelled: () => {
+            stopGate.requestStop('JOB_CANCELLED');
+            abortController.abort();
+        }
+    });
+
+    const control = { checkpoint, checkPaused, stopGate };
 
     const serperTasks = chunks.map((chunk, batchIdx) =>
         serperLimit(async () => {
             await assertNotStopped(control);
-            if (fatalQuotaError || fatalTaskError) {
+            if (fatalQuotaError || fatalTaskError || stopGate.isStopped()) {
                 return;
             }
-
-            const payload = chunk.items.map(q => ({ q }));
-            const config = {
-                method: 'post',
-                maxBodyLength: Infinity,
-                url: SERPER_URL,
-                headers: {
-                    'X-API-KEY': SERPER_API_KEY,
-                    'Content-Type': 'application/json'
-                },
-                data: JSON.stringify(payload)
-            };
 
             // Check which domains in this batch need Serper requests
             const domainsToFetch = [];
@@ -491,42 +510,51 @@ export async function runFounderFinder({
                         'X-API-KEY': SERPER_API_KEY,
                         'Content-Type': 'application/json'
                     },
-                    data: JSON.stringify(fetchPayload)
+                    data: JSON.stringify(fetchPayload),
+                    signal: abortController.signal
                 };
                 
-                const res = await withRetry(
-                    async () => {
-                        if (rateLimitHooks?.serper) await rateLimitHooks.serper();
-                        return axios.request(fetchConfig);
-                    },
-                    `Serper batch ${batchIdx + 1}`,
-                    status => status === 429 || (status >= 500 && status < 600),
-                    log
-                );
-                
-                rows = Array.isArray(res.data) ? res.data : [];
-                
-                // Cache the results
-                for (let i = 0; i < domainsToFetch.length; i++) {
-                    const domain = domains[domainIndices[i]];
-                    serperCache[domain] = rows[i] || {};
+                const fetchSerper = () =>
+                    withRetry(
+                        async () => {
+                            const request = () => axios.request(fetchConfig);
+                            return rateLimitHooks?.serper
+                                ? rateLimitHooks.serper(request)
+                                : request();
+                        },
+                        `Serper batch ${batchIdx + 1}`,
+                        shouldRetryHttpOrNetwork,
+                        log,
+                        SERPER_MAX_RETRIES
+                    );
+
+                try {
+                    const res = await fetchSerper();
+                    rows = Array.isArray(res.data) ? res.data : [];
+
+                    for (let i = 0; i < domainsToFetch.length; i++) {
+                        const domain = domains[domainIndices[i]];
+                        serperCache[domain] = rows[i] || {};
+                    }
+
+                    const cacheWrites = domainsToFetch.map((_, i) => ({
+                        domain: domains[domainIndices[i]],
+                        payload: rows[i] || {}
+                    }));
+                    await persistSerperBatch(cacheWrites);
+                    await assertNotStopped(control);
+                    log(`Founders: fetched and cached Serper batch ${batchIdx + 1}/${chunks.length} with ${domainsToFetch.length} new queries`);
+                } catch (err) {
+                    if (stopGate.isStopped() || err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') {
+                        return;
+                    }
+                    log(`Founders: Serper batch ${batchIdx + 1} failed after retries, continuing with empty search results (${formatRequestError(err, { includePayload: false })})`);
                 }
-                
-                const cacheWrites = domainsToFetch.map((_, i) => ({
-                    domain: domains[domainIndices[i]],
-                    payload: rows[i] || {}
-                }));
-                await persistSerperBatch(cacheWrites);
-                await assertNotStopped(control);
-                log(`Founders: fetched and cached Serper batch ${batchIdx + 1}/${chunks.length} with ${domainsToFetch.length} new queries`);
             } else {
                 log(`Founders: using cached results for batch ${batchIdx + 1}/${chunks.length}`);
             }
 
             if ((batchIdx + 1) % 10 === 0 || batchIdx + 1 === chunks.length) {
-                // Log-only: do NOT write progress.processed/total here — those keys
-                // represent domain-level progress (consumed by the UI hero stats).
-                // Serper batches are an internal sub-step, not the user-facing total.
                 log(`Founders: Serper ${batchIdx + 1} / ${chunks.length}`);
             }
 
@@ -648,6 +676,11 @@ export async function runFounderFinder({
                     doneDomainsBuffer.push(domain);
                     await flushDomainsDone(false);
                 }).catch((err) => {
+                    if (err?.code === 'JOB_PAUSED' || err?.code === 'JOB_CANCELLED') {
+                        stopGate.requestStop(err.code);
+                        abortController.abort();
+                        return;
+                    }
                     fatalTaskError = fatalTaskError || err;
                 });
 
@@ -659,6 +692,7 @@ export async function runFounderFinder({
     try {
         await Promise.all(serperTasks);
         await Promise.all(aiTasks);
+        stopGate.throwIfStopped();
         if (fatalTaskError) {
             throw fatalTaskError;
         }
@@ -674,6 +708,8 @@ export async function runFounderFinder({
             // If flush also fails, preserve original error cause.
         }
         throw err;
+    } finally {
+        stopPoll();
     }
 
     if (fatalQuotaError) {

@@ -1,50 +1,21 @@
-import { Ratelimit } from '@upstash/ratelimit';
-import { Redis } from '@upstash/redis';
+/**
+ * Postgres-backed rate limiting (used by Vercel workflow steps via server enrichment).
+ * Mirrors server/src/enrichment/postgresRateLimit.js — keep defaults in sync.
+ */
 
-type Provider = 'openai' | 'serper' | 'trykitt';
-
-const DEFAULT_RPM: Record<Provider, number> = {
+export const DEFAULT_RPM = {
   openai: 500,
-  serper: 100,
+  serper: 60,
   trykitt: 60,
-};
+} as const;
 
-const limiters = new Map<string, Ratelimit>();
+export type RateLimitProvider = keyof typeof DEFAULT_RPM;
 
-function getLimiter(agencyId: string, provider: Provider, rpm: number) {
-  const key = `${agencyId}:${provider}:${rpm}`;
-  let limiter = limiters.get(key);
-  if (!limiter) {
-    const url = process.env.UPSTASH_REDIS_REST_URL;
-    const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-    if (!url || !token) {
-      return null;
-    }
-    limiter = new Ratelimit({
-      redis: new Redis({ url, token }),
-      limiter: Ratelimit.slidingWindow(rpm, '1 m'),
-      prefix: `enrichment:${provider}`,
-    });
-    limiters.set(key, limiter);
-  }
-  return limiter;
-}
-
-/** Wait for tenant-scoped rate limit token before external API calls. No-op if Upstash unset. */
+/** @deprecated Use server enrichment createRateLimitHooks — this module is not imported at runtime. */
 export async function waitForRateLimit(
-  agencyId: string,
-  provider: Provider,
-  customRpm?: number
+  _agencyId: string,
+  _provider: RateLimitProvider,
+  _customRpm?: number
 ): Promise<void> {
-  const rpm = customRpm ?? DEFAULT_RPM[provider];
-  const limiter = getLimiter(agencyId, provider, rpm);
-  if (!limiter) return;
-
-  const { success, reset } = await limiter.limit(agencyId);
-  if (success) return;
-
-  const waitMs = Math.max(0, reset - Date.now());
-  if (waitMs > 0) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, 60_000)));
-  }
+  // Implemented in server/src/enrichment/rateLimit.js (Postgres).
 }

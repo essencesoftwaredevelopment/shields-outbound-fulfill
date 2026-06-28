@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { createConcurrencyLimit } from '../../lib/concurrency.js';
+import { shouldRetryHttpOrNetwork } from '../../utils/transientNetwork.js';
 import {
     DEFAULT_SERPER_GEO,
     SERPER_SHOPPING_URL
@@ -200,15 +200,18 @@ export async function runSerperShoppingBatch({
             try {
                 const payload = await withRetry(
                     async () => {
-                        if (rateLimitHooks?.serper) await rateLimitHooks.serper();
-                        return postSerperShopping(
-                            items.map((item) => ({ query: item.query })),
-                            apiKey,
-                            geo
-                        );
+                        const request = () =>
+                            postSerperShopping(
+                                items.map((item) => ({ query: item.query })),
+                                apiKey,
+                                geo
+                            );
+                        return rateLimitHooks?.serper
+                            ? rateLimitHooks.serper(request)
+                            : request();
                     },
                     `Serper Shopping batch ${batchIdx + 1}`,
-                    (status) => status === 429 || (status >= 500 && status < 600),
+                    shouldRetryHttpOrNetwork,
                     log
                 );
                 const rows = Array.isArray(payload) ? payload : [payload];

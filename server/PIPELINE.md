@@ -56,8 +56,32 @@ Enrichment jobs can run on **PM2** (default) or **Vercel Workflows** (opt-in). I
 - `workflows/enrichment-parent.ts` — domain prep → batch fan-out (100 domains, wave 15) → finalize
 - `workflows/enrichment-child.ts` — shopping audit (if applicable) → founders → emails → verify → personalization
 - `app/internal/enrichment/start/route.ts` — secured trigger (`WORKFLOW_TRIGGER_SECRET`)
+- `app/internal/enrichment/reap/route.ts` — stalled-job watchdog, hit by Vercel Cron (`vercel.json`)
 
-**Required env (Vercel + Express):** Postgres vars, `APP_URL`, `WORKFLOW_TRIGGER_SECRET`, optional `UPSTASH_REDIS_REST_URL/TOKEN` for tenant rate limits.
+**Failure handling (Vercel runner):** The parent/child workflows are wrapped in a top-level
+catch → `handleWorkflowFailure` (`finalize.js`). Any throw resolves the job to a recoverable
+terminal state — **cancelled** (`status='failed'`), **paused** (user stop), or **paused-with-error**
+(`paused=true` + `jobs.error`, resumable via the normal resume route). Disposition is driven by the
+DB control flags, not the error's `.code` (which may not survive the step boundary). Batches run
+under `Promise.allSettled` so one bad batch never cancels its siblings; if **any** batch fails the
+run is paused-with-error (never silently finalized), and a resume reprocesses only still-pending
+domains via the idempotent queues. Queue-based stages (founders/emails/verify/personalization) carry
+`maxRetries=2`; shopping-audit steps stay at 0 until per-item idempotency is verified.
+
+**Credit exhaustion (TryKitt):** a 402 whose body signals out-of-credits (or a 402 that
+persists past retries) is detected in `services/trykittCredits.js` and raised as a
+`CREDIT_EXHAUSTED` error from `emailFinder`/`emailVerifier`. Credit-failed rows are left
+*unstamped* (`email_find_completed_at` / `email_verify_completed_at` stay NULL) so a resume
+after top-up reprocesses exactly them, while partial successes are flushed first. On Vercel
+this routes through `handleWorkflowFailure` → paused-with-error (`jobs.error` carries the
+"add credits and resume" message); on PM2 it hits the existing `pauseJobWithError` handler.
+
+**Watchdog:** Vercel Cron hits `/internal/enrichment/reap` every 10 min. It flips Vercel-runner jobs
+stuck at `status='running'` with no `updated_at` movement for `ENRICHMENT_STALL_MINUTES` (default 20)
+into paused-with-error — the backstop for a workflow that dies before its catch runs (eviction/OOM).
+It does **not** auto-retrigger (would double-run a slow-but-alive job); recovery is via resume.
+
+**Required env (Vercel + Express):** Postgres vars, `APP_URL`, `WORKFLOW_TRIGGER_SECRET`. Optional `SERPER_MAX_CONCURRENT_BATCHES` / `SERPER_RPM_LIMIT` for Postgres API throttling, `CRON_SECRET` to authenticate the reap cron, `ENRICHMENT_STALL_MINUTES` to tune the watchdog threshold.
 
 **Shadow validation:** Run the same fixture job with `executionRunner: pm2` vs `vercel` and compare `contacts` + shopping audit tables before flipping the default.
 

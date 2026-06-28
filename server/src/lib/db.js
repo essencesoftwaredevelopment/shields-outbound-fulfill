@@ -20,7 +20,7 @@ export const pool = dbPool;
 const MAX_SAFE_QUERY_PARAMS = 4000;
 const COMPANY_FIXED_PARAMS = 2;
 const CONTACT_FIXED_PARAMS = 1;
-const CONTACT_PARAMS_PER_ROW = 11;
+const CONTACT_PARAMS_PER_ROW = 12;
 
 function chunkArray(items, size) {
     if (!Array.isArray(items) || items.length === 0) return [];
@@ -141,6 +141,7 @@ function buildContactUpsertUpdateClause(mergeMode, upsertType = 'default') {
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
             email_find_completed_at = COALESCE(EXCLUDED.email_find_completed_at, contacts.email_find_completed_at),
             email_verify_completed_at = COALESCE(EXCLUDED.email_verify_completed_at, contacts.email_verify_completed_at),
+            founder_find_completed_at = COALESCE(EXCLUDED.founder_find_completed_at, contacts.founder_find_completed_at),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
             job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
@@ -157,6 +158,7 @@ function buildContactUpsertUpdateClause(mergeMode, upsertType = 'default') {
             END,
             email = COALESCE(EXCLUDED.email, contacts.email),
             email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
+            founder_find_completed_at = COALESCE(EXCLUDED.founder_find_completed_at, contacts.founder_find_completed_at),
             confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
             personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
             job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
@@ -274,6 +276,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
             email_status = null,
             email_find_completed_at = null,
             email_verify_completed_at = null,
+            founder_find_completed_at = null,
             confidence = null,
             personalization_first_line = null,
             job_id = null
@@ -297,6 +300,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
             email_status: normalizeOptionalText(email_status),
             email_find_completed_at: email_find_completed_at || null,
             email_verify_completed_at: email_verify_completed_at || null,
+            founder_find_completed_at: founder_find_completed_at || null,
             confidence,
             personalization_first_line: normalizeOptionalText(personalization_first_line),
             job_id: normalizeOptionalText(job_id)
@@ -314,6 +318,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
             email_status: normalizedRow.email_status ?? previous.email_status,
             email_find_completed_at: normalizedRow.email_find_completed_at ?? previous.email_find_completed_at,
             email_verify_completed_at: normalizedRow.email_verify_completed_at ?? previous.email_verify_completed_at,
+            founder_find_completed_at: normalizedRow.founder_find_completed_at ?? previous.founder_find_completed_at,
             confidence: normalizedRow.confidence ?? previous.confidence,
             personalization_first_line: normalizedRow.personalization_first_line ?? previous.personalization_first_line,
             job_id: normalizedRow.job_id ?? previous.job_id
@@ -344,12 +349,12 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
     }
 
     const buildBulkContactUpsertQuery = (valuesSql) => `
-        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, email_find_completed_at, email_verify_completed_at, confidence, agency_id, personalization_first_line, job_id)
+        INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, email_find_completed_at, email_verify_completed_at, founder_find_completed_at, confidence, agency_id, personalization_first_line, job_id)
         VALUES ${valuesSql}
         ON CONFLICT (company_id, role_type)
         DO UPDATE SET ${updateClause}
         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
-                  email_find_completed_at, email_verify_completed_at,
+                  email_find_completed_at, email_verify_completed_at, founder_find_completed_at,
                   last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
     `;
 
@@ -361,18 +366,18 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
             try {
                 await txClient.query('SAVEPOINT contacts_row_upsert');
                 const individualQuery = `
-                    INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, email_find_completed_at, email_verify_completed_at, confidence, agency_id, personalization_first_line, job_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, email_find_completed_at, email_verify_completed_at, founder_find_completed_at, confidence, agency_id, personalization_first_line, job_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                     ON CONFLICT (company_id, role_type)
                     DO UPDATE SET ${updateClause}
                     RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
-                              email_find_completed_at, email_verify_completed_at,
+                              email_find_completed_at, email_verify_completed_at, founder_find_completed_at,
                               last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
                 `;
                 const individualResult = await txClient.query(individualQuery, [
                     clientId, row.company_id, row.role_type, row.full_name,
                     row.email, row.email_status, row.email_find_completed_at, row.email_verify_completed_at,
-                    row.confidence, agencyId, row.personalization_first_line, row.job_id
+                    row.founder_find_completed_at, row.confidence, agencyId, row.personalization_first_line, row.job_id
                 ]);
                 await txClient.query('RELEASE SAVEPOINT contacts_row_upsert');
                 results.push(individualResult.rows[0]);
@@ -390,13 +395,14 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                             email_status = COALESCE($4, email_status),
                             email_find_completed_at = COALESCE($5::timestamptz, email_find_completed_at),
                             email_verify_completed_at = COALESCE($6::timestamptz, email_verify_completed_at),
-                            confidence = COALESCE($7, confidence),
-                            personalization_first_line = COALESCE($8, personalization_first_line),
-                            job_id = COALESCE($9, job_id),
+                            founder_find_completed_at = COALESCE($7::timestamptz, founder_find_completed_at),
+                            confidence = COALESCE($8, confidence),
+                            personalization_first_line = COALESCE($9, personalization_first_line),
+                            job_id = COALESCE($10, job_id),
                             updated_at = now()
-                        WHERE client_id = $10 AND email = $11
+                        WHERE client_id = $11 AND email = $12
                         RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
-                                  email_find_completed_at, email_verify_completed_at,
+                                  email_find_completed_at, email_verify_completed_at, founder_find_completed_at,
                                   last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
                     `;
                     try {
@@ -404,7 +410,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                         const updateResult = await txClient.query(updateQuery, [
                             row.company_id, row.role_type, row.full_name,
                             row.email_status, row.email_find_completed_at, row.email_verify_completed_at,
-                            row.confidence, row.personalization_first_line, row.job_id,
+                            row.founder_find_completed_at, row.confidence, row.personalization_first_line, row.job_id,
                             clientId, row.email
                         ]);
                         await txClient.query('RELEASE SAVEPOINT contacts_email_owner_update');
@@ -421,20 +427,21 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                             );
 
                             const upsertTargetWithoutEmailQuery = `
-                                INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, email_find_completed_at, email_verify_completed_at, confidence, agency_id, personalization_first_line, job_id)
-                                VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11)
+                                INSERT INTO contacts (client_id, company_id, role_type, full_name, email, email_status, email_find_completed_at, email_verify_completed_at, founder_find_completed_at, confidence, agency_id, personalization_first_line, job_id)
+                                VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11, $12)
                                 ON CONFLICT (company_id, role_type)
                                 DO UPDATE SET
                                     full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
                                     email_status = COALESCE(EXCLUDED.email_status, contacts.email_status),
                                     email_find_completed_at = COALESCE(EXCLUDED.email_find_completed_at, contacts.email_find_completed_at),
                                     email_verify_completed_at = COALESCE(EXCLUDED.email_verify_completed_at, contacts.email_verify_completed_at),
+                                    founder_find_completed_at = COALESCE(EXCLUDED.founder_find_completed_at, contacts.founder_find_completed_at),
                                     confidence = COALESCE(EXCLUDED.confidence, contacts.confidence),
                                     personalization_first_line = COALESCE(EXCLUDED.personalization_first_line, contacts.personalization_first_line),
                                     job_id = COALESCE(EXCLUDED.job_id, contacts.job_id),
                                     updated_at = now()
                                 RETURNING id, agency_id, company_id, role_type, full_name, email, email_status,
-                                          email_find_completed_at, email_verify_completed_at,
+                                          email_find_completed_at, email_verify_completed_at, founder_find_completed_at,
                                           last_contacted_at, confidence, personalization_first_line, job_id, created_at, updated_at
                             `;
                             const targetResult = await txClient.query(upsertTargetWithoutEmailQuery, [
@@ -445,6 +452,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                                 row.email_status,
                                 row.email_find_completed_at,
                                 row.email_verify_completed_at,
+                                row.founder_find_completed_at,
                                 row.confidence,
                                 agencyId,
                                 row.personalization_first_line,
@@ -488,6 +496,7 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                 email_status,
                 email_find_completed_at,
                 email_verify_completed_at,
+                founder_find_completed_at,
                 confidence,
                 personalization_first_line,
                 job_id
@@ -501,12 +510,13 @@ export async function batchUpsertContacts(txClient, agencyId, clientId, rows, op
                 email_status,
                 email_find_completed_at,
                 email_verify_completed_at,
+                founder_find_completed_at,
                 confidence,
                 agencyId,
                 personalization_first_line,
                 job_id
             );
-            valuesList.push(`($1, $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, $${paramIndex + 8}, $${paramIndex + 9}, $${paramIndex + 10})`);
+            valuesList.push(`($1, $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, $${paramIndex + 8}, $${paramIndex + 9}, $${paramIndex + 10}, $${paramIndex + 11})`);
             paramIndex += CONTACT_PARAMS_PER_ROW;
         }
 

@@ -1,8 +1,8 @@
 /**
- * Vercel Workflow — one batch of domains (up to 100).
- * Coarse steps; per-lead concurrency lives inside each server stage runner.
+ * Vercel Workflow — one batch of domains.
+ * Shopping audit runs as separate steps so each stays under maxDuration.
  */
-import type { ChildBatchInput } from '@/lib/enrichment/types';
+import type { ChildBatchInput, ShoppingAuditBatchState } from '@/lib/enrichment/types';
 
 type EnrichmentModule = typeof import('../server/src/enrichment/index.js');
 
@@ -13,33 +13,121 @@ async function loadEnrichment(): Promise<EnrichmentModule> {
 export async function enrichmentChildWorkflow(input: ChildBatchInput) {
   'use workflow';
 
-  const auditSummary = await shoppingAuditStep(input);
-  await foundersStep(input);
-  await emailsStep(input);
-  await verificationStep(input);
-  await personalizationStep(input);
+  try {
+    let auditSummary: Awaited<
+      ReturnType<EnrichmentModule['finalizeShoppingAuditStageBatch']>
+    > | null = null;
 
-  return {
-    batchIndex: input.batchIndex,
-    domainCount: input.batchDomains.length,
-    auditSignals:
-      auditSummary && 'stats' in auditSummary && auditSummary.stats
-        ? (auditSummary.stats as { signals?: number }).signals ?? 0
-        : 0,
-  };
+    if (input.pipelineMode === 'shopping_audit') {
+      let auditState = await shopifyCatalogStep(input);
+      auditState = await heroSelectionStep(input, auditState);
+      auditState = await serperShoppingStep(input, auditState);
+      auditState = await signalWaterfallStep(input, auditState);
+      auditSummary = await finalizeShoppingAuditStep(input, auditState);
+    }
+
+    await foundersStep(input);
+    await emailsStep(input);
+    await verificationStep(input);
+    await personalizationStep(input);
+
+    return {
+      batchIndex: input.batchIndex,
+      domainCount: input.batchDomains.length,
+      auditSignals: auditSummary?.stats?.signals ?? 0,
+    };
+  } catch (err) {
+    // Never swallow: re-throw so the parent's handleWorkflowFailureStep writes the
+    // authoritative job state. Log the batch index for diagnostics. (Per-batch
+    // isolation — letting healthy batches finish — is a separate change: Promise.all
+    // -> allSettled in the parent.)
+    console.error(
+      `[enrichment-child] batch ${input.batchIndex} failed:`,
+      err instanceof Error ? err.message : String(err)
+    );
+    throw err;
+  }
 }
 
-async function shoppingAuditStep(input: ChildBatchInput) {
+async function shopifyCatalogStep(input: ChildBatchInput) {
   'use step';
-
-  if (input.pipelineMode !== 'shopping_audit') {
-    return null;
-  }
 
   const enrichment = await loadEnrichment();
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runShoppingAuditBatch(ctx, input.batchDomains);
+  return enrichment.runShoppingAuditStageBatch(
+    ctx,
+    input.batchDomains,
+    'shopifyCatalog',
+    null,
+    { batchIndex: input.batchIndex }
+  );
+}
+
+async function heroSelectionStep(
+  input: ChildBatchInput,
+  state: ShoppingAuditBatchState | null
+) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.runShoppingAuditStageBatch(
+    ctx,
+    input.batchDomains,
+    'heroSelection',
+    state,
+    { batchIndex: input.batchIndex }
+  );
+}
+
+async function serperShoppingStep(
+  input: ChildBatchInput,
+  state: ShoppingAuditBatchState | null
+) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.runShoppingAuditStageBatch(
+    ctx,
+    input.batchDomains,
+    'serperShopping',
+    state,
+    { batchIndex: input.batchIndex }
+  );
+}
+
+async function signalWaterfallStep(
+  input: ChildBatchInput,
+  state: ShoppingAuditBatchState | null
+) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.runShoppingAuditStageBatch(
+    ctx,
+    input.batchDomains,
+    'signalWaterfall',
+    state,
+    { batchIndex: input.batchIndex }
+  );
+}
+
+async function finalizeShoppingAuditStep(
+  input: ChildBatchInput,
+  state: ShoppingAuditBatchState | null
+) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.finalizeShoppingAuditStageBatch(ctx, state ?? {});
 }
 
 async function foundersStep(input: ChildBatchInput) {
@@ -48,7 +136,9 @@ async function foundersStep(input: ChildBatchInput) {
   const enrichment = await loadEnrichment();
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runFoundersBatch(ctx, input.batchDomains);
+  return enrichment.runFoundersBatch(ctx, input.batchDomains, {
+    batchIndex: input.batchIndex,
+  });
 }
 
 async function emailsStep(input: ChildBatchInput) {
@@ -57,7 +147,9 @@ async function emailsStep(input: ChildBatchInput) {
   const enrichment = await loadEnrichment();
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runEmailsBatch(ctx, input.batchDomains);
+  return enrichment.runEmailsBatch(ctx, input.batchDomains, {
+    batchIndex: input.batchIndex,
+  });
 }
 
 async function verificationStep(input: ChildBatchInput) {
@@ -66,7 +158,9 @@ async function verificationStep(input: ChildBatchInput) {
   const enrichment = await loadEnrichment();
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runVerificationBatch(ctx, input.batchDomains);
+  return enrichment.runVerificationBatch(ctx, input.batchDomains, {
+    batchIndex: input.batchIndex,
+  });
 }
 
 async function personalizationStep(input: ChildBatchInput) {
@@ -75,11 +169,21 @@ async function personalizationStep(input: ChildBatchInput) {
   const enrichment = await loadEnrichment();
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runPersonalizationBatch(ctx, input.batchDomains);
+  return enrichment.runPersonalizationBatch(ctx, input.batchDomains, {
+    batchIndex: input.batchIndex,
+  });
 }
 
-shoppingAuditStep.maxRetries = 0;
-foundersStep.maxRetries = 0;
-emailsStep.maxRetries = 0;
-verificationStep.maxRetries = 0;
-personalizationStep.maxRetries = 0;
+// Shopping-audit steps thread serializable state between them and re-call Serper/Shopify
+// on re-run; leave at 0 until per-item idempotency (no double-charge) is verified.
+shopifyCatalogStep.maxRetries = 0;
+heroSelectionStep.maxRetries = 0;
+serperShoppingStep.maxRetries = 0;
+signalWaterfallStep.maxRetries = 0;
+finalizeShoppingAuditStep.maxRetries = 0;
+// Standard stages re-query the DB queue each run, so a retry only processes still-pending
+// rows (already-done items drop out) — safe to retry through transient provider failures.
+foundersStep.maxRetries = 2;
+emailsStep.maxRetries = 2;
+verificationStep.maxRetries = 2;
+personalizationStep.maxRetries = 2;

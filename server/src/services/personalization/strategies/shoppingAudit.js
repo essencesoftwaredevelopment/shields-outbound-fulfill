@@ -129,15 +129,17 @@ export async function runPersonalization({
                 }
 
                 try {
-                    if (rateLimitHooks?.openai) await rateLimitHooks.openai();
-                    const llmStart = Date.now();
-                    const { first_line, inputTokens, outputTokens } = await generateFirstLineFromSignal({
+                    const generate = () => generateFirstLineFromSignal({
                         signal,
                         snapshot,
                         apiKey: apiKeys.openai,
                         templates,
                         log
                     });
+                    const llmStart = Date.now();
+                    const { first_line, inputTokens, outputTokens } = rateLimitHooks?.openai
+                        ? await rateLimitHooks.openai(generate)
+                        : await generate();
                     llmMs += Date.now() - llmStart;
                     totalInputTokens += inputTokens;
                     totalOutputTokens += outputTokens;

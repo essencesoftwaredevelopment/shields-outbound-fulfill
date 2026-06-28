@@ -4,6 +4,7 @@ import { parse } from 'csv-parse';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
+import { isCreditExhaustion, createCreditExhaustedError } from './trykittCredits.js';
 
 dotenv.config();
 
@@ -149,15 +150,23 @@ async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
     while (attempt < maxAttempts) {
         attempt += 1;
         try {
-            if (rateLimitHooks?.trykitt) await rateLimitHooks.trykitt();
-            const res = await fetch('https://api.trykitt.ai/job/find_email', {
-                method: 'POST',
-                headers: {
-                    'x-api-key': apiKey,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(body)
-            });
+            const res = rateLimitHooks?.trykitt
+                ? await rateLimitHooks.trykitt(() => fetch('https://api.trykitt.ai/job/find_email', {
+                    method: 'POST',
+                    headers: {
+                        'x-api-key': apiKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(body)
+                }))
+                : await fetch('https://api.trykitt.ai/job/find_email', {
+                    method: 'POST',
+                    headers: {
+                        'x-api-key': apiKey,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(body)
+                });
 
             const text = await res.text();
             
@@ -168,18 +177,19 @@ async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
                 parsed = null;
             }
 
-            // Handle 402 (rate limit) with dedicated backoff
+            // 402 Payment Required — distinguish out-of-credits from a transient blip.
             if (res.status === 402) {
+                if (isCreditExhaustion(parsed)) {
+                    return { email: null, status: 'error: credit_exhausted', creditExhausted: true };
+                }
                 rateLimitHits += 1;
                 if (rateLimitHits >= RATE_LIMIT_MAX_RETRIES) {
-                    console.warn(`[EMAIL_FINDER] 402 rate-limited ${rateLimitHits} times for ${domain}, giving up on this row`);
-                    return {
-                        email: null,
-                        status: 'error: rate_limited'
-                    };
+                    // A 402 that won't clear after repeated retries is payment-required, not transient.
+                    console.warn(`[EMAIL_FINDER] 402 persisted ${rateLimitHits}x for ${domain} — treating as credit exhaustion`);
+                    return { email: null, status: 'error: credit_exhausted', creditExhausted: true };
                 }
                 const rlBackoff = RATE_LIMIT_BACKOFF_MS * rateLimitHits;
-                console.warn(`[EMAIL_FINDER] 402 rate-limited for ${domain}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
+                console.warn(`[EMAIL_FINDER] 402 for ${domain}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
                 await wait(rlBackoff);
                 continue;
             }
@@ -397,6 +407,7 @@ export async function runEmailFinder({
 
     const limit = createConcurrencyLimit(CONCURRENCY);
     let completedEligible = 0;
+    let creditExhausted = false;
     let stageCost = 0;
     const stats = { Found: 0, 'Not Found': 0, Skipped: 0, errors: 0 };
     const results = new Array(totalRows);
@@ -486,6 +497,11 @@ export async function runEmailFinder({
             if (controller.signal.aborted) {
                 return;
             }
+            // Credits already known exhausted: skip the call AND the persist, so these
+            // domains stay unmarked (email_find_completed_at NULL) and a resume retries them.
+            if (creditExhausted) {
+                return;
+            }
             // Check if paused and abort if so
             if (checkpoint) {
                 try {
@@ -528,6 +544,13 @@ export async function runEmailFinder({
                 if (status === 'no-results-found') {
                     status = 'not_found';
                 }
+
+                // Out of TryKitt credits: flag it and leave this row unpersisted so the
+                // job pauses (below) and a post-top-up resume reprocesses it.
+                if (lookup?.creditExhausted) {
+                    creditExhausted = true;
+                    return;
+                }
             } catch (error) {
                 console.error(`[EMAIL_FINDER] Lookup failed for ${domain}: ${error?.message || error}`);
                 status = `error: ${error?.message || 'unknown'}`;
@@ -561,8 +584,8 @@ export async function runEmailFinder({
             const progressPayload = {
                 progress: {
                     stage: 'emailDiscovery',
-                    processed: processedForUi,
-                    total: jobTotal,
+                    processed: completedEligible,
+                    total: eligibleTotal,
                     found: stats['Found'],
                     cost: costNumber,
                     stats: {
@@ -615,6 +638,10 @@ export async function runEmailFinder({
         try {
             await Promise.all(tasks);
             await flushAllPending();
+            // Partial successes are now persisted; pause the job for a credit top-up.
+            if (creditExhausted) {
+                throw createCreditExhaustedError('email discovery');
+            }
             const stopped = await refreshJobControlFlags(job, refreshControl, checkPaused);
             if (stopped || controller.signal.aborted) {
                 await flushAllPending();
@@ -675,7 +702,7 @@ export async function runEmailFinder({
     return {
         totalRows,
         eligible: eligibleTotal,
-        processed: displayProcessed(completedEligible),
+        processed: completedEligible,
         cost,
         Found: stats.Found,
         'Not Found': stats['Not Found'],

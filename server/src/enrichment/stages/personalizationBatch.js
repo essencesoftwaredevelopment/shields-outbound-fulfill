@@ -1,10 +1,15 @@
-import { getPersonalizeQueue } from '../../services/db/jobs.js';
+import { getPersonalizeQueue, getJobById } from '../../services/db/jobs.js';
 import { upsertLeadRowsBatch } from '../../services/leads.js';
 import { runPersonalizationFromRows } from '../../services/personalization/index.js';
 import { runPersonalization as runShoppingAuditPersonalization } from '../../services/personalization/strategies/shoppingAudit.js';
 import { getSignalEmissionByDomain } from '../../services/shoppingAudit/db.js';
-import { assertJobActive, updateJobStage, setJobActivity } from '../persist.js';
+import { assertJobActive } from '../persist.js';
 import { createRateLimitHooks } from '../rateLimit.js';
+import {
+    beginJobStage,
+    finishJobStage,
+    createStageLogger
+} from '../stageProgress.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -35,14 +40,19 @@ async function buildSignalMap(ctx, domains) {
 /**
  * @param {import('../context.js').EnrichmentContext} ctx
  * @param {string[]} batchDomains
+ * @param {{ batchIndex?: number }} [batchOpts]
  */
-export async function runPersonalizationBatch(ctx, batchDomains) {
+export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {}) {
+    const batchIndex = batchOpts.batchIndex ?? 0;
+    const jobRow = await getJobById(ctx.jobId, ctx.agencyId);
+    const stageLog = createStageLogger(ctx, 'personalization', {
+        label: 'personalization',
+        batchLocalProgress: true,
+        batchIndex
+    });
+
     if (!ctx.options.personalizeFirstLine) {
-        await updateJobStage(ctx.jobId, ctx.agencyId, 'personalization', {
-            status: 'completed',
-            completedAt: new Date().toISOString(),
-            summary: { skipped: true, personalized: 0 }
-        });
+        await finishJobStage(ctx, 'personalization', { skipped: true, personalized: 0 });
         return { skipped: true };
     }
 
@@ -51,20 +61,21 @@ export async function runPersonalizationBatch(ctx, batchDomains) {
         await getPersonalizeQueue(ctx.agencyId, ctx.clientId, ctx.jobId, {
             reprocessInclude,
             requireValidEmail: reprocessInclude,
-            limit: batchDomains.length + 500
+            limit: batchDomains.length + 500,
+            jobStartedAt: jobRow?.created_at || null
         }),
         batchDomains
     );
 
     if (!queue.length) {
+        await finishJobStage(ctx, 'personalization', { processed: 0, personalized: 0, cost: 0 });
         return { processed: 0 };
     }
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'personalization', {
-        status: 'running',
-        startedAt: new Date().toISOString()
+    await beginJobStage(ctx, 'personalization', {
+        activity: `Personalization (${queue.length})…`,
+        batchIndex
     });
-    await setJobActivity(ctx.jobId, ctx.agencyId, `Personalization (${queue.length})…`);
 
     const rows = queue.map((r) => ({
         domain: r.domain,
@@ -79,7 +90,7 @@ export async function runPersonalizationBatch(ctx, batchDomains) {
         const summary = await runShoppingAuditPersonalization({
             rows,
             apiKeys: ctx.apiKeys,
-            log: (msg) => console.log(`[${ctx.jobId}] [personalization] ${msg}`),
+            log: stageLog,
             signalEmissionByDomain,
             templates: ctx.auditFeatures?.signalTemplates,
             checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
@@ -101,10 +112,9 @@ export async function runPersonalizationBatch(ctx, batchDomains) {
             }
         });
 
-        await updateJobStage(ctx.jobId, ctx.agencyId, 'personalization', {
-            status: 'completed',
-            completedAt: new Date().toISOString(),
-            summary: { personalized: summary.processed }
+        await finishJobStage(ctx, 'personalization', {
+            personalized: summary.processed,
+            ...summary
         });
         return summary;
     }
@@ -112,7 +122,7 @@ export async function runPersonalizationBatch(ctx, batchDomains) {
     const summary = await runPersonalizationFromRows({
         rows,
         apiKeys: ctx.apiKeys,
-        log: (msg) => console.log(`[${ctx.jobId}] [personalization] ${msg}`),
+        log: stageLog,
         industry: ctx.options.industry,
         nicheId: ctx.options.nicheId,
         nicheLabel: ctx.options.nicheLabel,
@@ -132,11 +142,9 @@ export async function runPersonalizationBatch(ctx, batchDomains) {
         }
     });
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'personalization', {
-        status: 'completed',
-        completedAt: new Date().toISOString(),
-        summary: { personalized: summary.processed ?? summary.personalized ?? 0 }
+    await finishJobStage(ctx, 'personalization', {
+        personalized: summary.processed ?? summary.personalized ?? 0,
+        ...summary
     });
-
     return summary;
 }

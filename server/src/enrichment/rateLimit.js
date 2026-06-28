@@ -1,55 +1,46 @@
-import { Ratelimit } from '@upstash/ratelimit';
-import { Redis } from '@upstash/redis';
+import {
+    DEFAULT_RPM,
+    SERPER_MAX_CONCURRENT_BATCHES,
+    TRYKITT_MAX_CONCURRENT,
+    runWithProviderLimit,
+    waitForRateLimitPostgres
+} from './postgresRateLimit.js';
 
-const DEFAULT_RPM = {
-    openai: 500,
-    serper: 100,
-    trykitt: 60
-};
+export { DEFAULT_RPM, SERPER_MAX_CONCURRENT_BATCHES, TRYKITT_MAX_CONCURRENT };
 
-const limiters = new Map();
-
-function getLimiter(agencyId, provider, rpm) {
-    const key = `${agencyId}:${provider}:${rpm}`;
-    let limiter = limiters.get(key);
-    if (!limiter) {
-        const url = process.env.UPSTASH_REDIS_REST_URL;
-        const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-        if (!url || !token) return null;
-        limiter = new Ratelimit({
-            redis: new Redis({ url, token }),
-            limiter: Ratelimit.slidingWindow(rpm, '1 m'),
-            prefix: `enrichment:${provider}`
-        });
-        limiters.set(key, limiter);
-    }
-    return limiter;
-}
-
-/** Wait for tenant-scoped rate limit before external API calls. No-op if Upstash unset. */
+/** Wait for tenant-scoped rate limit before external API calls (Postgres-backed). */
 export async function waitForRateLimit(agencyId, provider, customRpm) {
-    const rpm = customRpm ?? DEFAULT_RPM[provider] ?? 60;
-    const limiter = getLimiter(agencyId, provider, rpm);
-    if (!limiter) return;
-
-    const { success, reset } = await limiter.limit(agencyId);
-    if (success) return;
-
-    const waitMs = Math.max(0, reset - Date.now());
-    if (waitMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, 60_000)));
-    }
+    await waitForRateLimitPostgres(agencyId, provider, customRpm);
 }
 
 /**
- * Hooks for stage runners — call before external API requests.
+ * Hooks for stage runners — wrap external API calls.
+ * Each hook accepts `() => Promise<T>` and returns `Promise<T>`.
  * @param {import('./context.js').EnrichmentContext} ctx
  */
 export function createRateLimitHooks(ctx) {
     const custom = ctx.options?.rateLimits || {};
     return {
-        serper: () => waitForRateLimit(ctx.agencyId, 'serper', custom.serper),
-        openai: () => waitForRateLimit(ctx.agencyId, 'openai', custom.openai),
-        trykitt: () => waitForRateLimit(ctx.agencyId, 'trykitt', custom.trykitt)
+        serper: (fn) => runWithProviderLimit(ctx.agencyId, 'serper', fn, {
+            customRpm: custom.serper,
+            maxConcurrent: SERPER_MAX_CONCURRENT_BATCHES
+        }),
+        openai: (fn) => runWithProviderLimit(ctx.agencyId, 'openai', fn, {
+            customRpm: custom.openai
+        }),
+        // TryKitt limits per API key by concurrency (default 15 simultaneous jobs;
+        // a 16th returns 402), not by RPM. Gate on an agency-scoped lease shared by
+        // BOTH email finding and verification, and skip the RPM window entirely.
+        trykitt: (fn) => runWithProviderLimit(ctx.agencyId, 'trykitt', fn, {
+            skipRateLimit: true,
+            maxConcurrent: custom.trykittConcurrency || TRYKITT_MAX_CONCURRENT,
+            concurrencyScope: `${ctx.agencyId}:trykitt`
+        })
     };
+}
+
+/** Call sites that may still use the legacy await-hook() pattern. */
+export async function invokeRateLimitHook(hook, fn) {
+    if (!hook) return fn();
+    return hook(fn);
 }

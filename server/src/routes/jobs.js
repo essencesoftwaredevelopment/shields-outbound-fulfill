@@ -38,6 +38,7 @@ import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, getRunnerRecord, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
 import { dispatchEnrichmentJob } from '../enrichment/dispatch.js';
+import { clearWorkflowRunId } from '../enrichment/persist.js';
 import { resolveExecutionRunner } from '../enrichment/executionRunner.js';
 
 async function enrichJobWithQueueRuntime(jobState, jobId) {
@@ -47,9 +48,10 @@ async function enrichJobWithQueueRuntime(jobState, jobId) {
         return { ...jobState, queueStatus: null, workerActive: false };
     }
     const workerActive = row.runner_pid != null && row.status === 'running';
+    const queueStatus = jobState.paused && row.status === 'running' ? 'paused' : row.status;
     return {
         ...jobState,
-        queueStatus: row.status,
+        queueStatus,
         workerActive
     };
 }
@@ -304,7 +306,10 @@ function buildQueuePayload(job) {
         cost: typeof job.cost === 'number' ? job.cost : 0,
         stages: job.stages || null,
         filteredPath: job.paths?.filtered || null,
-        executionRunner: job.executionRunner || job.options?.executionRunner || 'pm2'
+        // Omit default — dispatchEnrichmentJob resolves runner from env/agency via resolveExecutionRunner.
+        ...(job.executionRunner || job.options?.executionRunner
+            ? { executionRunner: job.executionRunner || job.options.executionRunner }
+            : {})
     };
 }
 
@@ -697,10 +702,13 @@ router.post('/jobs/:id/pause', async (req, res) => {
 
         writeJobControl(jobId, { paused: true, cancelled: false });
         await updateJobControl(jobId, { paused: true, cancelled: false });
+        await clearWorkflowRunId(jobId);
         const queueJob = await getQueueJob(jobId);
         if (queueJob) {
             await updateQueueControl(jobId, { paused: true });
-            if (queueJob.status === 'queued') await setQueueStatus(jobId, 'paused');
+            if (queueJob.status === 'queued' || queueJob.status === 'running') {
+                await setQueueStatus(jobId, 'paused');
+            }
         }
 
         const localJob = jobs.get(jobId);
@@ -752,7 +760,7 @@ router.post('/jobs/:id/resume', async (req, res) => {
         }
 
         const options = row.options || {};
-        const recoveryResume = row.status === 'completed' && await jobHasRemainingPipelineWork({
+        const remainingWork = await jobHasRemainingPipelineWork({
             agencyId: uid,
             clientId: row.client_id,
             jobId,
@@ -761,11 +769,22 @@ router.post('/jobs/:id/resume', async (req, res) => {
             dedupeStrategy: options.dedupeStrategy || 'skip',
             jobStartedAt: row.created_at ? new Date(row.created_at).toISOString() : null
         });
+        const settings = await getAgencySettings(uid);
+        const runner = resolveExecutionRunner({ settings, jobOptions: options });
+        const stuckVercelWorkflow =
+            runner === 'vercel'
+            && row.status === 'running'
+            && !row.cancelled
+            && !row.paused
+            && !!options.workflowRunId
+            && remainingWork;
+
+        const recoveryResume = row.status === 'completed' && remainingWork;
 
         if (row.status === 'completed' && !recoveryResume) {
             return res.json({ status: 'completed', message: 'Job already completed.' });
         }
-        if (!row.paused && !recoveryResume) {
+        if (!row.paused && !recoveryResume && !stuckVercelWorkflow) {
             return res.json({ status: row.status, message: 'Job is not paused.' });
         }
 
@@ -779,6 +798,13 @@ router.post('/jobs/:id/resume', async (req, res) => {
             if (queueJob) {
                 await setQueueStatus(jobId, 'paused', { error: null });
             }
+        } else if (stuckVercelWorkflow) {
+            await clearWorkflowRunId(jobId);
+            await pool.query(
+                `UPDATE jobs SET error = NULL, updated_at = NOW() WHERE id = $1`,
+                [jobId]
+            );
+            row.error = null;
         }
 
         const localJob = jobs.get(jobId);
@@ -797,8 +823,6 @@ router.post('/jobs/:id/resume', async (req, res) => {
         }
 
         const payload = buildQueuePayload(jobRowToState(row));
-        const settings = await getAgencySettings(uid);
-        const runner = resolveExecutionRunner({ settings, jobOptions: payload });
         await dispatchEnrichmentJob({
             jobId,
             uid,

@@ -21,6 +21,8 @@ import fs from 'fs';
 import { parse as csvParse } from 'csv-parse';
 import { pool, withTx, batchUpsertCompanies, batchUpsertContacts, writeCheckpoint, getExistingDomainsSet, markEmailsContacted } from '../lib/db.js';
 import { normalizeDomain } from '../utils/domain.js';
+import { isNotFoundValue } from './enrichmentCohort.js';
+import { markJobDomainsFounderExcluded } from './db/jobs.js';
 import * as queries from './db/queries.js';
 
 /**
@@ -54,7 +56,13 @@ function buildContactPayload(row, type) {
     if (!domain) return null;
 
     if (type === 'founders') {
-        return { domain, roleType: 'founder', fullName: founderName, confidence: Number.isFinite(confidence) ? confidence : null };
+        return {
+            domain,
+            roleType: 'founder',
+            fullName: isNotFoundValue(founderName) ? null : founderName,
+            founderFindCompletedAt: completedAt,
+            confidence: Number.isFinite(confidence) ? confidence : null
+        };
     }
     if (type === 'emails') {
         return {
@@ -90,6 +98,54 @@ function buildContactPayload(row, type) {
         };
     }
     return { domain, roleType: 'founder', fullName: founderName };
+}
+
+/**
+ * Persist founder search outcomes (found and not-found) with completion timestamps.
+ */
+export async function upsertFounderSearchBatch({
+    agencyId,
+    clientId,
+    jobId,
+    rows,
+    mergeMode = 'preserve',
+    onTiming = null
+}) {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    if (!agencyId || !clientId) return;
+
+    const excludedDomains = [];
+    const upsertRows = [];
+
+    for (const row of rows) {
+        const domain = normalizeDomain(row.domain);
+        if (!domain) continue;
+        const founderName = String(row.founder_name || row.full_name || row.name || '').trim();
+        if (isNotFoundValue(founderName)) {
+            excludedDomains.push(domain);
+        }
+        upsertRows.push({
+            ...row,
+            domain,
+            founder_name: isNotFoundValue(founderName) ? '' : founderName
+        });
+    }
+
+    if (excludedDomains.length && jobId) {
+        await markJobDomainsFounderExcluded(jobId, excludedDomains);
+    }
+
+    if (upsertRows.length) {
+        await upsertLeadRowsBatch({
+            agencyId,
+            clientId,
+            rows: upsertRows,
+            type: 'founders',
+            jobId,
+            mergeMode,
+            onTiming
+        });
+    }
 }
 
 /**
@@ -133,6 +189,7 @@ export async function upsertLeadRowsBatch({
                 email_status: p.emailStatus || null,
                 email_find_completed_at: p.emailFindCompletedAt || null,
                 email_verify_completed_at: p.emailVerifyCompletedAt || null,
+                founder_find_completed_at: p.founderFindCompletedAt || null,
                 confidence: p.confidence || null,
                 personalization_first_line: p.personalizationFirstLine || null,
                 job_id: jobId
@@ -173,6 +230,12 @@ export async function upsertLeadRowsBatch({
             signalMs,
             totalMs: Date.now() - batchStart
         });
+    }
+
+    if (jobId && agencyId) {
+        void import('../enrichment/stageReconcileScheduler.js')
+            .then(({ scheduleStageReconcile }) => scheduleStageReconcile(jobId, agencyId))
+            .catch(() => {});
     }
 }
 

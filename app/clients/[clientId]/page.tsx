@@ -94,6 +94,7 @@ type Lead = {
     createdAt?: string;
     emailFindCompletedAt?: string;
     emailVerifyCompletedAt?: string;
+    founderFindCompletedAt?: string;
     lastContactedAt?: string;
     jobId?: string;
     campaignCountAllTime?: number | null;
@@ -343,6 +344,8 @@ const INSTANTLY_SYNC_POLL_MS = 5000;
 
 const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
     { key: 'founder_name', label: 'Founder Name', group: 'Lead', defaultSelected: true },
+    { key: 'first_name', label: 'First Name', group: 'Lead' },
+    { key: 'last_name', label: 'Last Name', group: 'Lead' },
     { key: 'email', label: 'Email', group: 'Lead', defaultSelected: true },
     { key: 'status', label: 'Status', group: 'Lead', defaultSelected: true },
     { key: 'domain', label: 'Domain', group: 'Lead', defaultSelected: true },
@@ -599,6 +602,13 @@ function csvEscape(value: unknown): string {
     return `"${normalized.replace(/"/g, '""')}"`;
 }
 
+function splitFounderName(fullName: string | undefined | null): { first: string; last: string } {
+    const parts = String(fullName ?? '').trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return { first: '', last: '' };
+    if (parts.length === 1) return { first: parts[0], last: '' };
+    return { first: parts[0], last: parts.slice(1).join(' ') };
+}
+
 function getLeadExportValue(lead: Lead, key: string): unknown {
     const latestCampaign = Array.isArray(lead.campaignsData) && lead.campaignsData.length > 0
         ? lead.campaignsData[0]
@@ -607,6 +617,10 @@ function getLeadExportValue(lead: Lead, key: string): unknown {
     switch (key) {
     case 'founder_name':
         return lead.founderName || '';
+    case 'first_name':
+        return splitFounderName(lead.founderName).first;
+    case 'last_name':
+        return splitFounderName(lead.founderName).last;
     case 'email':
         return lead.email || '';
     case 'status':
@@ -953,47 +967,179 @@ const extractNumberFrom = (source: Record<string, unknown> | null | undefined, k
     return null;
 };
 
-const deriveStageTotals = (stage?: PipelineStageState) => {
+/** Aggregate parallel batch slots (mirrors server merge rules). */
+const aggregateBatchProgress = (
+    stageKey: string,
+    batches: Record<string, Record<string, unknown>>,
+): Record<string, unknown> | null => {
+    const slots = Object.values(batches).filter((s) => s && typeof s === "object");
+    if (!slots.length) return null;
+
+    const sum = (vals: number[]) => vals.reduce((a, b) => a + b, 0);
+    const max = (vals: number[]) => Math.max(...vals);
+    const pick = (mode: "sum" | "max", vals: number[]) => (mode === "sum" ? sum(vals) : max(vals));
+
+    const processedMode =
+        stageKey === "emailDiscovery" || stageKey === "personalization" ? "sum" : "max";
+    const foundMode = "sum";
+    const totalMode =
+        stageKey === "emailDiscovery" || stageKey === "personalization" ? "sum" : "max";
+
+    const num = (slot: Record<string, unknown>, key: string) => {
+        const v = slot[key];
+        return typeof v === "number" && Number.isFinite(v) ? v : null;
+    };
+
+    const processedVals = slots.map((s) => num(s, "processed")).filter((n): n is number => n !== null);
+    const foundVals = slots.map((s) => num(s, "found")).filter((n): n is number => n !== null);
+    const totalVals = slots.map((s) => num(s, "total")).filter((n): n is number => n !== null);
+
+    const mergedStats: Record<string, number> = {};
+    for (const slot of slots) {
+        const slotStats = slot.stats as Record<string, unknown> | undefined;
+        if (!slotStats) continue;
+        for (const [key, val] of Object.entries(slotStats)) {
+            if (typeof val !== "number" || !Number.isFinite(val)) continue;
+            const mode =
+                key === "Found" || key === "found" || key === "personalized" || key === "Personalized" || key === "valid" || key === "Valid"
+                    ? "sum"
+                    : "max";
+            mergedStats[key] =
+                mergedStats[key] === undefined
+                    ? val
+                    : mode === "sum"
+                      ? mergedStats[key] + val
+                      : Math.max(mergedStats[key], val);
+        }
+    }
+
+    return {
+        ...(processedVals.length ? { processed: pick(processedMode, processedVals) } : {}),
+        ...(foundVals.length ? { found: pick(foundMode, foundVals) } : {}),
+        ...(totalVals.length ? { total: pick(totalMode, totalVals) } : {}),
+        ...(Object.keys(mergedStats).length ? { stats: mergedStats } : {}),
+    };
+};
+
+const capToBaseline = (value: number | null, baseline: number | null): number | null => {
+    if (value === null) return null;
+    if (baseline === null || baseline <= 0) return value;
+    return Math.min(value, baseline);
+};
+
+/** Count for stages skipped because data was imported from CSV (`processed: 0` is not a real count). */
+const csvSkippedImportCount = (
+    summary: Record<string, unknown> | null | undefined,
+    jobBaseline: number | null | undefined,
+): number | null => {
+    if (summary?.skipped !== true) return null;
+    const explicit = extractNumberFrom(summary, ["imported", "Found", "found"]);
+    if (explicit !== null && explicit > 0) return capToBaseline(explicit, jobBaseline ?? null);
+    return jobBaseline ?? null;
+};
+
+const deriveStageTotals = (stage?: PipelineStageState, jobBaseline?: number | null) => {
     const stageName = stage?.progress?.stage;
     const progress = stage?.progress;
     const summary = stage?.summary as Record<string, unknown> | null;
-    const stats = progress?.stats as Record<string, unknown> | undefined;
-    // Once a stage is completed, `summary` is canonical. `progress` can still
-    // hold stale or sub-step values written before completion (e.g. founders
-    // briefly using batch counters), so prefer summary in that case to avoid
-    // displaying numbers that were never the user-facing totals.
-    const preferSummary = stage?.status === "completed" || stage?.status === "error";
+    const batchAgg = progress?.batches && typeof progress.batches === "object"
+        ? aggregateBatchProgress(stageName ?? "", progress.batches as Record<string, Record<string, unknown>>)
+        : null;
+    const batchStats = batchAgg?.stats as Record<string, unknown> | undefined;
+    const stats = batchStats ?? (progress?.stats as Record<string, unknown> | undefined);
+    const batchProcessed =
+        typeof batchAgg?.processed === "number" && Number.isFinite(batchAgg.processed)
+            ? batchAgg.processed
+            : null;
+    const batchFound =
+        typeof batchAgg?.found === "number" && Number.isFinite(batchAgg.found)
+            ? batchAgg.found
+            : null;
+    const batchTotal =
+        typeof batchAgg?.total === "number" && Number.isFinite(batchAgg.total)
+            ? batchAgg.total
+            : null;
+    // Spreadsheet reconcile writes canonical summary + progress (no batch slots).
+    const preferSummary =
+        (stage?.summary && Object.keys(stage.summary).length > 0 && !batchAgg)
+        || (stage?.status === "completed" || stage?.status === "error") && !batchAgg;
     const progressTotal = typeof progress?.total === "number" && Number.isFinite(progress.total) ? progress.total : null;
-    const summaryTotal = extractNumberFrom(summary, ["total", "queued", "attempted"]);
+    const summaryTotal = preferSummary
+        ? capToBaseline(
+            extractNumberFrom(summary, [
+                "processed",
+                "eligible",
+                "Verified",
+                "attempted",
+                "queued",
+                "checked",
+                "processable",
+            ])
+                ?? extractNumberFrom(stats, ["processed", "eligible", "total", "queued", "attempted"])
+                ?? progressTotal,
+            jobBaseline ?? null,
+        )
+        : null;
+    const fallbackTotal = extractNumberFrom(summary, ["total", "queued", "attempted"]);
     const statsTotal = extractNumberFrom(stats, ["total", "queued", "attempted"]);
+
+    const importedFromCsv =
+        stageName === "emailDiscovery"
+            ? csvSkippedImportCount(summary, jobBaseline)
+            : null;
 
     // if it's the founders stage, or email find stage, use found
     // if it's the verification stage, use verified/valid
-    const throughputNum =
+    let throughputNum =
         stageName === "domainPrep" ?
             extractNumberFrom(summary, ["processable", "live"])
             ?? extractNumberFrom(stats, ["processable", "live"])
             : stageName === "founders" || stageName === "emailDiscovery" ?
-            (preferSummary
-                ? (extractNumberFrom(summary, ["Found", "found"])
+            (importedFromCsv !== null && stageName === "emailDiscovery"
+                ? importedFromCsv
+                : preferSummary
+                ? (extractNumberFrom(summary, ["Found", "found", "imported"])
+                    ?? capToBaseline(extractNumberFrom(summary, ["processed"]), jobBaseline ?? null)
                     ?? extractNumberFrom(stats, ["Found", "found"])
                     ?? (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null))
-                : (extractNumberFrom(stats, ["Found", "found"])
+                : (batchFound
+                    ?? extractNumberFrom(stats, ["Found", "found"])
                     ?? (typeof progress?.found === "number" && Number.isFinite(progress.found) ? progress.found : null)
-                    ?? extractNumberFrom(summary, ["Found", "found", "processed", "completed", "personalized"])))
+                    ?? extractNumberFrom(summary, ["Found", "found", "imported", "processed", "completed", "personalized"])))
             : stageName === "verification" ?
-                extractNumberFrom(summary, ["Valid", "valid"])
-                ?? extractNumberFrom(stats, ["valid"])
+                extractNumberFrom(stats, ["valid", "Valid"])
+                ?? extractNumberFrom(summary, ["Valid", "valid"])
                 : stageName === "personalization" ?
                     extractNumberFrom(stats, ["personalized", "Personalized"])
+                    ?? batchProcessed
                     ?? (typeof progress?.processed === "number" && Number.isFinite(progress.processed)
                         ? progress.processed
                         : null)
                     ?? extractNumberFrom(summary, ["personalized", "Personalized"]) : null;
 
-    const total = preferSummary
+    if (stageName === "founders" && (throughputNum === null || throughputNum === 0)) {
+        throughputNum = capToBaseline(
+            extractNumberFrom(summary, ["imported", "Found", "found"])
+                ?? extractNumberFrom(summary, ["processed"])
+                ?? jobBaseline
+                ?? null,
+            jobBaseline ?? null,
+        );
+    }
+
+    let total = preferSummary
         ? (summaryTotal ?? statsTotal ?? progressTotal)
-        : (progressTotal ?? statsTotal ?? summaryTotal);
+        : (batchProcessed ?? progressTotal ?? statsTotal ?? fallbackTotal);
+
+    if (jobBaseline && typeof total === "number") {
+        total = Math.min(total, jobBaseline);
+    } else if (stageName === "founders" && typeof total === "number" && jobBaseline) {
+        total = Math.min(total, jobBaseline);
+    }
+
+    if (batchTotal && (!total || batchTotal > total)) {
+        total = jobBaseline ? Math.min(batchTotal, jobBaseline) : batchTotal;
+    }
 
     return { throughputNum, total };
 };
@@ -1092,13 +1238,18 @@ const calculateJobProgress = (job: PipelineJob): { processed: number; total: num
 
     if (activeKey) {
         const stage = job.stages[activeKey];
-        const stageTotals = deriveStageTotals(stage);
+        const stageTotals = deriveStageTotals(stage, dedupedTotal);
+        const batchAgg = stage.progress?.batches && typeof stage.progress.batches === "object"
+            ? aggregateBatchProgress(activeKey, stage.progress.batches as Record<string, Record<string, unknown>>)
+            : null;
         if (stageTotals.total) {
             total = stageTotals.total;
         } else if (typeof stage.progress?.total === "number" && stage.progress.total > 0) {
             total = stage.progress.total;
         }
-        if (typeof stage.progress?.processed === "number") {
+        if (typeof batchAgg?.processed === "number") {
+            processed = batchAgg.processed;
+        } else if (typeof stage.progress?.processed === "number") {
             processed = stage.progress.processed;
         }
     }
@@ -1414,7 +1565,35 @@ export default function ClientPage() {
             return Math.max(a ?? 0, b ?? 0);
         };
 
-        // Incoming Realtime row last; then lift monotonic counters so stale prior cannot rewind.
+        const nextBatches =
+            nextProgress?.batches && typeof nextProgress.batches === "object"
+                ? (nextProgress.batches as Record<string, Record<string, unknown>>)
+                : null;
+        const priorBatches =
+            priorProgress?.batches && typeof priorProgress.batches === "object"
+                ? (priorProgress.batches as Record<string, Record<string, unknown>>)
+                : null;
+
+        if (nextBatches || priorBatches) {
+            const merged: NonNullable<PipelineStageState["progress"]> = {
+                ...(priorProgress || {}),
+                ...(nextProgress || {}),
+                stage: key,
+                batches: { ...(priorBatches || {}), ...(nextBatches || {}) },
+            };
+            for (const field of ["processed", "found", "total", "cost"] as const) {
+                const p = typeof priorProgress?.[field] === "number" ? priorProgress[field] : null;
+                const n = typeof nextProgress?.[field] === "number" ? nextProgress[field] : null;
+                const lifted = maxCounter(p, n);
+                if (lifted !== null) merged[field] = lifted;
+            }
+            const priorStats = (priorProgress?.stats || {}) as Record<string, unknown>;
+            const nextStats = (nextProgress?.stats || {}) as Record<string, unknown>;
+            merged.stats = { ...priorStats, ...nextStats } as Record<string, number>;
+            return merged;
+        }
+
+        // Legacy rows without per-batch slots — lift monotonic counters only.
         const merged: NonNullable<PipelineStageState["progress"]> = {
             ...(priorProgress || {}),
             ...(nextProgress || {}),
@@ -1498,7 +1677,6 @@ export default function ClientPage() {
                 for (const key of ALL_PIPELINE_STAGE_KEYS) {
                     const prior = prev.stages[key];
                     const next = stages[key];
-                    const status = pickStageStatus(prior?.status, next?.status);
                     const nextSummary =
                         next?.summary && Object.keys(next.summary).length > 0
                             ? next.summary
@@ -1507,6 +1685,9 @@ export default function ClientPage() {
                         prior?.summary && Object.keys(prior.summary).length > 0
                             ? prior.summary
                             : null;
+                    const status = nextSummary
+                        ? (next?.status || prior?.status || "pending")
+                        : pickStageStatus(prior?.status, next?.status);
                     stages[key] = {
                         ...next,
                         status,
@@ -1932,7 +2113,9 @@ export default function ClientPage() {
         if (!jobState) return 0;
         const stageOrder = resolveStageOrder(jobState);
         const stageWeight = 100 / stageOrder.length;
+        const dedupedTotal = deriveDedupedDomainBaseline(jobState);
         let percent = 0;
+
         for (const key of stageOrder) {
             const stage = jobState.stages[key];
             if (stage?.status === "completed" || stage?.status === "error") {
@@ -1940,22 +2123,26 @@ export default function ClientPage() {
                 continue;
             }
             if (stage?.status === "running") {
-                const total = typeof stage.progress?.total === "number" ? stage.progress.total : null;
+                const totals = deriveStageTotals(stage, dedupedTotal);
                 const processed =
-                    typeof stage.progress?.processed === "number" ? stage.progress.processed : null;
+                    typeof stage.progress?.processed === "number"
+                        ? stage.progress.processed
+                        : totals.throughputNum;
+                const total = totals.total ?? stage.progress?.total ?? dedupedTotal;
                 if (total && total > 0 && processed !== null) {
                     percent += stageWeight * Math.min(1, processed / total);
                 }
             }
+            // Spreadsheet model: later stages may advance while earlier ones run — keep summing.
         }
+
         return Math.min(100, Math.round(percent));
     }, [jobState]);
 
     const validLeadsCompleted = useMemo(() => {
         if (!jobState) return 0;
-        return (jobState.stages?.verification?.summary as any)?.valid 
-            || (jobState.stages?.verification?.summary as any)?.Valid 
-            || 0;
+        const dedupedTotal = deriveDedupedDomainBaseline(jobState);
+        return deriveStageTotals(jobState.stages?.verification, dedupedTotal).throughputNum ?? 0;
     }, [jobState]);
 
     const activeStatusLabel = useMemo(() => {
@@ -1963,16 +2150,23 @@ export default function ClientPage() {
         if (jobState.paused) return 'Job paused';
         if (jobState.status === 'running' || jobState.status === 'queued') {
             const stageOrder = resolveStageOrder(jobState);
-            const runningStage = stageOrder.find(k => jobState.stages[k]?.status === 'running');
-            if (runningStage) {
-                const stage = jobState.stages[runningStage];
-                const processed = stage?.progress?.processed;
-                const total = stage?.progress?.total;
-                const title = STAGE_METADATA[runningStage]?.title || runningStage;
-                if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
-                    return `${title}: ${processed.toLocaleString()} / ${total.toLocaleString()}`;
-                }
-                return `Running ${title}…`;
+            const runningStages = stageOrder.filter(k => jobState.stages[k]?.status === 'running');
+            if (runningStages.length > 0) {
+                const parts = runningStages.map((key) => {
+                    const stage = jobState.stages[key];
+                    const dedupedTotal = deriveDedupedDomainBaseline(jobState);
+                    const totals = deriveStageTotals(stage, dedupedTotal);
+                    const title = STAGE_METADATA[key]?.title || key;
+                    const processed = typeof stage?.progress?.processed === "number"
+                        ? stage.progress.processed
+                        : totals.throughputNum;
+                    const total = totals.total ?? stage?.progress?.total;
+                    if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
+                        return `${title}: ${processed.toLocaleString()} / ${total.toLocaleString()}`;
+                    }
+                    return title;
+                });
+                return parts.join(' · ');
             }
             if (jobState.activityMessage) {
                 return jobState.activityMessage;
@@ -2137,6 +2331,11 @@ export default function ClientPage() {
         return emailLower === 'not found' || emailLower === 'not_found' || emailLower.includes('not found');
     };
 
+    const isLegacyNotFoundFounderName = (founderName: string) => {
+        const nameLower = founderName.toLowerCase().trim();
+        return nameLower === 'not found' || nameLower === 'not_found' || nameLower.includes('not found');
+    };
+
     /** Raw contacts.email value for table/detail — null/empty stays empty (—). */
     const formatRawEmailValue = (email: string | undefined | null) => {
         const trimmed = String(email ?? '').trim();
@@ -2147,6 +2346,19 @@ export default function ClientPage() {
     const hasDiscoveredEmail = (email: string | undefined | null) => {
         const trimmed = String(email ?? '').trim();
         return Boolean(trimmed && !isLegacyNotFoundEmail(trimmed));
+    };
+
+    const hasValidFounderName = (founderName: string | undefined | null) => {
+        const trimmed = String(founderName ?? '').trim();
+        return Boolean(trimmed && !isLegacyNotFoundFounderName(trimmed));
+    };
+
+    const hasFounderSearchCompleted = (
+        founderName: string | undefined | null,
+        founderFindCompletedAt: string | undefined | null
+    ) => {
+        const trimmed = String(founderName ?? '').trim();
+        return Boolean(founderFindCompletedAt) || isLegacyNotFoundFounderName(trimmed);
     };
 
     const formatLeadStageTimestamp = (value?: string | null) => {
@@ -2191,6 +2403,33 @@ export default function ClientPage() {
         return {
             label: 'Not searched',
             detail: 'Email discovery has not run for this lead',
+            variant: 'not-run'
+        };
+    };
+
+    const getFounderFindDisplay = (
+        founderName: string | undefined | null,
+        founderFindCompletedAt: string | undefined | null
+    ): EmailStageDisplay => {
+        if (hasValidFounderName(founderName)) {
+            const when = formatLeadStageTimestamp(founderFindCompletedAt);
+            return {
+                label: String(founderName).trim(),
+                detail: when ? `Discovered ${when}` : undefined,
+                variant: 'valid'
+            };
+        }
+        if (hasFounderSearchCompleted(founderName, founderFindCompletedAt)) {
+            const when = formatLeadStageTimestamp(founderFindCompletedAt);
+            return {
+                label: 'Not found',
+                detail: when ? `Searched ${when}` : 'Discovery completed',
+                variant: 'not-found'
+            };
+        }
+        return {
+            label: 'Not searched',
+            detail: 'Founder discovery has not run for this lead',
             variant: 'not-run'
         };
     };
@@ -2314,6 +2553,24 @@ export default function ClientPage() {
         );
     };
 
+    const renderFounderNameCell = (
+        founderName: string | undefined | null,
+        founderFindCompletedAt: string | undefined | null
+    ) => {
+        if (hasValidFounderName(founderName)) {
+            return String(founderName).trim();
+        }
+        const find = getFounderFindDisplay(founderName, founderFindCompletedAt);
+        return (
+            <span
+                className={`lead-pastel-chip lead-pastel-chip--status-${find.variant}`}
+                style={{ flexShrink: 0 }}
+            >
+                {find.label}
+            </span>
+        );
+    };
+
     const renderEmailStageRow = (
         title: string,
         stage: EmailStageDisplay,
@@ -2354,7 +2611,7 @@ export default function ClientPage() {
         const field = leadFilterFieldMap.get(fieldKey);
         if (!field) return false;
         if (!field.operators.some((operator) => operator.key === operatorKey)) return false;
-        const noValueOps = ['is_empty', 'not_empty', 'is_true', 'is_false'];
+        const noValueOps = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid'];
         return !noValueOps.includes(operatorKey);
     }, [leadFilterFieldMap]);
 
@@ -3059,6 +3316,7 @@ export default function ClientPage() {
         createdAt: row.createdAt || "",
         emailFindCompletedAt: row.emailFindCompletedAt || "",
         emailVerifyCompletedAt: row.emailVerifyCompletedAt || "",
+        founderFindCompletedAt: row.founderFindCompletedAt || "",
         lastContactedAt: row.lastContactedAt || "",
         jobId: row.jobId || "",
         campaignCountAllTime: typeof row.campaignCountAllTime === "number" ? row.campaignCountAllTime : null,
@@ -4709,7 +4967,7 @@ export default function ClientPage() {
 
     const waitForGracefulPause = useCallback(
         async (jobId: string) => {
-            const deadline = Date.now() + 120_000;
+            const deadline = Date.now() + 15_000;
             while (Date.now() < deadline) {
                 const idToken = await getAccessToken();
                 if (!idToken) return null;
@@ -4721,28 +4979,27 @@ export default function ClientPage() {
                     }
                 );
                 if (!response.ok) {
-                    await new Promise((resolve) => setTimeout(resolve, 500));
+                    await new Promise((resolve) => setTimeout(resolve, 200));
                     continue;
                 }
                 const payload = await response.json();
                 const raw = payload?.job as Record<string, unknown> | undefined;
                 if (!raw?.id) {
-                    await new Promise((resolve) => setTimeout(resolve, 500));
+                    await new Promise((resolve) => setTimeout(resolve, 200));
                     continue;
                 }
                 const snapshot = mapApiJobToJob(raw);
                 setJobState((prev) => mergeJobState(prev, snapshot));
                 const pauseSettled =
-                    snapshot.queueStatus === 'paused'
-                    || (
-                        snapshot.paused === true
-                        && snapshot.workerActive !== true
-                        && snapshot.queueStatus !== 'running'
+                    snapshot.paused === true
+                    && (
+                        snapshot.queueStatus === 'paused'
+                        || snapshot.workerActive !== true
                     );
                 if (pauseSettled) {
                     return snapshot;
                 }
-                await new Promise((resolve) => setTimeout(resolve, 500));
+                await new Promise((resolve) => setTimeout(resolve, 200));
             }
             return null;
         },
@@ -4774,20 +5031,30 @@ export default function ClientPage() {
                 setJobState((prev) => (prev ? { ...prev, paused: false } : prev));
                 setJobStatusMessage('Job resumed.');
             } else {
-                const snapshot = await waitForGracefulPause(jobState.id);
                 setJobState((prev) =>
                     prev
                         ? {
                               ...prev,
                               paused: true,
-                              queueStatus: snapshot?.queueStatus ?? 'paused',
+                              queueStatus: 'paused',
                               workerActive: false,
                           }
                         : prev
                 );
-                setJobStatusMessage(
-                    snapshot ? 'Job paused.' : 'Pause requested; worker may still be stopping.'
-                );
+                setJobStatusMessage('Job paused.');
+                void waitForGracefulPause(jobState.id).then((snapshot) => {
+                    if (!snapshot) return;
+                    setJobState((prev) =>
+                        prev
+                            ? {
+                                  ...prev,
+                                  paused: true,
+                                  queueStatus: snapshot.queueStatus ?? 'paused',
+                                  workerActive: snapshot.workerActive === true,
+                              }
+                            : prev
+                    );
+                });
             }
         } catch (error) {
             setToastMessage(error instanceof Error ? error.message : `Failed to ${endpoint} job`);
@@ -6896,7 +7163,7 @@ export default function ClientPage() {
                                                     overflow: 'hidden',
                                                     textOverflow: 'ellipsis',
                                                     whiteSpace: 'nowrap'
-                                                }}>{lead.founderName || '—'}</td>
+                                                }}>{renderFounderNameCell(lead.founderName, lead.founderFindCompletedAt)}</td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
                                                     maxWidth: '320px'
@@ -8138,14 +8405,14 @@ export default function ClientPage() {
                                     <>
                                         {/* Pipeline flow summary */}
                                         {(() => {
-                                            const foundersFound = deriveStageTotals(jobState.stages.founders).throughputNum ?? 0;
                                             const dedupedTotal = deriveDedupedDomainBaseline(jobState);
-                                            const foundersProcessedRaw = deriveStageTotals(jobState.stages.founders).total ?? 0;
+                                            const foundersFound = deriveStageTotals(jobState.stages.founders, dedupedTotal).throughputNum ?? 0;
+                                            const foundersProcessedRaw = deriveStageTotals(jobState.stages.founders, dedupedTotal).total ?? 0;
                                             const foundersProcessed = foundersProcessedRaw > 0 ? foundersProcessedRaw : (dedupedTotal ?? 0);
                                             const foundersFoundDisplay = foundersProcessed > 0 ? Math.min(foundersFound, foundersProcessed) : foundersFound;
-                                            const emailsFound = (jobState.stages.emailDiscovery?.summary as any)?.Found ?? (jobState.stages.emailDiscovery?.summary as any)?.found ?? deriveStageTotals(jobState.stages.emailDiscovery).throughputNum ?? 0;
-                                            const safe = (jobState.stages.verification?.summary as any)?.Valid ?? (jobState.stages.verification?.summary as any)?.valid ?? 0;
-                                            const personalized = (jobState.stages.personalization?.summary as any)?.Personalized ?? (jobState.stages.personalization?.summary as any)?.personalized ?? (jobState.stages.personalization?.progress?.stats as any)?.personalized ?? 0;
+                                            const emailsFound = deriveStageTotals(jobState.stages.emailDiscovery, dedupedTotal).throughputNum ?? 0;
+                                            const safe = deriveStageTotals(jobState.stages.verification, dedupedTotal).throughputNum ?? 0;
+                                            const personalized = deriveStageTotals(jobState.stages.personalization, dedupedTotal).throughputNum ?? 0;
                                             
                                             return (
                                                 <div style={{ 
@@ -8193,9 +8460,14 @@ export default function ClientPage() {
                                         {[...resolveStageOrder(jobState)].map((stageKey) => {
                                             const stage = jobState.stages[stageKey];
                                             const meta = STAGE_METADATA[stageKey];
-                                            const { throughputNum, total } = deriveStageTotals(stage);
+                                            const dedupedTotal = deriveDedupedDomainBaseline(jobState);
+                                            const { throughputNum, total } = deriveStageTotals(stage, dedupedTotal);
                                             const summary = stage?.summary as Record<string, unknown> | null;
-                                            const stats = stage?.progress?.stats as Record<string, unknown> | undefined;
+                                            const batchAgg = stage?.progress?.batches && typeof stage.progress.batches === "object"
+                                                ? aggregateBatchProgress(stageKey, stage.progress.batches as Record<string, Record<string, unknown>>)
+                                                : null;
+                                            const stats = (batchAgg?.stats as Record<string, unknown> | undefined)
+                                                ?? (stage?.progress?.stats as Record<string, unknown> | undefined);
                                             
                                             // Simplified metrics based on stage type
                                             let heroNumber = null;
@@ -8254,24 +8526,32 @@ export default function ClientPage() {
                                                     ? `${signals.toLocaleString()} emitted`
                                                     : "Awaiting...";
                                             } else if (stageKey === "founders") {
-                                                const dedupedTotal = deriveDedupedDomainBaseline(jobState);
-                                                const processedRaw = total ?? 0;
-                                                const processed = processedRaw > 0 ? processedRaw : (dedupedTotal ?? 0);
+                                                const processedRaw = total ?? dedupedTotal ?? 0;
+                                                const processed = processedRaw > 0 ? Math.min(processedRaw, dedupedTotal ?? processedRaw) : (dedupedTotal ?? 0);
                                                 const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
+                                                const importedFromCsv =
+                                                    !extractNumberFrom(summary, ["Found", "found"])
+                                                    && (extractNumberFrom(summary, ["processed", "imported"]) ?? found) > 0;
                                                 const cost = stageCostFromStage(stage);
                                                 heroNumber = found;
-                                                heroLabel = "Found";
-                                                subtext = processed > 0 ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield` : "Awaiting...";
+                                                heroLabel = importedFromCsv ? "Imported" : "Found";
+                                                subtext = processed > 0
+                                                    ? importedFromCsv
+                                                        ? `${found.toLocaleString()} imported from CSV`
+                                                        : `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield`
+                                                    : "Awaiting...";
                                                 if (cost !== null && cost > 0) costFooter = `Cost $${cost.toFixed(2)}`;
                                             } else if (stageKey === "emailDiscovery") {
-                                                const imported =
-                                                    extractNumberFrom(stats, ["imported", "Found", "found"])
+                                                const skippedImport = summary?.skipped === true;
+                                                const imported = skippedImport
+                                                    ? (dedupedTotal ?? throughputNum ?? 0)
+                                                    : (extractNumberFrom(stats, ["imported", "Found", "found"])
                                                     ?? (typeof stage?.progress?.found === "number"
                                                         ? stage.progress.found
                                                         : null)
                                                     ?? extractNumberFrom(summary, ["Found", "found", "imported"])
                                                     ?? throughputNum
-                                                    ?? 0;
+                                                    ?? 0);
                                                 const found = imported;
                                                 // `stage.progress.processed` is job-wide: it includes the offset for
                                                 // founders that had no name (or were already done) and were never
@@ -8294,10 +8574,12 @@ export default function ClientPage() {
                                                         ? stage.progress.processed
                                                         : total ?? 0);
                                                 heroNumber = found;
-                                                heroLabel = found > 0 && checkedThisRun === 0 && attempted > 0
+                                                heroLabel = skippedImport || (found > 0 && checkedThisRun === 0 && attempted > 0)
                                                     ? "Emails Imported"
                                                     : "Emails Found";
-                                                subtext = attempted > 0
+                                                subtext = skippedImport && found > 0
+                                                    ? `${found.toLocaleString()} imported from CSV`
+                                                    : attempted > 0
                                                     ? checkedThisRun > 0
                                                         ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
                                                         : `${attempted.toLocaleString()} imported from CSV`
@@ -8308,19 +8590,21 @@ export default function ClientPage() {
                                                 }
                                             } else if (stageKey === "verification") {
                                                 const safe =
-                                                    extractNumberFrom(summary, ["Valid", "valid"])
-                                                    ?? extractNumberFrom(stats, ["valid", "Valid"])
+                                                    extractNumberFrom(stats, ["valid", "Valid"])
+                                                    ?? extractNumberFrom(summary, ["Valid", "valid"])
                                                     ?? 0;
                                                 const risky =
                                                     extractNumberFrom(summary, ["Valid-Risky", "valid-risky"])
                                                     ?? extractNumberFrom(stats, ["valid-risky", "Valid-Risky"])
                                                     ?? 0;
                                                 const verified =
-                                                    typeof stage?.progress?.processed === "number"
+                                                    typeof batchAgg?.processed === "number"
+                                                        ? batchAgg.processed
+                                                        : typeof stage?.progress?.processed === "number"
                                                         ? stage.progress.processed
                                                         : total ?? 0;
                                                 heroNumber = verified;
-                                                heroLabel = "Verfified";
+                                                heroLabel = "Verified";
                                                 const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
                                                 subtext =
                                                     verified > 0
@@ -8333,6 +8617,9 @@ export default function ClientPage() {
                                             } else if (stageKey === "personalization") {
                                                 const personalized =
                                                     extractNumberFrom(stats, ["personalized", "Personalized"])
+                                                    ?? (typeof batchAgg?.processed === "number"
+                                                        ? batchAgg.processed
+                                                        : null)
                                                     ?? (typeof stage?.progress?.processed === "number"
                                                         ? stage.progress.processed
                                                         : null)
@@ -8340,11 +8627,14 @@ export default function ClientPage() {
                                                     ?? throughputNum
                                                     ?? 0;
                                                 const candidates =
-                                                    total
+                                                    (typeof batchAgg?.total === "number" ? batchAgg.total : null)
+                                                    ?? total
                                                     ?? extractNumberFrom(summary, ["total", "queued", "attempted"])
                                                     ?? 0;
                                                 const processedNow =
-                                                    typeof stage?.progress?.processed === "number"
+                                                    typeof batchAgg?.processed === "number"
+                                                        ? batchAgg.processed
+                                                        : typeof stage?.progress?.processed === "number"
                                                         ? stage.progress.processed
                                                         : personalized;
                                                 const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
@@ -11950,9 +12240,11 @@ export default function ClientPage() {
                                             overflow: 'hidden',
                                             textOverflow: 'ellipsis'
                                         }}>
-                                            {selectedLead.founderName || selectedLead.domain || '—'}
+                                            {hasValidFounderName(selectedLead.founderName)
+                                                ? selectedLead.founderName
+                                                : (selectedLead.domain || '—')}
                                         </h2>
-                                        {selectedLead.founderName && selectedLead.domain && (
+                                        {hasValidFounderName(selectedLead.founderName) && selectedLead.domain && (
                                             <span style={{ fontSize: '0.85rem', color: 'var(--app-text-ghost)' }}>
                                                 {selectedLead.domain}
                                             </span>
@@ -12060,10 +12352,15 @@ export default function ClientPage() {
                                     fontSize: '0.9rem',
                                     lineHeight: 1.6
                                 }}>
-                                    {selectedLead.founderName && (
+                                    {hasValidFounderName(selectedLead.founderName) ? (
                                         <>
                                             <span style={{ color: 'var(--app-text-faint)' }}>Founder</span>
                                             <span style={{ color: 'var(--app-text-high)' }}>{selectedLead.founderName}</span>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <span style={{ color: 'var(--app-text-faint)' }}>Founder</span>
+                                            <span>{renderFounderNameCell(selectedLead.founderName, selectedLead.founderFindCompletedAt)}</span>
                                         </>
                                     )}
                                     {selectedLead.createdAt && (

@@ -5,7 +5,7 @@ import { promises as dns } from 'dns';
 import { env } from '../config/env.js';
 import { logTimestamp } from '../utils/logTimestamp.js';
 import { DEFAULT_PRICING, loadPricing, computeJobCost, normalizeStageSummary } from '../utils/pricing.js';
-import { filterJobDomainsForDedupe, upsertLeadRowsBatch } from './leads.js';
+import { filterJobDomainsForDedupe, upsertLeadRowsBatch, upsertFounderSearchBatch } from './leads.js';
 import { isNotFoundValue } from './enrichmentCohort.js';
 import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
@@ -64,8 +64,10 @@ export const jobs = new Map();
 const SQL_UPDATE_INTERVAL = 5;
 const SQL_MIN_INTERVAL_MS = 2000;
 const REALTIME_STAGE_MIN_INTERVAL_MS = 500;
-const DNS_QUERY_TIMEOUT_MS = 2500;
-const DNS_CHECK_CONCURRENCY = 25;
+import {
+    DNS_QUERY_TIMEOUT_MS,
+    DNS_CHECK_CONCURRENCY
+} from '../enrichment/domainPrepConfig.js';
 const PLACEHOLDER_CONTACT_MAX_DOMAINS = Math.max(
     0,
     parseInt(process.env.PLACEHOLDER_CONTACT_MAX_DOMAINS || '5000', 10)
@@ -589,34 +591,16 @@ async function resolveProcessableCount(job) {
     return (counts.done || 0) + (counts.processing || 0) + (counts.pending || 0);
 }
 
-async function upsertFounderBatch(job, rows) {
+async function handleFounderBatch(job, rows) {
     if (!rows?.length) return;
-    await upsertLeadRowsBatch({
+    await upsertFounderSearchBatch({
         agencyId: job.uid,
         clientId: job.sqlClientId,
-        rows,
-        type: 'founders',
         jobId: job.id,
+        rows,
         mergeMode: enrichmentMergeMode(job),
         onTiming: makeUpsertTiming(job, 'founders')
     });
-}
-
-async function handleFounderBatch(job, rows) {
-    if (!rows?.length) return;
-    const toUpsert = [];
-    const excludedDomains = [];
-    for (const row of rows) {
-        if (isNotFoundValue(row.founder_name)) {
-            excludedDomains.push(row.domain);
-            continue;
-        }
-        toUpsert.push(row);
-    }
-    if (excludedDomains.length) {
-        await markJobDomainsFounderExcluded(job.id, excludedDomains);
-    }
-    await upsertFounderBatch(job, toUpsert);
 }
 
 async function processJob(job) {
@@ -874,6 +858,7 @@ async function processJob(job) {
                     const founder = String(raw[founderCol] || raw.founder_name || '').trim();
                     if (isNotFoundValue(founder)) {
                         excludedDomains.push(row.domain_normalized);
+                        founderRows.push({ domain: row.domain_normalized, founder_name: '' });
                         doneDomains.push(row.domain_normalized);
                         continue;
                     }
@@ -889,13 +874,6 @@ async function processJob(job) {
                     }
                 }
 
-                if (excludedDomains.length) {
-                    await timeJobOp(
-                        job,
-                        { label: 'misc:markFounderExcluded', category: 'misc', stage: 'founders', rows: excludedDomains.length },
-                        () => markJobDomainsFounderExcluded(job.id, excludedDomains)
-                    );
-                }
                 if (doneDomains.length) {
                     await timeJobOp(
                         job,
@@ -904,7 +882,14 @@ async function processJob(job) {
                     );
                 }
                 if (founderRows.length) {
-                    await upsertFounderBatch(job, founderRows);
+                    await upsertFounderSearchBatch({
+                        agencyId: job.uid,
+                        clientId: job.sqlClientId,
+                        jobId: job.id,
+                        rows: founderRows,
+                        mergeMode: enrichmentMergeMode(job),
+                        onTiming: makeUpsertTiming(job, 'founders')
+                    });
                 }
 
                 log(job, `Founders from CSV: upserted ${founderRows.length.toLocaleString()} founders`);
@@ -925,6 +910,8 @@ async function processJob(job) {
                     markDomainsDone: (domains) => markJobDomainsDone(job.id, domains),
                     checkpoint: () => gate.checkpoint(),
                     checkPaused: () => gate.checkPaused(),
+                    jobId: job.id,
+                    agencyId: job.uid,
                     totalDomainCount: totalForJob,
                     apiKeys: job.apiKeys,
                     pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,

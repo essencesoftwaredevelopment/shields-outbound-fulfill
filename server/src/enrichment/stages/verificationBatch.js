@@ -1,8 +1,16 @@
 import { runEmailVerifier } from '../../services/emailVerifier.js';
-import { getVerifyQueue } from '../../services/db/jobs.js';
+import { getVerifyQueue, getJobById } from '../../services/db/jobs.js';
 import { upsertLeadRowsBatch } from '../../services/leads.js';
-import { assertJobActive, updateJobStage, setJobActivity } from '../persist.js';
+import { assertJobActive } from '../persist.js';
+import { createRateLimitHooks } from '../rateLimit.js';
 import { contextToJob } from '../context.js';
+import {
+    beginJobStage,
+    finishJobStage,
+    createStageLogger,
+    resolveJobTotal,
+    batchProgressOffset
+} from '../stageProgress.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -18,14 +26,22 @@ function filterToBatch(rows, batchDomains) {
 /**
  * @param {import('../context.js').EnrichmentContext} ctx
  * @param {string[]} batchDomains
+ * @param {{ batchIndex?: number }} [batchOpts]
  */
-export async function runVerificationBatch(ctx, batchDomains) {
+export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
+    const batchIndex = batchOpts.batchIndex ?? 0;
+    const jobRow = await getJobById(ctx.jobId, ctx.agencyId);
+    const jobTotal = resolveJobTotal(ctx) ?? batchDomains.length;
+    const progressOffset = batchProgressOffset(batchIndex);
+    const stageLog = createStageLogger(ctx, 'verification', {
+        label: 'verify',
+        jobTotal,
+        progressOffset,
+        batchIndex
+    });
+
     if (ctx.options.skipVerification) {
-        await updateJobStage(ctx.jobId, ctx.agencyId, 'verification', {
-            status: 'completed',
-            completedAt: new Date().toISOString(),
-            summary: { skipped: true }
-        });
+        await finishJobStage(ctx, 'verification', { skipped: true });
         return { skipped: true };
     }
 
@@ -33,20 +49,21 @@ export async function runVerificationBatch(ctx, batchDomains) {
     const queue = filterToBatch(
         await getVerifyQueue(ctx.agencyId, ctx.clientId, ctx.jobId, {
             reprocessInclude,
-            limit: batchDomains.length + 500
+            limit: batchDomains.length + 500,
+            jobStartedAt: jobRow?.created_at || null
         }),
         batchDomains
     );
 
     if (!queue.length) {
+        await finishJobStage(ctx, 'verification', { processed: 0, cost: 0 });
         return { processed: 0 };
     }
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'verification', {
-        status: 'running',
-        startedAt: new Date().toISOString()
+    await beginJobStage(ctx, 'verification', {
+        activity: `Email verification (${queue.length})…`,
+        batchIndex
     });
-    await setJobActivity(ctx.jobId, ctx.agencyId, `Email verification (${queue.length})…`);
 
     const candidates = queue.map((r) => ({
         domain: r.domain,
@@ -55,12 +72,14 @@ export async function runVerificationBatch(ctx, batchDomains) {
     }));
 
     const job = contextToJob(ctx);
+
     const summary = await runEmailVerifier({
         candidates,
         apiKeys: { ...ctx.apiKeys, kitt: ctx.apiKeys.trykitt },
         provider: ctx.options.emailVerificationProvider || 'trykitt',
-        log: (msg) => console.log(`[${ctx.jobId}] [verify] ${msg}`),
+        log: stageLog,
         job,
+        rateLimitHooks: createRateLimitHooks(ctx),
         checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
         checkPaused: () => assertJobActive(ctx.jobId, ctx.agencyId),
         pricing: ctx.pricing,
@@ -77,11 +96,6 @@ export async function runVerificationBatch(ctx, batchDomains) {
         }
     });
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'verification', {
-        status: 'completed',
-        completedAt: new Date().toISOString(),
-        summary
-    });
-
+    await finishJobStage(ctx, 'verification', summary);
     return summary;
 }

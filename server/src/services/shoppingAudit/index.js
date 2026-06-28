@@ -181,6 +181,322 @@ export function isShoppingAuditJob(job) {
     return Boolean(job?.stages?.shopifyCatalog);
 }
 
+export function createShoppingAuditBatchState() {
+    return {
+        stats: {
+            shopify: 0,
+            heroes: 0,
+            serperClean: 0,
+            serperAmbiguous: 0,
+            serperNone: 0,
+            signals: 0,
+            headless: 0,
+            cost: 0
+        },
+        companyIdByDomain: {},
+        catalogResults: [],
+        selections: [],
+        observations: [],
+        signalByDomain: {},
+        qualifiedDomains: []
+    };
+}
+
+function hydrateShoppingAuditBatchState(raw) {
+    const base = createShoppingAuditBatchState();
+    if (!raw || typeof raw !== 'object') return base;
+    return {
+        ...base,
+        ...raw,
+        stats: { ...base.stats, ...(raw.stats || {}) },
+        companyIdByDomain: raw.companyIdByDomain || {},
+        catalogResults: Array.isArray(raw.catalogResults) ? raw.catalogResults : [],
+        selections: Array.isArray(raw.selections) ? raw.selections : [],
+        observations: Array.isArray(raw.observations) ? raw.observations : [],
+        signalByDomain: raw.signalByDomain || {},
+        qualifiedDomains: Array.isArray(raw.qualifiedDomains) ? raw.qualifiedDomains : []
+    };
+}
+
+function buildSkipDomains(state) {
+    const nonShopifyDomains = state.catalogResults
+        .filter((row) => !row.isShopify)
+        .map((row) => row.domain);
+    const shopifyNoSignal = state.selections
+        .map((selection) => selection.domain)
+        .filter((domain) => !state.signalByDomain[domain]);
+
+    return {
+        not_shopify: nonShopifyDomains,
+        no_signal: shopifyNoSignal
+    };
+}
+
+/**
+ * Run one shopping-audit stage for a workflow batch.
+ * Returns serializable state for the next step.
+ */
+export async function runShoppingAuditPipelineStage({
+    stage,
+    job,
+    domains,
+    state: rawState = null,
+    features: rawFeatures,
+    log,
+    setActivity,
+    checkpoint,
+    updateStage,
+    pricing,
+    recordTiming,
+    enableTier2 = true,
+    enableBrokenPage = false,
+    rateLimitHooks = null
+}) {
+    const features = mergeAuditFeatures(rawFeatures);
+    const state = hydrateShoppingAuditBatchState(rawState);
+    const companyIdByDomain = new Map(Object.entries(state.companyIdByDomain || {}));
+
+    if (stage === 'shopifyCatalog') {
+        if (domains.length) {
+            const companyStart = Date.now();
+            const companyMap = await batchUpsertCompanies(
+                pool,
+                job.uid,
+                job.sqlClientId,
+                domains.map((d) => ({ domain: d }))
+            );
+            for (const [domain, companyId] of companyMap.entries()) {
+                companyIdByDomain.set(domain, companyId);
+            }
+            recordTiming?.({
+                label: 'upsert:auditCompanies',
+                category: 'upsert',
+                durationMs: Date.now() - companyStart,
+                rows: domains.length,
+                stage: 'shopifyCatalog'
+            });
+        }
+
+        await updateStage('shopifyCatalog', async () => {
+            setActivity?.(`Fetching Shopify catalogs for ${domains.length} domains…`);
+            const fetchStart = Date.now();
+            const result = await runShopifyCatalogStage({
+                domains,
+                log,
+                checkpoint,
+                onProgress: ({ processed, total, shopify }) => {
+                    log(`Shopify catalog: ${processed}/${total} (${shopify} Shopify)`, {
+                        progress: { stage: 'shopifyCatalog', processed, total, stats: { shopify } }
+                    });
+                }
+            });
+            recordTiming?.({
+                label: 'fetch:shopifyCatalog',
+                category: 'fetch',
+                durationMs: Date.now() - fetchStart,
+                rows: domains.length,
+                stage: 'shopifyCatalog'
+            });
+
+            state.catalogResults = result.results;
+            state.stats.shopify = result.shopifyCount;
+
+            await persistCatalogSnapshots({
+                catalogResults: state.catalogResults,
+                agencyId: job.uid,
+                clientId: job.sqlClientId,
+                companyIdByDomain,
+                jobId: job.id,
+                log,
+                setActivity,
+                recordTiming
+            });
+
+            return {
+                processed: domains.length,
+                shopify: result.shopifyCount,
+                nonShopify: result.nonShopifyDomains.length,
+                cost: 0
+            };
+        });
+    }
+
+    if (stage === 'heroSelection') {
+        await updateStage('heroSelection', async () => {
+            let selections = runHeroSelectionStage(state.catalogResults, features, log);
+            state.stats.heroes = selections.length;
+
+            selections = await persistHeroSelections({
+                selections,
+                agencyId: job.uid,
+                clientId: job.sqlClientId,
+                companyIdByDomain,
+                jobId: job.id,
+                features,
+                log,
+                recordTiming
+            });
+            state.selections = selections;
+
+            return { processed: selections.length, cost: 0 };
+        });
+    }
+
+    if (stage === 'serperShopping') {
+        const cacheMap = await loadSerperShoppingCacheMap(job.id);
+        let serperCacheUpsertMs = 0;
+        let serperCacheUpsertCount = 0;
+
+        await updateStage('serperShopping', async () => {
+            setActivity?.(`Running Serper Shopping for ${state.selections.length} products…`);
+            const fetchStart = Date.now();
+            const serperResult = await runSerperShoppingBatch({
+                selections: state.selections,
+                apiKey: job.apiKeys?.serper,
+                geo: features.serperGeo,
+                loadCache: async (domain) => cacheMap.get(domain) || null,
+                saveCache: async (entries) => {
+                    if (!entries?.length) return;
+                    setActivity?.(`Caching ${entries.length} Serper Shopping results…`);
+                    const cacheStart = Date.now();
+                    await upsertSerperShoppingCacheBatch(job.id, entries);
+                    serperCacheUpsertMs += Date.now() - cacheStart;
+                    serperCacheUpsertCount += entries.length;
+                },
+                log,
+                checkpoint,
+                onProgress: ({ processed, total, serperRequests }) => {
+                    setActivity?.(`Serper Shopping: ${processed}/${total}`);
+                    log(`Serper Shopping: ${processed}/${total}`, {
+                        progress: { stage: 'serperShopping', processed, total, stats: { serperRequests } }
+                    });
+                },
+                pricing: pricing?.stages?.serperShopping,
+                rateLimitHooks
+            });
+            recordTiming?.({
+                label: 'fetch:serperShopping',
+                category: 'fetch',
+                durationMs: Date.now() - fetchStart - serperCacheUpsertMs,
+                rows: state.selections.length,
+                stage: 'serperShopping'
+            });
+            if (serperCacheUpsertMs > 0) {
+                recordTiming?.({
+                    label: 'upsert:serperShoppingCache',
+                    category: 'upsert',
+                    durationMs: serperCacheUpsertMs,
+                    rows: serperCacheUpsertCount,
+                    stage: 'serperShopping'
+                });
+            }
+
+            state.observations = serperResult.observations;
+            state.stats.serperClean = serperResult.clean;
+            state.stats.serperAmbiguous = serperResult.ambiguous;
+            state.stats.serperNone = serperResult.none;
+            state.stats.cost += serperResult.cost;
+
+            await persistAdObservations({
+                observations: state.observations,
+                agencyId: job.uid,
+                clientId: job.sqlClientId,
+                jobId: job.id,
+                features,
+                log,
+                setActivity,
+                recordTiming
+            });
+
+            return {
+                processed: state.observations.length,
+                clean: serperResult.clean,
+                ambiguous: serperResult.ambiguous,
+                none: serperResult.none,
+                headless: state.stats.headless,
+                cost: serperResult.cost
+            };
+        });
+    }
+
+    if (stage === 'signalWaterfall') {
+        const signalByDomain = new Map(Object.entries(state.signalByDomain || {}));
+        const qualifiedDomains = [...state.qualifiedDomains];
+
+        await updateStage('signalWaterfall', async () => {
+            const emissions = await runSignalWaterfallStage({
+                selectionsWithObservations: state.observations,
+                features,
+                log,
+                enableTier2,
+                enableBrokenPage
+            });
+
+            if (emissions.length) {
+                log(`Signal waterfall: persisting ${emissions.length} emissions to DB…`);
+                const persistStart = Date.now();
+
+                const idByDomain = await insertSignalEmissionsBatch({
+                    agencyId: job.uid,
+                    clientId: job.sqlClientId,
+                    companyIdByDomain,
+                    jobId: job.id,
+                    rows: emissions.map((row) => ({
+                        domain: row.domain,
+                        signal: row.signal
+                    }))
+                });
+
+                for (const row of emissions) {
+                    const signalId = idByDomain.get(row.domain);
+                    if (!signalId) continue;
+                    signalByDomain.set(row.domain, {
+                        signalId,
+                        signal: row.signal,
+                        selection: row.selection
+                    });
+                    qualifiedDomains.push(row.domain);
+                }
+
+                recordTiming?.({
+                    label: 'upsert:signalEmissions',
+                    category: 'upsert',
+                    durationMs: Date.now() - persistStart,
+                    rows: emissions.length,
+                    stage: 'signalWaterfall'
+                });
+                log(`Signal waterfall: persisted ${emissions.length} emissions`);
+            }
+
+            state.stats.signals = emissions.length;
+            state.signalByDomain = Object.fromEntries(signalByDomain.entries());
+            state.qualifiedDomains = qualifiedDomains;
+            await updateCompanyLastAudit(job.sqlClientId, qualifiedDomains);
+
+            return {
+                processed: emissions.length,
+                totalCandidates: state.observations.length,
+                cost: 0
+            };
+        });
+    }
+
+    state.companyIdByDomain = Object.fromEntries(companyIdByDomain.entries());
+    return state;
+}
+
+export function finalizeShoppingAuditBatchState(rawState) {
+    const state = hydrateShoppingAuditBatchState(rawState);
+    const skipDomains = buildSkipDomains(state);
+
+    return {
+        stats: state.stats,
+        signalByDomain: state.signalByDomain,
+        qualifiedDomains: state.qualifiedDomains,
+        skipDomains
+    };
+}
+
 export async function runShoppingAuditPipeline({
     job,
     domains,

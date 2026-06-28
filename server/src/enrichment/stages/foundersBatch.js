@@ -4,13 +4,20 @@ import {
     loadSerperCacheMap,
     upsertSerperCacheBatch,
     markJobDomainsDone,
-    markJobDomainsFounderExcluded
+    getJobById
 } from '../../services/db/jobs.js';
-import { upsertLeadRowsBatch } from '../../services/leads.js';
+import { upsertLeadRowsBatch, upsertFounderSearchBatch } from '../../services/leads.js';
 import { isNotFoundValue } from '../../services/enrichmentCohort.js';
 import { contextToJob } from '../context.js';
-import { assertJobActive, updateJobStage, setJobActivity } from '../persist.js';
+import { assertJobActive } from '../persist.js';
 import { createRateLimitHooks } from '../rateLimit.js';
+import {
+    beginJobStage,
+    finishJobStage,
+    createStageLogger,
+    resolveJobTotal,
+    batchProgressOffset
+} from '../stageProgress.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -21,9 +28,19 @@ function enrichmentMergeMode(ctx) {
 /**
  * @param {import('../context.js').EnrichmentContext} ctx
  * @param {string[]} batchDomains
+ * @param {{ batchIndex?: number }} [batchOpts]
  */
-export async function runFoundersBatch(ctx, batchDomains) {
+export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
+    const batchIndex = batchOpts.batchIndex ?? 0;
     const batchSet = new Set(batchDomains.map((d) => d.toLowerCase()));
+    const jobTotal = resolveJobTotal(ctx);
+    const progressOffset = batchProgressOffset(batchIndex);
+    const stageLog = createStageLogger(ctx, 'founders', {
+        label: 'founders',
+        jobTotal,
+        progressOffset,
+        batchIndex
+    });
 
     if (ctx.options.skipFounderFinder) {
         const founderCol = ctx.options.columnMapping?.founder || 'founder_name';
@@ -40,6 +57,7 @@ export async function runFoundersBatch(ctx, batchDomains) {
             const founder = String(raw[founderCol] || raw.founder_name || '').trim();
             if (isNotFoundValue(founder)) {
                 excludedDomains.push(row.domain_normalized);
+                founderRows.push({ domain: row.domain_normalized, founder_name: '' });
                 doneDomains.push(row.domain_normalized);
                 continue;
             }
@@ -49,63 +67,60 @@ export async function runFoundersBatch(ctx, batchDomains) {
             }
         }
 
-        if (excludedDomains.length) {
-            await markJobDomainsFounderExcluded(ctx.jobId, excludedDomains);
-        }
         if (doneDomains.length) {
             await markJobDomainsDone(ctx.jobId, doneDomains);
         }
         if (founderRows.length) {
-            await upsertLeadRowsBatch({
+            await upsertFounderSearchBatch({
                 agencyId: ctx.agencyId,
                 clientId: ctx.clientId,
                 rows: founderRows,
-                type: 'founders',
                 jobId: ctx.jobId,
                 mergeMode: enrichmentMergeMode(ctx)
             });
         }
 
-        return { processed: founderRows.length, excluded: excludedDomains.length };
+        const summary = {
+            processed: founderRows.length,
+            excluded: excludedDomains.length,
+            Found: founderRows.length,
+            imported: founderRows.length,
+            cost: 0
+        };
+        await finishJobStage(ctx, 'founders', summary);
+        return summary;
     }
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'founders', {
-        status: 'running',
-        startedAt: new Date().toISOString()
+    await beginJobStage(ctx, 'founders', {
+        activity: `Founder lookup (${batchDomains.length} domains)…`,
+        batchIndex
     });
-    await setJobActivity(ctx.jobId, ctx.agencyId, `Founder lookup (${batchDomains.length} domains)…`);
 
-    const job = contextToJob(ctx);
     const summary = await runFounderFinder({
         domains: batchDomains,
         loadSerperCache: () => loadSerperCacheMap(ctx.jobId),
         saveSerperCache: (entries) => upsertSerperCacheBatch(ctx.jobId, entries),
         markDomainsDone: (domains) => markJobDomainsDone(ctx.jobId, domains),
         checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
-        checkPaused: () => assertJobActive(ctx.jobId, ctx.agencyId),
+        jobId: ctx.jobId,
+        agencyId: ctx.agencyId,
         apiKeys: ctx.apiKeys,
         pricing: ctx.pricing,
-        log: (msg, meta) => console.log(`[${ctx.jobId}] [founders] ${msg}`, meta || ''),
+        log: stageLog,
         onBatch: async (rows) => {
             if (!rows?.length) return;
-            await upsertLeadRowsBatch({
+            await upsertFounderSearchBatch({
                 agencyId: ctx.agencyId,
                 clientId: ctx.clientId,
                 rows,
-                type: 'founders',
                 jobId: ctx.jobId,
                 mergeMode: enrichmentMergeMode(ctx)
             });
         },
-        totalDomainCount: batchDomains.length,
+        totalDomainCount: jobTotal || batchDomains.length,
         rateLimitHooks: createRateLimitHooks(ctx)
     });
 
-    await updateJobStage(ctx.jobId, ctx.agencyId, 'founders', {
-        status: 'completed',
-        completedAt: new Date().toISOString(),
-        summary
-    });
-
+    await finishJobStage(ctx, 'founders', summary);
     return summary;
 }

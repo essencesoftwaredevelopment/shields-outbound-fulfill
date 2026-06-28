@@ -734,6 +734,191 @@ export async function countFinishedLeadsForJob(jobId) {
     return result.rows[0]?.count ?? 0;
 }
 
+/**
+ * Ground-truth stage column counts from processing markers (not bare column values).
+ * Used at job finalize to reconcile jobs.stages with the filled "spreadsheet".
+ *
+ * Markers:
+ * - domainPrep: job_domains.status (skipped vs processable)
+ * - founders: job_domains.status done/processing + founderExcluded flag
+ * - emailDiscovery: contacts.email_find_completed_at (or CSV import when skipped)
+ * - verification: contacts.email_verify_completed_at
+ * - personalization: contacts.job_id + personalization_first_line for this run
+ */
+export async function countJobStageStats(agencyId, clientId, jobId, options = {}) {
+    const {
+        skipFounderFinder = false,
+        skipEmailFinder = false,
+        skipVerification = false,
+        personalizeFirstLine = false,
+        domainCheckSkipped = false
+    } = options;
+
+    const domainCounts = await countJobDomainsByStatus(jobId);
+    const domainTotal = domainCounts.pending + domainCounts.processing + domainCounts.done + domainCounts.skipped;
+
+    const foundersResult = await pool.query(
+        `SELECT
+            COUNT(*) FILTER (
+                WHERE jd.status IN ('done', 'processing')
+            )::int AS processed,
+            COUNT(*) FILTER (
+                WHERE COALESCE(jd.raw_row->'_enrichment'->>'founderExcluded', 'false') = 'true'
+            )::int AS excluded
+         FROM job_domains jd
+         WHERE jd.job_id = $1
+           AND jd.status <> 'skipped'`,
+        [jobId]
+    );
+
+    const foundersFoundResult = await pool.query(
+        `SELECT COUNT(DISTINCT jd.domain_normalized)::int AS found
+         FROM job_domains jd
+         JOIN companies co ON co.domain_normalized = jd.domain_normalized
+             AND co.client_id = $2 AND co.agency_id = $1
+         JOIN contacts c ON c.company_id = co.id
+             AND c.role_type = 'founder' AND c.agency_id = $1
+         WHERE jd.job_id = $3
+           AND jd.status IN ('done', 'processing')
+           AND jd.status <> 'skipped'
+           AND COALESCE(jd.raw_row->'_enrichment'->>'founderExcluded', 'false') <> 'true'
+           AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
+           AND LOWER(BTRIM(c.full_name)) <> 'not found'`,
+        [agencyId, clientId, jobId]
+    );
+
+    const emailSql = skipEmailFinder
+        ? `SELECT
+            COUNT(DISTINCT c.id)::int AS processed,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email IS NOT NULL AND BTRIM(c.email) <> ''
+            )::int AS found,
+            0::int AS not_found,
+            0::int AS errors
+           ${EMAIL_DISCOVERY_COHORT_SQL}`
+        : `SELECT
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_find_completed_at IS NOT NULL
+            )::int AS processed,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_find_completed_at IS NOT NULL
+                  AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+            )::int AS found,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_find_completed_at IS NOT NULL
+                  AND (c.email IS NULL OR BTRIM(c.email) = '')
+            )::int AS not_found,
+            0::int AS errors
+           ${EMAIL_DISCOVERY_COHORT_SQL}`;
+
+    const emailResult = await pool.query(emailSql, [agencyId, clientId, jobId]);
+
+    const verificationSql = skipVerification
+        ? `SELECT 0::int AS verified, 0::int AS valid, 0::int AS invalid, 0::int AS unknown, 0::int AS valid_risky`
+        : `SELECT
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_verify_completed_at IS NOT NULL
+            )::int AS verified,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_verify_completed_at IS NOT NULL
+                  AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'valid'
+            )::int AS valid,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_verify_completed_at IS NOT NULL
+                  AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'invalid'
+            )::int AS invalid,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_verify_completed_at IS NOT NULL
+                  AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'unknown'
+            )::int AS unknown,
+            COUNT(DISTINCT c.id) FILTER (
+                WHERE c.email_verify_completed_at IS NOT NULL
+                  AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid-risky', 'risky')
+            )::int AS valid_risky
+           FROM contacts c
+           JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
+           JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+           WHERE c.agency_id = $1 AND c.client_id = $2
+             AND c.role_type = 'founder'
+             AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+             AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
+             ${COHORT_ELIGIBLE_SQL}
+             ${skippedJobDomainSql(false)}`;
+
+    const verificationResult = skipVerification
+        ? { rows: [{ verified: 0, valid: 0, invalid: 0, unknown: 0, valid_risky: 0 }] }
+        : await pool.query(verificationSql, [agencyId, clientId, jobId]);
+
+    const personalizationResult = !personalizeFirstLine
+        ? { rows: [{ processed: 0, personalized: 0 }] }
+        : await pool.query(
+            `SELECT
+                COUNT(DISTINCT c.id) FILTER (
+                    WHERE c.job_id = $4
+                      AND c.personalization_first_line IS NOT NULL
+                      AND BTRIM(c.personalization_first_line) <> ''
+                )::int AS processed,
+                COUNT(DISTINCT c.id) FILTER (
+                    WHERE c.job_id = $4
+                      AND c.personalization_first_line IS NOT NULL
+                      AND BTRIM(c.personalization_first_line) <> ''
+                      AND c.personalization_first_line NOT IN ('[Generation failed]', 'invalid')
+                )::int AS personalized
+             FROM contacts c
+             JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
+             JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+             WHERE c.agency_id = $1 AND c.client_id = $2
+               AND c.role_type = 'founder'
+               AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+               AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
+               ${COHORT_ELIGIBLE_SQL}
+               ${skippedJobDomainSql(false)}`,
+            [agencyId, clientId, jobId, jobId]
+        );
+
+    const foundersRow = foundersResult.rows[0] || {};
+    const emailRow = emailResult.rows[0] || {};
+    const verifyRow = verificationResult.rows[0] || {};
+    const personalizeRow = personalizationResult.rows[0] || {};
+
+    const processable = domainCounts.pending + domainCounts.processing + domainCounts.done;
+
+    return {
+        domainPrep: {
+            checked: domainCheckSkipped ? 0 : domainTotal,
+            processable,
+            skipped: domainCounts.skipped,
+            domainCheckSkipped: !!domainCheckSkipped
+        },
+        founders: {
+            processed: Number(foundersRow.processed ?? 0),
+            excluded: Number(foundersRow.excluded ?? 0),
+            found: Number(foundersFoundResult.rows[0]?.found ?? 0),
+            skipped: !!skipFounderFinder
+        },
+        emailDiscovery: {
+            processed: Number(emailRow.processed ?? 0),
+            found: Number(emailRow.found ?? 0),
+            notFound: Number(emailRow.not_found ?? 0),
+            errors: Number(emailRow.errors ?? 0),
+            skipped: !!skipEmailFinder
+        },
+        verification: {
+            verified: Number(verifyRow.verified ?? 0),
+            valid: Number(verifyRow.valid ?? 0),
+            invalid: Number(verifyRow.invalid ?? 0),
+            unknown: Number(verifyRow.unknown ?? 0),
+            validRisky: Number(verifyRow.valid_risky ?? 0),
+            skipped: !!skipVerification
+        },
+        personalization: {
+            processed: Number(personalizeRow.processed ?? 0),
+            personalized: Number(personalizeRow.personalized ?? 0),
+            skipped: !personalizeFirstLine
+        }
+    };
+}
+
 function isValidUploadEmailStatus(status) {
     return String(status || '').toLowerCase().trim() === 'valid';
 }

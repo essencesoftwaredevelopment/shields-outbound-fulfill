@@ -1,6 +1,7 @@
 import { pool } from '../config/db.js';
 import { enqueuePipelineJob, setQueueStatus } from '../services/jobQueue.js';
 import { resolveExecutionRunner, withExecutionRunner } from './executionRunner.js';
+import { clearWorkflowRunId } from './persist.js';
 import { triggerEnrichmentWorkflow } from './trigger.js';
 
 export async function persistExecutionRunner(jobId, runner) {
@@ -34,6 +35,7 @@ export async function dispatchEnrichmentJob({
 
     if (runner === 'vercel') {
         await setQueueStatus(jobId, 'running');
+        await clearWorkflowRunId(jobId);
         await triggerEnrichmentWorkflow({ jobId, agencyId: uid });
         return { runner: 'vercel' };
     }
