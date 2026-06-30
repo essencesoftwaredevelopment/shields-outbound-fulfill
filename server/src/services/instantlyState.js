@@ -3,7 +3,8 @@ import { pool } from '../config/db.js';
 import { getOrCreateClient, getClientRowBySlug, listClientsWithInstantlyKey } from './db/queries.js';
 import {
     cancelNonInterestedAutoResponderDrafts,
-    createInterestedAutoResponderDraftFromEvent
+    createInterestedAutoResponderDraftFromEvent,
+    maybeCreatePostAutoresponderFollowUpDraft
 } from './interestedAutoResponder.js';
 
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
@@ -2664,6 +2665,25 @@ async function runReplyInterestStatusReconcile({
                 `[instantly-reply-reconcile] no interest status transition for contact=${contactId}`
                 + ` campaign=${campaignId} (prior=${previousInterestStatus}, next=${nextInterestStatus})`
             );
+
+            if (nextInterestStatus === 1 && replyEventId) {
+                try {
+                    await maybeCreatePostAutoresponderFollowUpDraft({
+                        agencyId,
+                        clientSlug,
+                        clientId,
+                        campaignId,
+                        contactId,
+                        instantlyLeadId: resolvedLeadId,
+                        leadEmail: normalizedLeadEmail,
+                        replyEventId,
+                        interestStatus: nextInterestStatus,
+                        logger
+                    });
+                } catch (draftError) {
+                    logger(`[instantly-reply-reconcile] post-autoresponder follow-up failed: ${draftError.message}`);
+                }
+            }
             return;
         }
 
@@ -3032,6 +3052,23 @@ export async function processInstantlyWebhookEvent({ agencyId, clientSlug, secre
                 `[instantly-reply-reconcile] scheduled interest check in ${INSTANTLY_REPLY_INTEREST_RECONCILE_DELAY_MS}ms`
                 + ` for contact=${contactId} campaign=${sqlCampaignId}`
             );
+
+            try {
+                await maybeCreatePostAutoresponderFollowUpDraft({
+                    agencyId,
+                    clientSlug,
+                    clientId: clientState.id,
+                    campaignId: sqlCampaignId,
+                    contactId,
+                    instantlyLeadId: asNullableText(event?.lead_id || event?.instantly_lead_id),
+                    leadEmail: normalizedEmail,
+                    replyEventId: insertedEventId,
+                    replyCategory: eventPatch.lastReplyCategory,
+                    logger
+                });
+            } catch (draftError) {
+                logger(`Post-autoresponder follow-up draft creation failed: ${draftError.message}`);
+            }
         }
 
         logger(`Stored Instantly webhook event ${event?.event_type || 'unknown'} for ${agencyId}/${clientSlug}`);

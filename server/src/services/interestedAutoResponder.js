@@ -311,7 +311,7 @@ export async function cancelStalePendingReviewDraftsForClient(db, clientId) {
 
 async function fetchSourceEventDetails(db, sourceEventId) {
     const result = await db.query(
-        `SELECT id, lead_email, message_text, reply_text_snippet, payload
+        `SELECT id, lead_email, message_text, reply_text_snippet, reply_category, payload
          FROM contact_instantly_events
          WHERE id = $1
          LIMIT 1`,
@@ -484,22 +484,27 @@ export async function generateDraftReply({ openaiKey, systemPrompt, campaignName
     };
 }
 
-async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl }) {
+async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false }) {
     if (!topic) return { notified: false, reason: 'missing_topic' };
+
+    const titlePrefix = isFollowUp
+        ? 'Interested lead follow-up review'
+        : 'Interested lead reply review';
 
     const response = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
         method: 'POST',
         headers: {
             'Content-Type': 'text/plain; charset=utf-8',
-            'Title': `Interested lead reply review: ${leadEmail}`,
+            'Title': `${titlePrefix}: ${leadEmail}`,
             'Tags': 'mailbox_with_mail,robot_face',
             'Click': reviewUrl
         },
         body: [
             `Lead: ${leadEmail}`,
             `Campaign: ${campaignName || 'Unknown campaign'}`,
+            isFollowUp ? 'Type: Post-autoresponder follow-up' : null,
             `Review URL: ${reviewUrl}`
-        ].join('\n')
+        ].filter(Boolean).join('\n')
     });
 
     if (!response.ok) {
@@ -554,6 +559,189 @@ async function sendInstantlyReplyDirect(apiKey, replyPayload) {
     return null;
 }
 
+function stripQuotedReplyThread(messageText = '') {
+    const lines = String(messageText || '').split('\n');
+    const kept = [];
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (/^On .+ wrote:$/i.test(trimmed)) break;
+        if (/^>{1,}\s/.test(trimmed)) break;
+        if (/^From:\s/i.test(trimmed) && kept.length > 3) break;
+        kept.push(line);
+    }
+    return kept.join('\n').trim();
+}
+
+/** Whether a post-autoresponder inbound reply is positive/neutral enough to draft a response. */
+export function isEligiblePostAutoresponderReplyCategory(replyCategory, interestStatus) {
+    if (asNullableInt(interestStatus) !== 1) return false;
+    const category = String(replyCategory || '').trim().toLowerCase();
+    if (category === 'negative') return false;
+    if (category === 'positive' || category === 'neutral') return true;
+    // reply_received webhooks often land as "other" while Instantly still marks the lead interested.
+    return category === 'other' || category === '';
+}
+
+/** Lead asked a question or sent substantive follow-up content worth replying to. */
+export function leadReplyMessageAsksOrEngages(messageText) {
+    const text = stripQuotedReplyThread(messageText);
+    if (!text || text.length < 15) return false;
+
+    if (/\?/.test(text)) return true;
+
+    const minimal = text.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (/^(thanks|thank you|ok|okay|got it|will do|sounds good|perfect|great)\.?!?$/.test(minimal)) {
+        return false;
+    }
+
+    return text.length >= 20;
+}
+
+function asNullableInt(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = Number.parseInt(String(value), 10);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function hasOpenInterestedAutoresponderDraft(db, contactId, campaignId) {
+    const result = await db.query(
+        `SELECT 1
+         FROM interested_autoresponder_drafts
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND status = ANY($3::text[])
+         LIMIT 1`,
+        [contactId, campaignId, OPEN_DRAFT_STATUSES]
+    );
+    return result.rowCount > 0;
+}
+
+async function hasDraftForSourceEvent(db, sourceEventId) {
+    const result = await db.query(
+        `SELECT 1
+         FROM interested_autoresponder_drafts
+         WHERE source_event_id = $1
+         LIMIT 1`,
+        [sourceEventId]
+    );
+    return result.rowCount > 0;
+}
+
+async function hasSentAutoresponderBeforeReplyEvent(db, contactId, campaignId, replyEventId) {
+    const result = await db.query(
+        `SELECT EXISTS (
+            SELECT 1
+            FROM contact_instantly_events sent
+            JOIN contact_instantly_events reply ON reply.id = $3
+            WHERE sent.contact_id = $1
+              AND sent.campaign_id = $2
+              AND sent.event_type = 'interested_reply_sent'
+              AND sent.event_timestamp < reply.event_timestamp
+         ) OR EXISTS (
+            SELECT 1
+            FROM interested_autoresponder_drafts d
+            JOIN contact_instantly_events reply ON reply.id = $3
+            WHERE d.contact_id = $1
+              AND d.campaign_id = $2
+              AND d.status = 'sent'
+              AND d.sent_at IS NOT NULL
+              AND d.sent_at < reply.event_timestamp
+         ) AS has_prior_autoresponder`,
+        [contactId, campaignId, replyEventId]
+    );
+    return result.rows[0]?.has_prior_autoresponder === true;
+}
+
+/**
+ * After we've sent an interested autoresponder, create a new review draft when the lead
+ * sends another positive/neutral follow-up that asks or engages substantively.
+ */
+export async function maybeCreatePostAutoresponderFollowUpDraft({
+    agencyId,
+    clientSlug,
+    clientId,
+    campaignId,
+    contactId,
+    instantlyLeadId,
+    leadEmail,
+    replyEventId,
+    interestStatus = null,
+    replyCategory = null,
+    logger = () => {}
+}) {
+    if (!campaignId || !contactId || !replyEventId) {
+        return { created: false, reason: 'missing_required_context' };
+    }
+
+    if (await hasDraftForSourceEvent(pool, replyEventId)) {
+        return { created: false, reason: 'draft_already_exists_for_reply' };
+    }
+
+    if (await hasOpenInterestedAutoresponderDraft(pool, contactId, campaignId)) {
+        return { created: false, reason: 'open_draft_exists' };
+    }
+
+    const priorAutoresponder = await hasSentAutoresponderBeforeReplyEvent(
+        pool,
+        contactId,
+        campaignId,
+        replyEventId
+    );
+    if (!priorAutoresponder) {
+        return { created: false, reason: 'no_prior_autoresponder' };
+    }
+
+    let resolvedInterestStatus = asNullableInt(interestStatus);
+    if (resolvedInterestStatus === null) {
+        const campaignState = await pool.query(
+            `SELECT interest_status
+             FROM contact_instantly_campaigns
+             WHERE contact_id = $1 AND campaign_id = $2
+             LIMIT 1`,
+            [contactId, campaignId]
+        );
+        resolvedInterestStatus = asNullableInt(campaignState.rows[0]?.interest_status);
+    }
+
+    const replyEvent = await fetchSourceEventDetails(pool, replyEventId);
+    const resolvedReplyCategory = asTrimmedText(replyCategory)
+        || asTrimmedText(replyEvent?.reply_category)
+        || 'other';
+
+    if (!isEligiblePostAutoresponderReplyCategory(resolvedReplyCategory, resolvedInterestStatus)) {
+        return {
+            created: false,
+            reason: 'ineligible_reply_category',
+            replyCategory: resolvedReplyCategory,
+            interestStatus: resolvedInterestStatus
+        };
+    }
+
+    const messageText = extractMessageTextFromEventRow(replyEvent);
+    if (!leadReplyMessageAsksOrEngages(messageText)) {
+        return { created: false, reason: 'reply_not_engaged' };
+    }
+
+    logger(
+        `[interested-autoresponder] post-autoresponder follow-up draft for contact=${contactId}`
+        + ` campaign=${campaignId} replyEvent=${replyEventId}`
+    );
+
+    return createInterestedAutoResponderDraftFromEvent({
+        agencyId,
+        clientSlug,
+        clientId,
+        campaignId,
+        contactId,
+        instantlyLeadId,
+        sourceEventId: replyEventId,
+        replySourceEventId: replyEventId,
+        leadEmail,
+        isFollowUp: true,
+        logger
+    });
+}
+
 async function insertDraftRow(db, draft) {
     const result = await db.query(
         `INSERT INTO interested_autoresponder_drafts (
@@ -601,6 +789,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
     sourceEventId,
     replySourceEventId = null,
     leadEmail,
+    isFollowUp = false,
     logger = () => {}
 }) {
     if (!campaignId || !contactId || !sourceEventId) {
@@ -776,7 +965,8 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 await sendNtfyNotification(settings.ntfyTopic, {
                     leadEmail: normalizedLeadEmail,
                     campaignName: promptConfig.campaign_name,
-                    reviewUrl
+                    reviewUrl,
+                    isFollowUp
                 });
             } catch (error) {
                 logger(`[interested-autoresponder] ntfy notification failed for draft=${savedDraft.id}: ${error.message}`);
