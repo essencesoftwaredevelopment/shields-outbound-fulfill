@@ -3,6 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
+import {
+    normalizeReplyEditorHtml,
+    prepareReplyEditorContent,
+} from "@/lib/interested-autoresponder/replyEditorHtml";
 
 type ReviewDraft = {
     id: number;
@@ -59,9 +63,10 @@ export default function InterestedAutoResponderReviewPage() {
                 }
                 if (!cancelled) {
                     const initialText = data.draft?.renderedText || "";
-                    lastSavedTextRef.current = initialText;
+                    const preparedText = prepareReplyEditorContent(initialText);
+                    lastSavedTextRef.current = preparedText;
                     setDraft(data.draft || null);
-                    setRenderedText(initialText);
+                    setRenderedText(preparedText);
                     // console.log("Loaded draft:", data.draft);
                     const preview = initialText.match(/https:\/\/essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+/)?.[0] || null;
                     // console.log("Extracted preview URL:", preview);
@@ -85,10 +90,19 @@ export default function InterestedAutoResponderReviewPage() {
     // Sync editor innerHTML when draft first loads
     useEffect(() => {
         if (editorRef.current && draft) {
-            editorRef.current.innerHTML = draft.renderedText || "";
+            editorRef.current.innerHTML = prepareReplyEditorContent(draft.renderedText || "");
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [draft?.id]);
+
+    // Prefer <p> over <div> for new paragraphs so formatting stays consistent
+    useEffect(() => {
+        try {
+            document.execCommand("defaultParagraphSeparator", false, "p");
+        } catch {
+            // execCommand may be unavailable in some environments
+        }
+    }, []);
 
     // Debounced auto-save
     useEffect(() => {
@@ -133,9 +147,30 @@ export default function InterestedAutoResponderReviewPage() {
         return () => document.removeEventListener("keydown", handler);
     }, [archiveModalOpen, archiving]);
 
-    const handleEditorInput = useCallback(() => {
-        if (editorRef.current) setRenderedText(editorRef.current.innerHTML);
+    const syncEditorContent = useCallback((syncDom = false) => {
+        if (!editorRef.current) return;
+        const normalized = normalizeReplyEditorHtml(editorRef.current.innerHTML);
+        if (syncDom && normalized !== editorRef.current.innerHTML) {
+            editorRef.current.innerHTML = normalized;
+        }
+        setRenderedText(normalized);
     }, []);
+
+    const handleEditorInput = useCallback(() => {
+        syncEditorContent(false);
+    }, [syncEditorContent]);
+
+    const handleEditorBlur = useCallback(() => {
+        syncEditorContent(true);
+    }, [syncEditorContent]);
+
+    const handleEditorPaste = useCallback((event: React.ClipboardEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        const text = event.clipboardData.getData("text/plain");
+        if (!text) return;
+        document.execCommand("insertText", false, text);
+        syncEditorContent(false);
+    }, [syncEditorContent]);
 
     const openLinkPopup = useCallback(() => {
         const sel = window.getSelection();
@@ -206,10 +241,8 @@ export default function InterestedAutoResponderReviewPage() {
         }
 
         setLinkPopup(null);
-        if (editorRef.current) {
-            setRenderedText(editorRef.current.innerHTML);
-        }
-    }, [linkPopup]);
+        syncEditorContent(true);
+    }, [linkPopup, syncEditorContent]);
 
     const handleEditorKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -299,9 +332,20 @@ export default function InterestedAutoResponderReviewPage() {
     return (
         <main style={{ minHeight: "100vh", background: "#0b1020", color: "#fff", padding: "1rem 0.25rem" }}>
             <style>{`
+                .reply-editor {
+                    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                }
+                .reply-editor,
+                .reply-editor * {
+                    font-family: inherit !important;
+                    font-size: inherit !important;
+                    line-height: inherit !important;
+                }
                 .reply-editor a { color: #60a5fa !important; text-decoration: underline !important; }
-                .reply-editor p { margin: 0 0 0.8em; }
-                .reply-editor p:last-child { margin-bottom: 0; }
+                .reply-editor p,
+                .reply-editor div { margin: 0 0 0.8em; }
+                .reply-editor p:last-child,
+                .reply-editor div:last-child { margin-bottom: 0; }
                 .reply-editor br { display: block; }
                 .reply-editor:focus { box-shadow: 0 0 0 2px rgba(96,165,250,0.3); }
                 .ar-card { padding: 1rem; }
@@ -505,6 +549,8 @@ export default function InterestedAutoResponderReviewPage() {
                                 contentEditable={!sendSuccess}
                                 suppressContentEditableWarning
                                 onInput={handleEditorInput}
+                                onBlur={handleEditorBlur}
+                                onPaste={handleEditorPaste}
                                 onKeyDown={handleEditorKeyDown}
                                 className="reply-editor"
                                 style={{
