@@ -4,7 +4,7 @@ import { parse } from 'csv-parse';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
-import { isCreditExhaustion, createCreditExhaustedError } from './trykittCredits.js';
+import { isCreditExhaustion, createCreditExhaustedError, createTryKittThrottledError } from './trykittCredits.js';
 
 dotenv.config();
 
@@ -184,9 +184,12 @@ async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
                 }
                 rateLimitHits += 1;
                 if (rateLimitHits >= RATE_LIMIT_MAX_RETRIES) {
-                    // A 402 that won't clear after repeated retries is payment-required, not transient.
-                    console.warn(`[EMAIL_FINDER] 402 persisted ${rateLimitHits}x for ${domain} — treating as credit exhaustion`);
-                    return { email: null, status: 'error: credit_exhausted', creditExhausted: true };
+                    // A 402 whose body doesn't say out-of-funds is TryKitt's concurrency/plan
+                    // throttle (the norm on the free tier). Transient: the row stays
+                    // unpersisted so a resume retries it — never "no email found", and never
+                    // credit exhaustion (that would silently drop the rest of the batch).
+                    console.warn(`[EMAIL_FINDER] 402 persisted ${rateLimitHits}x for ${domain} — throttled, leaving row for retry`);
+                    return { email: null, status: 'error: rate_limited', transient: true };
                 }
                 const rlBackoff = RATE_LIMIT_BACKOFF_MS * rateLimitHits;
                 console.warn(`[EMAIL_FINDER] 402 for ${domain}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
@@ -194,10 +197,15 @@ async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
                 continue;
             }
 
-            if (!res.ok && shouldRetry(res.status) && attempt < maxAttempts) {
-                await wait(backoff);
-                backoff *= 2;
-                continue;
+            if (!res.ok && shouldRetry(res.status)) {
+                if (attempt < maxAttempts) {
+                    await wait(backoff);
+                    backoff *= 2;
+                    continue;
+                }
+                // Throttled/5xx through every retry: no verdict was obtained, so don't
+                // mark the domain done — report transient and let a resume retry it.
+                return { email: null, status: 'error: rate_limited', transient: true };
             }
 
             const email = extractEmail(parsed);
@@ -220,7 +228,8 @@ async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
             if (attempt >= maxAttempts) {
                 return {
                     email: null,
-                    status: `error: ${error.message}`
+                    status: `error: ${error.message}`,
+                    transient: true
                 };
             }
         }
@@ -231,7 +240,8 @@ async function lookupEmail(fullName, domain, apiKey, rateLimitHooks = null) {
 
     return {
         email: null,
-        status: 'error: max_retries_exceeded'
+        status: 'error: max_retries_exceeded',
+        transient: true
     };
 }
 
@@ -408,6 +418,7 @@ export async function runEmailFinder({
     const limit = createConcurrencyLimit(CONCURRENCY);
     let completedEligible = 0;
     let creditExhausted = false;
+    let transientSkipped = 0;
     let stageCost = 0;
     const stats = { Found: 0, 'Not Found': 0, Skipped: 0, errors: 0 };
     const results = new Array(totalRows);
@@ -551,6 +562,14 @@ export async function runEmailFinder({
                     creditExhausted = true;
                     return;
                 }
+
+                // Throttle/transport failure that never cleared: no verdict, so no
+                // persist — the domain stays unmarked (email_find_completed_at NULL)
+                // and the stage pauses below once the batch drains.
+                if (lookup?.transient) {
+                    transientSkipped += 1;
+                    return;
+                }
             } catch (error) {
                 console.error(`[EMAIL_FINDER] Lookup failed for ${domain}: ${error?.message || error}`);
                 status = `error: ${error?.message || 'unknown'}`;
@@ -649,6 +668,10 @@ export async function runEmailFinder({
                     cancelledMessage: 'Job cancelled during email discovery',
                     pausedMessage: 'Job paused during email discovery'
                 });
+            }
+            if (transientSkipped > 0) {
+                log(`Emails: ${transientSkipped}/${eligibleTotal} throttled or errored — left unmarked for a resume to retry.`);
+                throw createTryKittThrottledError('email discovery', transientSkipped, eligibleTotal);
             }
         } catch (error) {
             if (controller.signal.aborted) {

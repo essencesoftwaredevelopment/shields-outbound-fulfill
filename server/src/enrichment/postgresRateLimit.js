@@ -11,7 +11,10 @@ function parsePositiveInt(value, fallback) {
 export const DEFAULT_RPM = {
     openai: parsePositiveInt(process.env.OPENAI_RPM_LIMIT, 500),
     serper: parsePositiveInt(process.env.SERPER_RPM_LIMIT, 60),
-    trykitt: parsePositiveInt(process.env.TRYKITT_RPM_LIMIT, 60)
+    // null = no TryKitt RPM gate by default (paid keys are concurrency-limited, not
+    // RPM-limited). Per-agency limits come from agency_settings.features.rateLimits;
+    // TRYKITT_RPM_LIMIT is a global fallback for constrained plans.
+    trykitt: parsePositiveInt(process.env.TRYKITT_RPM_LIMIT, 0) || null
 };
 
 /** Global in-flight Serper batch requests (across all workflow children). */
@@ -21,11 +24,11 @@ export const SERPER_MAX_CONCURRENT_BATCHES = parsePositiveInt(
 );
 
 /**
- * Max concurrent TryKitt calls per agency API key. TryKitt's documented limit is
- * concurrency-based (default 15 simultaneous jobs per key; a 16th returns HTTP 402),
- * NOT requests-per-minute — so a concurrency lease, not an RPM gate, is the correct
- * limiter. find_email and verify_email share this pool. Raise via env once TryKitt
- * lifts the key's cap (they scale it on request when reporting shows you near it).
+ * Max concurrent TryKitt calls per agency API key. Paid TryKitt keys allow ~15
+ * simultaneous jobs (a 16th returns HTTP 402); find_email and verify_email share
+ * this pool. Constrained plans (free tier) throttle far below that — lower this
+ * AND set TRYKITT_RPM_LIMIT via env, since both gates apply (see rateLimit.js).
+ * Raise via env once TryKitt lifts the key's cap.
  */
 export const TRYKITT_MAX_CONCURRENT = parsePositiveInt(
     process.env.TRYKITT_MAX_CONCURRENT,

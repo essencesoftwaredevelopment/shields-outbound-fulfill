@@ -1,5 +1,4 @@
 import { pool } from '../config/db.js';
-import { getJobById } from '../services/db/jobs.js';
 import { normalizeStageSummary, extractStageCostAmount } from '../utils/pricing.js';
 
 export const WORKFLOW_BATCH_SIZE = 100;
@@ -304,25 +303,74 @@ function remapProgressForJob(progress, stageKey, { jobTotal, progressOffset }) {
     return remapped;
 }
 
+/** Per-job in-process queues so at most one pool client per process waits on the row lock. */
+const stagesWriteChains = new Map();
+
+/**
+ * Serialize read-modify-write cycles on jobs.stages. Every writer (batch progress,
+ * cost merges, live/final reconciles) runs in parallel across the parent and child
+ * worker processes; without serialization a writer holding a stale read clobbers a
+ * fresher write and progress visibly goes backwards. In-process calls are chained
+ * per job, and `SELECT ... FOR UPDATE` serializes across processes.
+ *
+ * `mutate(row)` receives the locked jobs row and returns the next stages object,
+ * or null/undefined to skip the write.
+ */
+export function updateJobStagesLocked(jobId, agencyId, mutate) {
+    const chainKey = `${agencyId}:${jobId}`;
+
+    const run = async () => {
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const { rows } = await client.query(
+                `SELECT * FROM jobs WHERE id = $1 AND agency_id = $2 FOR UPDATE`,
+                [jobId, agencyId]
+            );
+            if (!rows.length) {
+                await client.query('ROLLBACK');
+                return null;
+            }
+            const next = await mutate(rows[0]);
+            if (next) {
+                await client.query(
+                    `UPDATE jobs SET stages = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
+                    [jobId, agencyId, JSON.stringify(next)]
+                );
+            }
+            await client.query('COMMIT');
+            return next;
+        } catch (err) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw err;
+        } finally {
+            client.release();
+        }
+    };
+
+    const prior = stagesWriteChains.get(chainKey) || Promise.resolve();
+    const result = prior.then(run, run);
+    // Keep the chain alive on failure without swallowing the caller's error.
+    stagesWriteChains.set(chainKey, result.catch(() => {}));
+    return result;
+}
+
 export async function persistStageProgress(jobId, agencyId, stageKey, patch) {
-    const row = await getJobById(jobId, agencyId);
-    if (!row) return;
-    const stages = { ...(row.stages || {}) };
-    const prior = stages[stageKey] || {};
-    const next = { ...patch };
+    await updateJobStagesLocked(jobId, agencyId, (row) => {
+        const stages = { ...(row.stages || {}) };
+        const prior = stages[stageKey] || {};
+        const next = { ...patch };
 
-    if (patch.progress) {
-        next.progress = mergeStageProgress(prior.progress, patch.progress, stageKey);
-    }
-    if (patch.summary) {
-        next.summary = mergeStageSummary(prior.summary, patch.summary);
-    }
+        if (patch.progress) {
+            next.progress = mergeStageProgress(prior.progress, patch.progress, stageKey);
+        }
+        if (patch.summary) {
+            next.summary = mergeStageSummary(prior.summary, patch.summary);
+        }
 
-    stages[stageKey] = { ...prior, ...next };
-    await pool.query(
-        `UPDATE jobs SET stages = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
-        [jobId, agencyId, JSON.stringify(stages)]
-    );
+        stages[stageKey] = { ...prior, ...next };
+        return stages;
+    });
 }
 
 /** Merge API-reported cost only — batches no longer own progress/status. */
@@ -330,26 +378,23 @@ export async function persistStageCostOnly(jobId, agencyId, stageKey, patch = {}
     const amount = extractStageCostAmount({ summary: patch, progress: patch });
     if (!(amount > 0)) return;
 
-    const row = await getJobById(jobId, agencyId);
-    if (!row) return;
-    const stages = { ...(row.stages || {}) };
-    const prior = stages[stageKey] || {};
-    const priorSummary = prior.summary || {};
-    const priorCost = extractStageCostAmount({ summary: priorSummary });
-    const totalCost = priorCost + amount;
-    if (totalCost <= priorCost) return;
+    await updateJobStagesLocked(jobId, agencyId, (row) => {
+        const stages = { ...(row.stages || {}) };
+        const prior = stages[stageKey] || {};
+        const priorSummary = prior.summary || {};
+        const priorCost = extractStageCostAmount({ summary: priorSummary });
+        const totalCost = priorCost + amount;
+        if (totalCost <= priorCost) return null;
 
-    const summary = {
-        ...priorSummary,
-        cost: Number(totalCost.toFixed(6)),
-        Cost: `$${totalCost.toFixed(2)}`
-    };
+        const summary = {
+            ...priorSummary,
+            cost: Number(totalCost.toFixed(6)),
+            Cost: `$${totalCost.toFixed(2)}`
+        };
 
-    stages[stageKey] = { ...prior, summary };
-    await pool.query(
-        `UPDATE jobs SET stages = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
-        [jobId, agencyId, JSON.stringify(stages)]
-    );
+        stages[stageKey] = { ...prior, summary };
+        return stages;
+    });
 }
 
 /**

@@ -5,10 +5,14 @@
  * every lookup "done" with no result.
  */
 
-// Matched against the body of a 402 response only — where "payment"/"credit"/"balance"
-// language unambiguously means out-of-funds rather than rate limiting.
+// Matched against the body of a 402 response only. Deliberately narrow: TryKitt's
+// throttle responses are ALSO 402 and use plan/quota/upgrade vocabulary, so only
+// explicit funds language (credit/balance/top-up/funds) counts as exhaustion.
+// Misclassifying exhaustion as throttle just pauses with a retry-flavored message;
+// misclassifying throttle as exhaustion silently drops every remaining row — so
+// when in doubt, prefer the throttle path.
 const CREDIT_PATTERN =
-    /credit|insufficient|balance|payment\s*required|top[\s-]?up|out\s*of\s*credit|no\s*credits|quota|exhaust|not\s*enough|add\s*funds|upgrade|subscription|billing/i;
+    /\bcredits?\b|\bbalance\b|top[\s-]?up|add\s+funds|\bfunds\b/i;
 
 /**
  * @param {unknown} parsed Parsed JSON body of a TryKitt 402 response (may be null).
@@ -36,7 +40,8 @@ export function isCreditExhaustion(parsed) {
         push(parsed.data.message);
     }
 
-    return candidates.some((c) => CREDIT_PATTERN.test(c));
+    // Codes arrive as INSUFFICIENT_CREDITS-style tokens; underscores defeat \b.
+    return candidates.some((c) => CREDIT_PATTERN.test(c.replace(/_/g, ' ')));
 }
 
 /**
@@ -52,5 +57,26 @@ export function createCreditExhaustedError(stage = '') {
     );
     err.code = 'CREDIT_EXHAUSTED';
     err.userFacing = true;
+    return err;
+}
+
+/**
+ * Build the error thrown when TryKitt throttled/timed out on rows even after
+ * retries. Those rows are left unpersisted (completed_at NULL), so resuming the
+ * job retries exactly the skipped set. `retryable` lets the workflow step layer
+ * retry instead of failing the batch outright.
+ * @param {string} stage e.g. 'email discovery' / 'email verification'
+ * @param {number} skipped rows left unprocessed
+ * @param {number} total rows attempted in this batch
+ */
+export function createTryKittThrottledError(stage, skipped, total) {
+    const err = new Error(
+        `TryKitt throttled or timed out on ${skipped} of ${total} ${stage} requests — `
+        + `they were left unprocessed; resume the job to retry them. If the account is on `
+        + `the free tier, lower TRYKITT_MAX_CONCURRENT / TRYKITT_RPM_LIMIT or upgrade the plan.`
+    );
+    err.code = 'TRYKITT_THROTTLED';
+    err.userFacing = true;
+    err.retryable = true;
     return err;
 }

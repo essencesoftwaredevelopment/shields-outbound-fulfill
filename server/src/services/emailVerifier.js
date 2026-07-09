@@ -4,7 +4,7 @@ import { parse } from 'csv-parse';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
 import http from 'http';
 import { refreshJobControlFlags, throwIfJobStopped } from './jobControlGate.js';
-import { isCreditExhaustion, createCreditExhaustedError } from './trykittCredits.js';
+import { isCreditExhaustion, createCreditExhaustedError, createTryKittThrottledError } from './trykittCredits.js';
 
 dotenv.config();
 
@@ -123,9 +123,12 @@ async function verifyEmailWithTryKitt(email, apiKey, rateLimitHooks = null) {
                 }
                 rateLimitHits += 1;
                 if (rateLimitHits >= RATE_LIMIT_MAX_RETRIES) {
-                    // A 402 that won't clear after repeated retries is payment-required, not transient.
-                    console.warn(`[EMAIL_VERIFIER] 402 persisted ${rateLimitHits}x for ${email} — treating as credit exhaustion`);
-                    return { email, status: 'ERROR', validity: 'error: credit_exhausted', creditExhausted: true };
+                    // A 402 whose body doesn't say out-of-funds is TryKitt's concurrency/plan
+                    // throttle (the norm on the free tier). Transient: the row stays
+                    // unpersisted so a resume retries it — never a verdict, and never
+                    // credit exhaustion (that would silently drop the rest of the batch).
+                    console.warn(`[EMAIL_VERIFIER] 402 persisted ${rateLimitHits}x for ${email} — throttled, leaving row for retry`);
+                    return { email, status: 402, validity: 'error: rate_limited', transient: true };
                 }
                 const rlBackoff = RATE_LIMIT_BACKOFF_MS * rateLimitHits;
                 console.warn(`[EMAIL_VERIFIER] 402 for ${email}, retry ${rateLimitHits}/${RATE_LIMIT_MAX_RETRIES} in ${rlBackoff}ms`);
@@ -135,10 +138,16 @@ async function verifyEmailWithTryKitt(email, apiKey, rateLimitHooks = null) {
 
             const validity = parsed?.validity ?? null;
 
-            if (!res.ok && shouldRetry(res.status) && attempt < maxAttempts) {
-                await wait(backoff);
-                backoff *= 2;
-                continue;
+            if (!res.ok && shouldRetry(res.status)) {
+                if (attempt < maxAttempts) {
+                    await wait(backoff);
+                    backoff *= 2;
+                    continue;
+                }
+                // Throttled/5xx through every retry. Only TryKitt's own verdict may be
+                // persisted as email_status — a rate limit degraded to 'unknown' poisons
+                // the lead and is never retried, so report transient instead.
+                return { email, status: res.status, validity: 'error: rate_limited', transient: true };
             }
 
             return {
@@ -152,14 +161,16 @@ async function verifyEmailWithTryKitt(email, apiKey, rateLimitHooks = null) {
                 return {
                     email,
                     status: 'ERROR',
-                    validity: 'timeout'
+                    validity: 'timeout',
+                    transient: true
                 };
             }
             if (attempt >= maxAttempts) {
                 return {
                     email,
                     status: 'ERROR',
-                    validity: `error: ${error.message}`
+                    validity: `error: ${error.message}`,
+                    transient: true
                 };
             }
         }
@@ -171,7 +182,8 @@ async function verifyEmailWithTryKitt(email, apiKey, rateLimitHooks = null) {
     return {
         email,
         status: 'ERROR',
-        validity: 'max_retries_exceeded'
+        validity: 'max_retries_exceeded',
+        transient: true
     };
 }
 
@@ -315,6 +327,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
     const stats = { valid: 0, invalid: 0, 'valid-risky': 0, unknown: 0 };
     let completed = 0;
     let creditExhausted = false;
+    let transientSkipped = 0;
     let stageCost = 0;
     const controller = new AbortController();
 
@@ -407,6 +420,14 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
                     return;
                 }
 
+                // Throttle/timeout that never cleared: no verdict was obtained, so no
+                // persist and no billing — the row stays eligible and the stage pauses
+                // below once the batch drains.
+                if (result?.transient) {
+                    transientSkipped += 1;
+                    return;
+                }
+
                 const status = result.validity || 'unknown';
                 rows[item.index].email_status = status;
 
@@ -488,6 +509,10 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
                 cancelledMessage: 'Job cancelled during verification',
                 pausedMessage: 'Job paused during verification'
             });
+        }
+        if (transientSkipped > 0) {
+            log(`Verify: ${transientSkipped}/${toVerify.length} throttled or timed out — left unverified for a resume to retry.`);
+            throw createTryKittThrottledError('email verification', transientSkipped, toVerify.length);
         }
     } catch (error) {
         if (controller.signal.aborted) {

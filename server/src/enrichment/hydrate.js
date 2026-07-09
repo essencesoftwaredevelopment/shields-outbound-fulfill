@@ -3,7 +3,8 @@ import {
     getAgencySettings,
     apiKeysFromSettings,
     agencyFeaturesFromSettings,
-    hasShoppingAuditFeature
+    hasShoppingAuditFeature,
+    rateLimitsFromSettings
 } from '../services/db/agencySettings.js';
 import { DEFAULT_PRICING } from '../utils/pricing.js';
 import { getPricingDefaults } from '../services/db/agencySettings.js';
@@ -69,7 +70,9 @@ export async function hydrateJobContext(jobId, agencyId) {
             emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
             columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
             executionRunner: options.executionRunner || 'pm2',
-            workflowRunId: options.workflowRunId || null
+            workflowRunId: options.workflowRunId || null,
+            // Agency plan limits first, explicit per-job overrides win.
+            rateLimits: { ...rateLimitsFromSettings(settings), ...(options.rateLimits || {}) }
         },
         auditFeatures: agencyFeaturesFromSettings(settings),
         stages: row.stages || {},

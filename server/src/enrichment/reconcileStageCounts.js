@@ -1,6 +1,5 @@
-import { pool } from '../config/db.js';
-import { getJobById, countJobStageStats } from '../services/db/jobs.js';
-import { buildCanonicalProgress, resolveJobTotal } from './stageProgress.js';
+import { countJobStageStats } from '../services/db/jobs.js';
+import { buildCanonicalProgress, resolveJobTotal, updateJobStagesLocked } from './stageProgress.js';
 import { extractStageCostAmount } from '../utils/pricing.js';
 
 export const STANDARD_STAGE_KEYS = [
@@ -296,17 +295,14 @@ async function countStatsForJob(ctx, runStartedAt = null) {
  * @param {import('./context.js').EnrichmentContext | { jobId: string, agencyId: string, clientId?: string, options?: object, stages?: object }} ctx
  */
 export async function reconcileJobStagesLive(ctx) {
-    const row = await getJobById(ctx.jobId, ctx.agencyId);
-    if (!row) return {};
-
-    const stats = await countStatsForJob(ctx, row.created_at);
-    const stages = buildStagesFromStats(row, stats, ctx, { finalize: false });
-
-    await pool.query(
-        `UPDATE jobs SET stages = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
-        [ctx.jobId, ctx.agencyId, JSON.stringify(stages)]
-    );
-
+    // Counting happens under the stages lock so a stale count from one process can
+    // never land after a fresher one — that's what made progress go backwards.
+    let stages = {};
+    await updateJobStagesLocked(ctx.jobId, ctx.agencyId, async (row) => {
+        const stats = await countStatsForJob(ctx, row.created_at);
+        stages = buildStagesFromStats(row, stats, ctx, { finalize: false });
+        return stages;
+    });
     return stages;
 }
 
@@ -315,16 +311,11 @@ export async function reconcileJobStagesLive(ctx) {
  * @param {import('./context.js').EnrichmentContext} ctx
  */
 export async function reconcileJobStagesFromDb(ctx) {
-    const row = await getJobById(ctx.jobId, ctx.agencyId);
-    if (!row) return {};
-
-    const stats = await countStatsForJob(ctx, row.created_at);
-    const stages = buildStagesFromStats(row, stats, ctx, { finalize: true });
-
-    await pool.query(
-        `UPDATE jobs SET stages = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
-        [ctx.jobId, ctx.agencyId, JSON.stringify(stages)]
-    );
-
+    let stages = {};
+    await updateJobStagesLocked(ctx.jobId, ctx.agencyId, async (row) => {
+        const stats = await countStatsForJob(ctx, row.created_at);
+        stages = buildStagesFromStats(row, stats, ctx, { finalize: true });
+        return stages;
+    });
     return stages;
 }

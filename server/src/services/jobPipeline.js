@@ -17,7 +17,8 @@ import {
     isShoppingAuditJob,
     runShoppingAuditPipeline
 } from './shoppingAudit/index.js';
-import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature } from './db/agencySettings.js';
+import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature, rateLimitsFromSettings } from './db/agencySettings.js';
+import { createRateLimitHooks } from '../enrichment/rateLimit.js';
 import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
 import { normalizeDomain } from '../utils/domain.js';
 import {
@@ -637,6 +638,7 @@ async function processJob(job) {
             agencySettings = await getAgencySettings(job.uid);
             job.auditFeatures = agencyFeaturesFromSettings(agencySettings);
         });
+        job.rateLimits = rateLimitsFromSettings(agencySettings);
         if (isShoppingAuditJob(job) && !hasShoppingAuditFeature(agencySettings)) {
             throw new Error('Shopping audit pipeline is not enabled for this agency.');
         }
@@ -649,6 +651,14 @@ async function processJob(job) {
 
         const gate = createJobControlGate(job);
         job.__controlGate = gate;
+
+        // Tenant-scoped TryKitt gating (concurrency lease + RPM window). Limits come
+        // from the agency's plan via agency_settings.features.rateLimits, falling back
+        // to the env defaults — the PM2 path previously ran ungated.
+        const rateLimitHooks = createRateLimitHooks({
+            agencyId: job.uid,
+            options: { rateLimits: job.rateLimits }
+        });
 
         const totalUploaded = (job.domainEntries || []).length;
         const pendingBeforePrep = await listPendingJobDomains(job.id, 1);
@@ -1068,6 +1078,7 @@ async function processJob(job) {
                     progressTotal,
                     log: (message, meta) => log(job, message, meta),
                     job,
+                    rateLimitHooks,
                     checkpoint: () => gate.checkpoint(),
                     checkPaused: () => gate.checkPaused(),
                     refreshControl: () => gate.refresh(),
@@ -1135,6 +1146,7 @@ async function processJob(job) {
                     pricing: job.pricing?.stages?.verification || DEFAULT_PRICING.stages.verification,
                     log: (message, meta) => log(job, message, meta),
                     job,
+                    rateLimitHooks,
                     checkpoint: () => gate.checkpoint(),
                     checkPaused: () => gate.checkPaused(),
                     refreshControl: () => gate.refresh(),

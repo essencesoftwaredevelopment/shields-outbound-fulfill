@@ -63,6 +63,26 @@ export function hasShoppingAuditFeature(settings) {
     return agencyFeaturesFromSettings(settings).shoppingAudit === true;
 }
 
+/**
+ * Per-agency API rate limits from `features.rateLimits`. TryKitt limits follow the
+ * agency's own API key/plan (a free-tier key throttles far below the paid ~15
+ * concurrent), so the caps live per tenant here — the env defaults in
+ * postgresRateLimit.js only apply when an agency has no override. Example:
+ *   features.rateLimits = { "trykitt": 20, "trykittConcurrency": 2 }
+ * Keys mirror what createRateLimitHooks reads: serper/openai/trykitt are RPM,
+ * trykittConcurrency is max simultaneous calls.
+ */
+export function rateLimitsFromSettings(settings) {
+    const raw = agencyFeaturesFromSettings(settings).rateLimits;
+    if (!raw || typeof raw !== 'object') return {};
+    const out = {};
+    for (const key of ['serper', 'openai', 'trykitt', 'trykittConcurrency']) {
+        const parsed = Number.parseInt(String(raw[key] ?? ''), 10);
+        if (Number.isFinite(parsed) && parsed > 0) out[key] = parsed;
+    }
+    return out;
+}
+
 export function hasVercelEnrichmentRunner(settings) {
     return agencyFeaturesFromSettings(settings).enrichmentRunner === 'vercel';
 }

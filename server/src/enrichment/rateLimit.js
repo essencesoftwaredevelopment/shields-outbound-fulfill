@@ -28,14 +28,22 @@ export function createRateLimitHooks(ctx) {
         openai: (fn) => runWithProviderLimit(ctx.agencyId, 'openai', fn, {
             customRpm: custom.openai
         }),
-        // TryKitt limits per API key by concurrency (default 15 simultaneous jobs;
-        // a 16th returns 402), not by RPM. Gate on an agency-scoped lease shared by
-        // BOTH email finding and verification, and skip the RPM window entirely.
-        trykitt: (fn) => runWithProviderLimit(ctx.agencyId, 'trykitt', fn, {
-            skipRateLimit: true,
-            maxConcurrent: custom.trykittConcurrency || TRYKITT_MAX_CONCURRENT,
-            concurrencyScope: `${ctx.agencyId}:trykitt`
-        })
+        // TryKitt is always gated by an agency-scoped concurrency lease shared by BOTH
+        // email finding and verification (paid keys allow ~15 simultaneous jobs; past
+        // the cap TryKitt returns 402). The RPM window engages only when a limit is
+        // configured — agency_settings.features.rateLimits.trykitt (per tenant, wins)
+        // or TRYKITT_RPM_LIMIT (global) — for constrained plans (e.g. free tier) that
+        // throttle well below the concurrency cap. Unconfigured tenants stay
+        // concurrency-only, so paid accounts run at full speed.
+        trykitt: (fn) => {
+            const rpm = custom.trykitt ?? DEFAULT_RPM.trykitt;
+            return runWithProviderLimit(ctx.agencyId, 'trykitt', fn, {
+                skipRateLimit: !rpm,
+                customRpm: rpm || undefined,
+                maxConcurrent: custom.trykittConcurrency || TRYKITT_MAX_CONCURRENT,
+                concurrencyScope: `${ctx.agencyId}:trykitt`
+            });
+        }
     };
 }
 
