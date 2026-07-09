@@ -39,6 +39,8 @@ export const IMPORT_COLLISION_STRATEGIES = new Set(['fill_blanks', 'overwrite', 
 export const IMPORT_MAPPING_TARGETS = new Set([
     'domain',
     'fullName',
+    'firstName',
+    'lastName',
     'email',
     'emailStatus',
     'annualRevenueText',
@@ -185,8 +187,8 @@ async function insertErrorRows(batchId, agencyId, errorRows) {
     }
 }
 
-/** Normalize one CSV row against the mapping. Returns { entry, problems[] } or { error }. */
-function normalizeImportRow(row, rowNumber, columnMapping, keepUnmapped) {
+/** Normalize one CSV row against the mapping. Returns { entry, problems[] } or { error }. Exported for tests. */
+export function normalizeImportRow(row, rowNumber, columnMapping, keepUnmapped) {
     const readMapped = (target) => (columnMapping[target] ? row[columnMapping[target]] : undefined);
 
     const domain = normalizeDomain(trimmedOrNull(readMapped('domain')) || '');
@@ -195,8 +197,18 @@ function normalizeImportRow(row, rowNumber, columnMapping, keepUnmapped) {
     }
 
     const problems = [];
+    // Full Name column wins per row; separate First/Last Name columns are the
+    // fallback (combined with a space) when Full Name is unmapped or blank.
     const fullNameRaw = trimmedOrNull(readMapped('fullName'));
-    const fullName = fullNameRaw && fullNameRaw.toLowerCase() !== 'not found' ? fullNameRaw : null;
+    let fullName = fullNameRaw && fullNameRaw.toLowerCase() !== 'not found' ? fullNameRaw : null;
+    if (!fullName) {
+        const firstName = trimmedOrNull(readMapped('firstName'));
+        const lastName = trimmedOrNull(readMapped('lastName'));
+        const combined = [firstName, lastName].filter(Boolean).join(' ');
+        if (combined && combined.toLowerCase() !== 'not found') {
+            fullName = combined.slice(0, MAX_TEXT_LENGTH);
+        }
+    }
 
     let email = trimmedOrNull(readMapped('email'), 320);
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {

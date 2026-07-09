@@ -217,7 +217,11 @@ type LeadImportTargetDef = {
 
 const LEAD_IMPORT_TARGET_FIELDS: LeadImportTargetDef[] = [
     { key: 'domain', label: 'Domain', required: true, group: 'Lead', guesses: [/^domain$/i, /website|url|domain/i] },
-    { key: 'fullName', label: 'Founder / Contact Name', group: 'Lead', guesses: [/^(founder|full)?[_ ]?name$/i, /founder|owner|ceo|contact.?name/i] },
+    // First/Last sit before Full Name so specific headers (e.g. founder_first_name)
+    // are claimed by them, not by Full Name's broad founder/owner/ceo guess.
+    { key: 'firstName', label: 'First Name', group: 'Lead', guesses: [/^first[_ ]?name$/i, /first.?name/i] },
+    { key: 'lastName', label: 'Last Name', group: 'Lead', guesses: [/^(last|sur)[_ ]?name$/i, /last.?name|surname/i] },
+    { key: 'fullName', label: 'Founder / Contact Name (full)', group: 'Lead', guesses: [/^(founder|full)?[_ ]?name$/i, /founder|owner|ceo|contact.?name/i] },
     { key: 'email', label: 'Email', group: 'Lead', guesses: [/^email$/i, /e-?mail/i] },
     { key: 'emailStatus', label: 'Email Verification Status', group: 'Lead', guesses: [/^(email_)?status$/i, /verif|deliverab|status|result/i] },
     { key: 'annualRevenueText', label: 'Annual Revenue (text)', group: 'Insights', guesses: [/revenue/i] },
