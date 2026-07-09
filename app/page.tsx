@@ -101,15 +101,25 @@ async function createFingerprintMap(keys: ApiKeyState): Promise<ApiKeyState> {
   }, createEmptyKeys());
 }
 
-const readKeysFromAgencySettings = (data: {
+type AgencySettingsPayload = {
   openai_key?: string;
   serper_key?: string;
   trykitt_key?: string;
-} | null | undefined): ApiKeyState => ({
+  trykitt_paid_account?: boolean;
+};
+
+const readKeysFromAgencySettings = (
+  data: AgencySettingsPayload | null | undefined,
+): ApiKeyState => ({
   openai: data?.openai_key || "",
   serper: data?.serper_key || "",
   kitt: data?.trykitt_key || "",
 });
+
+// Absent flag = paid, matching the server's isTryKittPaidAccount default.
+const readTryKittPaidFromAgencySettings = (
+  data: AgencySettingsPayload | null | undefined,
+): boolean => data?.trykitt_paid_account !== false;
 
 function HomeContent() {
   const router = useRouter();
@@ -119,6 +129,8 @@ function HomeContent() {
   const agencyId = user?.id ?? "";
   const [apiKeys, setApiKeys] = useState<ApiKeyState>(() => createEmptyKeys());
   const [lastSavedKeys, setLastSavedKeys] = useState<ApiKeyState>(() => createEmptyKeys());
+  const [kittPaidAccount, setKittPaidAccount] = useState(true);
+  const [lastSavedKittPaidAccount, setLastSavedKittPaidAccount] = useState(true);
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
   const [clientModalOpen, setClientModalOpen] = useState(false);
   const [newClientName, setNewClientName] = useState("");
@@ -279,9 +291,12 @@ function HomeContent() {
         });
         const payload = response.ok ? await response.json() : null;
         const storedKeys = readKeysFromAgencySettings(payload);
+        const storedPaid = readTryKittPaidFromAgencySettings(payload);
         if (!cancelled) {
           setApiKeys(storedKeys);
           setLastSavedKeys(storedKeys);
+          setKittPaidAccount(storedPaid);
+          setLastSavedKittPaidAccount(storedPaid);
         }
       } catch {
         if (!cancelled) {
@@ -358,6 +373,7 @@ function HomeContent() {
           openai_key: sanitizedKeys.openai,
           serper_key: sanitizedKeys.serper,
           trykitt_key: sanitizedKeys.kitt,
+          trykitt_paid_account: kittPaidAccount,
         }),
       });
       if (!response.ok) {
@@ -367,6 +383,7 @@ function HomeContent() {
 
       setApiKeys(sanitizedKeys);
       setLastSavedKeys(sanitizedKeys);
+      setLastSavedKittPaidAccount(kittPaidAccount);
       setVaultMessage({ tone: "success", text: "Keys saved to your vault." });
     } catch (error) {
       setVaultMessage({
@@ -421,7 +438,9 @@ function HomeContent() {
   const showVaultStatus = vaultLoading || Boolean(vaultMessage.text);
   const vaultStatusTone = vaultLoading ? "idle" : vaultMessage.tone;
   const vaultStatusText = vaultLoading ? "Loading saved keys..." : vaultMessage.text;
-  const hasVaultChanges = API_KEY_FIELDS.some((key) => apiKeys[key] !== lastSavedKeys[key]);
+  const hasVaultChanges =
+    API_KEY_FIELDS.some((key) => apiKeys[key] !== lastSavedKeys[key])
+    || kittPaidAccount !== lastSavedKittPaidAccount;
 
   const openClientModal = () => {
     setClientMessage({ tone: "idle", text: "" });
@@ -576,7 +595,27 @@ function HomeContent() {
               <p className="text-xs text-muted-foreground">Automating Google searches at scale</p>
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="kitt-key">Kitt API Key</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="kitt-key">Kitt API Key</Label>
+                <Label
+                  htmlFor="kitt-paid-account"
+                  className="flex cursor-pointer items-center gap-1.5 text-xs font-normal text-muted-foreground"
+                >
+                  <input
+                    id="kitt-paid-account"
+                    type="checkbox"
+                    className="size-3.5 cursor-pointer accent-primary"
+                    checked={kittPaidAccount}
+                    onChange={(event) => {
+                      if (vaultMessage.tone !== "idle") {
+                        setVaultMessage({ tone: "idle", text: "" });
+                      }
+                      setKittPaidAccount(event.target.checked);
+                    }}
+                  />
+                  Paid Account
+                </Label>
+              </div>
               <Input
                 id="kitt-key"
                 type="password"
@@ -584,7 +623,12 @@ function HomeContent() {
                 value={apiKeys.kitt}
                 onChange={(event) => handleKeyChange(event, "kitt")}
               />
-              <p className="text-xs text-muted-foreground">Email finding + verification.</p>
+              <p className="text-xs text-muted-foreground">
+                Email finding + verification.
+                {!kittPaidAccount
+                  ? " Free-tier keys are throttled to 2 concurrent requests at 20/min."
+                  : ""}
+              </p>
             </div>
             {showVaultStatus && (
               <Alert variant={vaultStatusTone === "error" ? "destructive" : "default"}>

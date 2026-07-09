@@ -8,13 +8,22 @@ export async function getAgencySettings(agencyId) {
     return result.rows[0] || null;
 }
 
+/**
+ * @param {object} patch
+ * @param {object} [patch.features]      Replaces the whole features object.
+ * @param {object} [patch.featuresPatch] Shallow-merges into existing features. Prefer
+ *        this when toggling one flag — a full `features` write from a caller that only
+ *        knows about one key silently drops the others (e.g. shoppingAudit).
+ */
 export async function upsertAgencySettings(agencyId, patch = {}) {
     const featuresJson = patch.features != null ? JSON.stringify(patch.features) : null;
+    const featuresPatchJson = patch.featuresPatch != null ? JSON.stringify(patch.featuresPatch) : null;
     await pool.query(
         `INSERT INTO agency_settings (
             agency_id, openai_key, serper_key, trykitt_key, openai_founder_model,
             email_verification_provider, pricing_overrides, features, vault_updated_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, COALESCE($8::jsonb, '{}'::jsonb), NOW(), NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb,
+            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), NOW(), NOW())
         ON CONFLICT (agency_id) DO UPDATE SET
             openai_key = COALESCE(EXCLUDED.openai_key, agency_settings.openai_key),
             serper_key = COALESCE(EXCLUDED.serper_key, agency_settings.serper_key),
@@ -24,6 +33,8 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             pricing_overrides = COALESCE(EXCLUDED.pricing_overrides, agency_settings.pricing_overrides),
             features = CASE
                 WHEN $8::jsonb IS NOT NULL THEN EXCLUDED.features
+                WHEN $9::jsonb IS NOT NULL
+                    THEN COALESCE(agency_settings.features, '{}'::jsonb) || $9::jsonb
                 ELSE agency_settings.features
             END,
             vault_updated_at = NOW(),
@@ -36,7 +47,8 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             patch.openai_founder_model ?? null,
             patch.email_verification_provider ?? null,
             JSON.stringify(patch.pricing_overrides ?? {}),
-            featuresJson
+            featuresJson,
+            featuresPatchJson
         ]
     );
 }
@@ -64,18 +76,42 @@ export function hasShoppingAuditFeature(settings) {
 }
 
 /**
- * Per-agency API rate limits from `features.rateLimits`. TryKitt limits follow the
- * agency's own API key/plan (a free-tier key throttles far below the paid ~15
- * concurrent), so the caps live per tenant here — the env defaults in
- * postgresRateLimit.js only apply when an agency has no override. Example:
- *   features.rateLimits = { "trykitt": 20, "trykittConcurrency": 2 }
- * Keys mirror what createRateLimitHooks reads: serper/openai/trykitt are RPM,
- * trykittConcurrency is max simultaneous calls.
+ * Caps applied to an agency whose TryKitt key is on the free tier. Free keys throttle
+ * far below the paid ~15-concurrent allowance; without these the pipeline hammers
+ * TryKitt, every request retries through its backoff, and the stage crawls.
+ * Deliberately conservative — raise per agency via `features.rateLimits` if a given
+ * free key tolerates more.
+ */
+export const TRYKITT_FREE_TIER_LIMITS = Object.freeze({
+    trykitt: 20,            // requests/minute
+    trykittConcurrency: 2   // simultaneous calls
+});
+
+/**
+ * Whether the agency's TryKitt key is on a paid plan. Absent flag = paid, which
+ * preserves the behavior every existing agency already had (concurrency-only gating
+ * at 15, no RPM window). A mislabeled free key is no longer silently destructive:
+ * the stage now pauses with TRYKITT_THROTTLED instead of writing 'unknown' verdicts.
+ */
+export function isTryKittPaidAccount(settings) {
+    return agencyFeaturesFromSettings(settings).trykittPaidAccount !== false;
+}
+
+/**
+ * Per-agency API rate limits. TryKitt limits follow the agency's own key/plan, so
+ * they live per tenant rather than in host env. Free-tier agencies get
+ * TRYKITT_FREE_TIER_LIMITS; an explicit `features.rateLimits` entry overrides either
+ * way, for hand-tuning a specific key. Keys mirror what createRateLimitHooks reads:
+ * serper/openai/trykitt are RPM, trykittConcurrency is max simultaneous calls.
+ * When nothing applies the env defaults in postgresRateLimit.js take over.
  */
 export function rateLimitsFromSettings(settings) {
+    const base = isTryKittPaidAccount(settings) ? {} : { ...TRYKITT_FREE_TIER_LIMITS };
+
     const raw = agencyFeaturesFromSettings(settings).rateLimits;
-    if (!raw || typeof raw !== 'object') return {};
-    const out = {};
+    if (!raw || typeof raw !== 'object') return base;
+
+    const out = { ...base };
     for (const key of ['serper', 'openai', 'trykitt', 'trykittConcurrency']) {
         const parsed = Number.parseInt(String(raw[key] ?? ''), 10);
         if (Number.isFinite(parsed) && parsed > 0) out[key] = parsed;

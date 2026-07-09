@@ -1,6 +1,11 @@
 import express from 'express';
 import { verifySupabaseToken } from '../middleware/auth.js';
-import { getAgencySettings, upsertAgencySettings, agencyFeaturesFromSettings } from '../services/db/agencySettings.js';
+import {
+    getAgencySettings,
+    upsertAgencySettings,
+    agencyFeaturesFromSettings,
+    isTryKittPaidAccount
+} from '../services/db/agencySettings.js';
 
 const router = express.Router();
 
@@ -25,6 +30,7 @@ router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
             trykitt_key: settings?.trykitt_key || '',
             openai_founder_model: settings?.openai_founder_model || '',
             email_verification_provider: settings?.email_verification_provider || 'trykitt',
+            trykitt_paid_account: isTryKittPaidAccount(settings),
             vault_updated_at: settings?.vault_updated_at || null,
             features
         });
@@ -37,13 +43,20 @@ router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
 router.patch('/agency/settings', verifySupabaseToken, async (req, res) => {
     try {
         const body = req.body || {};
+        // Merge the single flag rather than writing `features` wholesale — the vault
+        // modal doesn't know about shoppingAudit/enrichmentRunner and would drop them.
+        const featuresPatch = typeof body.trykitt_paid_account === 'boolean'
+            ? { trykittPaidAccount: body.trykitt_paid_account }
+            : null;
+
         await upsertAgencySettings(req.agencyId, {
             openai_key: body.openai_key,
             serper_key: body.serper_key,
             trykitt_key: body.trykitt_key,
             openai_founder_model: body.openai_founder_model,
             email_verification_provider: body.email_verification_provider,
-            ...(body.features != null ? { features: body.features } : {})
+            ...(body.features != null ? { features: body.features } : {}),
+            ...(featuresPatch ? { featuresPatch } : {})
         });
         res.json({ ok: true });
     } catch (error) {
