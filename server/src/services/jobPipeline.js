@@ -365,7 +365,11 @@ function resolveJobPaths(jobId) {
 async function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId, dedupeStrategy = 'skip', options = {}) {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const domainColumn = options.columnMapping?.domain || 'domain';
-    const domainEntries = parseDomainsFromBuffer(fileBuffer, domainColumn);
+    // Seed either from a parsed CSV buffer (upload flow) or from pre-built
+    // entries (filtered-leads enrichment, which has no file).
+    const domainEntries = Array.isArray(options.domainEntries)
+        ? options.domainEntries
+        : parseDomainsFromBuffer(fileBuffer, domainColumn);
     const pipelineMode = options.pipelineMode === 'shopping_audit' ? 'shopping_audit' : 'standard';
 
     const stages = {
@@ -393,6 +397,10 @@ async function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId,
         productPromptProducts: Number.isFinite(options.productPromptProducts) ? options.productPromptProducts : 3,
         emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
         columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
+        // Filtered-leads jobs: record where the seed came from (never the
+        // entries themselves — 100k domains do not belong in options JSONB).
+        ...(options.jobSource ? { jobSource: options.jobSource } : {}),
+        ...(options.leadFilter ? { leadFilter: options.leadFilter } : {}),
         initialStages: stages
     };
 

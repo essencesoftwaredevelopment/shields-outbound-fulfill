@@ -78,6 +78,99 @@ export interface CreatePipelineJobOptions {
     signal?: AbortSignal;
 }
 
+export interface LeadFilterSnapshot {
+    search?: string;
+    instantlyCampaignId?: string;
+    filters?: { clauses: Array<{ id?: string; field: string; op: string; value: string; joinOp?: 'AND' | 'OR' }> };
+    rowLimit?: number;
+}
+
+export interface CreateFilteredPipelineJobOptions {
+    idToken: string;
+    clientId: string;
+    leadFilter: LeadFilterSnapshot;
+    nicheId?: string;
+    nicheLabel?: string;
+    pipelineMode?: PipelineMode;
+    campaignId?: string;
+    findFounder?: boolean;
+    skipFounderFinder?: boolean;
+    findEmail?: boolean;
+    skipEmailFinder?: boolean;
+    verifyEmail?: boolean;
+    skipVerification?: boolean;
+    skipDomainCheck?: boolean;
+    personalizeFirstLine?: boolean;
+    productPromptVersion?: 'old' | 'new_gpt5mini';
+    productPromptProducts?: number;
+    signal?: AbortSignal;
+}
+
+/**
+ * Start an enrichment job seeded from the current all-leads filter instead of
+ * a CSV upload. The server snapshots the matching leads into the job's domain
+ * queue at creation time and always runs in reprocess/merge mode.
+ */
+export async function createFilteredPipelineJob({
+    idToken,
+    clientId,
+    leadFilter,
+    nicheId,
+    nicheLabel,
+    pipelineMode,
+    campaignId,
+    findFounder,
+    skipFounderFinder,
+    findEmail,
+    skipEmailFinder,
+    verifyEmail,
+    skipVerification,
+    skipDomainCheck,
+    personalizeFirstLine,
+    productPromptVersion,
+    productPromptProducts,
+    signal,
+}: CreateFilteredPipelineJobOptions) {
+    const payload: Record<string, unknown> = {
+        clientId,
+        leadFilter,
+    };
+    if (nicheId) payload.nicheId = nicheId;
+    if (nicheLabel) payload.nicheLabel = nicheLabel;
+    if (pipelineMode) payload.pipelineMode = pipelineMode;
+    if (campaignId) payload.campaignId = campaignId;
+    if (typeof findFounder === 'boolean') payload.findFounder = String(findFounder);
+    if (typeof skipFounderFinder === 'boolean') payload.skipFounderFinder = String(skipFounderFinder);
+    if (typeof findEmail === 'boolean') payload.findEmail = String(findEmail);
+    if (typeof skipEmailFinder === 'boolean') payload.skipEmailFinder = String(skipEmailFinder);
+    if (typeof verifyEmail === 'boolean') payload.verifyEmail = String(verifyEmail);
+    if (typeof skipVerification === 'boolean') payload.skipVerification = String(skipVerification);
+    if (typeof skipDomainCheck === 'boolean') payload.skipDomainCheck = String(skipDomainCheck);
+    if (typeof personalizeFirstLine === 'boolean') payload.personalizeFirstLine = String(personalizeFirstLine);
+    if (productPromptVersion) payload.productPromptVersion = productPromptVersion;
+    if (typeof productPromptProducts === 'number' && Number.isFinite(productPromptProducts)) {
+        payload.productPromptProducts = String(productPromptProducts);
+    }
+
+    const response = await fetchWithRetry(`${pipelineBaseUrl}/api/jobs`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify(payload),
+        signal,
+    });
+
+    if (!response.ok) {
+        const errorPayload = await readJsonSafely(response);
+        const message = (errorPayload?.error as string | undefined) || response.statusText || "Failed to start enrichment.";
+        throw new Error(message);
+    }
+
+    return (await response.json()) as CreateJobResponse;
+}
+
 export function getPipelineBaseUrl() {
     return pipelineBaseUrl;
 }

@@ -13,7 +13,7 @@ import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAuth } from "@/hooks/use-auth";
 import { useAgencyId } from "@/lib/hooks/useAgencyId";
 import { apiFetch, apiJson } from "@/lib/api/http";
-import { createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
 import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
@@ -177,6 +177,58 @@ type LeadExportFieldDef = {
     group: "Lead" | "Insights" | "Campaigns" | "Events";
     defaultSelected?: boolean;
 };
+
+type LeadImportBatch = {
+    id: string;
+    fileName: string | null;
+    status: 'processing' | 'completed' | 'failed';
+    stalled?: boolean;
+    collisionStrategy: string;
+    totalRows: number;
+    processedRows: number;
+    createdCount: number;
+    updatedCount: number;
+    skippedCount: number;
+    errorCount: number;
+    error?: string | null;
+    createdAt?: string | null;
+    completedAt?: string | null;
+};
+
+type FilteredEnrichPreview = {
+    totalContacts: number;
+    totalDomains: number;
+    founderContacts: number;
+    nonFounderContacts: number;
+    withEmail: number;
+    withoutEmail: number;
+    withFounderName: number;
+    verifiedValid: number;
+    withFirstLine: number;
+};
+
+type LeadImportTargetDef = {
+    key: string;
+    label: string;
+    required?: boolean;
+    group: 'Lead' | 'Insights';
+    guesses: RegExp[];
+};
+
+const LEAD_IMPORT_TARGET_FIELDS: LeadImportTargetDef[] = [
+    { key: 'domain', label: 'Domain', required: true, group: 'Lead', guesses: [/^domain$/i, /website|url|domain/i] },
+    { key: 'fullName', label: 'Founder / Contact Name', group: 'Lead', guesses: [/^(founder|full)?[_ ]?name$/i, /founder|owner|ceo|contact.?name/i] },
+    { key: 'email', label: 'Email', group: 'Lead', guesses: [/^email$/i, /e-?mail/i] },
+    { key: 'emailStatus', label: 'Email Verification Status', group: 'Lead', guesses: [/^(email_)?status$/i, /verif|deliverab|status|result/i] },
+    { key: 'annualRevenueText', label: 'Annual Revenue (text)', group: 'Insights', guesses: [/revenue/i] },
+    { key: 'annualRevenueMin', label: 'Annual Revenue Min ($)', group: 'Insights', guesses: [/revenue.?min/i] },
+    { key: 'annualRevenueMax', label: 'Annual Revenue Max ($)', group: 'Insights', guesses: [/revenue.?max/i] },
+    { key: 'usesKlaviyo', label: 'Uses Klaviyo', group: 'Insights', guesses: [/klaviyo(?!.*(percent|%))/i] },
+    { key: 'klaviyoPercent', label: 'Klaviyo Percent', group: 'Insights', guesses: [/klaviyo.?(percent|%)/i] },
+    { key: 'discoveryCallHeld', label: 'Discovery Call Held', group: 'Insights', guesses: [/discovery/i] },
+    { key: 'source', label: 'Source', group: 'Insights', guesses: [/^source$/i] },
+    { key: 'notes', label: 'Notes', group: 'Insights', guesses: [/^notes?$/i] }
+];
 
 type InstantlySyncRun = {
     id: number;
@@ -1438,6 +1490,27 @@ export default function ClientPage() {
         notFound: number;
     } | null>(null);
 
+    // No-enrichment lead import (column-mapped CSV) state
+    const [leadImportModalOpen, setLeadImportModalOpen] = useState(false);
+    const [leadImportStep, setLeadImportStep] = useState<1 | 2 | 3>(1);
+    const [leadImportFile, setLeadImportFile] = useState<File | null>(null);
+    const [leadImportHeaders, setLeadImportHeaders] = useState<string[]>([]);
+    const [leadImportPreviewRows, setLeadImportPreviewRows] = useState<Record<string, string>[]>([]);
+    const [leadImportTotalRows, setLeadImportTotalRows] = useState<number>(0);
+    const [leadImportParsing, setLeadImportParsing] = useState(false);
+    const [leadImportMapping, setLeadImportMapping] = useState<Record<string, string>>({});
+    const [leadImportCollisionStrategy, setLeadImportCollisionStrategy] = useState<'fill_blanks' | 'overwrite' | 'skip'>('fill_blanks');
+    const [leadImportKeepUnmapped, setLeadImportKeepUnmapped] = useState(true);
+    const [leadImportStarting, setLeadImportStarting] = useState(false);
+    const [leadImportBatch, setLeadImportBatch] = useState<LeadImportBatch | null>(null);
+    const [leadImportDownloadingErrors, setLeadImportDownloadingErrors] = useState(false);
+
+    // Enrich-filtered-leads state (reuses the upload wizard from step 3)
+    const [enrichSource, setEnrichSource] = useState<'csv' | 'filtered'>('csv');
+    const [filteredEnrichPreview, setFilteredEnrichPreview] = useState<FilteredEnrichPreview | null>(null);
+    const [filteredEnrichPreviewLoading, setFilteredEnrichPreviewLoading] = useState(false);
+    const [filteredEnrichRowLimit, setFilteredEnrichRowLimit] = useState<string>("");
+
     const [showInstantlyCsvImportModal, setShowInstantlyCsvImportModal] = useState(false);
     const [instantlyCsvImportFile, setInstantlyCsvImportFile] = useState<File | null>(null);
     const [instantlyCsvImportNotes, setInstantlyCsvImportNotes] = useState('');
@@ -2052,6 +2125,9 @@ export default function ClientPage() {
         return () => { window.clearTimeout(timeoutId); };
     }, [autoResponderTestLeadSearch]);
 
+    // Bumped after a lead import completes so the Import Batch filter picks up the new batch.
+    const [leadFilterFieldsNonce, setLeadFilterFieldsNonce] = useState(0);
+
     useEffect(() => {
         if (!user) return;
         let cancelled = false;
@@ -2061,7 +2137,9 @@ export default function ClientPage() {
             try {
                 const idToken = await getAccessToken();
             if (!idToken) return;
-                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/filter-fields`, {
+                const params = new URLSearchParams();
+                if (clientId) params.append('clientId', clientId);
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/filter-fields?${params.toString()}`, {
                     headers: { Authorization: `Bearer ${idToken}` }
                 });
                 if (!response.ok) {
@@ -2086,7 +2164,7 @@ export default function ClientPage() {
         return () => {
             cancelled = true;
         };
-    }, [user?.id]);
+    }, [user?.id, clientId, leadFilterFieldsNonce]);
 
     // Campaigns state
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -2618,6 +2696,16 @@ export default function ClientPage() {
                 {find.label}
             </span>
         );
+    };
+
+    const renderEmailCell = (
+        email: string | undefined | null,
+        emailFindCompletedAt: string | undefined | null
+    ) => {
+        if (hasDiscoveredEmail(email)) {
+            return String(email).trim();
+        }
+        return renderEmailFindChip(email, emailFindCompletedAt);
     };
 
     const renderFounderNameCell = (
@@ -4833,9 +4921,81 @@ export default function ClientPage() {
         setToastVisible(true);
     }, []);
 
+    const handleStartFilteredEnrichment = async () => {
+        if (!user || !clientId) return;
+        setUploadError("");
+        setUploading(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) {
+                reportUploadError("Session expired. Sign in again and retry.");
+                return;
+            }
+            const activeNiche = niches.find(n => n.id === clientIndustry);
+            const selectedProductPromptVersion: 'old' | 'new_gpt5mini' | undefined =
+                clientIndustry === 'ecom' && personalizeFirstLine
+                    ? (productPromptUseNew ? 'new_gpt5mini' : 'old')
+                    : undefined;
+            const selectedProductPromptProducts =
+                clientIndustry === 'ecom' && personalizeFirstLine && productPromptUseNew
+                    ? productPromptProducts
+                    : undefined;
+
+            const parsedRowLimit = Number.parseInt(filteredEnrichRowLimit, 10);
+            const snapshot = buildLeadDeleteQuery();
+            const response = await createFilteredPipelineJob({
+                idToken,
+                clientId,
+                leadFilter: {
+                    search: snapshot.search,
+                    instantlyCampaignId: snapshot.instantlyCampaignId,
+                    filters: snapshot.filters,
+                    ...(Number.isInteger(parsedRowLimit) && parsedRowLimit > 0 ? { rowLimit: parsedRowLimit } : {})
+                },
+                nicheId: activeNiche?.id,
+                nicheLabel: activeNiche?.label,
+                pipelineMode: 'standard',
+                campaignId: selectedCampaignId || undefined,
+                findFounder,
+                skipFounderFinder,
+                findEmail,
+                skipEmailFinder,
+                verifyEmail,
+                skipVerification: !verifyEmail,
+                skipDomainCheck: !runDomainCheck,
+                personalizeFirstLine,
+                productPromptVersion: selectedProductPromptVersion,
+                productPromptProducts: selectedProductPromptProducts,
+            });
+
+            const freshJob = response.job;
+            setJobState(freshJob);
+            setJobHistory((prev) => {
+                if (prev.some((job) => job.id === freshJob.id)) return prev;
+                return [freshJob, ...prev];
+            });
+            setJobStatusMessage("Enrichment job queued from filtered leads.");
+            setToastMessage(`✓ Enrichment started for ${freshJob.fileName || 'filtered leads'}.`);
+            setToastVisible(true);
+
+            startJobWatch(response.jobId || freshJob.id);
+            setModalOpen(false);
+            setEnrichSource('csv');
+            setSelectedCampaignId("");
+        } catch (error) {
+            reportUploadError(error instanceof Error ? error.message : "Unable to start enrichment.");
+        } finally {
+            setUploading(false);
+        }
+    };
+
     const handleUploadClick = async () => {
         if (!user) {
             reportUploadError("You must be signed in to upload leads.");
+            return;
+        }
+        if (enrichSource === 'filtered') {
+            await handleStartFilteredEnrichment();
             return;
         }
         if (!selectedFile) {
@@ -6411,6 +6571,252 @@ export default function ClientPage() {
         }
     };
 
+    const guessLeadImportMapping = (headers: string[]) => {
+        const mapping: Record<string, string> = {};
+        const taken = new Set<string>();
+        for (const target of LEAD_IMPORT_TARGET_FIELDS) {
+            for (const pattern of target.guesses) {
+                const match = headers.find((header) => !taken.has(header) && pattern.test(header));
+                if (match) {
+                    mapping[target.key] = match;
+                    taken.add(match);
+                    break;
+                }
+            }
+        }
+        return mapping;
+    };
+
+    const handleOpenLeadImportModal = () => {
+        setLeadImportModalOpen(true);
+        setLeadImportStep(1);
+        setLeadImportFile(null);
+        setLeadImportHeaders([]);
+        setLeadImportPreviewRows([]);
+        setLeadImportTotalRows(0);
+        setLeadImportMapping({});
+        setLeadImportCollisionStrategy('fill_blanks');
+        setLeadImportKeepUnmapped(true);
+        setLeadImportBatch(null);
+    };
+
+    const handleLeadImportFileChange = async (file: File | null) => {
+        setLeadImportFile(file);
+        setLeadImportBatch(null);
+        if (!file) {
+            setLeadImportStep(1);
+            setLeadImportHeaders([]);
+            setLeadImportPreviewRows([]);
+            setLeadImportTotalRows(0);
+            setLeadImportMapping({});
+            return;
+        }
+        try {
+            setLeadImportParsing(true);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const formData = new FormData();
+            formData.append('file', file);
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/verification-import/preview`,
+                { method: 'POST', headers: { Authorization: `Bearer ${idToken}` }, body: formData }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || `Parse failed (${response.status})`);
+            const headers: string[] = data.headers || [];
+            setLeadImportHeaders(headers);
+            setLeadImportPreviewRows(data.previewRows || []);
+            setLeadImportTotalRows(data.totalRows || 0);
+            setLeadImportMapping(guessLeadImportMapping(headers));
+            setLeadImportStep(2);
+        } catch (error) {
+            console.error('Error previewing lead import CSV:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to parse CSV');
+            setToastVisible(true);
+        } finally {
+            setLeadImportParsing(false);
+        }
+    };
+
+    const handleStartLeadImport = async () => {
+        if (!user || !clientId || !leadImportFile) return;
+        if (!leadImportMapping.domain) {
+            setToastMessage('Map the Domain column before importing.');
+            setToastVisible(true);
+            return;
+        }
+        try {
+            setLeadImportStarting(true);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const formData = new FormData();
+            formData.append('file', leadImportFile);
+            formData.append('clientId', clientId);
+            formData.append('columnMapping', JSON.stringify(leadImportMapping));
+            formData.append('collisionStrategy', leadImportCollisionStrategy);
+            formData.append('keepUnmapped', String(leadImportKeepUnmapped));
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/import`,
+                { method: 'POST', headers: { Authorization: `Bearer ${idToken}` }, body: formData }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || `Import failed (${response.status})`);
+            setLeadImportBatch(data.batch || null);
+            setLeadImportStep(3);
+        } catch (error) {
+            console.error('Error starting lead import:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to start lead import');
+            setToastVisible(true);
+        } finally {
+            setLeadImportStarting(false);
+        }
+    };
+
+    // Poll batch progress while the import modal shows a processing batch.
+    useEffect(() => {
+        if (!leadImportModalOpen || !leadImportBatch || leadImportBatch.status !== 'processing' || !clientId) {
+            return;
+        }
+        let cancelled = false;
+        const poll = async () => {
+            try {
+                const idToken = await getAccessToken();
+                if (!idToken || cancelled) return;
+                const params = new URLSearchParams({ clientId });
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/leads/import/batches/${leadImportBatch.id}?${params.toString()}`,
+                    { headers: { Authorization: `Bearer ${idToken}` } }
+                );
+                if (!response.ok) return;
+                const data = await response.json();
+                if (cancelled || !data?.batch) return;
+                setLeadImportBatch(data.batch);
+                if (data.batch.status === 'completed') {
+                    setToastMessage(`Import complete: ${data.batch.createdCount} new, ${data.batch.updatedCount} updated, ${data.batch.skippedCount} skipped${data.batch.errorCount ? `, ${data.batch.errorCount} error rows` : ''}.`);
+                    setToastVisible(true);
+                    setLeadFilterFieldsNonce((prev) => prev + 1);
+                    fetchLeads(true);
+                    fetchLeadTotal();
+                } else if (data.batch.status === 'failed') {
+                    setToastMessage(`Import failed: ${data.batch.error || 'Unknown error'}`);
+                    setToastVisible(true);
+                }
+            } catch (error) {
+                console.error('Error polling import batch:', error);
+            }
+        };
+        const interval = window.setInterval(poll, 1500);
+        return () => {
+            cancelled = true;
+            window.clearInterval(interval);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [leadImportModalOpen, leadImportBatch?.id, leadImportBatch?.status, clientId]);
+
+    const handleDownloadLeadImportErrors = async () => {
+        if (!leadImportBatch || !clientId) return;
+        try {
+            setLeadImportDownloadingErrors(true);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const params = new URLSearchParams({ clientId });
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/import/batches/${leadImportBatch.id}/errors?${params.toString()}`,
+                { headers: { Authorization: `Bearer ${idToken}` } }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || 'Failed to load error rows');
+            const errors: Array<{ rowNumber: number | null; reason: string; raw: Record<string, unknown> }> = data.errors || [];
+            if (!errors.length) {
+                setToastMessage('No error rows recorded for this import.');
+                setToastVisible(true);
+                return;
+            }
+            const rawKeys = Array.from(new Set(errors.flatMap((row) => Object.keys(row.raw || {}))));
+            const header = ['row_number', 'reason', ...rawKeys];
+            const lines = [header.map(csvEscape).join(',')];
+            for (const row of errors) {
+                lines.push([
+                    row.rowNumber ?? '',
+                    row.reason || '',
+                    ...rawKeys.map((key) => {
+                        const value = (row.raw || {})[key];
+                        return value === null || value === undefined ? '' : String(value);
+                    })
+                ].map(csvEscape).join(','));
+            }
+            const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = `${clientName || clientId}_import_${leadImportBatch.id}_errors.csv`;
+            document.body.appendChild(anchor);
+            anchor.click();
+            document.body.removeChild(anchor);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error('Error downloading import errors:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to download error report');
+            setToastVisible(true);
+        } finally {
+            setLeadImportDownloadingErrors(false);
+        }
+    };
+
+    const handleOpenFilteredEnrichModal = async () => {
+        if (!user || !clientId) return;
+        setEnrichSource('filtered');
+        setFilteredEnrichPreview(null);
+        setFilteredEnrichRowLimit("");
+        setUploadError("");
+        setSelectedFile(null);
+        // Clear CSV column state from any prior upload session — a leftover
+        // founder/email column mapping would auto-disable those stage toggles.
+        setCsvColumns([]);
+        setDomainColumn("");
+        setFounderColumn("");
+        setEmailColumn("");
+        setDedupeStrategy('include');
+        // These domains already live in the DB; DNS-checking them again is usually wasted time.
+        setRunDomainCheck(false);
+        setFindFounder(true);
+        setFindEmail(true);
+        setVerifyEmail(emailProvider !== 'self_hosted');
+        setSkipFounderFinder(false);
+        setSkipEmailFinder(false);
+        setPersonalizeFirstLine(false);
+        setUseShoppingAuditPipeline(false);
+        setSelectedCampaignId("");
+        setWizardStep(3);
+        setModalOpen(true);
+
+        try {
+            setFilteredEnrichPreviewLoading(true);
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/enrich-preview`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${idToken}`
+                },
+                body: JSON.stringify({
+                    clientId,
+                    query: buildLeadDeleteQuery()
+                })
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || 'Failed to load preview');
+            setFilteredEnrichPreview(data.preview || null);
+        } catch (error) {
+            console.error('Error loading enrich preview:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to load filtered lead preview');
+            setToastVisible(true);
+        } finally {
+            setFilteredEnrichPreviewLoading(false);
+        }
+    };
+
     const handleOpenInstantlyCsvImportModal = async () => {
         setShowInstantlyCsvImportModal(true);
         setInstantlyCsvImportFile(null);
@@ -6869,6 +7275,27 @@ export default function ClientPage() {
                     </button>
                     <button
                         type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={handleOpenLeadImportModal}
+                        style={{ flex: '0 0 auto' }}
+                        disabled={leadImportStarting}
+                    >
+                        📥 Import Leads CSV
+                    </button>
+                    <button
+                        type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={handleOpenFilteredEnrichModal}
+                        style={{ flex: '0 0 auto' }}
+                        disabled={leadsLoading || filteredEnrichPreviewLoading || (jobState !== null && (jobState.status === 'running' || jobState.status === 'queued'))}
+                        title={jobState && (jobState.status === 'running' || jobState.status === 'queued')
+                            ? 'Another enrichment job is already active for this client.'
+                            : 'Start an enrichment job on the currently filtered leads'}
+                    >
+                        ⚡ Enrich Filtered ({displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString()})
+                    </button>
+                    <button
+                        type="button"
                         className="primary-button"
                         onClick={() => setLeadExportModalOpen(true)}
                         style={{ flex: '0 0 auto' }}
@@ -7245,27 +7672,11 @@ export default function ClientPage() {
                                                 }}>{renderFounderNameCell(lead.founderName, lead.founderFindCompletedAt)}</td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
-                                                    maxWidth: '320px'
-                                                }}>
-                                                    <div style={{
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        gap: '0.5rem',
-                                                        flexWrap: 'wrap',
-                                                        minWidth: 0
-                                                    }}>
-                                                        <span style={{
-                                                            overflow: 'hidden',
-                                                            textOverflow: 'ellipsis',
-                                                            whiteSpace: 'nowrap',
-                                                            minWidth: 0,
-                                                            flex: '1 1 auto'
-                                                        }}>
-                                                            {formatRawEmailValue(lead.email)}
-                                                        </span>
-                                                        {!lead.email && renderEmailFindChip(lead.email, lead.emailFindCompletedAt)}
-                                                    </div>
-                                                </td>
+                                                    maxWidth: '320px',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap'
+                                                }}>{renderEmailCell(lead.email, lead.emailFindCompletedAt)}</td>
                                                 <td style={{
                                                     padding: '0.75rem 1rem',
                                                     minWidth: '140px'
@@ -8194,6 +8605,7 @@ export default function ClientPage() {
                                         type="button"
                                         className="primary-button"
                                         onClick={() => {
+                                            setEnrichSource('csv');
                                             setModalOpen(true);
                                             setWizardStep(1);
                                             setSelectedFile(null);
@@ -10357,28 +10769,37 @@ export default function ClientPage() {
                 </div>
             )}
 
-            {/* Upload Modal - Wizard */}
+            {/* Upload Modal - Wizard (CSV upload or filtered-leads enrichment) */}
             {modalOpen && (
                 <div
                     className="modal-overlay"
                     role="dialog"
                     aria-modal="true"
-                    onClick={() => setModalOpen(false)}
+                    onClick={() => {
+                        setModalOpen(false);
+                        setEnrichSource('csv');
+                    }}
                 >
                     <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '720px' }}>
                         <div className="modal__header">
                             <div>
-                                <p className="eyebrow eyebrow--muted">Step {wizardStep} / 4</p>
+                                <p className="eyebrow eyebrow--muted">
+                                    {enrichSource === 'filtered'
+                                        ? `Step ${wizardStep - 2} / 2`
+                                        : `Step ${wizardStep} / 4`}
+                                </p>
                                 <h2 className="modal__title">
                                     {wizardStep === 1 && '📤 Upload CSV'}
                                     {wizardStep === 2 && '🗂️ Map Columns'}
-                                    {wizardStep === 3 && '⚙️ Processing Options'}
+                                    {wizardStep === 3 && (enrichSource === 'filtered' ? '⚡ Enrich Filtered Leads' : '⚙️ Processing Options')}
                                     {wizardStep === 4 && '✨ Personalization'}
                                 </h2>
                                 <p className="modal__description">
                                     {wizardStep === 1 && 'Upload your CSV file with domain column'}
                                     {wizardStep === 2 && 'Confirm which CSV columns map to required fields'}
-                                    {wizardStep === 3 && 'Configure enrichment and verification steps'}
+                                    {wizardStep === 3 && (enrichSource === 'filtered'
+                                        ? 'Run enrichment stages on the leads matching your current filter — no CSV needed'
+                                        : 'Configure enrichment and verification steps')}
                                     {wizardStep === 4 && 'Industry-specific personalization settings'}
                                 </p>
                             </div>
@@ -10391,7 +10812,7 @@ export default function ClientPage() {
                                 gap: '0.5rem',
                                 marginBottom: '1.5rem'
                             }}>
-                                {[1, 2, 3, 4].map((step) => (
+                                {(enrichSource === 'filtered' ? [3, 4] : [1, 2, 3, 4]).map((step) => (
                                     <div
                                         key={step}
                                         style={{
@@ -10570,6 +10991,88 @@ export default function ClientPage() {
                             {/* Step 3: Processing Options */}
                             {wizardStep === 3 && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+                                    {enrichSource === 'filtered' ? (
+                                        <>
+                                            <div style={{
+                                                padding: '0.75rem 1rem',
+                                                background: 'rgba(59, 130, 246, 0.1)',
+                                                border: '1px solid rgba(59, 130, 246, 0.3)',
+                                                borderRadius: '8px',
+                                                fontSize: '0.875rem'
+                                            }}>
+                                                {filteredEnrichPreviewLoading ? (
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--app-text-muted)' }}>
+                                                        <div style={{
+                                                            width: '14px',
+                                                            height: '14px',
+                                                            border: '2px solid var(--app-border-mid)',
+                                                            borderTopColor: '#3b82f6',
+                                                            borderRadius: '50%',
+                                                            animation: 'spin 0.8s linear infinite'
+                                                        }} />
+                                                        Counting filtered leads...
+                                                    </div>
+                                                ) : filteredEnrichPreview ? (
+                                                    <div style={{ color: 'var(--app-text)' }}>
+                                                        <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>
+                                                            🎯 Filtered set snapshot
+                                                        </div>
+                                                        <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+                                                            <span><strong style={{ color: 'var(--app-text)' }}>{filteredEnrichPreview.totalDomains.toLocaleString()}</strong> domains</span>
+                                                            <span><strong style={{ color: '#60a5fa' }}>{filteredEnrichPreview.founderContacts.toLocaleString()}</strong> pipeline-eligible leads</span>
+                                                            {filteredEnrichPreview.nonFounderContacts > 0 && (
+                                                                <span><strong style={{ color: '#f59e0b' }}>{filteredEnrichPreview.nonFounderContacts.toLocaleString()}</strong> non-founder rows (stages skip these)</span>
+                                                            )}
+                                                        </div>
+                                                        <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)' }}>
+                                                            <span><strong style={{ color: '#8b5cf6' }}>{filteredEnrichPreview.withFounderName.toLocaleString()}</strong> w/ names</span>
+                                                            <span><strong style={{ color: '#ec4899' }}>{filteredEnrichPreview.withEmail.toLocaleString()}</strong> w/ emails</span>
+                                                            <span><strong style={{ color: '#22c55e' }}>{filteredEnrichPreview.verifiedValid.toLocaleString()}</strong> verified valid</span>
+                                                            <span><strong style={{ color: '#06b6d4' }}>{filteredEnrichPreview.withFirstLine.toLocaleString()}</strong> w/ first lines</span>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <span style={{ color: 'var(--app-text-muted)' }}>Preview unavailable — the job will still snapshot the current filter.</span>
+                                                )}
+                                            </div>
+
+                                            <label className="settings-field">
+                                                <span className="settings-field__label">Limit to first N leads (optional)</span>
+                                                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                                                    <input
+                                                        type="number"
+                                                        min={1}
+                                                        placeholder="All matching leads"
+                                                        value={filteredEnrichRowLimit}
+                                                        onChange={(e) => setFilteredEnrichRowLimit(e.target.value)}
+                                                        style={{ width: '180px' }}
+                                                    />
+                                                    {[100, 500, 1000, 5000].map((preset) => (
+                                                        <button
+                                                            key={preset}
+                                                            type="button"
+                                                            className="secondary-button"
+                                                            onClick={() => setFilteredEnrichRowLimit(String(preset))}
+                                                        >
+                                                            {preset.toLocaleString()}
+                                                        </button>
+                                                    ))}
+                                                    {filteredEnrichRowLimit && (
+                                                        <button
+                                                            type="button"
+                                                            className="secondary-button"
+                                                            onClick={() => setFilteredEnrichRowLimit("")}
+                                                        >
+                                                            Clear
+                                                        </button>
+                                                    )}
+                                                </div>
+                                                <span className="settings-field__hint">
+                                                    Newest leads first — handy for test-driving a stage on a sample before committing to the full set. Enabled stages re-run for every selected lead this run; existing data merges (non-empty results win, blanks never overwrite).
+                                                </span>
+                                            </label>
+                                        </>
+                                    ) : (
                                     <label className="settings-field">
                                         <span className="settings-field__label">Duplicates</span>
                                         <select
@@ -10585,6 +11088,7 @@ export default function ClientPage() {
                                                 : 'Deduplication is scoped to this client.'}
                                         </span>
                                     </label>
+                                    )}
 
                                     <div style={{
                                         display: 'flex',
@@ -10846,7 +11350,7 @@ export default function ClientPage() {
                                         borderRadius: '8px',
                                         border: '1px solid var(--app-border)'
                                     }}>
-                                        {shoppingAuditEnabled && (
+                                        {shoppingAuditEnabled && enrichSource === 'csv' && (
                                             <label style={{
                                                 display: 'flex',
                                                 alignItems: 'flex-start',
@@ -11059,7 +11563,7 @@ export default function ClientPage() {
                                     </p>
                                 )}
                                 <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
-                                {wizardStep > 1 && (
+                                {wizardStep > (enrichSource === 'filtered' ? 3 : 1) && (
                                     <button
                                         type="button"
                                         className="secondary-button secondary-button--active"
@@ -11073,8 +11577,10 @@ export default function ClientPage() {
                                         type="button"
                                         className="primary-button"
                                         disabled={
-                                            (wizardStep === 1 && !selectedFile) ||
-                                            (wizardStep === 2 && !domainColumn)
+                                            enrichSource === 'csv' && (
+                                                (wizardStep === 1 && !selectedFile) ||
+                                                (wizardStep === 2 && !domainColumn)
+                                            )
                                         }
                                         onClick={() => setWizardStep((prev) => (prev + 1) as 1 | 2 | 3 | 4)}
                                     >
@@ -11084,10 +11590,14 @@ export default function ClientPage() {
                                     <button
                                         type="button"
                                         className="primary-button"
-                                        disabled={uploading}
+                                        disabled={uploading || (enrichSource === 'filtered' && filteredEnrichPreview?.totalContacts === 0)}
                                         onClick={handleUploadClick}
                                     >
-                                        {uploading ? "Processing..." : "Upload Leads"}
+                                        {uploading
+                                            ? "Processing..."
+                                            : enrichSource === 'filtered'
+                                                ? `Start Enrichment${filteredEnrichPreview ? ` (${(filteredEnrichRowLimit && Number.parseInt(filteredEnrichRowLimit, 10) > 0 ? Math.min(Number.parseInt(filteredEnrichRowLimit, 10), filteredEnrichPreview.totalDomains) : filteredEnrichPreview.totalDomains).toLocaleString()} domains)` : ''}`
+                                                : "Upload Leads"}
                                     </button>
                                 )}
                                 </div>
@@ -11302,6 +11812,216 @@ export default function ClientPage() {
             )}
 
             {/* Verification CSV Import Modal */}
+            {/* Import Leads CSV Modal (no enrichment, column-mapped) */}
+            {leadImportModalOpen && (
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    onClick={() => { if (!leadImportStarting && !leadImportParsing) setLeadImportModalOpen(false); }}
+                >
+                    <div
+                        className="modal"
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ maxWidth: '760px', maxHeight: '92vh', display: 'flex', flexDirection: 'column' }}
+                    >
+                        <div className="modal__header">
+                            <div>
+                                <h2 className="modal__title">📥 Import Leads CSV</h2>
+                                <p className="modal__description">
+                                    Add leads to this client without starting an enrichment. Map CSV columns to lead fields — unmapped columns are kept as custom attributes. Large files (100k+ rows) import in the background.
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', overflowY: 'auto' }}>
+                            {/* Step 1 – File upload */}
+                            {leadImportStep < 3 && (
+                                <div>
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">CSV File {leadImportStep === 1 ? '*' : ''}</span>
+                                        <input
+                                            type="file"
+                                            accept=".csv,text/csv"
+                                            disabled={leadImportParsing || leadImportStarting}
+                                            onChange={(e) => handleLeadImportFileChange(e.target.files?.[0] || null)}
+                                        />
+                                        <span className="settings-field__hint">
+                                            {leadImportParsing
+                                                ? 'Parsing CSV…'
+                                                : leadImportFile
+                                                    ? `${leadImportFile.name}${leadImportTotalRows ? ` — ${leadImportTotalRows.toLocaleString()} rows` : ''}`
+                                                    : 'A domain column is required. Optional: name, email, verification status, insight fields.'}
+                                        </span>
+                                    </label>
+                                </div>
+                            )}
+
+                            {/* Step 2 – Column mapping + options */}
+                            {leadImportStep === 2 && (
+                                <>
+                                    <div>
+                                        <div style={{ fontSize: '0.78rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
+                                            Column Mapping
+                                        </div>
+                                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '0.75rem' }}>
+                                            {LEAD_IMPORT_TARGET_FIELDS.map((target) => (
+                                                <label key={target.key} className="settings-field">
+                                                    <span className="settings-field__label">
+                                                        {target.label}{target.required ? <span style={{ color: '#f87171' }}> *</span> : ''}
+                                                        <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', color: 'var(--app-text-faint)' }}>{target.group}</span>
+                                                    </span>
+                                                    <select
+                                                        value={leadImportMapping[target.key] || ''}
+                                                        onChange={(e) => {
+                                                            const value = e.target.value;
+                                                            setLeadImportMapping((prev) => {
+                                                                const next = { ...prev };
+                                                                if (value) next[target.key] = value;
+                                                                else delete next[target.key];
+                                                                return next;
+                                                            });
+                                                        }}
+                                                    >
+                                                        <option value="">— Not mapped —</option>
+                                                        {leadImportHeaders.map((header) => (
+                                                            <option key={header} value={header}>{header}</option>
+                                                        ))}
+                                                    </select>
+                                                    {leadImportMapping[target.key] && leadImportPreviewRows.length > 0 && (
+                                                        <span className="settings-field__hint" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            e.g. {leadImportPreviewRows.slice(0, 2).map((row) => row[leadImportMapping[target.key]] || '(empty)').join(' · ')}
+                                                        </span>
+                                                    )}
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">When a lead already exists (same domain)</span>
+                                        <select
+                                            value={leadImportCollisionStrategy}
+                                            onChange={(e) => setLeadImportCollisionStrategy(e.target.value as 'fill_blanks' | 'overwrite' | 'skip')}
+                                        >
+                                            <option value="fill_blanks">Fill blanks only — never overwrite existing data</option>
+                                            <option value="overwrite">Overwrite with CSV values (blank cells keep existing data)</option>
+                                            <option value="skip">Skip existing leads — only create new domains</option>
+                                        </select>
+                                        <span className="settings-field__hint">
+                                            {leadImportCollisionStrategy === 'fill_blanks' && 'Safest: enriched emails, verification statuses and first lines are preserved; the CSV only fills what is missing.'}
+                                            {leadImportCollisionStrategy === 'overwrite' && 'CSV is the source of truth for mapped columns. Changing an email resets its verification status to the CSV’s status.'}
+                                            {leadImportCollisionStrategy === 'skip' && 'Existing domains are counted as skipped and left untouched.'}
+                                        </span>
+                                    </label>
+
+                                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.6rem', cursor: 'pointer', padding: '0.25rem 0' }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={leadImportKeepUnmapped}
+                                            onChange={(e) => setLeadImportKeepUnmapped(e.target.checked)}
+                                            style={{ width: '16px', height: '16px', cursor: 'pointer', marginTop: '0.15rem' }}
+                                        />
+                                        <div>
+                                            <div style={{ fontWeight: 500, color: 'var(--app-text)', fontSize: '0.9rem' }}>
+                                                Keep unmapped columns as custom attributes
+                                            </div>
+                                            <div style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>
+                                                {(() => {
+                                                    const mapped = new Set(Object.values(leadImportMapping));
+                                                    const unmapped = leadImportHeaders.filter((header) => !mapped.has(header));
+                                                    return unmapped.length
+                                                        ? `${unmapped.length} unmapped column${unmapped.length === 1 ? '' : 's'} (${unmapped.slice(0, 5).join(', ')}${unmapped.length > 5 ? ', …' : ''}) will be stored on each lead's insights.`
+                                                        : 'Every CSV column is mapped.';
+                                                })()}
+                                            </div>
+                                        </div>
+                                    </label>
+                                </>
+                            )}
+
+                            {/* Step 3 – Progress / result */}
+                            {leadImportStep === 3 && leadImportBatch && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                    <div style={{
+                                        padding: '1rem',
+                                        background: 'var(--app-surface-3)',
+                                        border: '1px solid var(--app-border)',
+                                        borderRadius: '10px'
+                                    }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.6rem' }}>
+                                            <span style={{ fontWeight: 600, color: 'var(--app-text)' }}>
+                                                {leadImportBatch.status === 'processing' && (leadImportBatch.stalled ? '⚠️ Import appears stalled' : '⏳ Importing…')}
+                                                {leadImportBatch.status === 'completed' && '✅ Import complete'}
+                                                {leadImportBatch.status === 'failed' && '❌ Import failed'}
+                                            </span>
+                                            <span style={{ color: 'var(--app-text-muted)', fontSize: '0.85rem' }}>
+                                                {leadImportBatch.processedRows.toLocaleString()} / {Math.max(leadImportBatch.totalRows, leadImportBatch.processedRows).toLocaleString()} rows
+                                            </span>
+                                        </div>
+                                        <div style={{ height: '6px', borderRadius: '3px', background: 'var(--app-surface-2)', overflow: 'hidden' }}>
+                                            <div style={{
+                                                height: '100%',
+                                                width: `${Math.min(100, Math.round((leadImportBatch.processedRows / Math.max(1, leadImportBatch.totalRows)) * 100))}%`,
+                                                background: leadImportBatch.status === 'failed' ? '#ef4444' : '#3b82f6',
+                                                transition: 'width 0.4s ease'
+                                            }} />
+                                        </div>
+                                        <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', marginTop: '0.75rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
+                                            <span><strong style={{ color: '#10b981' }}>{leadImportBatch.createdCount.toLocaleString()}</strong> new</span>
+                                            <span><strong style={{ color: '#60a5fa' }}>{leadImportBatch.updatedCount.toLocaleString()}</strong> updated</span>
+                                            <span><strong style={{ color: '#f59e0b' }}>{leadImportBatch.skippedCount.toLocaleString()}</strong> skipped</span>
+                                            <span><strong style={{ color: leadImportBatch.errorCount ? '#ef4444' : 'var(--app-text)' }}>{leadImportBatch.errorCount.toLocaleString()}</strong> error rows</span>
+                                        </div>
+                                        {leadImportBatch.error && (
+                                            <p className="form-error" role="alert" style={{ marginTop: '0.75rem' }}>{leadImportBatch.error}</p>
+                                        )}
+                                    </div>
+                                    {leadImportBatch.status === 'completed' && (
+                                        <div style={{ fontSize: '0.85rem', color: 'var(--app-text-muted)' }}>
+                                            Tip: filter the leads table with <strong>Import Batch = {leadImportBatch.fileName || `#${leadImportBatch.id}`}</strong>, then use “⚡ Enrich Filtered” to run enrichment on exactly these leads.
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="modal__actions">
+                            {leadImportStep === 3 && leadImportBatch && leadImportBatch.errorCount > 0 && (
+                                <button
+                                    type="button"
+                                    className="secondary-button secondary-button--active"
+                                    onClick={handleDownloadLeadImportErrors}
+                                    disabled={leadImportDownloadingErrors}
+                                >
+                                    {leadImportDownloadingErrors ? 'Preparing…' : '📄 Download error report'}
+                                </button>
+                            )}
+                            {leadImportStep === 2 && (
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={handleStartLeadImport}
+                                    disabled={leadImportStarting || !leadImportMapping.domain}
+                                >
+                                    {leadImportStarting
+                                        ? 'Starting…'
+                                        : `Import ${leadImportTotalRows ? leadImportTotalRows.toLocaleString() : ''} rows`}
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={() => setLeadImportModalOpen(false)}
+                                disabled={leadImportStarting}
+                            >
+                                {leadImportStep === 3 && leadImportBatch?.status === 'processing' ? 'Continue in background' : 'Close'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {verificationImportModalOpen && (
                 <div
                     className="modal-overlay"

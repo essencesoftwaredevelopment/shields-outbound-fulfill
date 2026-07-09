@@ -43,6 +43,7 @@ import { deleteQueueJob, enqueuePipelineJob, getQueueJob, getRunnerRecord, setQu
 import { dispatchEnrichmentJob } from '../enrichment/dispatch.js';
 import { clearWorkflowRunId } from '../enrichment/persist.js';
 import { resolveExecutionRunner } from '../enrichment/executionRunner.js';
+import { queryFilteredLeadSeedRows } from './leads.js';
 
 async function enrichJobWithQueueRuntime(jobState, jobId) {
     if (!jobState || !jobId) return jobState;
@@ -465,9 +466,33 @@ router.get('/jobs/:id/leads-preview', async (req, res) => {
     }
 });
 
+/** Max domains a filtered-leads job may seed (fat-finger guard; filters are the real cap). */
+const LEAD_FILTER_JOB_MAX_DOMAINS = 200000;
+
+function sanitizeLeadFilterInput(rawLeadFilter) {
+    if (!rawLeadFilter || typeof rawLeadFilter !== 'object' || Array.isArray(rawLeadFilter)) return null;
+    const search = typeof rawLeadFilter.search === 'string' ? rawLeadFilter.search.trim() : '';
+    const instantlyCampaignId = typeof rawLeadFilter.instantlyCampaignId === 'string'
+        ? rawLeadFilter.instantlyCampaignId.trim()
+        : '';
+    const filters = rawLeadFilter.filters && typeof rawLeadFilter.filters === 'object'
+        ? rawLeadFilter.filters
+        : undefined;
+    const parsedRowLimit = Number.parseInt(rawLeadFilter.rowLimit, 10);
+    const rowLimit = Number.isInteger(parsedRowLimit) && parsedRowLimit > 0 ? parsedRowLimit : null;
+    return {
+        ...(search ? { search } : {}),
+        ...(instantlyCampaignId ? { instantlyCampaignId } : {}),
+        ...(filters ? { filters } : {}),
+        ...(rowLimit ? { rowLimit } : {})
+    };
+}
+
 router.post('/jobs', uploadFields, async (req, res) => {
     try {
-        if (!req.files?.file || !req.files.file[0]) {
+        const hasFile = Boolean(req.files?.file && req.files.file[0]);
+        const leadFilter = hasFile ? null : sanitizeLeadFilterInput(req.body?.leadFilter);
+        if (!hasFile && !leadFilter) {
             return res.status(400).json({ error: 'Missing CSV file upload.' });
         }
 
@@ -484,11 +509,13 @@ router.post('/jobs', uploadFields, async (req, res) => {
             return res.status(400).json({ error: 'Missing Kitt API key for TryKitt provider.' });
         }
 
-        const file = req.files.file[0];
+        const file = hasFile ? req.files.file[0] : null;
         const clientSlug = (req.body.clientId || '').toString().trim();
         const sqlClientId = await getOrCreateClient(uid, clientSlug);
 
-        const dedupeStrategy = (req.body.dedupeStrategy || 'skip').toString();
+        // Filtered-leads jobs re-process rows that by definition already exist;
+        // 'skip' would silently no-op the entire job.
+        const dedupeStrategy = leadFilter ? 'include' : (req.body.dedupeStrategy || 'skip').toString();
         const rawSkipFounder = String(req.body.skipFounderFinder || '').toLowerCase() === 'true';
         const rawFindFounder = String(req.body.findFounder ?? 'true').toLowerCase() !== 'false';
         const skipFounderFinder = rawSkipFounder || !rawFindFounder;
@@ -512,7 +539,33 @@ router.post('/jobs', uploadFields, async (req, res) => {
             return res.status(403).json({ error: 'Shopping audit pipeline is not enabled for this agency.' });
         }
 
-        const job = await createJobRecord(file.buffer, file.originalname, apiKeys, uid, clientSlug, dedupeStrategy, {
+        let seedEntries = null;
+        let jobFileName = file?.originalname || null;
+        if (leadFilter) {
+            const seedRows = await queryFilteredLeadSeedRows(uid, sqlClientId, leadFilter, {
+                rowLimit: Math.min(leadFilter.rowLimit || LEAD_FILTER_JOB_MAX_DOMAINS, LEAD_FILTER_JOB_MAX_DOMAINS)
+            });
+            if (!seedRows.length) {
+                return res.status(400).json({ error: 'No leads match the current filter.' });
+            }
+            // raw_row carries existing values for visibility/debugging, but the
+            // column mapping deliberately leaves founder/email unmapped: a mapped
+            // column with an empty value flags the row founderExcluded /
+            // out-of-cohort (see computeCohortMeta), which would silently drop
+            // every lead missing that value. Stage toggles + 'include' queues
+            // already scope re-runs correctly.
+            seedEntries = seedRows.map((row) => ({
+                domain: row.domain,
+                raw: {
+                    domain: row.domain,
+                    founder_name: row.full_name || '',
+                    email: row.email || ''
+                }
+            }));
+            jobFileName = `Filtered leads (${seedEntries.length.toLocaleString('en-US')} domains)`;
+        }
+
+        const job = await createJobRecord(file?.buffer || null, jobFileName, apiKeys, uid, clientSlug, dedupeStrategy, {
             skipFounderFinder,
             skipEmailFinder,
             skipVerification,
@@ -527,11 +580,20 @@ router.post('/jobs', uploadFields, async (req, res) => {
             emailVerificationProvider,
             pipelineMode,
             sqlClientId,
-            columnMapping: {
-                domain: (req.body.domainColumn || 'domain').toString().trim(),
-                founder: (req.body.founderColumn || '').toString().trim(),
-                email: (req.body.emailColumn || '').toString().trim()
-            }
+            ...(seedEntries
+                ? {
+                    domainEntries: seedEntries,
+                    jobSource: 'lead_filter',
+                    leadFilter,
+                    columnMapping: { domain: 'domain', founder: '', email: '' }
+                }
+                : {
+                    columnMapping: {
+                        domain: (req.body.domainColumn || 'domain').toString().trim(),
+                        founder: (req.body.founderColumn || '').toString().trim(),
+                        email: (req.body.emailColumn || '').toString().trim()
+                    }
+                })
         });
 
         await setActiveJob(job.id, uid, sqlClientId);

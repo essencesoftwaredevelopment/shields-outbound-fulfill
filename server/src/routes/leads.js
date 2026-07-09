@@ -15,6 +15,7 @@ import multer from 'multer';
 import { parse as csvParse } from 'csv-parse';
 import { verifyFirebaseToken } from '../middleware/auth.js';
 import * as leadsService from '../services/leads.js';
+import * as leadImportService from '../services/leadImport.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
 import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
@@ -785,18 +786,34 @@ const LEAD_FILTER_FIELDS = [
             { key: 'is_empty', label: 'Not Set' },
             { key: 'not_empty', label: 'Is Set' }
         ]
+    },
+    // ── Import tracking ──────────────────────────────────────────────────────
+    {
+        key: 'import_batch',
+        label: 'Import Batch',
+        type: 'enum',
+        // Options are per-client (lead_import_batches) — injected by the
+        // filter-fields endpoint when a clientId is provided.
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' },
+            { key: 'is_empty', label: 'Not Imported' },
+            { key: 'not_empty', label: 'Any Import' }
+        ]
     }
 ];
 
 const LEAD_FILTER_FIELD_MAP = new Map(LEAD_FILTER_FIELDS.map((field) => [field.key, field]));
 
-function getLeadFilterFieldsPayload() {
+function getLeadFilterFieldsPayload(dynamicOptions = {}) {
     return LEAD_FILTER_FIELDS.map((field) => ({
         key: field.key,
         label: field.label,
         type: field.type,
         operators: field.operators,
-        options: field.options || []
+        options: dynamicOptions[field.key] || field.options || []
     }));
 }
 
@@ -919,7 +936,104 @@ function buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilter
         `;
 }
 
-async function buildLeadListFilterContext(agencyId, clientId, queryInput = {}) {
+function emptyEnrichPreview() {
+    return {
+        totalContacts: 0,
+        totalDomains: 0,
+        founderContacts: 0,
+        nonFounderContacts: 0,
+        withEmail: 0,
+        withoutEmail: 0,
+        withFounderName: 0,
+        verifiedValid: 0,
+        withFirstLine: 0
+    };
+}
+
+/** Per-stage eligibility stats for the filtered set (enrich-filtered preview). */
+async function queryFilteredLeadEnrichStats(filterContext) {
+    const { whereClause, filterParams, baseWithClause, filterJoins } = filterContext;
+    const result = await pool.query(
+        `${baseWithClause}
+        SELECT
+            COUNT(*)::int AS total_contacts,
+            COUNT(DISTINCT co.domain_normalized)::int AS total_domains,
+            COUNT(*) FILTER (WHERE c.role_type = 'founder')::int AS founder_contacts,
+            COUNT(*) FILTER (WHERE c.role_type = 'founder'
+                AND c.email IS NOT NULL AND BTRIM(c.email) <> '')::int AS with_email,
+            COUNT(*) FILTER (WHERE c.role_type = 'founder'
+                AND (c.email IS NULL OR BTRIM(c.email) = ''))::int AS without_email,
+            COUNT(*) FILTER (WHERE c.role_type = 'founder'
+                AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
+                AND LOWER(BTRIM(c.full_name)) <> 'not found')::int AS with_founder_name,
+            COUNT(*) FILTER (WHERE c.role_type = 'founder'
+                AND LOWER(COALESCE(c.email_status, '')) = 'valid')::int AS verified_valid,
+            COUNT(*) FILTER (WHERE c.role_type = 'founder'
+                AND c.personalization_first_line IS NOT NULL
+                AND BTRIM(c.personalization_first_line) <> '')::int AS with_first_line
+        FROM contacts c
+        JOIN scoped_companies co ON c.company_id = co.id
+        ${filterJoins}
+        WHERE ${whereClause}`,
+        filterParams
+    );
+    const row = result.rows[0] || {};
+    return {
+        totalContacts: row.total_contacts || 0,
+        totalDomains: row.total_domains || 0,
+        founderContacts: row.founder_contacts || 0,
+        nonFounderContacts: Math.max(0, (row.total_contacts || 0) - (row.founder_contacts || 0)),
+        withEmail: row.with_email || 0,
+        withoutEmail: row.without_email || 0,
+        withFounderName: row.with_founder_name || 0,
+        verifiedValid: row.verified_valid || 0,
+        withFirstLine: row.with_first_line || 0
+    };
+}
+
+/**
+ * Materialize the filtered lead set into pipeline seed rows — one per domain,
+ * preferring the founder contact. Consumed by POST /api/jobs (leadFilter mode).
+ * Ordering matches the leads list (newest contact first) so an optional
+ * rowLimit means "the first N leads you see in the table".
+ */
+export async function queryFilteredLeadSeedRows(agencyId, clientId, queryInput = {}, { rowLimit = null } = {}) {
+    const filterContext = await buildLeadListFilterContext(agencyId, clientId, queryInput);
+    if (filterContext.emptyResult) return [];
+    const { whereClause, filterParams, baseWithClause, filterJoins } = filterContext;
+
+    const params = [...filterParams];
+    let limitSql = '';
+    const parsedLimit = Number.parseInt(rowLimit, 10);
+    if (Number.isInteger(parsedLimit) && parsedLimit > 0) {
+        params.push(parsedLimit);
+        limitSql = `LIMIT $${params.length}`;
+    }
+
+    const result = await pool.query(
+        `${baseWithClause}
+        SELECT domain, full_name, email
+        FROM (
+            SELECT DISTINCT ON (co.domain_normalized)
+                co.domain_normalized AS domain,
+                c.full_name,
+                c.email,
+                c.created_at,
+                c.id
+            FROM contacts c
+            JOIN scoped_companies co ON c.company_id = co.id
+            ${filterJoins}
+            WHERE ${whereClause}
+            ORDER BY co.domain_normalized, (c.role_type = 'founder') DESC, c.created_at DESC, c.id DESC
+        ) seed
+        ORDER BY seed.created_at DESC, seed.id DESC
+        ${limitSql}`,
+        params
+    );
+    return result.rows;
+}
+
+export async function buildLeadListFilterContext(agencyId, clientId, queryInput = {}) {
     const {
         emailStatus,
         emailStatusMulti,
@@ -1276,6 +1390,40 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
 
         const normalizedValue = normalizeLeadFilterValue(fieldKey, operatorKey, rawFilter.value);
         if (!NO_VALUE_OPS.has(operatorKey) && normalizedValue === null) continue;
+
+        // ── import_batch (contacts.import_batch_id) ────────────────────────
+        if (fieldKey === 'import_batch') {
+            if (operatorKey === 'is_empty') {
+                clauses.push(`c.import_batch_id IS NULL`);
+                continue;
+            }
+            if (operatorKey === 'not_empty') {
+                clauses.push(`c.import_batch_id IS NOT NULL`);
+                continue;
+            }
+            const rawIds = operatorKey === 'in' || operatorKey === 'not_in'
+                ? (Array.isArray(normalizedValue) ? normalizedValue : [])
+                : [String(normalizedValue)];
+            const ids = rawIds
+                .map((value) => String(value).trim())
+                .filter((value) => /^\d+$/.test(value));
+            if (!ids.length) continue;
+
+            if (operatorKey === 'eq') {
+                const ref = bindParam(ids[0]);
+                clauses.push(`c.import_batch_id = ${ref}::bigint`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(ids[0]);
+                clauses.push(`(c.import_batch_id IS NULL OR c.import_batch_id <> ${ref}::bigint)`);
+            } else if (operatorKey === 'in') {
+                const refs = bindArray(ids);
+                clauses.push(`c.import_batch_id = ANY(ARRAY[${refs.join(', ')}]::bigint[])`);
+            } else if (operatorKey === 'not_in') {
+                const refs = bindArray(ids);
+                clauses.push(`(c.import_batch_id IS NULL OR c.import_batch_id <> ALL(ARRAY[${refs.join(', ')}]::bigint[]))`);
+            }
+            continue;
+        }
 
         // ── full_name ──────────────────────────────────────────────────────
         if (fieldKey === 'full_name') {
@@ -2036,10 +2184,188 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-router.get('/leads/filter-fields', verifyFirebaseToken, async (_req, res) => {
-    res.json({
-        fields: getLeadFilterFieldsPayload()
-    });
+router.get('/leads/filter-fields', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        const dynamicOptions = {};
+
+        if (clientSlug) {
+            const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+            const batches = await leadImportService.listImportBatches(agencyId, clientId, 100);
+            dynamicOptions.import_batch = batches.map((batch) => ({
+                value: String(batch.id),
+                label: `${batch.file_name || 'Import'} — ${batch.created_at ? new Date(batch.created_at).toLocaleDateString('en-GB') : ''} (#${batch.id})`
+            }));
+        }
+
+        res.json({
+            fields: getLeadFilterFieldsPayload(dynamicOptions)
+        });
+    } catch (error) {
+        console.error('Error loading lead filter fields:', error);
+        res.json({ fields: getLeadFilterFieldsPayload() });
+    }
+});
+
+/**
+ * POST /leads/import
+ *
+ * No-enrichment CSV import with column mapping. Creates a lead_import_batches
+ * row, kicks off background batched upserts into companies/contacts
+ * (+contact_insights), and returns immediately with the batch for polling.
+ *
+ * Body: multipart/form-data
+ *   file              – CSV file (required)
+ *   clientId          – client slug (required)
+ *   columnMapping     – JSON object mapping target keys to CSV headers;
+ *                       requires "domain". See IMPORT_MAPPING_TARGETS.
+ *   collisionStrategy – fill_blanks (default) | overwrite | skip
+ *   keepUnmapped      – 'false' to drop unmapped columns (default keeps them
+ *                       in contact_insights.attributes keyed by header)
+ */
+router.post('/leads/import', verifyFirebaseToken, uploadVerification.single('file'), async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = normalizeOptionalText(req.body?.clientId);
+        if (!clientSlug) return res.status(400).json({ error: 'clientId is required.' });
+        if (!req.file) return res.status(400).json({ error: 'CSV file is required.' });
+
+        let rawMapping;
+        try {
+            rawMapping = typeof req.body?.columnMapping === 'string'
+                ? JSON.parse(req.body.columnMapping)
+                : req.body?.columnMapping;
+        } catch {
+            return res.status(400).json({ error: 'columnMapping must be valid JSON.' });
+        }
+        const columnMapping = leadImportService.sanitizeImportColumnMapping(rawMapping);
+        if (!columnMapping.domain) {
+            return res.status(400).json({ error: 'A domain column mapping is required.' });
+        }
+
+        const collisionStrategy = normalizeOptionalText(req.body?.collisionStrategy) || 'fill_blanks';
+        if (!leadImportService.IMPORT_COLLISION_STRATEGIES.has(collisionStrategy)) {
+            return res.status(400).json({ error: `Invalid collisionStrategy "${collisionStrategy}".` });
+        }
+        const keepUnmapped = String(req.body?.keepUnmapped ?? 'true').toLowerCase() !== 'false';
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const batchRow = await leadImportService.createImportBatch({
+            agencyId,
+            clientId,
+            fileName: req.file.originalname,
+            collisionStrategy,
+            columnMapping,
+            keepUnmapped,
+            totalRowsEstimate: leadImportService.estimateCsvRowCount(req.file.buffer)
+        });
+
+        // Background processing — progress lands on the batch row; the client polls.
+        void leadImportService.processLeadImportBatch({
+            batchId: batchRow.id,
+            agencyId,
+            clientId,
+            fileBuffer: req.file.buffer,
+            columnMapping,
+            collisionStrategy,
+            keepUnmapped
+        });
+
+        return res.status(202).json({ batch: leadImportService.serializeImportBatch(batchRow) });
+    } catch (error) {
+        console.error('Error starting lead import:', error);
+        return res.status(500).json({ error: error?.message || 'Failed to start lead import.' });
+    }
+});
+
+router.get('/leads/import/batches', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        if (!clientSlug) return res.status(400).json({ error: 'clientId parameter is required.' });
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const limit = Number.parseInt(req.query.limit, 10) || 50;
+        const rows = await leadImportService.listImportBatches(agencyId, clientId, limit);
+        return res.json({ batches: rows.map(leadImportService.serializeImportBatch) });
+    } catch (error) {
+        console.error('Error listing import batches:', error);
+        return res.status(500).json({ error: 'Failed to list import batches.' });
+    }
+});
+
+router.get('/leads/import/batches/:batchId', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        const batchId = Number.parseInt(req.params.batchId, 10);
+        if (!clientSlug) return res.status(400).json({ error: 'clientId parameter is required.' });
+        if (!Number.isInteger(batchId) || batchId <= 0) {
+            return res.status(400).json({ error: 'Valid batchId is required.' });
+        }
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const row = await leadImportService.getImportBatch(agencyId, clientId, batchId);
+        if (!row) return res.status(404).json({ error: 'Import batch not found.' });
+        return res.json({ batch: leadImportService.serializeImportBatch(row) });
+    } catch (error) {
+        console.error('Error loading import batch:', error);
+        return res.status(500).json({ error: 'Failed to load import batch.' });
+    }
+});
+
+router.get('/leads/import/batches/:batchId/errors', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        const batchId = Number.parseInt(req.params.batchId, 10);
+        if (!clientSlug) return res.status(400).json({ error: 'clientId parameter is required.' });
+        if (!Number.isInteger(batchId) || batchId <= 0) {
+            return res.status(400).json({ error: 'Valid batchId is required.' });
+        }
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const row = await leadImportService.getImportBatch(agencyId, clientId, batchId);
+        if (!row) return res.status(404).json({ error: 'Import batch not found.' });
+
+        const errors = await leadImportService.listImportErrors(agencyId, batchId);
+        return res.json({ errors });
+    } catch (error) {
+        console.error('Error loading import errors:', error);
+        return res.status(500).json({ error: 'Failed to load import errors.' });
+    }
+});
+
+/**
+ * POST /leads/enrich-preview
+ *
+ * Pre-launch stats for "enrich filtered leads": how many leads match the
+ * current filter and what each pipeline stage would have to work with.
+ * Body: { clientId, query: { search, instantlyCampaignId, filters } }
+ */
+router.post('/leads/enrich-preview', verifyFirebaseToken, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const clientSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        if (!clientSlug) return res.status(400).json({ error: 'clientId is required.' });
+        const queryInput = req.body?.query && typeof req.body.query === 'object' ? req.body.query : {};
+
+        const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const filterContext = await buildLeadListFilterContext(agencyId, clientId, queryInput);
+        if (filterContext.emptyResult) {
+            return res.json({ preview: emptyEnrichPreview() });
+        }
+
+        const preview = await queryFilteredLeadEnrichStats(filterContext);
+        return res.json({ preview });
+    } catch (error) {
+        console.error('Error building enrich preview:', error);
+        return res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to build enrich preview.' });
+    }
 });
 
 /**
