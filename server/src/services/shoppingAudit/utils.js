@@ -37,6 +37,16 @@ export function normalizeProductTitle(title) {
         .trim();
 }
 
+/** Serper Shopping search query: "{domain} {hero product title}". */
+export function buildSerperShoppingQuery(domain, productTitle) {
+    const host = normalizeHostname(domain);
+    const title = normalizeProductTitle(productTitle);
+    if (!host && !title) return '';
+    if (!title) return host;
+    if (!host) return title;
+    return `${host} ${title}`;
+}
+
 export function parsePriceValue(raw) {
     if (raw === null || raw === undefined) return null;
     if (typeof raw === 'number' && Number.isFinite(raw)) return raw;

@@ -209,6 +209,25 @@ test('eligibility: eligible when email_sent appears after Warm Follow Up', () =>
     assert.equal(isEligible(events), true);
 });
 
+test('eligibility: eligible after interested autoresponder auto-enrolls warm follow up', () => {
+    const events = [
+        { type: 'reply_received', ts: 500 },
+        { type: 'lead_interested', ts: 600 },
+        { type: 'interested_reply_sent', ts: 700 },
+        { type: 'Warm Follow Up', ts: 800 },
+    ];
+    assert.equal(isEligible(events), true);
+});
+
+test('eligibility: not eligible when lead replies after autoresponder warm follow up enrollment', () => {
+    const events = [
+        { type: 'interested_reply_sent', ts: 700 },
+        { type: 'Warm Follow Up', ts: 800 },
+        { type: 'reply_received', ts: 900 },
+    ];
+    assert.equal(isEligible(events), false);
+});
+
 test('eligibility: eligible when multiple email_sent events appear after Warm Follow Up', () => {
     const events = [
         { type: 'Warm Follow Up', ts: 1000 },

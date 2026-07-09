@@ -6,6 +6,7 @@ import {
     SERPER_SHOPPING_URL
 } from './constants.js';
 import {
+    buildSerperShoppingQuery,
     extractCardFields,
     matchShoppingCard,
     normalizeProductTitle,
@@ -87,9 +88,14 @@ function feedPriceForSelection(sel) {
     return snap?.variants?.[0]?.price ? parseFloat(snap.variants[0].price) : null;
 }
 
+function heroProductTitle(sel) {
+    return normalizeProductTitle(sel.snapshot?.title || '');
+}
+
 function observationFromResult(sel, query, cards, geo) {
     const feedPrice = feedPriceForSelection(sel);
-    const { match, branch } = matchShoppingCard(cards, { domain: sel.domain, productTitle: query, feedPrice });
+    const productTitle = heroProductTitle(sel);
+    const { match, branch } = matchShoppingCard(cards, { domain: sel.domain, productTitle, feedPrice });
     return {
         domain: sel.domain,
         selection: sel,
@@ -140,11 +146,12 @@ export async function searchShoppingForHero({
     apiKey,
     geo = DEFAULT_SERPER_GEO
 }) {
-    const query = normalizeProductTitle(productTitle);
+    const title = normalizeProductTitle(productTitle);
+    const query = buildSerperShoppingQuery(domain, productTitle);
     const payload = await postSerperShopping([{ query }], apiKey, geo);
     const result = Array.isArray(payload) ? payload[0] : payload;
     const cards = result?.shopping || [];
-    const { match, branch, score } = matchShoppingCard(cards, { domain, productTitle: query, feedPrice });
+    const { match, branch, score } = matchShoppingCard(cards, { domain, productTitle: title, feedPrice });
     return {
         query,
         branch,
@@ -194,7 +201,7 @@ export async function runSerperShoppingBatch({
 
             const items = chunk.map((sel) => ({
                 sel,
-                query: normalizeProductTitle(sel.snapshot?.title || '')
+                query: buildSerperShoppingQuery(sel.domain, sel.snapshot?.title || '')
             }));
 
             let batchResults;
@@ -265,4 +272,11 @@ export async function runSerperShoppingBatch({
     };
 }
 
-export { extractCardFields, matchShoppingCard, normalizeProductTitle, SERPER_BATCH_SIZE, SERPER_CONCURRENCY };
+export {
+    buildSerperShoppingQuery,
+    extractCardFields,
+    matchShoppingCard,
+    normalizeProductTitle,
+    SERPER_BATCH_SIZE,
+    SERPER_CONCURRENCY
+};

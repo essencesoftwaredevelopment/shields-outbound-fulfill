@@ -13,6 +13,9 @@ import {
     listUnifiedRowsFromDb,
     countUnifiedRowsByEmailStatus,
     filterUnifiedRowsByEmailStatus,
+    getUnifiedRowHeaders,
+    isShoppingAuditJobById,
+    shoppingAuditFromJobRow,
     getJobById,
     jobHasRemainingPipelineWork,
     jobRowToState,
@@ -445,7 +448,15 @@ router.get('/jobs/:id/leads-preview', async (req, res) => {
         const includeValid = req.query.includeValid !== 'false';
         const includeRisky = req.query.includeRisky !== 'false';
         const options = scope === 'valid' ? { includeValid, includeRisky } : {};
-        const result = await listUnifiedRowsFromDb(jobId, { scope, limit, offset, ...options });
+        const shoppingAudit = shoppingAuditFromJobRow(row);
+        const result = await listUnifiedRowsFromDb(jobId, {
+            scope,
+            limit,
+            offset,
+            shoppingAudit,
+            sortByCompleteness: true,
+            ...options
+        });
 
         res.json(result);
     } catch (error) {
@@ -910,11 +921,16 @@ router.get('/jobs/:id/result', async (req, res) => {
     const scopeParam = (req.query?.scope || '').toString() === 'valid' ? 'valid' : 'all';
 
     try {
-        const rows = await buildUnifiedRowsFromDb(jobId, scopeParam === 'valid' ? 'valid' : 'all');
+        const shoppingAudit = await isShoppingAuditJobById(jobId);
+        const rows = await buildUnifiedRowsFromDb(
+            jobId,
+            scopeParam === 'valid' ? 'valid' : 'all',
+            { shoppingAudit }
+        );
         if (!rows.length) {
             return res.status(404).json({ error: 'No data to export.' });
         }
-        const headers = Array.from(new Set(rows.flatMap(r => Object.keys(r))));
+        const headers = getUnifiedRowHeaders(shoppingAudit);
         const csvLines = [headers.join(',')];
         rows.forEach((row) => {
             const line = headers.map((key) => {

@@ -3,7 +3,12 @@ import OpenAI from 'openai';
 import { pool } from '../config/db.js';
 import { getAgencySettings } from './db/agencySettings.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
-import { fetchThreadReplyMetadata, resolveTemplateVars, renderTemplate } from './followUpSender.js';
+import {
+    fetchThreadReplyMetadata,
+    persistWarmFollowUpAnchorFromAutoresponder,
+    resolveTemplateVars,
+    renderTemplate
+} from './followUpSender.js';
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1179,6 +1184,18 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
             sentReplyId: replyResult?.id || replyResult?.email_id || null,
             parentReplyToUuid: replyToUuid,
             renderedText: outgoingText
+        });
+        await persistWarmFollowUpAnchorFromAutoresponder(client, {
+            draftId: draft.id,
+            agencyId: draft.agency_id,
+            clientId: draft.client_id,
+            contactId: draft.contact_id,
+            campaignId: draft.campaign_id,
+            instantlyCampaignId: draft.instantly_campaign_id,
+            instantlyLeadId: draft.instantly_lead_id,
+            leadEmail: draft.lead_email,
+            eaccount,
+            autoresponderSentEventId: sentEventId
         });
         await client.query(
             `UPDATE interested_autoresponder_drafts

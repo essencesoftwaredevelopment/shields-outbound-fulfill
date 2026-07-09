@@ -991,8 +991,30 @@ function buildUnifiedScopeFilter(scope, options = {}) {
     return '';
 }
 
-const UNIFIED_ROW_SELECT = `
-    SELECT
+export const STANDARD_UNIFIED_HEADERS = [
+    'domain',
+    'founder_name',
+    'email',
+    'email_status',
+    'first_name',
+    'last_name',
+    'personalization'
+];
+
+export const SHOPPING_AUDIT_UNIFIED_HEADERS = [
+    'domain',
+    'founder_name',
+    'email',
+    'email_status',
+    'first_name',
+    'last_name',
+    'shopify_store',
+    'hero_product',
+    'shopping_ad_link',
+    'personalization'
+];
+
+const UNIFIED_ROW_BASE_SELECT = `
         co.domain_normalized AS domain,
         c.full_name AS founder_name,
         c.email,
@@ -1000,16 +1022,104 @@ const UNIFIED_ROW_SELECT = `
         c.personalization_first_line AS personalization,
         c.personalization_first_line AS first_line`;
 
-const UNIFIED_ROW_FROM = `
+const SHOPPING_AUDIT_ROW_JOINS = `
+    LEFT JOIN hero_selections hs
+        ON hs.job_id = c.job_id AND hs.domain_normalized = co.domain_normalized
+    LEFT JOIN shopify_snapshots hero_snap
+        ON hero_snap.id = hs.shopify_snapshot_id
+    LEFT JOIN LATERAL (
+        SELECT ao.matched_card
+        FROM ad_observations ao
+        WHERE ao.job_id = c.job_id
+          AND ao.hero_selection_id = hs.id
+          AND ao.matched_card IS NOT NULL
+        ORDER BY
+            CASE ao.branch WHEN 'clean' THEN 0 WHEN 'ambiguous' THEN 1 ELSE 2 END,
+            ao.observed_at DESC NULLS LAST
+        LIMIT 1
+    ) ad ON true`;
+
+const UNIFIED_ROW_FROM_BASE = `
     FROM contacts c
-    JOIN companies co ON co.id = c.company_id
+    JOIN companies co ON co.id = c.company_id`;
+
+const UNIFIED_ROW_WHERE = `
     WHERE c.job_id = $1 AND c.role_type = 'founder'`;
 
-function mapUnifiedContactRow(row) {
+const INVALID_FOUNDER_NAMES_SQL = `'not found', 'n/a', 'unknown'`;
+
+function buildCompletenessOrderBy(shoppingAudit) {
+    const adLinkScore = shoppingAudit
+        ? `CASE WHEN COALESCE(ad.matched_card->>'link', '') <> '' THEN 10000 ELSE 0 END + `
+        : '';
+    const founderScore = `CASE WHEN c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
+        AND LOWER(BTRIM(c.full_name)) NOT IN (${INVALID_FOUNDER_NAMES_SQL}) THEN 1000 ELSE 0 END`;
+    const emailScore = `CASE WHEN c.email IS NOT NULL AND BTRIM(c.email) <> '' AND c.email LIKE '%@%'
+        AND LOWER(TRIM(COALESCE(c.email_status, ''))) = 'valid' THEN 100 ELSE 0 END`;
+    const personalizationScore = `CASE WHEN c.personalization_first_line IS NOT NULL AND BTRIM(c.personalization_first_line) <> ''
+        AND LOWER(BTRIM(c.personalization_first_line)) <> 'invalid' THEN 10 ELSE 0 END`;
+
+    return `ORDER BY (${adLinkScore}${founderScore} + ${emailScore} + ${personalizationScore}) DESC, co.domain_normalized ASC`;
+}
+
+function buildUnifiedOrderBy(shoppingAudit, { sortByCompleteness = false } = {}) {
+    if (sortByCompleteness) {
+        return buildCompletenessOrderBy(shoppingAudit);
+    }
+    return 'ORDER BY co.domain_normalized ASC';
+}
+
+function buildUnifiedQueryParts(shoppingAudit) {
+    if (!shoppingAudit) {
+        return {
+            select: `SELECT ${UNIFIED_ROW_BASE_SELECT}`,
+            from: `${UNIFIED_ROW_FROM_BASE}${UNIFIED_ROW_WHERE}`
+        };
+    }
+
+    return {
+        select: `SELECT
+        ${UNIFIED_ROW_BASE_SELECT},
+        CASE
+            WHEN hs.id IS NOT NULL THEN 'Yes'
+            WHEN EXISTS (
+                SELECT 1 FROM shopify_snapshots ss
+                WHERE ss.job_id = c.job_id AND ss.domain_normalized = co.domain_normalized
+                LIMIT 1
+            ) THEN 'Yes'
+            ELSE 'No'
+        END AS shopify_store,
+        COALESCE(hero_snap.title, '') AS hero_product,
+        COALESCE(ad.matched_card->>'link', '') AS shopping_ad_link`,
+        from: `${UNIFIED_ROW_FROM_BASE}
+    ${SHOPPING_AUDIT_ROW_JOINS}${UNIFIED_ROW_WHERE}`
+    };
+}
+
+export function shoppingAuditFromJobRow(row) {
+    if (!row) return false;
+    return resolvePipelineMode(row.options || {}, row.stages || {}) === 'shopping_audit';
+}
+
+export async function isShoppingAuditJobById(jobId) {
+    const result = await pool.query(
+        `SELECT options, stages FROM jobs WHERE id = $1`,
+        [jobId]
+    );
+    const row = result.rows[0];
+    if (!row) return false;
+    return resolvePipelineMode(row.options || {}, row.stages || {}) === 'shopping_audit';
+}
+
+export function getUnifiedRowHeaders(shoppingAudit = false) {
+    return shoppingAudit ? SHOPPING_AUDIT_UNIFIED_HEADERS : STANDARD_UNIFIED_HEADERS;
+}
+
+function mapUnifiedContactRow(row, shoppingAudit = false) {
     const parts = String(row.founder_name || '').trim().split(/\s+/);
     const firstName = parts[0] || '';
     const lastName = parts.length > 1 ? parts.slice(1).join(' ') : '';
-    return {
+    const base = {
         domain: row.domain,
         founder_name: row.founder_name || '',
         email: row.email || '',
@@ -1018,53 +1128,74 @@ function mapUnifiedContactRow(row) {
         last_name: lastName,
         personalization: row.personalization || row.first_line || ''
     };
+    if (!shoppingAudit) return base;
+    return {
+        ...base,
+        shopify_store: row.shopify_store || 'No',
+        hero_product: row.hero_product || '',
+        shopping_ad_link: row.shopping_ad_link || ''
+    };
+}
+
+async function resolveShoppingAuditFlag(jobId, options = {}) {
+    if (typeof options.shoppingAudit === 'boolean') {
+        return options.shoppingAudit;
+    }
+    return isShoppingAuditJobById(jobId);
 }
 
 export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {}) {
+    const shoppingAudit = await resolveShoppingAuditFlag(jobId, options);
+    const { select, from } = buildUnifiedQueryParts(shoppingAudit);
     const statusFilter = buildUnifiedScopeFilter(scope, options);
     const result = await pool.query(
-        `${UNIFIED_ROW_SELECT}
-         ${UNIFIED_ROW_FROM}
+        `${select}
+         ${from}
          ${statusFilter}
          ORDER BY co.domain_normalized ASC`,
         [jobId]
     );
 
-    return result.rows.map(mapUnifiedContactRow);
+    return result.rows.map((row) => mapUnifiedContactRow(row, shoppingAudit));
 }
 
 export async function listUnifiedRowsFromDb(jobId, {
     scope = 'all',
     limit = 100,
     offset = 0,
+    sortByCompleteness = false,
     ...options
 } = {}) {
+    const shoppingAudit = await resolveShoppingAuditFlag(jobId, options);
+    const { select, from } = buildUnifiedQueryParts(shoppingAudit);
     const statusFilter = buildUnifiedScopeFilter(scope, options);
+    const orderBy = buildUnifiedOrderBy(shoppingAudit, { sortByCompleteness });
     const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
 
-    const countResult = await pool.query(
-        `SELECT COUNT(*)::int AS total ${UNIFIED_ROW_FROM} ${statusFilter}`,
-        [jobId]
-    );
-    const total = countResult.rows[0]?.total ?? 0;
-
     const result = await pool.query(
-        `${UNIFIED_ROW_SELECT}
-         ${UNIFIED_ROW_FROM}
+        `${select},
+         COUNT(*) OVER()::int AS _total_count
+         ${from}
          ${statusFilter}
-         ORDER BY co.domain_normalized ASC
+         ${orderBy}
          LIMIT $2 OFFSET $3`,
         [jobId, parsedLimit, parsedOffset]
     );
 
-    const rows = result.rows.map(mapUnifiedContactRow);
+    const total = result.rows[0]?._total_count ?? 0;
+    const rows = result.rows.map((row) => {
+        const { _total_count: _ignored, ...dataRow } = row;
+        return mapUnifiedContactRow(dataRow, shoppingAudit);
+    });
     return {
         rows,
         total,
         limit: parsedLimit,
         offset: parsedOffset,
-        hasMore: parsedOffset + rows.length < total
+        hasMore: parsedOffset + rows.length < total,
+        shoppingAudit,
+        headers: getUnifiedRowHeaders(shoppingAudit)
     };
 }
 

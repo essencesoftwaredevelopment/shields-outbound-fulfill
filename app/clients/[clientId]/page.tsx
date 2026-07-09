@@ -1879,7 +1879,74 @@ export default function ClientPage() {
         first_name: string;
         last_name: string;
         personalization: string;
+        shopify_store?: string;
+        hero_product?: string;
+        shopping_ad_link?: string;
     };
+    const jobPreviewColumns = useMemo(() => {
+        const shoppingAudit = isShoppingAuditPipelineJob(jobState);
+        if (!shoppingAudit) {
+            return [
+                { key: 'domain' as const, label: 'Domain' },
+                { key: 'founder_name' as const, label: 'Founder' },
+                { key: 'email' as const, label: 'Email' },
+                { key: 'email_status' as const, label: 'Status' },
+                { key: 'personalization' as const, label: 'First line', multiline: true, minWidth: '280px' },
+            ];
+        }
+        return [
+            { key: 'domain' as const, label: 'Domain' },
+            { key: 'founder_name' as const, label: 'Founder' },
+            { key: 'email' as const, label: 'Email' },
+            { key: 'email_status' as const, label: 'Status' },
+            { key: 'first_name' as const, label: 'First name' },
+            { key: 'last_name' as const, label: 'Last name' },
+            { key: 'shopify_store' as const, label: 'Shopify store' },
+            { key: 'hero_product' as const, label: 'Hero product' },
+            { key: 'shopping_ad_link' as const, label: 'Shopping ad link', link: true },
+            { key: 'personalization' as const, label: 'Personalization', multiline: true, minWidth: '360px' },
+        ];
+    }, [jobState]);
+
+    const renderJobPreviewCell = (lead: JobPreviewLead, column: { key: keyof JobPreviewLead; multiline?: boolean; link?: boolean; minWidth?: string }) => {
+        const { key, multiline, link, minWidth } = column;
+        let value = lead[key] ?? '';
+        if (key === 'email') {
+            value = formatRawEmailValue(lead.email);
+            if (value === '—') value = '';
+        }
+        const display = value || '—';
+        const cellStyle: React.CSSProperties = {
+            padding: '0.75rem 1rem',
+            verticalAlign: 'top',
+            ...(minWidth ? { minWidth, width: minWidth } : {}),
+            ...(multiline
+                ? { whiteSpace: 'normal', lineHeight: 1.45, wordBreak: 'break-word' }
+                : { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }),
+        };
+        if (link && value) {
+            const linkText = value.length > 40 ? `${value.slice(0, 40)}…` : value;
+            return (
+                <td key={key} style={cellStyle}>
+                    <a
+                        href={value}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={value}
+                        style={{ color: 'var(--app-link, #3b82f6)', wordBreak: 'break-all' }}
+                    >
+                        {linkText}
+                    </a>
+                </td>
+            );
+        }
+        return (
+            <td key={key} style={cellStyle} title={display !== '—' ? String(value) : undefined}>
+                {display}
+            </td>
+        );
+    };
+
     const [jobPreviewModalOpen, setJobPreviewModalOpen] = useState(false);
     const [jobPreviewLeads, setJobPreviewLeads] = useState<JobPreviewLead[]>([]);
     const [jobPreviewLoading, setJobPreviewLoading] = useState(false);
@@ -5920,6 +5987,8 @@ export default function ClientPage() {
         return total;
     }, [includeValidEmails, includeRiskyEmails, uploadEmailStatusCounts]);
 
+    const jobPreviewAutoFillCountRef = useRef(0);
+
     const fetchJobPreviewLeads = useCallback(async (reset = false) => {
         const currentJobId = jobState?.id || jobPendingUpload;
         if (!currentJobId || !user || !clientId) return;
@@ -5927,6 +5996,9 @@ export default function ClientPage() {
         if (!reset && !jobPreviewHasMoreRef.current) return;
 
         const offset = reset ? 0 : jobPreviewOffsetRef.current;
+        if (reset) {
+            jobPreviewAutoFillCountRef.current = 0;
+        }
         jobPreviewLoadingRef.current = true;
         setJobPreviewLoading(true);
         try {
@@ -5976,10 +6048,17 @@ export default function ClientPage() {
         } finally {
             jobPreviewLoadingRef.current = false;
             setJobPreviewLoading(false);
-            if (jobPreviewScrollRef.current && jobPreviewHasMoreRef.current) {
+            if (
+                jobPreviewScrollRef.current
+                && jobPreviewHasMoreRef.current
+                && jobPreviewAutoFillCountRef.current < 5
+            ) {
                 const el = jobPreviewScrollRef.current;
                 if (el.scrollHeight <= el.clientHeight + 80) {
-                    void fetchJobPreviewLeads(false);
+                    jobPreviewAutoFillCountRef.current += 1;
+                    window.setTimeout(() => {
+                        void fetchJobPreviewLeads(false);
+                    }, 250);
                 }
             }
         }
@@ -11662,7 +11741,7 @@ export default function ClientPage() {
                             ref={jobPreviewScrollRef}
                             className="modal__body"
                             onScroll={handleJobPreviewScroll}
-                            style={{ overflowY: 'auto', padding: 0 }}
+                            style={{ overflowY: 'auto', overflowX: 'auto', padding: 0 }}
                         >
                             {jobPreviewLoading && jobPreviewLeads.length === 0 ? (
                                 <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--app-text-muted)' }}>
@@ -11673,19 +11752,20 @@ export default function ClientPage() {
                                     No leads available for this job.
                                 </div>
                             ) : (
-                                <table className="leads-table" style={{ width: '100%', tableLayout: 'fixed', borderCollapse: 'separate', borderSpacing: 0, fontSize: '0.875rem' }}>
+                                <table className="leads-table" style={{ width: '100%', tableLayout: 'auto', borderCollapse: 'separate', borderSpacing: 0, fontSize: '0.875rem', minWidth: isShoppingAuditPipelineJob(jobState) ? '1400px' : undefined }}>
                                     <colgroup>
-                                        <col style={{ width: '14%' }} />
-                                        <col style={{ width: '12%' }} />
-                                        <col style={{ width: '150px' }} />
-                                        <col style={{ width: '90px' }} />
-                                        <col />
+                                        {jobPreviewColumns.map((column) => (
+                                            <col
+                                                key={column.key}
+                                                style={column.minWidth ? { minWidth: column.minWidth, width: column.minWidth } : undefined}
+                                            />
+                                        ))}
                                     </colgroup>
                                     <thead>
                                         <tr style={{ backgroundColor: 'var(--app-surface-2)', borderBottom: '1px solid var(--app-border)' }}>
-                                            {['Domain', 'Founder', 'Email', 'Status', 'First line'].map((label) => (
+                                            {jobPreviewColumns.map((column) => (
                                                 <th
-                                                    key={label}
+                                                    key={column.key}
                                                     style={{
                                                         position: 'sticky',
                                                         top: 0,
@@ -11699,28 +11779,22 @@ export default function ClientPage() {
                                                         overflow: 'hidden',
                                                         textOverflow: 'ellipsis',
                                                         whiteSpace: 'nowrap',
+                                                        ...(column.minWidth ? { minWidth: column.minWidth, width: column.minWidth } : {}),
                                                     }}
                                                 >
-                                                    {label}
+                                                    {column.label}
                                                 </th>
                                             ))}
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {jobPreviewLeads.map((lead, index) => {
-                                            const emailDisplay = formatRawEmailValue(lead.email);
-                                            return (
+                                        {jobPreviewLeads.map((lead, index) => (
                                             <tr key={`${lead.domain}-${lead.email}-${index}`}>
-                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={lead.domain || undefined}>{lead.domain || '—'}</td>
-                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={lead.founder_name || undefined}>{lead.founder_name || '—'}</td>
-                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={emailDisplay !== '—' ? emailDisplay : undefined}>{emailDisplay}</td>
-                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{lead.email_status || '—'}</td>
-                                                <td style={{ padding: '0.75rem 1rem', verticalAlign: 'top', whiteSpace: 'normal', lineHeight: 1.45, wordBreak: 'break-word' }}>
-                                                    {lead.personalization || '—'}
-                                                </td>
+                                                {jobPreviewColumns.map((column) =>
+                                                    renderJobPreviewCell(lead, column)
+                                                )}
                                             </tr>
-                                            );
-                                        })}
+                                        ))}
                                     </tbody>
                                 </table>
                             )}

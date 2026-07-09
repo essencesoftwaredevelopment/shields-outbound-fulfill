@@ -17,7 +17,7 @@ import crypto from 'crypto';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const WARM_FOLLOW_UP_EVENT = 'Warm Follow Up';
+export const WARM_FOLLOW_UP_EVENT = 'Warm Follow Up';
 
 /**
  * Events that stop the follow-up sequence for a contact+campaign, provided
@@ -642,6 +642,72 @@ async function persistSentFollowUpActivity(db, {
             JSON.stringify(payload)
         ]
     );
+}
+
+/**
+ * Enroll a contact in the warm follow-up sequence after an interested autoresponder send.
+ * Inserts a Warm Follow Up anchor event (idempotent per draft).
+ */
+export async function persistWarmFollowUpAnchorFromAutoresponder(db, {
+    draftId,
+    agencyId,
+    clientId,
+    contactId,
+    campaignId,
+    instantlyCampaignId,
+    instantlyLeadId,
+    leadEmail,
+    eaccount,
+    autoresponderSentEventId = null,
+    eventTimestamp = null
+}) {
+    const ts = eventTimestamp || new Date().toISOString();
+    const fingerprint = crypto
+        .createHash('sha256')
+        .update(`warm-follow-up-from-autoresponder|${draftId}`)
+        .digest('hex');
+    const payload = {
+        event_type: WARM_FOLLOW_UP_EVENT,
+        source: 'interested_autoresponder',
+        interested_autoresponder_draft_id: draftId,
+        autoresponder_sent_event_id: autoresponderSentEventId,
+        auto_enrolled: true
+    };
+
+    const result = await db.query(
+        `INSERT INTO contact_instantly_events (
+            agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
+            event_type, reply_category, lead_email, email_account, message_text,
+            reply_text_snippet, reply_to_uuid, event_timestamp, fingerprint, source, payload
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17::jsonb
+        )
+        ON CONFLICT (source, fingerprint) DO NOTHING
+        RETURNING id`,
+        [
+            agencyId,
+            clientId,
+            contactId,
+            campaignId,
+            instantlyCampaignId || null,
+            instantlyLeadId || null,
+            WARM_FOLLOW_UP_EVENT,
+            null,
+            leadEmail || null,
+            eaccount || null,
+            null,
+            null,
+            null,
+            ts,
+            fingerprint,
+            'interested_autoresponder',
+            JSON.stringify(payload)
+        ]
+    );
+    return result.rows[0]?.id || null;
 }
 
 // ─── Sending ─────────────────────────────────────────────────────────────────
