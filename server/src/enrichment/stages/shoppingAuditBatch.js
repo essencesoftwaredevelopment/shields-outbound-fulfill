@@ -110,7 +110,7 @@ export async function runShoppingAuditBatch(ctx, batchDomains, batchOpts = {}) {
         recordTiming: hooks.recordTiming,
         enableHeadless: false,
         enableTier2: true,
-        enableBrokenPage: false,
+        enableBrokenPage: process.env.SHOPPING_AUDIT_BROKEN_PAGE !== 'false',
         rateLimitHooks: hooks.rateLimitHooks
     });
 
@@ -156,7 +156,7 @@ export async function runShoppingAuditStageBatch(
         pricing: ctx.pricing,
         recordTiming: hooks.recordTiming,
         enableTier2: true,
-        enableBrokenPage: false,
+        enableBrokenPage: process.env.SHOPPING_AUDIT_BROKEN_PAGE !== 'false',
         rateLimitHooks: hooks.rateLimitHooks
     });
 }

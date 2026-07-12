@@ -281,7 +281,7 @@ export async function insertSignalEmissionsBatch({
 }) {
     if (!rows?.length) return new Map();
 
-    const paramsPerRow = 12;
+    const paramsPerRow = 14;
     const chunkSize = Math.max(1, Math.floor(QUERY_PARAM_BUDGET / paramsPerRow));
     const idByDomain = new Map();
 
@@ -293,7 +293,7 @@ export async function insertSignalEmissionsBatch({
         for (const row of chunk) {
             const signal = row.signal;
             values.push(
-                `($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}, $${idx + 6}, $${idx + 7}, $${idx + 8}::jsonb, $${idx + 9}::jsonb, $${idx + 10}::jsonb, $${idx + 11})`
+                `($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}, $${idx + 6}, $${idx + 7}, $${idx + 8}::jsonb, $${idx + 9}::jsonb, $${idx + 10}::jsonb, $${idx + 11}, $${idx + 12}::jsonb, $${idx + 13}::jsonb)`
             );
             params.push(
                 agencyId,
@@ -307,7 +307,9 @@ export async function insertSignalEmissionsBatch({
                 JSON.stringify(signal.observed || {}),
                 JSON.stringify(signal.expected || {}),
                 signal.competitor_ref ? JSON.stringify(signal.competitor_ref) : null,
-                signal.observed_at || new Date().toISOString()
+                signal.observed_at || new Date().toISOString(),
+                signal.export_vars ? JSON.stringify(signal.export_vars) : null,
+                signal.secondary_signals ? JSON.stringify(signal.secondary_signals) : null
             );
             idx += paramsPerRow;
         }
@@ -315,7 +317,8 @@ export async function insertSignalEmissionsBatch({
         const result = await pool.query(
             `INSERT INTO signal_emissions (
                 agency_id, client_id, company_id, job_id, ad_observation_id,
-                domain_normalized, signal_type, tier, observed, expected, competitor_ref, observed_at
+                domain_normalized, signal_type, tier, observed, expected, competitor_ref, observed_at,
+                export_vars, secondary_signals
             ) VALUES ${values.join(', ')}
             ON CONFLICT (job_id, domain_normalized) DO UPDATE SET
                 ad_observation_id = EXCLUDED.ad_observation_id,
@@ -324,7 +327,9 @@ export async function insertSignalEmissionsBatch({
                 observed = EXCLUDED.observed,
                 expected = EXCLUDED.expected,
                 competitor_ref = EXCLUDED.competitor_ref,
-                observed_at = EXCLUDED.observed_at
+                observed_at = EXCLUDED.observed_at,
+                export_vars = COALESCE(EXCLUDED.export_vars, signal_emissions.export_vars),
+                secondary_signals = COALESCE(EXCLUDED.secondary_signals, signal_emissions.secondary_signals)
             RETURNING id, domain_normalized`,
             params
         );
@@ -351,6 +356,25 @@ export async function insertSignalEmission(params) {
         }]
     });
     return idByDomain.get(params.domain);
+}
+
+/**
+ * Merge fields into signal_emissions.export_vars (e.g. product_short from the
+ * personalization stage). patches: [{ id, vars: {..} }]
+ */
+export async function updateSignalEmissionExportVars(patches) {
+    const rows = (patches || []).filter((p) => p?.id && p?.vars && Object.keys(p.vars).length);
+    if (!rows.length) return;
+    for (const chunk of chunkArray(rows, 50)) {
+        await Promise.all(chunk.map(({ id, vars }) =>
+            pool.query(
+                `UPDATE signal_emissions
+                 SET export_vars = COALESCE(export_vars, '{}'::jsonb) || $2::jsonb
+                 WHERE id = $1`,
+                [id, JSON.stringify(vars)]
+            )
+        ));
+    }
 }
 
 export async function updateCompanyLastAudit(clientId, domains) {

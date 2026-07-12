@@ -28,7 +28,25 @@ export const SIGNAL_TYPES = {
     AD_MATCH: 'ad_match'
 };
 
-/** Waterfall order — first match wins. */
+/**
+ * Customer-style {{issue}} phrasing per signal, used verbatim in cold emails
+ * ("the {{issue}} on your ad"). ad_match intentionally maps to '' so leads with
+ * no detected issue surface as missing-variable rows in Instantly instead of
+ * rendering a nonsense sentence.
+ */
+export const SIGNAL_ISSUE_LABELS = {
+    [SIGNAL_TYPES.PRICE_MISMATCH]: 'price mismatch',
+    [SIGNAL_TYPES.STOCK_MISMATCH]: 'stock issue',
+    [SIGNAL_TYPES.BROKEN_PAGE]: 'broken link',
+    [SIGNAL_TYPES.REVIEW_GAP]: 'missing reviews',
+    [SIGNAL_TYPES.NO_STARS_VS_COMPETITOR]: 'missing star ratings',
+    [SIGNAL_TYPES.NO_SALE_VS_COMPETITOR]: 'missing sale price',
+    [SIGNAL_TYPES.NO_SHIPPING_VS_COMPETITOR]: 'missing shipping info',
+    [SIGNAL_TYPES.TITLE_QUALITY]: 'weak product title',
+    [SIGNAL_TYPES.AD_MATCH]: ''
+};
+
+/** Waterfall order — determines the PRIMARY signal; later matches are kept as secondary. */
 export const SIGNAL_WATERFALL = [
     { type: SIGNAL_TYPES.PRICE_MISMATCH, tier: 1, requiresAd: true },
     { type: SIGNAL_TYPES.STOCK_MISMATCH, tier: 1, requiresAd: true },
@@ -56,7 +74,7 @@ export const DEFAULT_SIGNAL_TEMPLATES = {
     no_sale_vs_competitor: 'Competitors on the same Shopping search show sale pricing for similar products, but your {{product}} listing does not.',
     no_shipping_vs_competitor: 'Competitors show free shipping on the same Shopping search, but your {{product}} listing does not.',
     title_quality: 'Your Shopping feed title for {{product}} front-loads the brand name and buries key attributes Google uses to match intent.',
-    ad_match: 'Saw your ad about {{product}}, and saw 2 areas we can improve it — mind if we send over an improved version?'
+    ad_match: 'Saw your Google Shopping ad for {{product}} — the listing checks out against your live product page.'
 };
 
 export const DEFAULT_AUDIT_FEATURES = {
@@ -65,5 +83,8 @@ export const DEFAULT_AUDIT_FEATURES = {
     reauditMonths: 4,
     headlessMinPrice: 75,
     titleQualityFallback: true,
-    serperGeo: DEFAULT_SERPER_GEO
+    serperGeo: DEFAULT_SERPER_GEO,
+    /** price_mismatch fires only when |ad - page| >= max(minDeltaUsd, page * minDeltaPct/100). */
+    priceMismatchMinDeltaPct: 2.5,
+    priceMismatchMinDeltaUsd: 0.75
 };

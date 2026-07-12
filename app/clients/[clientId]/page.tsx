@@ -1959,6 +1959,12 @@ export default function ClientPage() {
         shopify_store?: string;
         hero_product?: string;
         shopping_ad_link?: string;
+        signal?: string;
+        issue?: string;
+        product_short?: string;
+        ad_price?: string;
+        page_price?: string;
+        other_signals?: string;
     };
     const jobPreviewColumns = useMemo(() => {
         const shoppingAudit = isShoppingAuditPipelineJob(jobState);
@@ -1981,6 +1987,12 @@ export default function ClientPage() {
             { key: 'shopify_store' as const, label: 'Shopify store' },
             { key: 'hero_product' as const, label: 'Hero product' },
             { key: 'shopping_ad_link' as const, label: 'Shopping ad link', link: true },
+            { key: 'signal' as const, label: 'Signal' },
+            { key: 'issue' as const, label: 'Issue' },
+            { key: 'product_short' as const, label: 'Product short' },
+            { key: 'ad_price' as const, label: 'Ad price' },
+            { key: 'page_price' as const, label: 'Page price' },
+            { key: 'other_signals' as const, label: 'Other signals' },
             { key: 'personalization' as const, label: 'Personalization', multiline: true, minWidth: '360px' },
         ];
     }, [jobState]);

@@ -831,7 +831,7 @@ async function processJob(job) {
                     pricing: job.pricing,
                     enableHeadless: process.env.SHOPPING_AUDIT_HEADLESS === 'true',
                     enableTier2: true,
-                    enableBrokenPage: process.env.SHOPPING_AUDIT_HEADLESS === 'true'
+                    enableBrokenPage: process.env.SHOPPING_AUDIT_BROKEN_PAGE !== 'false'
                 });
 
                 job.signalByDomain = auditResult.signalByDomain;

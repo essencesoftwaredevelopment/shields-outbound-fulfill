@@ -1,4 +1,5 @@
 import {
+    SIGNAL_ISSUE_LABELS,
     SIGNAL_TYPES,
     SIGNAL_WATERFALL
 } from './constants.js';
@@ -7,17 +8,35 @@ import {
     domainRootLabel,
     evaluateTitleQuality,
     extractCardFields,
+    formatPriceUsd,
     lowestInStockPrice,
     parsePriceValue,
     sellerMatchesDomain
 } from './utils.js';
+import { createConcurrencyLimit } from '../../lib/concurrency.js';
 
-function detectPriceMismatch(snapshot, adCard) {
+const DESTINATION_CHECK_TIMEOUT_MS = 6000;
+const DESTINATION_CHECK_CONCURRENCY = 8;
+
+function finiteOr(raw, fallback) {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function detectPriceMismatch(snapshot, adCard, features) {
     const pagePrice = lowestInStockPrice(snapshot.variants);
     const adPrice = adCard?.priceValue ?? parsePriceValue(adCard?.price);
     if (pagePrice == null || adPrice == null) return { fires: false };
     const delta = Math.abs(pagePrice - adPrice);
-    if (delta < 0.01) return { fires: false };
+
+    // The emails quote both numbers, so trivial deltas would undercut the
+    // loss-aversion premise. Floor of $0.01 keeps identical prices from firing
+    // even if both thresholds are configured to 0.
+    const minPct = finiteOr(features?.priceMismatchMinDeltaPct, 2.5);
+    const minUsd = finiteOr(features?.priceMismatchMinDeltaUsd, 0.75);
+    const threshold = Math.max(0.01, minUsd, pagePrice * (minPct / 100));
+    if (delta < threshold) return { fires: false };
+
     return {
         fires: true,
         observed: { ad_price: adPrice, currency: 'USD' },
@@ -110,10 +129,11 @@ function detectTitleQuality(snapshot) {
     };
 }
 
-async function detectBrokenPage(adCard) {
+async function detectBrokenPage(adCard, destinationChecks) {
     const link = adCard?.link;
     if (!link) return { fires: false };
-    const check = await checkDestinationPage(link);
+    const check = destinationChecks?.get?.(link)
+        || await checkDestinationPage(link, DESTINATION_CHECK_TIMEOUT_MS);
     if (!check.broken) return { fires: false };
     return {
         fires: true,
@@ -123,11 +143,13 @@ async function detectBrokenPage(adCard) {
 }
 
 const DETECTORS = {
-    [SIGNAL_TYPES.PRICE_MISMATCH]: ({ snapshot, adCard }) => detectPriceMismatch(snapshot, adCard),
+    [SIGNAL_TYPES.PRICE_MISMATCH]: ({ snapshot, adCard, features }) =>
+        detectPriceMismatch(snapshot, adCard, features),
     [SIGNAL_TYPES.STOCK_MISMATCH]: ({ snapshot, adCard }) => detectStockMismatch(snapshot, adCard),
     [SIGNAL_TYPES.REVIEW_GAP]: ({ snapshot, adCard }) => detectReviewGap(snapshot, adCard),
     [SIGNAL_TYPES.TITLE_QUALITY]: ({ snapshot }) => detectTitleQuality(snapshot),
-    [SIGNAL_TYPES.BROKEN_PAGE]: async ({ adCard }) => detectBrokenPage(adCard),
+    [SIGNAL_TYPES.BROKEN_PAGE]: async ({ adCard, destinationChecks }) =>
+        detectBrokenPage(adCard, destinationChecks),
     [SIGNAL_TYPES.NO_STARS_VS_COMPETITOR]: ({ adCard, allCards, domain }) =>
         detectCompetitorStars(adCard, allCards, domain),
     [SIGNAL_TYPES.NO_SALE_VS_COMPETITOR]: ({ adCard, allCards, domain }) =>
@@ -136,45 +158,77 @@ const DETECTORS = {
         detectCompetitorShipping(adCard, allCards, domain)
 };
 
+/**
+ * Cold-email variables for the results CSV / Instantly upload.
+ * product_short is patched in later by the personalization stage (LLM).
+ */
+export function buildSignalExportVars({ signalType, observed = {}, expected = {}, snapshot, adCard }) {
+    const card = adCard ? extractCardFields(adCard.raw || adCard) : null;
+    const adPriceValue = observed.ad_price ?? card?.priceValue ?? parsePriceValue(card?.price);
+    const pagePriceValue = expected.page_price ?? lowestInStockPrice(snapshot?.variants || []);
+    const product = snapshot?.title || observed.ad_title || observed.feed_title || card?.title || '';
+    return {
+        product,
+        issue: SIGNAL_ISSUE_LABELS[signalType] ?? '',
+        ad_price: formatPriceUsd(adPriceValue),
+        page_price: formatPriceUsd(pagePriceValue),
+        ad_price_value: adPriceValue ?? null,
+        page_price_value: pagePriceValue ?? null
+    };
+}
+
+function compactSignal(type, tier, result) {
+    return {
+        signal_type: type,
+        tier,
+        observed: result.observed || {},
+        expected: result.expected || {},
+        competitor_ref: result.competitor_ref || null
+    };
+}
+
+/**
+ * Evaluate ALL eligible detectors. The first match in waterfall order becomes the
+ * primary signal (drives {{issue}}); every other match is kept in secondary_signals
+ * so leads researched via Serper are never wasted — the CSV carries everything and
+ * campaign routing happens manually in Instantly.
+ */
 export async function runSignalWaterfall({
     snapshot,
     observation,
     domain,
     features,
     enableTier2 = true,
-    enableBrokenPage = true
+    enableBrokenPage = true,
+    destinationChecks = null
 }) {
     const adCard = observation?.matched_card;
     const allCards = observation?.all_cards || [];
     const hasAd = observation?.branch === 'clean' || observation?.branch === 'ambiguous';
-    const context = { snapshot, adCard, allCards, domain };
+    const context = { snapshot, adCard, allCards, domain, destinationChecks, features };
+    const observedAt = observation?.observed_at || new Date().toISOString();
 
+    const fired = [];
     for (const step of SIGNAL_WATERFALL) {
         if (step.requiresAd && !hasAd) continue;
         if (step.tier === 2 && !enableTier2) continue;
         if (step.type === SIGNAL_TYPES.BROKEN_PAGE && !enableBrokenPage) continue;
-        if (step.type === SIGNAL_TYPES.TITLE_QUALITY && hasAd && observation?.branch === 'clean') {
-            // title quality is fallback when no ad or as last resort
-        }
+        if (step.type === SIGNAL_TYPES.TITLE_QUALITY && features?.titleQualityFallback === false) continue;
 
         const detector = DETECTORS[step.type];
         if (!detector) continue;
         const result = await detector(context);
         if (result?.fires) {
-            return {
-                signal_type: step.type,
-                tier: step.tier,
-                observed: result.observed || {},
-                expected: result.expected || {},
-                competitor_ref: result.competitor_ref || null,
-                observed_at: observation?.observed_at || new Date().toISOString()
-            };
+            fired.push(compactSignal(step.type, step.tier, result));
         }
     }
 
-    if (hasAd) {
+    let primary = fired[0] || null;
+    const secondary = fired.slice(1);
+
+    if (!primary && hasAd) {
         const adFields = extractCardFields(adCard?.raw || adCard || {});
-        return {
+        primary = {
             signal_type: SIGNAL_TYPES.AD_MATCH,
             tier: 3,
             observed: {
@@ -183,26 +237,57 @@ export async function runSignalWaterfall({
                 branch: observation?.branch || null
             },
             expected: {},
-            competitor_ref: null,
-            observed_at: observation?.observed_at || new Date().toISOString()
+            competitor_ref: null
         };
     }
 
-    if (features?.titleQualityFallback !== false) {
-        const titleResult = detectTitleQuality(snapshot);
-        if (titleResult.fires) {
-            return {
-                signal_type: SIGNAL_TYPES.TITLE_QUALITY,
-                tier: 3,
-                observed: titleResult.observed || {},
-                expected: titleResult.expected || {},
-                competitor_ref: null,
-                observed_at: new Date().toISOString()
-            };
-        }
+    if (!primary) return null;
+
+    return {
+        ...primary,
+        observed_at: observedAt,
+        secondary_signals: secondary,
+        export_vars: buildSignalExportVars({
+            signalType: primary.signal_type,
+            observed: primary.observed,
+            expected: primary.expected,
+            snapshot,
+            adCard
+        })
+    };
+}
+
+/**
+ * Destination-page health checks for every matched ad link, run concurrently up
+ * front so the per-domain waterfall loop stays synchronous and a slow site can't
+ * serialize the whole batch.
+ */
+export async function precomputeDestinationChecks(rows, {
+    concurrency = DESTINATION_CHECK_CONCURRENCY,
+    timeoutMs = DESTINATION_CHECK_TIMEOUT_MS,
+    log
+} = {}) {
+    const links = new Set();
+    for (const row of rows || []) {
+        const hasAd = row?.branch === 'clean' || row?.branch === 'ambiguous';
+        const link = row?.matched_card?.link;
+        if (hasAd && link) links.add(link);
     }
 
-    return null;
+    const map = new Map();
+    if (!links.size) return map;
+
+    const limit = createConcurrencyLimit(concurrency);
+    await Promise.all(
+        [...links].map((link) =>
+            limit(async () => {
+                map.set(link, await checkDestinationPage(link, timeoutMs));
+            })
+        )
+    );
+    const broken = [...map.values()].filter((c) => c.broken).length;
+    log?.(`Destination checks: ${map.size} ad links checked (${broken} broken)`);
+    return map;
 }
 
 export async function runSignalWaterfallStage({
@@ -212,6 +297,10 @@ export async function runSignalWaterfallStage({
     enableTier2 = true,
     enableBrokenPage = false
 }) {
+    const destinationChecks = enableBrokenPage
+        ? await precomputeDestinationChecks(selectionsWithObservations, { log })
+        : null;
+
     const emissions = [];
     for (const row of selectionsWithObservations) {
         const snap = row.selection?.snapshot;
@@ -222,7 +311,8 @@ export async function runSignalWaterfallStage({
             domain: row.domain,
             features,
             enableTier2,
-            enableBrokenPage
+            enableBrokenPage,
+            destinationChecks
         });
         if (signal) {
             emissions.push({ domain: row.domain, selection: row.selection, observation: row, signal });

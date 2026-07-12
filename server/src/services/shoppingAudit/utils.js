@@ -61,6 +61,13 @@ export function parsePriceValue(raw) {
     return Number.isFinite(value) ? value : null;
 }
 
+/** "$66.95" / "$80" — the exact form the cold-email {{ad_price}}/{{page_price}} variables render. */
+export function formatPriceUsd(value) {
+    const num = parsePriceValue(value);
+    if (num == null) return '';
+    return `$${num.toFixed(2).replace(/\.00$/, '')}`;
+}
+
 export function tokenize(text) {
     return String(text || '')
         .toLowerCase()

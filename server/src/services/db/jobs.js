@@ -6,6 +6,8 @@ import { pool } from '../../config/db.js';
 import { normalizeDomain } from '../../utils/domain.js';
 import { parse as csvParse } from 'csv-parse/sync';
 import { mergeEnrichmentIntoRawRow } from '../enrichmentCohort.js';
+import { SIGNAL_ISSUE_LABELS } from '../shoppingAudit/constants.js';
+import { formatPriceUsd } from '../shoppingAudit/utils.js';
 
 /** Domains eligible for enrichment stages (cohort + not founder-excluded this job). */
 const COHORT_ELIGIBLE_SQL = `
@@ -1011,6 +1013,12 @@ export const SHOPPING_AUDIT_UNIFIED_HEADERS = [
     'shopify_store',
     'hero_product',
     'shopping_ad_link',
+    'signal',
+    'issue',
+    'product_short',
+    'ad_price',
+    'page_price',
+    'other_signals',
     'personalization'
 ];
 
@@ -1027,6 +1035,8 @@ const SHOPPING_AUDIT_ROW_JOINS = `
         ON hs.job_id = c.job_id AND hs.domain_normalized = co.domain_normalized
     LEFT JOIN shopify_snapshots hero_snap
         ON hero_snap.id = hs.shopify_snapshot_id
+    LEFT JOIN signal_emissions se
+        ON se.job_id = c.job_id AND se.domain_normalized = co.domain_normalized
     LEFT JOIN LATERAL (
         SELECT ao.matched_card
         FROM ad_observations ao
@@ -1090,7 +1100,12 @@ function buildUnifiedQueryParts(shoppingAudit) {
             ELSE 'No'
         END AS shopify_store,
         COALESCE(hero_snap.title, '') AS hero_product,
-        COALESCE(ad.matched_card->>'link', '') AS shopping_ad_link`,
+        COALESCE(ad.matched_card->>'link', '') AS shopping_ad_link,
+        se.signal_type,
+        se.observed AS signal_observed,
+        se.expected AS signal_expected,
+        se.export_vars AS signal_export_vars,
+        se.secondary_signals AS signal_secondary`,
         from: `${UNIFIED_ROW_FROM_BASE}
     ${SHOPPING_AUDIT_ROW_JOINS}${UNIFIED_ROW_WHERE}`
     };
@@ -1129,11 +1144,26 @@ function mapUnifiedContactRow(row, shoppingAudit = false) {
         personalization: row.personalization || row.first_line || ''
     };
     if (!shoppingAudit) return base;
+
+    // Cold-email variables. export_vars is authoritative; rows emitted before the
+    // export_vars column existed fall back to deriving from the raw signal fields.
+    const exportVars = row.signal_export_vars || {};
+    const observed = row.signal_observed || {};
+    const expected = row.signal_expected || {};
+    const signalType = row.signal_type || '';
+    const secondary = Array.isArray(row.signal_secondary) ? row.signal_secondary : [];
+
     return {
         ...base,
         shopify_store: row.shopify_store || 'No',
         hero_product: row.hero_product || '',
-        shopping_ad_link: row.shopping_ad_link || ''
+        shopping_ad_link: row.shopping_ad_link || '',
+        signal: signalType,
+        issue: exportVars.issue ?? (SIGNAL_ISSUE_LABELS[signalType] || ''),
+        product_short: exportVars.product_short || '',
+        ad_price: exportVars.ad_price || formatPriceUsd(observed.ad_price),
+        page_price: exportVars.page_price || formatPriceUsd(expected.page_price),
+        other_signals: secondary.map((s) => s?.signal_type).filter(Boolean).join('; ')
     };
 }
 
