@@ -1,6 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { deriveStageStatus, resolveStageDenominators } from '../reconcileStageCounts.js';
+import {
+    deriveStageStatus,
+    resolveStageDenominators,
+    applyMonotonicStageCounts
+} from '../reconcileStageCounts.js';
 
 const baseStats = {
     domainPrep: { checked: 1000, processable: 1000, skipped: 0, domainCheckSkipped: false },
@@ -59,5 +63,46 @@ describe('deriveStageStatus', () => {
             deriveStageStatus('emailDiscovery', stats, d, { jobRunning: true }),
             'completed'
         );
+    });
+});
+
+describe('applyMonotonicStageCounts', () => {
+    it('keeps higher prior progress when a stale count would rewind', () => {
+        const prior = {
+            founders: {
+                status: 'running',
+                progress: { processed: 80 },
+                summary: { processed: 80, Found: 40 }
+            }
+        };
+        const next = {
+            founders: {
+                status: 'running',
+                progress: { processed: 40 },
+                summary: { processed: 40, Found: 20 }
+            }
+        };
+        const merged = applyMonotonicStageCounts(prior, next);
+        assert.equal(merged.founders.progress.processed, 80);
+        assert.equal(merged.founders.summary.Found, 40);
+    });
+
+    it('accepts fresher higher counts', () => {
+        const prior = {
+            founders: {
+                status: 'running',
+                progress: { processed: 40 },
+                summary: { processed: 40 }
+            }
+        };
+        const next = {
+            founders: {
+                status: 'running',
+                progress: { processed: 90 },
+                summary: { processed: 90 }
+            }
+        };
+        const merged = applyMonotonicStageCounts(prior, next);
+        assert.equal(merged.founders.progress.processed, 90);
     });
 });

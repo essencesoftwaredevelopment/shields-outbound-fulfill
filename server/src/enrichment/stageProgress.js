@@ -421,7 +421,9 @@ export function createStageLogger(ctx, stageKey, options = {}) {
         lastReconcileAt = now;
 
         void import('./stageReconcileScheduler.js').then(({ scheduleStageReconcile }) => {
-            scheduleStageReconcile(ctx.jobId, ctx.agencyId, 0);
+            // Debounce across parallel child isolates — immediate (0) reconciles used to
+            // stampede countJobStageStats while holding the jobs row lock.
+            scheduleStageReconcile(ctx.jobId, ctx.agencyId);
         }).catch(() => {});
     };
 }

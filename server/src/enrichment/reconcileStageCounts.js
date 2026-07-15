@@ -1,3 +1,4 @@
+import { pool } from '../config/db.js';
 import { countJobStageStats } from '../services/db/jobs.js';
 import { buildCanonicalProgress, resolveJobTotal, updateJobStagesLocked } from './stageProgress.js';
 import { extractStageCostAmount } from '../utils/pricing.js';
@@ -290,17 +291,82 @@ async function countStatsForJob(ctx, runStartedAt = null) {
     });
 }
 
+function stageProcessedHint(stage) {
+    if (!stage || typeof stage !== 'object') return null;
+    const fromProgress = stage.progress?.processed;
+    if (typeof fromProgress === 'number' && Number.isFinite(fromProgress)) return fromProgress;
+    const fromSummary = stage.summary?.processed;
+    if (typeof fromSummary === 'number' && Number.isFinite(fromSummary)) return fromSummary;
+    return null;
+}
+
+/**
+ * If counts were taken outside the jobs row lock, a slower reconciler can finish
+ * after a fresher one and would otherwise rewind UI progress. Keep the higher
+ * spreadsheet fill when that happens; leave non-standard stages untouched.
+ */
+export function applyMonotonicStageCounts(priorStages = {}, nextStages = {}) {
+    const out = { ...nextStages };
+    for (const stageKey of STANDARD_STAGE_KEYS) {
+        const prior = priorStages[stageKey];
+        const next = nextStages[stageKey];
+        if (!prior || !next) continue;
+
+        const priorProcessed = stageProcessedHint(prior);
+        const nextProcessed = stageProcessedHint(next);
+        if (
+            priorProcessed == null
+            || nextProcessed == null
+            || priorProcessed <= nextProcessed
+        ) {
+            continue;
+        }
+
+        out[stageKey] = {
+            ...next,
+            status: prior.status === 'completed' ? 'completed' : next.status,
+            startedAt: prior.startedAt || next.startedAt,
+            completedAt: prior.status === 'completed'
+                ? (prior.completedAt || next.completedAt)
+                : next.completedAt,
+            summary: prior.summary || next.summary,
+            progress: prior.progress || next.progress,
+            error: prior.error ?? next.error ?? null
+        };
+    }
+    return out;
+}
+
+async function loadJobCreatedAt(jobId, agencyId) {
+    const { rows } = await pool.query(
+        `SELECT created_at FROM jobs WHERE id = $1 AND agency_id = $2`,
+        [jobId, agencyId]
+    );
+    return rows[0]?.created_at ?? null;
+}
+
 /**
  * Live reconcile during a run — spreadsheet counts drive summary/progress/status.
+ *
+ * Counts run *outside* the jobs row lock so parallel Vercel child steps (or any
+ * multi-isolate writers) are not blocked for the full duration of countJobStageStats.
+ * The FOR UPDATE section only applies the already-computed patch. Stale slower
+ * counts are rejected via applyMonotonicStageCounts.
+ *
  * @param {import('./context.js').EnrichmentContext | { jobId: string, agencyId: string, clientId?: string, options?: object, stages?: object }} ctx
  */
 export async function reconcileJobStagesLive(ctx) {
-    // Counting happens under the stages lock so a stale count from one process can
-    // never land after a fresher one — that's what made progress go backwards.
+    const createdAt = await loadJobCreatedAt(ctx.jobId, ctx.agencyId);
+    if (!createdAt) return {};
+
+    const stats = await countStatsForJob(ctx, createdAt);
+
     let stages = {};
     await updateJobStagesLocked(ctx.jobId, ctx.agencyId, async (row) => {
-        const stats = await countStatsForJob(ctx, row.created_at);
-        stages = buildStagesFromStats(row, stats, ctx, { finalize: false });
+        stages = applyMonotonicStageCounts(
+            row.stages || {},
+            buildStagesFromStats(row, stats, ctx, { finalize: false })
+        );
         return stages;
     });
     return stages;
@@ -311,9 +377,14 @@ export async function reconcileJobStagesLive(ctx) {
  * @param {import('./context.js').EnrichmentContext} ctx
  */
 export async function reconcileJobStagesFromDb(ctx) {
+    const createdAt = await loadJobCreatedAt(ctx.jobId, ctx.agencyId);
+    if (!createdAt) return {};
+
+    const stats = await countStatsForJob(ctx, createdAt);
+
     let stages = {};
     await updateJobStagesLocked(ctx.jobId, ctx.agencyId, async (row) => {
-        const stats = await countStatsForJob(ctx, row.created_at);
+        // Finalize is authoritative — do not keep stale-higher live counts.
         stages = buildStagesFromStats(row, stats, ctx, { finalize: true });
         return stages;
     });
