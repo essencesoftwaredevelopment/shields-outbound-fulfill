@@ -13,11 +13,23 @@ import {
     batchProgressOffset,
     persistStageProgress
 } from '../stageProgress.js';
+import { pool } from '../../config/db.js';
+
+function resolveShoppingBatchSize(batchOpts = {}) {
+    if (typeof batchOpts.batchSize === 'number' && batchOpts.batchSize > 0) {
+        return batchOpts.batchSize;
+    }
+    const fromEnv = Number.parseInt(process.env.SHOPPING_AUDIT_BATCH_SIZE || '', 10);
+    return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 25;
+}
 
 function makeStageHooks(ctx, stageKey, batchOpts = {}) {
     const batchIndex = batchOpts.batchIndex ?? 0;
     const jobTotal = resolveJobTotal(ctx) ?? batchOpts.batchSize ?? 0;
-    const progressOffset = batchProgressOffset(batchIndex);
+    const progressOffset = batchProgressOffset(
+        batchIndex,
+        ctx.pipelineMode === 'shopping_audit' ? resolveShoppingBatchSize(batchOpts) : undefined
+    );
     const stageLog = createStageLogger(ctx, stageKey, {
         label: stageKey,
         jobTotal,
@@ -37,12 +49,27 @@ function makeStageHooks(ctx, stageKey, batchOpts = {}) {
             });
             try {
                 const summary = await handler();
+                // Parallel child batches each finish their own slice — do not mark the
+                // job-level stage completed until cumulative processed covers jobTotal.
+                // (False "completed" at 625/1000 hid hung later waves.)
                 await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
-                    status: 'completed',
-                    completedAt: new Date().toISOString(),
+                    status: 'running',
                     summary,
                     error: null
                 });
+                const { rows } = await pool.query(
+                    `SELECT stages->$3 AS stage FROM jobs WHERE id = $1 AND agency_id = $2`,
+                    [ctx.jobId, ctx.agencyId, key]
+                );
+                const mergedSummary = rows[0]?.stage?.summary || summary || {};
+                const processed = Number(mergedSummary.processed ?? 0);
+                if (jobTotal > 0 && processed >= jobTotal) {
+                    await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
+                        status: 'completed',
+                        completedAt: new Date().toISOString(),
+                        error: null
+                    });
+                }
                 return summary;
             } catch (err) {
                 await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
@@ -58,7 +85,10 @@ function makeStageHooks(ctx, stageKey, batchOpts = {}) {
 function makePipelineHooks(ctx, batchOpts = {}) {
     const batchIndex = batchOpts.batchIndex ?? 0;
     const jobTotal = resolveJobTotal(ctx) ?? batchOpts.batchSize ?? 0;
-    const progressOffset = batchProgressOffset(batchIndex);
+    const progressOffset = batchProgressOffset(
+        batchIndex,
+        ctx.pipelineMode === 'shopping_audit' ? resolveShoppingBatchSize(batchOpts) : undefined
+    );
 
     return {
         log: (message, meta) => {

@@ -11,6 +11,7 @@ import {
     insertSignalEmissionsBatch,
     loadSerperShoppingCacheMap,
     upsertSerperShoppingCacheBatch,
+    loadShopifySnapshotsForDomains,
     updateCompanyLastAudit,
     snapshotKey
 } from './db.js';
@@ -218,6 +219,28 @@ function hydrateShoppingAuditBatchState(raw) {
     };
 }
 
+/** Drop raw products.json + in-memory snapshot arrays before crossing a workflow step boundary. */
+function slimCatalogResultsForWorkflow(catalogResults) {
+    return (catalogResults || []).map((row) => ({
+        domain: row.domain,
+        isShopify: !!row.isShopify
+    }));
+}
+
+async function hydrateCatalogSnapshotsFromDb(jobId, catalogResults) {
+    const rows = catalogResults || [];
+    const needsHydrate = rows.some((row) => row.isShopify && !row.snapshots?.length);
+    if (!needsHydrate) return rows;
+
+    const domains = rows.map((row) => row.domain).filter(Boolean);
+    const byDomain = await loadShopifySnapshotsForDomains(jobId, domains);
+    return rows.map((row) => ({
+        domain: row.domain,
+        isShopify: !!row.isShopify,
+        snapshots: row.snapshots?.length ? row.snapshots : (byDomain.get(row.domain) || [])
+    }));
+}
+
 function buildSkipDomains(state) {
     const nonShopifyDomains = state.catalogResults
         .filter((row) => !row.isShopify)
@@ -312,6 +335,10 @@ export async function runShoppingAuditPipelineStage({
                 recordTiming
             });
 
+            // Snapshots are in DB now — keep workflow step payload tiny so the
+            // catalog→hero handoff cannot hang serializing multi‑MB products.json blobs.
+            state.catalogResults = slimCatalogResultsForWorkflow(state.catalogResults);
+
             return {
                 processed: domains.length,
                 shopify: result.shopifyCount,
@@ -323,7 +350,10 @@ export async function runShoppingAuditPipelineStage({
 
     if (stage === 'heroSelection') {
         await updateStage('heroSelection', async () => {
-            let selections = runHeroSelectionStage(state.catalogResults, features, log);
+            const catalogResults = await hydrateCatalogSnapshotsFromDb(job.id, state.catalogResults);
+            state.catalogResults = slimCatalogResultsForWorkflow(catalogResults);
+
+            let selections = runHeroSelectionStage(catalogResults, features, log);
             state.stats.heroes = selections.length;
 
             selections = await persistHeroSelections({

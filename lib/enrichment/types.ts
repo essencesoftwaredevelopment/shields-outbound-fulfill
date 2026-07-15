@@ -41,7 +41,10 @@ export const CHILD_WAVE_CONCURRENCY = Math.max(
   parseInt(process.env.ENRICHMENT_CHILD_WAVE_CONCURRENCY || '5', 10)
 );
 
-/** Serializable shopping-audit state passed between child workflow steps. */
+/** Serializable shopping-audit state passed between child workflow steps.
+ * catalogResults must stay slim ({ domain, isShopify }) — snapshots live in DB
+ * between shopifyCatalog and heroSelection so Vercel step payloads stay small.
+ */
 export type ShoppingAuditBatchState = {
   stats: {
     shopify: number;

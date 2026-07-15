@@ -278,8 +278,9 @@ export function resolveJobTotal(ctx) {
     return null;
 }
 
-export function batchProgressOffset(batchIndex = 0) {
-    return Math.max(0, batchIndex) * WORKFLOW_BATCH_SIZE;
+export function batchProgressOffset(batchIndex = 0, batchSize = WORKFLOW_BATCH_SIZE) {
+    const size = Number.isFinite(batchSize) && batchSize > 0 ? batchSize : WORKFLOW_BATCH_SIZE;
+    return Math.max(0, batchIndex) * size;
 }
 
 function remapProgressForJob(progress, stageKey, { jobTotal, progressOffset }) {

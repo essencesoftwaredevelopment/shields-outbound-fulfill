@@ -95,11 +95,14 @@ export async function runShopifyCatalogStage({
                 const host = normalizeHostname(domain);
                 const isShopify = await detectShopify(host, log);
                 if (!isShopify) {
-                    results[index] = { domain: host, isShopify: false, products: [], snapshots: [] };
+                    // Never retain raw Shopify products.json payloads — hero+workflow
+                    // steps only need slim snapshots, and fat step state hung Vercel
+                    // child handoffs (catalog → hero) so later waves never started.
+                    results[index] = { domain: host, isShopify: false, snapshots: [] };
                 } else {
                     const { products } = await fetchShopifyCatalogSample(host, log);
                     const snapshots = products.map((p) => productToSnapshotRow(p, host));
-                    results[index] = { domain: host, isShopify: true, products, snapshots };
+                    results[index] = { domain: host, isShopify: true, snapshots };
                 }
 
                 processed += 1;

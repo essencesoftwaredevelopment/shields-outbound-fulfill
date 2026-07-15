@@ -48,6 +48,46 @@ export async function upsertSerperShoppingCacheBatch(jobId, entries) {
     }
 }
 
+/**
+ * Load persisted catalog snapshots for a job domain set — used by heroSelection
+ * after the catalog step drops in-memory snapshots from workflow step state.
+ * @param {string} jobId
+ * @param {string[]} domains
+ * @returns {Promise<Map<string, object[]>>} domain_normalized → snapshot rows
+ */
+export async function loadShopifySnapshotsForDomains(jobId, domains) {
+    const map = new Map();
+    const list = (domains || []).map((d) => String(d || '').toLowerCase()).filter(Boolean);
+    if (!jobId || !list.length) return map;
+
+    for (const chunk of chunkArray(list, 200)) {
+        const result = await pool.query(
+            `SELECT domain_normalized, handle, product_id, title, variants, review_signals,
+                    tags, image_count, published_at
+             FROM shopify_snapshots
+             WHERE job_id = $1
+               AND domain_normalized = ANY($2::text[])`,
+            [jobId, chunk]
+        );
+        for (const row of result.rows) {
+            const domain = row.domain_normalized;
+            if (!map.has(domain)) map.set(domain, []);
+            map.get(domain).push({
+                domain_normalized: domain,
+                handle: row.handle,
+                product_id: row.product_id,
+                title: row.title || '',
+                variants: row.variants || [],
+                review_signals: row.review_signals || {},
+                tags: row.tags || '',
+                image_count: row.image_count || 0,
+                published_at: row.published_at || null
+            });
+        }
+    }
+    return map;
+}
+
 export async function upsertShopifySnapshotsBatch({
     agencyId,
     clientId,
