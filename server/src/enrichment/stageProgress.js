@@ -323,6 +323,11 @@ export function updateJobStagesLocked(jobId, agencyId, mutate) {
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
+            // Prevent a wedged reconcile (or any slow mutate) from holding FOR UPDATE
+            // forever and blocking Pause/Stop. Idle-in-transaction is how the Vulcan
+            // shopping-audit hang bricked the job row for 20+ minutes.
+            await client.query(`SET LOCAL idle_in_transaction_session_timeout = '20s'`);
+            await client.query(`SET LOCAL lock_timeout = '15s'`);
             const { rows } = await client.query(
                 `SELECT * FROM jobs WHERE id = $1 AND agency_id = $2 FOR UPDATE`,
                 [jobId, agencyId]
