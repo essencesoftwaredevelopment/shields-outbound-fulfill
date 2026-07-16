@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {
     buildSignalExportVars,
     precomputeDestinationChecks,
-    runSignalWaterfall
+    runSignalWaterfall,
+    runSignalWaterfallStage
 } from '../signalWaterfall.js';
 import { formatPriceUsd } from '../utils.js';
 import { SIGNAL_TYPES } from '../constants.js';
@@ -266,6 +267,207 @@ test('precomputeDestinationChecks returns empty map when no ad links', async () 
     const map = await precomputeDestinationChecks([
         { branch: 'none', matched_card: null },
         { branch: 'clean', matched_card: {} }
+    ]);
+    assert.equal(map.size, 0);
+});
+
+test('binary matched=true drives hasAd without any branch field', async () => {
+    const snapshot = makeSnapshot({
+        variants: [{ price: '66.95', available: true }],
+        review_signals: {}
+    });
+    const signal = await runSignalWaterfall({
+        snapshot,
+        observation: {
+            matched: true,
+            seller_match_method: 'concat',
+            matched_card: makeAdCard(),
+            all_cards: []
+        },
+        domain: 'grip6.com',
+        features: {},
+        destinationChecks: OK_CHECKS
+    });
+
+    assert.equal(signal.signal_type, SIGNAL_TYPES.AD_MATCH);
+    assert.equal(signal.observed.matched, true);
+    assert.equal(signal.observed.seller_match_method, 'concat');
+});
+
+test('explicit matched=false overrides a stale clean branch', async () => {
+    const snapshot = makeSnapshot({ title: 'Socks', review_signals: {} });
+    const signal = await runSignalWaterfall({
+        snapshot,
+        observation: { matched: false, branch: 'clean', matched_card: makeAdCard(), all_cards: [] },
+        domain: 'grip6.com',
+        features: {},
+        destinationChecks: OK_CHECKS
+    });
+
+    // No ad → only the title-quality fallback is eligible.
+    assert.equal(signal.signal_type, SIGNAL_TYPES.TITLE_QUALITY);
+});
+
+test('legacy observations without matched fall back to branch inference', async () => {
+    const snapshot = makeSnapshot({
+        variants: [{ price: '66.95', available: true }],
+        review_signals: {}
+    });
+    const signal = await runSignalWaterfall({
+        snapshot,
+        observation: makeObservation(),
+        domain: 'grip6.com',
+        features: {},
+        destinationChecks: OK_CHECKS
+    });
+
+    assert.equal(signal.signal_type, SIGNAL_TYPES.AD_MATCH);
+});
+
+test('runSignalWaterfallStage compares the ad against the matched product, not the hero', async () => {
+    const heroSnapshot = makeSnapshot({ title: 'Hero Product', variants: [{ price: '10.00', available: true }] });
+    const matchedProduct = makeSnapshot({
+        title: 'Merino Wool Crew Sock 3-Pack',
+        variants: [{ price: '74.97', available: true }],
+        review_signals: {}
+    });
+    const emissions = await runSignalWaterfallStage({
+        selectionsWithObservations: [{
+            domain: 'grip6.com',
+            selection: { domain: 'grip6.com', snapshot: heroSnapshot },
+            matched: true,
+            matched_product: matchedProduct,
+            matched_card: makeAdCard(),
+            all_cards: [],
+            observed_at: '2026-07-17T00:00:00.000Z'
+        }],
+        features: {},
+        enableBrokenPage: false
+    });
+
+    assert.equal(emissions.length, 1);
+    const { signal } = emissions[0];
+    // Price mismatch computed against the matched product ($74.97), not the hero ($10).
+    assert.equal(signal.signal_type, SIGNAL_TYPES.PRICE_MISMATCH);
+    assert.equal(signal.export_vars.product, 'Merino Wool Crew Sock 3-Pack');
+    assert.equal(signal.export_vars.page_price, '$74.97');
+});
+
+test('runSignalWaterfallStage falls back to the hero snapshot for legacy unmatched rows', async () => {
+    const heroSnapshot = makeSnapshot({ title: 'Socks', review_signals: {} });
+    const emissions = await runSignalWaterfallStage({
+        selectionsWithObservations: [{
+            domain: 'grip6.com',
+            selection: { domain: 'grip6.com', snapshot: heroSnapshot },
+            matched: false,
+            matched_product: null,
+            matched_card: null,
+            all_cards: []
+        }],
+        features: {},
+        enableBrokenPage: false
+    });
+
+    assert.equal(emissions.length, 1);
+    assert.equal(emissions[0].signal.signal_type, SIGNAL_TYPES.TITLE_QUALITY);
+});
+
+test('runSignalWaterfallStage emits nothing for unmatched serper-first rows — they do not move forward', async () => {
+    const emissions = await runSignalWaterfallStage({
+        selectionsWithObservations: [{
+            domain: 'grip6.com',
+            matched: false,
+            matched_product: null,
+            matched_card: null,
+            all_cards: []
+        }],
+        features: {},
+        enableBrokenPage: false
+    });
+
+    assert.equal(emissions.length, 0);
+});
+
+test('runSignalWaterfallStage supplies the matched product as the personalization selection', async () => {
+    const matchedProduct = makeSnapshot({ title: 'Merino Wool Crew Sock 3-Pack' });
+    const emissions = await runSignalWaterfallStage({
+        selectionsWithObservations: [{
+            domain: 'grip6.com',
+            matched: true,
+            matched_product: matchedProduct,
+            matched_card: makeAdCard({ price: '74.97', priceValue: 74.97 }),
+            all_cards: []
+        }],
+        features: {},
+        enableBrokenPage: false
+    });
+
+    assert.equal(emissions.length, 1);
+    assert.equal(emissions[0].selection.snapshot.title, 'Merino Wool Crew Sock 3-Pack');
+});
+
+test('price mismatch compares against the variant closest to the ad price, not the cheapest', async () => {
+    // Gift-card style product: denominations $10–$100 as variants. Ad shows the
+    // $50 card — the page agrees, so no mismatch.
+    const snapshot = makeSnapshot({
+        variants: [
+            { price: '10.00', available: true },
+            { price: '25.00', available: true },
+            { price: '50.00', available: true },
+            { price: '100.00', available: true }
+        ],
+        review_signals: {}
+    });
+    const agree = await runSignalWaterfall({
+        snapshot,
+        observation: makeObservation({ matched_card: makeAdCard({ price: '50.00', priceValue: 50 }) }),
+        domain: 'grip6.com',
+        features: {},
+        destinationChecks: OK_CHECKS
+    });
+    assert.equal(agree.signal_type, SIGNAL_TYPES.AD_MATCH);
+
+    // Ad price far from every variant still fires, against the closest one.
+    const mismatch = await runSignalWaterfall({
+        snapshot,
+        observation: makeObservation({ matched_card: makeAdCard({ price: '70.00', priceValue: 70 }) }),
+        domain: 'grip6.com',
+        features: {},
+        destinationChecks: OK_CHECKS
+    });
+    assert.equal(mismatch.signal_type, SIGNAL_TYPES.PRICE_MISMATCH);
+    assert.equal(mismatch.expected.page_price, 50);
+});
+
+test('precomputeDestinationChecks excludes links when matched=false despite a clean branch', async () => {
+    const map = await precomputeDestinationChecks([
+        { matched: false, branch: 'clean', matched_card: { link: AD_LINK } }
+    ]);
+    assert.equal(map.size, 0);
+});
+
+test('google redirect links never fire broken_page (rate-limited 429s are not broken pages)', async () => {
+    const googleLink = 'https://www.google.com/search?ibp=oshop&q=grip6.com&prds=x';
+    const snapshot = makeSnapshot({
+        variants: [{ price: '66.95', available: true }],
+        review_signals: {}
+    });
+    const signal = await runSignalWaterfall({
+        snapshot,
+        observation: {
+            matched: true,
+            matched_card: makeAdCard({ link: googleLink }),
+            all_cards: []
+        },
+        domain: 'grip6.com',
+        features: {},
+        destinationChecks: new Map([[googleLink, { broken: true, reason: 'http_error', statusCode: 429 }]])
+    });
+    assert.equal(signal.signal_type, SIGNAL_TYPES.AD_MATCH);
+
+    // And precompute never even queues google links for checking.
+    const map = await precomputeDestinationChecks([
+        { matched: true, matched_card: { link: googleLink } }
     ]);
     assert.equal(map.size, 0);
 });

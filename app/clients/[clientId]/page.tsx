@@ -839,6 +839,16 @@ type StageStatus = PipelineStageStatus;
 const STANDARD_STAGE_ORDER: PipelineStageKey[] = ["domainPrep", "founders", "emailDiscovery", "verification", "personalization"];
 const SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
     "domainPrep",
+    "serperShopping",
+    "signalWaterfall",
+    "founders",
+    "emailDiscovery",
+    "verification",
+    "personalization",
+];
+/** Jobs created before the serper-first refactor still carry catalog/hero stages. */
+const LEGACY_SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
+    "domainPrep",
     "shopifyCatalog",
     "heroSelection",
     "serperShopping",
@@ -851,7 +861,9 @@ const SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
 
 function resolveStageOrder(job?: PipelineJob | null): PipelineStageKey[] {
     if (isShoppingAuditPipelineJob(job)) {
-        return SHOPPING_AUDIT_STAGE_ORDER;
+        return job?.stages?.shopifyCatalog
+            ? LEGACY_SHOPPING_AUDIT_STAGE_ORDER
+            : SHOPPING_AUDIT_STAGE_ORDER;
     }
     return STANDARD_STAGE_ORDER;
 }
@@ -871,7 +883,7 @@ const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }
     },
     serperShopping: {
         title: "Serper Shopping",
-        detail: "Confirm Google Shopping ad for hero product",
+        detail: "Domain query + reverse catalog match",
     },
     signalWaterfall: {
         title: "Signal Waterfall",
@@ -1398,6 +1410,7 @@ export default function ClientPage() {
     const [modalOpen, setModalOpen] = useState(false);
     const [wizardStep, setWizardStep] = useState<1 | 2 | 3 | 4>(1);
     const [selectedFile, setSelectedFile] = useState<File | null>(null);
+    const [isDragOver, setIsDragOver] = useState(false);
     const [csvColumns, setCsvColumns] = useState<string[]>([]);
     const [domainColumn, setDomainColumn] = useState<string>("");
     const [founderColumn, setFounderColumn] = useState<string>("");
@@ -1957,6 +1970,7 @@ export default function ClientPage() {
         last_name: string;
         personalization: string;
         shopify_store?: string;
+        ad_matched?: string;
         hero_product?: string;
         shopping_ad_link?: string;
         signal?: string;
@@ -1985,6 +1999,7 @@ export default function ClientPage() {
             { key: 'first_name' as const, label: 'First name' },
             { key: 'last_name' as const, label: 'Last name' },
             { key: 'shopify_store' as const, label: 'Shopify store' },
+            { key: 'ad_matched' as const, label: 'Ad matched' },
             { key: 'hero_product' as const, label: 'Hero product' },
             { key: 'shopping_ad_link' as const, label: 'Shopping ad link', link: true },
             { key: 'signal' as const, label: 'Signal' },
@@ -4819,6 +4834,12 @@ export default function ClientPage() {
 
     const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0] ?? null;
+        // Allow re-selecting the same file to re-trigger onChange
+        event.target.value = "";
+        await processSelectedFile(file);
+    };
+
+    const processSelectedFile = async (file: File | null) => {
         setSelectedFile(file);
         setUploadError("");
         setDomainCheckStats(null);
@@ -9014,8 +9035,9 @@ export default function ClientPage() {
                                                 const clean = (summary?.clean as number) ?? 0;
                                                 const none = (summary?.none as number) ?? 0;
                                                 const ambiguous = (summary?.ambiguous as number) ?? 0;
+                                                const matched = (summary?.matched as number) ?? clean;
                                                 const processed = (summary?.processed as number) ?? total ?? clean + none + ambiguous;
-                                                heroNumber = clean;
+                                                heroNumber = matched;
                                                 heroLabel = "Ads Matched";
                                                 subtext = processed > 0
                                                     ? `${processed.toLocaleString()} queried • ${none.toLocaleString()} no match${ambiguous > 0 ? ` • ${ambiguous.toLocaleString()} ambiguous` : ""}`
@@ -10845,7 +10867,24 @@ export default function ClientPage() {
                             {/* Step 1: File Upload */}
                             {wizardStep === 1 && (
                                 <>
-                                    <label className="upload-area">
+                                    <label
+                                        className={`upload-area${isDragOver ? ' upload-area--drag' : ''}`}
+                                        onDragOver={(event) => {
+                                            event.preventDefault();
+                                            setIsDragOver(true);
+                                        }}
+                                        onDragLeave={() => setIsDragOver(false)}
+                                        onDrop={(event) => {
+                                            event.preventDefault();
+                                            setIsDragOver(false);
+                                            const file = event.dataTransfer.files?.[0] ?? null;
+                                            if (file && !/\.csv$/i.test(file.name)) {
+                                                setUploadError('Please drop a .csv file');
+                                                return;
+                                            }
+                                            void processSelectedFile(file);
+                                        }}
+                                    >
                                         <span className="upload-area__title">Drop CSV or click to browse</span>
                                         <span className="upload-area__hint">Must contain a domain column</span>
                                         {selectedFile && (

@@ -16,7 +16,7 @@ function parsePositiveInt(raw, fallback) {
 const CATALOG_TIMEOUT_MS = parsePositiveInt(process.env.SHOPIFY_CATALOG_TIMEOUT_MS, 3500);
 const CATALOG_CONCURRENCY = parsePositiveInt(process.env.SHOPIFY_CATALOG_CONCURRENCY, 25);
 /** Retries only apply to HTTP 429 rate limits, not timeouts. */
-const CATALOG_RETRIES = parsePositiveInt(process.env.SHOPIFY_CATALOG_RETRIES, 1);
+const CATALOG_RETRIES = parsePositiveInt(process.env.SHOPIFY_CATALOG_RETRIES, 2);
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,16 +29,17 @@ function isRetryableCatalogError(message) {
 export async function fetchShopifyCatalogSample(
     domain,
     log,
-    { limit = SHOPIFY_CATALOG_LIMIT, retries = CATALOG_RETRIES, timeoutMs = CATALOG_TIMEOUT_MS } = {}
+    { limit = SHOPIFY_CATALOG_LIMIT, page = 1, retries = CATALOG_RETRIES, timeoutMs = CATALOG_TIMEOUT_MS } = {}
 ) {
     const host = normalizeHostname(domain);
-    const url = `https://${host}/products.json?limit=${limit}`;
+    const url = `https://${host}/products.json?limit=${limit}${page > 1 ? `&page=${page}` : ''}`;
     let lastError = null;
 
     for (let attempt = 0; attempt <= retries; attempt += 1) {
         try {
             if (attempt > 0) {
-                const backoffMs = 500 * attempt + Math.random() * 250;
+                // 429s are Shopify per-IP throttling — short backoffs just burn retries.
+                const backoffMs = 1500 * attempt + Math.random() * 500;
                 log?.(`Catalog fetch retry ${attempt}/${retries} for ${host} (${Math.round(backoffMs)}ms)`);
                 await sleep(backoffMs);
             }

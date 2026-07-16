@@ -1,3 +1,9 @@
+/**
+ * @deprecated Removed from the production pipeline with the serper-first
+ * refactor (2026-07) — matching is domain-first and only matched domains move
+ * forward, so no hero product is selected. Retained for the spike scripts'
+ * --compare mode; delete together with them.
+ */
 import { heroVariantPrice, lowestInStockPrice } from './utils.js';
 
 function parseDate(value) {

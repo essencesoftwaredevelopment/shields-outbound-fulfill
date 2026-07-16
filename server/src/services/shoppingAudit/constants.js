@@ -6,13 +6,52 @@ export const DEFAULT_SERPER_GEO = {
     location: 'United States'
 };
 
-/** Max products pulled from /products.json per store (single request). */
-export const SHOPIFY_CATALOG_LIMIT = 10;
+function envInt(name, fallback) {
+    const n = parseInt(process.env[name], 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
-/** Minimum matchShoppingCard score to treat a Serper card as this merchant's ad. */
+function envFloat(name, fallback) {
+    const n = parseFloat(process.env[name]);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Max products pulled from /products.json per store, per page. */
+export const SHOPIFY_CATALOG_LIMIT = envInt('SHOPPING_CATALOG_PAGE_LIMIT', 50);
+
+/** Max /products.json pages fetched per store during reverse card→catalog matching. */
+export const SHOPPING_CATALOG_MAX_PAGES = envInt('SHOPPING_CATALOG_MAX_PAGES', 10);
+
+/** Minimum lenient card-title vs product-title token overlap to count as matched. */
+export const MIN_CARD_PRODUCT_SIMILARITY = envFloat('SHOPPING_MIN_CARD_PRODUCT_SIM', 0.6);
+
+/** Max seller-matched Shopping cards reverse-matched against the catalog per domain. */
+export const MAX_SELLER_CARDS = envInt('SHOPPING_MAX_SELLER_CARDS', 5);
+
+/**
+ * Strict similarity at which a card→product match is near-exact and catalog
+ * pagination can stop searching for a better product. Below this, keep
+ * scanning: sibling variants ("… LH", "5-String") pass the lenient threshold
+ * while the advertised product sits on a later page.
+ */
+export const STRONG_MATCH_STRICT = envFloat('SHOPPING_STRONG_MATCH_STRICT', 0.9);
+
+/** Serper Shopping results requested per query. */
+export const SERPER_SHOPPING_NUM = envInt('SHOPPING_SERPER_NUM', 20);
+
+/** Cross-domain concurrency for catalog pagination during reverse matching. */
+export const CATALOG_PAGINATION_CONCURRENCY = envInt('SHOPPING_CATALOG_PAGINATION_CONCURRENCY', 4);
+
+/**
+ * @deprecated Hero-first matching only (matchShoppingCard) — removed from the
+ * production path in favor of domain-first matching (2026-07).
+ */
 export const MIN_SHOPPING_MATCH_SCORE = 0.4;
 
-/** Minimum title token overlap when seller already matches the domain. */
+/**
+ * @deprecated Hero-first matching only (matchShoppingCard) — removed from the
+ * production path in favor of domain-first matching (2026-07).
+ */
 export const MIN_SHOPPING_TITLE_SIMILARITY = 0.15;
 
 export const SIGNAL_TYPES = {
@@ -58,9 +97,13 @@ export const SIGNAL_WATERFALL = [
     { type: SIGNAL_TYPES.TITLE_QUALITY, tier: 3, requiresAd: false }
 ];
 
+/**
+ * Serper-first: the bare-domain Serper query runs first and the catalog is
+ * fetched on demand only for domains with seller-matched cards. The old
+ * shopifyCatalog/heroSelection stages are gone — only matched domains move
+ * forward to enrichment.
+ */
 export const SHOPPING_AUDIT_STAGE_KEYS = [
-    'shopifyCatalog',
-    'heroSelection',
     'serperShopping',
     'signalWaterfall'
 ];

@@ -9,6 +9,7 @@ import {
     evaluateTitleQuality,
     extractCardFields,
     formatPriceUsd,
+    isCheckableDestination,
     lowestInStockPrice,
     parsePriceValue,
     sellerMatchesDomain
@@ -24,9 +25,20 @@ function finiteOr(raw, fallback) {
 }
 
 function detectPriceMismatch(snapshot, adCard, features) {
-    const pagePrice = lowestInStockPrice(snapshot.variants);
     const adPrice = adCard?.priceValue ?? parsePriceValue(adCard?.price);
-    if (pagePrice == null || adPrice == null) return { fires: false };
+    if (adPrice == null) return { fires: false };
+
+    // The ad promotes ONE variant. Compare against the in-stock variant price
+    // closest to the ad — gift cards and multi-variant products would
+    // otherwise "mismatch" against the cheapest denomination ($50 ad vs the
+    // $10 card the lowest-price rule picked).
+    const variants = (snapshot.variants || []).filter((v) => v.available !== false);
+    const pool = variants.length ? variants : (snapshot.variants || []);
+    const prices = pool.map((v) => parsePriceValue(v.price)).filter((p) => p != null);
+    if (!prices.length) return { fires: false };
+    const pagePrice = prices.reduce(
+        (best, p) => (Math.abs(p - adPrice) < Math.abs(best - adPrice) ? p : best)
+    );
     const delta = Math.abs(pagePrice - adPrice);
 
     // The emails quote both numbers, so trivial deltas would undercut the
@@ -131,7 +143,7 @@ function detectTitleQuality(snapshot) {
 
 async function detectBrokenPage(adCard, destinationChecks) {
     const link = adCard?.link;
-    if (!link) return { fires: false };
+    if (!link || !isCheckableDestination(link)) return { fires: false };
     const check = destinationChecks?.get?.(link)
         || await checkDestinationPage(link, DESTINATION_CHECK_TIMEOUT_MS);
     if (!check.broken) return { fires: false };
@@ -204,7 +216,10 @@ export async function runSignalWaterfall({
 }) {
     const adCard = observation?.matched_card;
     const allCards = observation?.all_cards || [];
-    const hasAd = observation?.branch === 'clean' || observation?.branch === 'ambiguous';
+    // Binary qualifier from domain-first matching; branch fallback covers
+    // observations persisted before the deploy (hero-first, no `matched`).
+    const hasAd = observation?.matched
+        ?? (observation?.branch === 'clean' || observation?.branch === 'ambiguous');
     const context = { snapshot, adCard, allCards, domain, destinationChecks, features };
     const observedAt = observation?.observed_at || new Date().toISOString();
 
@@ -232,8 +247,10 @@ export async function runSignalWaterfall({
             signal_type: SIGNAL_TYPES.AD_MATCH,
             tier: 3,
             observed: {
+                matched: true,
                 ad_title: adFields.title || snapshot?.title || null,
                 feed_title: snapshot?.title || null,
+                seller_match_method: observation?.seller_match_method || null,
                 branch: observation?.branch || null
             },
             expected: {},
@@ -269,9 +286,9 @@ export async function precomputeDestinationChecks(rows, {
 } = {}) {
     const links = new Set();
     for (const row of rows || []) {
-        const hasAd = row?.branch === 'clean' || row?.branch === 'ambiguous';
+        const hasAd = row?.matched ?? (row?.branch === 'clean' || row?.branch === 'ambiguous');
         const link = row?.matched_card?.link;
-        if (hasAd && link) links.add(link);
+        if (hasAd && link && isCheckableDestination(link)) links.add(link);
     }
 
     const map = new Map();
@@ -303,7 +320,11 @@ export async function runSignalWaterfallStage({
 
     const emissions = [];
     for (const row of selectionsWithObservations) {
-        const snap = row.selection?.snapshot;
+        // Detectors compare the ad against the product it actually matched.
+        // Unmatched domains have no product and emit nothing — only matched
+        // domains move forward to enrichment. (row.selection covers legacy
+        // hero-first state.)
+        const snap = row.matched_product || row.selection?.snapshot;
         if (!snap) continue;
         const signal = await runSignalWaterfall({
             snapshot: snap,
@@ -315,7 +336,13 @@ export async function runSignalWaterfallStage({
             destinationChecks
         });
         if (signal) {
-            emissions.push({ domain: row.domain, selection: row.selection, observation: row, signal });
+            emissions.push({
+                domain: row.domain,
+                // Personalization reads selection.snapshot as its product context.
+                selection: row.selection ?? { domain: row.domain, snapshot: snap },
+                observation: row,
+                signal
+            });
         }
     }
     log?.(`Signal waterfall: ${emissions.length} signals emitted`);

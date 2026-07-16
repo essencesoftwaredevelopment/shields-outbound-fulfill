@@ -19,9 +19,9 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
     > | null = null;
 
     if (input.pipelineMode === 'shopping_audit') {
-      let auditState = await shopifyCatalogStep(input);
-      auditState = await heroSelectionStep(input, auditState);
-      auditState = await serperShoppingStep(input, auditState);
+      // Serper-first: bare-domain query + on-demand catalog reverse match,
+      // then the waterfall. Only matched domains move forward to enrichment.
+      let auditState = await serperShoppingStep(input, null);
       auditState = await signalWaterfallStep(input, auditState);
       auditSummary = await finalizeShoppingAuditStep(input, auditState);
     }
@@ -47,39 +47,6 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
     );
     throw err;
   }
-}
-
-async function shopifyCatalogStep(input: ChildBatchInput) {
-  'use step';
-
-  const enrichment = await loadEnrichment();
-  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
-  await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runShoppingAuditStageBatch(
-    ctx,
-    input.batchDomains,
-    'shopifyCatalog',
-    null,
-    { batchIndex: input.batchIndex }
-  );
-}
-
-async function heroSelectionStep(
-  input: ChildBatchInput,
-  state: ShoppingAuditBatchState | null
-) {
-  'use step';
-
-  const enrichment = await loadEnrichment();
-  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
-  await enrichment.assertJobActive(input.jobId, input.agencyId);
-  return enrichment.runShoppingAuditStageBatch(
-    ctx,
-    input.batchDomains,
-    'heroSelection',
-    state,
-    { batchIndex: input.batchIndex }
-  );
 }
 
 async function serperShoppingStep(
@@ -176,8 +143,6 @@ async function personalizationStep(input: ChildBatchInput) {
 
 // Shopping-audit steps thread serializable state between them and re-call Serper/Shopify
 // on re-run; leave at 0 until per-item idempotency (no double-charge) is verified.
-shopifyCatalogStep.maxRetries = 0;
-heroSelectionStep.maxRetries = 0;
 serperShoppingStep.maxRetries = 0;
 signalWaterfallStep.maxRetries = 0;
 finalizeShoppingAuditStep.maxRetries = 0;

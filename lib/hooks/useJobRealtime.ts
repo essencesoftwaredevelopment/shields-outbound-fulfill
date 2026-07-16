@@ -36,6 +36,7 @@ export function rowToJobState(row: JobRealtimeRow) {
         options.pipelineMode === "shopping_audit"
         || options.nicheId === "shopping_audit"
         || options.industry === "shopping_audit"
+        || Boolean(stages.serperShopping)
         || Boolean(stages.shopifyCatalog)
             ? "shopping_audit"
             : "standard";

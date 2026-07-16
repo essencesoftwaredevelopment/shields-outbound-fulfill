@@ -37,7 +37,11 @@ export function normalizeProductTitle(title) {
         .trim();
 }
 
-/** Serper Shopping search query: "{domain} {hero product title}". */
+/**
+ * Serper Shopping search query: "{domain} {hero product title}".
+ * @deprecated Hero-first path removed from production (2026-07) — the pipeline
+ * now queries the bare domain. Retained for the spike scripts' --compare mode.
+ */
 export function buildSerperShoppingQuery(domain, productTitle) {
     const host = normalizeHostname(domain);
     const title = normalizeProductTitle(productTitle);
@@ -94,6 +98,107 @@ export function sellerMatchesDomain(seller, domain) {
     if (!s || !d) return false;
     if (s.includes(d) || s.includes(root)) return true;
     return titleSimilarity(s, root) > 0.8;
+}
+
+/**
+ * Brand root label that survives two-level ccTLDs — domainRootLabel() returns
+ * "com" for silvershop.com.au, which breaks seller matching and false-positives
+ * on any seller containing "com".
+ */
+export function brandRootLabel(host) {
+    const parts = normalizeHostname(host).split('.');
+    if (parts.length >= 3 && /^(com?|net|org)$/.test(parts[parts.length - 2]) && parts[parts.length - 1].length === 2) {
+        return parts[parts.length - 3];
+    }
+    return domainRootLabel(host);
+}
+
+/**
+ * Seller-vs-brand match, including the space-insensitive case the legacy
+ * matcher misses ("Spicy Wear" → "spicywear"). Returns the method that hit so
+ * observations record how the seller matched.
+ */
+export function matchSellerToBrand(seller, domain) {
+    const s = String(seller || '').toLowerCase().trim();
+    if (!s) return { matched: false, method: null };
+    const host = normalizeHostname(domain);
+    const root = brandRootLabel(host);
+    const sConcat = s.replace(/[^a-z0-9]/g, '');
+    if (s.includes(host) || s.includes(root)) return { matched: true, method: 'substring' };
+    if (sConcat && (sConcat === root || sConcat.includes(root) || root.includes(sConcat))) {
+        return { matched: true, method: 'concat' };
+    }
+    // Token similarity against the ccTLD-safe root — deliberately NOT
+    // sellerMatchesDomain, whose domainRootLabel("x.com.au") === "com" makes
+    // every seller containing "com" a false positive.
+    if (titleSimilarity(s, root) > 0.8) return { matched: true, method: 'legacy_similarity' };
+    return { matched: false, method: null };
+}
+
+/**
+ * Tokens for card↔product title matching. Unlike tokenize(), keeps 2-char
+ * tokens and single digits — short designators ("L3" vs "L5", "4-String" vs
+ * "5-String") are often the only thing distinguishing sibling products, and
+ * dropping them matched "…L3 P90" ads to "…L5 LH" catalog rows at 1.0.
+ */
+function productMatchTokens(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter((t) => t.length >= 2 || /^\d$/.test(t));
+}
+
+function disjointNonEmpty(a, b) {
+    return a.length > 0 && b.length > 0 && !a.some((t) => b.includes(t));
+}
+
+/** Token overlap between an ad-card title and a catalog product title, brand tokens stripped. */
+export function cardToProductSimilarity(cardTitle, productTitle, root) {
+    const strip = (tokens) => tokens.filter((t) => !root.includes(t));
+    const ta = new Set(strip(productMatchTokens(cardTitle)));
+    const tb = new Set(strip(productMatchTokens(productTitle)));
+    if (!ta.size || !tb.size) return { lenient: 0, strict: 0 };
+
+    // Sibling-product veto: same-series products ("…D5 Bass" vs "…P7 4-String",
+    // "12-pack" vs "24-pack") share their wordy tokens and differ only in the
+    // designators, so plain overlap scores them as matches. Compare model-like
+    // tokens (letter+digit: d5, p90) and pure numbers (4, 24) as separate
+    // families — if either family is present on both sides with no agreement,
+    // these are different products.
+    const models = (tokens) => [...tokens].filter((t) => /\d/.test(t) && /[a-z]/.test(t));
+    const numbers = (tokens) => [...tokens].filter((t) => /^\d+$/.test(t));
+    if (disjointNonEmpty(models(ta), models(tb)) || disjointNonEmpty(numbers(ta), numbers(tb))) {
+        return { lenient: 0, strict: 0 };
+    }
+
+    let overlap = 0;
+    for (const t of ta) {
+        if (tb.has(t)) overlap += 1;
+    }
+    return {
+        lenient: overlap / Math.min(ta.size, tb.size),
+        strict: overlap / Math.max(ta.size, tb.size)
+    };
+}
+
+/** Best catalog snapshot row for a card title by lenient similarity (strict tiebreak). */
+export function bestCatalogMatch(cardFields, snapshots, root) {
+    let best = null;
+    for (const snapshot of snapshots || []) {
+        const title = snapshot?.title || '';
+        if (!title) continue;
+        const sim = cardToProductSimilarity(cardFields.title, title, root);
+        if (!best || sim.lenient > best.similarity_lenient
+            || (sim.lenient === best.similarity_lenient && sim.strict > best.similarity_strict)) {
+            best = {
+                snapshot,
+                similarity_lenient: Number(sim.lenient.toFixed(3)),
+                similarity_strict: Number(sim.strict.toFixed(3))
+            };
+        }
+    }
+    return best;
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -222,6 +327,11 @@ export function classifyCard(cardFields) {
     return 'none';
 }
 
+/**
+ * @deprecated Hero-first matcher — removed from production (2026-07) in favor
+ * of domain-first matching (matchSellerToBrand + bestCatalogMatch). Retained
+ * for the spike scripts' --compare mode; delete together with them.
+ */
 export function matchShoppingCard(cards, { domain, productTitle, feedPrice }) {
     const normalizedTitle = normalizeProductTitle(productTitle);
     let best = null;
@@ -305,11 +415,29 @@ export function evaluateTitleQuality(title, brandHint = '') {
     return { fires: issues.length > 0, issues };
 }
 
+/**
+ * Shopping card links are usually Google redirect URLs — checking them probes
+ * Google (which rate-limits with 429s), not the merchant's page, so a broken
+ * verdict there is meaningless.
+ */
+export function isCheckableDestination(url) {
+    try {
+        const host = new URL(url).hostname.toLowerCase();
+        return !/(^|\.)google\.[a-z.]+$|(^|\.)googleadservices\.com$/.test(host);
+    } catch {
+        return false;
+    }
+}
+
 export async function checkDestinationPage(url, timeout = 8000) {
     if (!url) return { broken: true, reason: 'missing_url', statusCode: null };
     try {
         const res = await fetchUrl(url, timeout, 'GET');
         const status = res.statusCode || 0;
+        // Rate limiting / bot blocking says nothing about the page itself.
+        if (status === 429 || status === 403) {
+            return { broken: false, reason: 'inconclusive_blocked', statusCode: status };
+        }
         if (status >= 400) {
             return { broken: true, reason: 'http_error', statusCode: status };
         }

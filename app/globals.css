@@ -1443,6 +1443,12 @@ body {
   color: var(--app-text);
 }
 
+.upload-area--drag {
+  border-color: #3b82f6;
+  color: var(--app-text);
+  background: rgba(59, 130, 246, 0.08);
+}
+
 .upload-area__title {
   font-size: 1rem;
   font-weight: 600;

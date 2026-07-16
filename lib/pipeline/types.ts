@@ -1,12 +1,13 @@
 export type StandardPipelineStageKey = "domainPrep" | "founders" | "emailDiscovery" | "verification" | "personalization";
 
+/** shopifyCatalog/heroSelection only exist on jobs created before the serper-first refactor. */
 export type ShoppingAuditStageKey = "shopifyCatalog" | "heroSelection" | "serperShopping" | "signalWaterfall";
 
 export type PipelineStageKey = StandardPipelineStageKey | ShoppingAuditStageKey;
 
 export type PipelineMode = "standard" | "shopping_audit";
 
-/** Every stage key the UI may persist — standard + shopping audit. */
+/** Every stage key the UI may persist — standard + shopping audit (incl. legacy). */
 export const ALL_PIPELINE_STAGE_KEYS: PipelineStageKey[] = [
     "domainPrep",
     "shopifyCatalog",
@@ -23,11 +24,12 @@ export function isShoppingAuditPipelineJob(
     job?: Pick<PipelineJob, "pipelineMode" | "stages"> | null
 ): boolean {
     if (job?.pipelineMode === "shopping_audit") return true;
-    const shopifyStage = job?.stages?.shopifyCatalog;
-    if (!shopifyStage) return false;
-    if (shopifyStage.status && shopifyStage.status !== "pending") return true;
-    if (shopifyStage.startedAt) return true;
-    if (shopifyStage.summary && Object.keys(shopifyStage.summary).length > 0) return true;
+    // serperShopping is the audit marker; shopifyCatalog covers legacy jobs.
+    const auditStage = job?.stages?.serperShopping ?? job?.stages?.shopifyCatalog;
+    if (!auditStage) return false;
+    if (auditStage.status && auditStage.status !== "pending") return true;
+    if (auditStage.startedAt) return true;
+    if (auditStage.summary && Object.keys(auditStage.summary).length > 0) return true;
     return false;
 }
 

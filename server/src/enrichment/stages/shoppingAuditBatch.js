@@ -152,7 +152,7 @@ export async function runShoppingAuditBatch(ctx, batchDomains, batchOpts = {}) {
  * One shopping-audit stage for Vercel child workflows (state passed between steps).
  * @param {import('../context.js').EnrichmentContext} ctx
  * @param {string[]} batchDomains
- * @param {'shopifyCatalog'|'heroSelection'|'serperShopping'|'signalWaterfall'} stage
+ * @param {'serperShopping'|'signalWaterfall'} stage
  * @param {object|null} state
  * @param {{ batchIndex?: number }} [batchOpts]
  */

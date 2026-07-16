@@ -42,13 +42,12 @@ export const CHILD_WAVE_CONCURRENCY = Math.max(
 );
 
 /** Serializable shopping-audit state passed between child workflow steps.
- * catalogResults must stay slim ({ domain, isShopify }) — snapshots live in DB
- * between shopifyCatalog and heroSelection so Vercel step payloads stay small.
+ * Serper-first: catalog snapshots are persisted to DB inside the serper stage
+ * and never carried in step state; observations hold slim cards only.
  */
 export type ShoppingAuditBatchState = {
   stats: {
-    shopify: number;
-    heroes: number;
+    serperMatched: number;
     serperClean: number;
     serperAmbiguous: number;
     serperNone: number;
@@ -57,8 +56,6 @@ export type ShoppingAuditBatchState = {
     cost: number;
   };
   companyIdByDomain: Record<string, number>;
-  catalogResults: unknown[];
-  selections: unknown[];
   observations: unknown[];
   signalByDomain: Record<string, unknown>;
   qualifiedDomains: string[];

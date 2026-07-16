@@ -62,7 +62,7 @@ export async function loadShopifySnapshotsForDomains(jobId, domains) {
 
     for (const chunk of chunkArray(list, 200)) {
         const result = await pool.query(
-            `SELECT domain_normalized, handle, product_id, title, variants, review_signals,
+            `SELECT id, domain_normalized, handle, product_id, title, variants, review_signals,
                     tags, image_count, published_at
              FROM shopify_snapshots
              WHERE job_id = $1
@@ -73,6 +73,7 @@ export async function loadShopifySnapshotsForDomains(jobId, domains) {
             const domain = row.domain_normalized;
             if (!map.has(domain)) map.set(domain, []);
             map.get(domain).push({
+                id: row.id,
                 domain_normalized: domain,
                 handle: row.handle,
                 product_id: row.product_id,
@@ -247,7 +248,7 @@ export async function insertAdObservationsBatch({
 }) {
     if (!rows?.length) return [];
 
-    const paramsPerRow = 11;
+    const paramsPerRow = 18;
     const chunkSize = Math.max(1, Math.floor(QUERY_PARAM_BUDGET / paramsPerRow));
     const ids = [];
 
@@ -258,7 +259,7 @@ export async function insertAdObservationsBatch({
 
         for (const row of chunk) {
             values.push(
-                `($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}::jsonb, $${idx + 6}::jsonb, $${idx + 7}, $${idx + 8}::jsonb, $${idx + 9}, $${idx + 10})`
+                `($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}::jsonb, $${idx + 6}::jsonb, $${idx + 7}, $${idx + 8}::jsonb, $${idx + 9}, $${idx + 10}, $${idx + 11}, $${idx + 12}::jsonb, $${idx + 13}, $${idx + 14}, $${idx + 15}, $${idx + 16}, $${idx + 17})`
             );
             params.push(
                 agencyId,
@@ -271,7 +272,14 @@ export async function insertAdObservationsBatch({
                 row.source || 'serper',
                 JSON.stringify(row.geo || {}),
                 row.queryText || null,
-                row.observedAt || new Date().toISOString()
+                row.observedAt || new Date().toISOString(),
+                row.matched === true,
+                row.matchedProduct ? JSON.stringify(row.matchedProduct) : null,
+                row.matchedSnapshotId ?? null,
+                row.sellerMatchMethod ?? null,
+                row.matchSimilarity ?? null,
+                row.catalogPagesFetched ?? null,
+                row.domain ?? null
             );
             idx += paramsPerRow;
         }
@@ -279,7 +287,9 @@ export async function insertAdObservationsBatch({
         const result = await pool.query(
             `INSERT INTO ad_observations (
                 agency_id, client_id, hero_selection_id, job_id, branch,
-                matched_card, all_cards, source, geo, query_text, observed_at
+                matched_card, all_cards, source, geo, query_text, observed_at,
+                matched, matched_product, matched_snapshot_id, seller_match_method,
+                match_similarity, catalog_pages_fetched, domain_normalized
             ) VALUES ${values.join(', ')}
             RETURNING id`,
             params
@@ -300,13 +310,20 @@ export async function insertAdObservation(params) {
         jobId: params.jobId,
         rows: [{
             heroSelectionId: params.heroSelectionId,
+            domain: params.domain,
             branch: params.branch,
             matchedCard: params.matchedCard,
             allCards: params.allCards,
             source: params.source,
             geo: params.geo,
             queryText: params.queryText,
-            observedAt: params.observedAt
+            observedAt: params.observedAt,
+            matched: params.matched,
+            matchedProduct: params.matchedProduct,
+            matchedSnapshotId: params.matchedSnapshotId,
+            sellerMatchMethod: params.sellerMatchMethod,
+            matchSimilarity: params.matchSimilarity,
+            catalogPagesFetched: params.catalogPagesFetched
         }]
     });
     return id ?? null;
@@ -467,6 +484,7 @@ export async function getBatchAuditMetrics(jobId) {
         `SELECT
             COUNT(*) FILTER (WHERE signal_type = 'price_mismatch') AS price_mismatch_count,
             COUNT(*) AS any_signal_count,
+            (SELECT COUNT(*) FROM ad_observations WHERE job_id = $1 AND matched) AS ad_found_matched,
             (SELECT COUNT(*) FROM ad_observations WHERE job_id = $1 AND branch = 'clean') AS ad_found_clean,
             (SELECT COUNT(*) FROM ad_observations WHERE job_id = $1) AS ad_observation_total,
             (SELECT COUNT(*) FROM ad_observations WHERE job_id = $1 AND source = 'headless') AS headless_count

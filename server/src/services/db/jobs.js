@@ -14,9 +14,15 @@ const COHORT_ELIGIBLE_SQL = `
     AND COALESCE(jd.raw_row->'_enrichment'->>'founderExcluded', 'false') <> 'true'
     AND COALESCE(jd.raw_row->'_enrichment'->>'inEmailCohort', 'true') = 'true'`;
 
-/** When dedupe strategy is skip, job_domains marked `skipped` must not re-enter enrichment queues. */
-function skippedJobDomainSql(reprocessInclude) {
-    return reprocessInclude ? '' : `AND jd.status <> 'skipped'`;
+/**
+ * job_domains marked `skipped` must never re-enter enrichment queues — whether
+ * skipped by dedupe (skip mode) or by the shopping-audit matched-only gate.
+ * Reprocess mode used to bypass this, but reprocess dedupe marks nothing as
+ * skipped, so the bypass only ever leaked audit-skipped (unmatched) domains
+ * into email/verification queues.
+ */
+function skippedJobDomainSql() {
+    return `AND jd.status <> 'skipped'`;
 }
 
 function resolvePipelineMode(options = {}, stages = {}) {
@@ -625,7 +631,7 @@ export async function getEmailFindQueue(
            AND (c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '' AND LOWER(BTRIM(c.full_name)) <> 'not found')
            AND COALESCE(jd.raw_row->'_enrichment'->>'inFounderCohort', 'true') = 'true'
            ${COHORT_ELIGIBLE_SQL}
-           ${skippedJobDomainSql(reprocessInclude)}
+           ${skippedJobDomainSql()}
          ORDER BY c.id ASC
          LIMIT $4`,
         params
@@ -669,7 +675,7 @@ export async function getVerifyQueue(
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
            ${freshnessConstraint}
            ${COHORT_ELIGIBLE_SQL}
-           ${skippedJobDomainSql(reprocessInclude)}
+           ${skippedJobDomainSql()}
          ORDER BY c.id ASC
          LIMIT $4`,
         params
@@ -720,7 +726,7 @@ export async function getPersonalizeQueue(
            ${personalizationFilter}
            ${emailStatusFilter}
            ${COHORT_ELIGIBLE_SQL}
-           ${skippedJobDomainSql(reprocessInclude)}
+           ${skippedJobDomainSql()}
          ORDER BY c.id ASC
          LIMIT $4`,
         params
@@ -868,7 +874,7 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
              AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
              AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
              ${COHORT_ELIGIBLE_SQL}
-             ${skippedJobDomainSql(false)}`;
+             ${skippedJobDomainSql()}`;
 
     const verificationResult = skipVerification
         ? { rows: [{ verified: 0, valid: 0, invalid: 0, unknown: 0, valid_risky: 0 }] }
@@ -899,7 +905,7 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
                AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
                AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
                ${COHORT_ELIGIBLE_SQL}
-               ${skippedJobDomainSql(false)}`,
+               ${skippedJobDomainSql()}`,
             [agencyId, clientId, jobId, runStartedAt]
         );
 
@@ -1011,6 +1017,7 @@ export const SHOPPING_AUDIT_UNIFIED_HEADERS = [
     'first_name',
     'last_name',
     'shopify_store',
+    'ad_matched',
     'hero_product',
     'shopping_ad_link',
     'signal',
@@ -1038,12 +1045,12 @@ const SHOPPING_AUDIT_ROW_JOINS = `
     LEFT JOIN signal_emissions se
         ON se.job_id = c.job_id AND se.domain_normalized = co.domain_normalized
     LEFT JOIN LATERAL (
-        SELECT ao.matched_card
+        SELECT ao.matched, ao.matched_card, ao.matched_product
         FROM ad_observations ao
         WHERE ao.job_id = c.job_id
-          AND ao.hero_selection_id = hs.id
-          AND ao.matched_card IS NOT NULL
+          AND ao.domain_normalized = co.domain_normalized
         ORDER BY
+            ao.matched DESC,
             CASE ao.branch WHEN 'clean' THEN 0 WHEN 'ambiguous' THEN 1 ELSE 2 END,
             ao.observed_at DESC NULLS LAST
         LIMIT 1
@@ -1060,7 +1067,7 @@ const INVALID_FOUNDER_NAMES_SQL = `'not found', 'n/a', 'unknown'`;
 
 function buildCompletenessOrderBy(shoppingAudit) {
     const adLinkScore = shoppingAudit
-        ? `CASE WHEN COALESCE(ad.matched_card->>'link', '') <> '' THEN 10000 ELSE 0 END + `
+        ? `CASE WHEN ad.matched THEN 10000 ELSE 0 END + `
         : '';
     const founderScore = `CASE WHEN c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
         AND LOWER(BTRIM(c.full_name)) NOT IN (${INVALID_FOUNDER_NAMES_SQL}) THEN 1000 ELSE 0 END`;
@@ -1099,7 +1106,8 @@ function buildUnifiedQueryParts(shoppingAudit) {
             ) THEN 'Yes'
             ELSE 'No'
         END AS shopify_store,
-        COALESCE(hero_snap.title, '') AS hero_product,
+        CASE WHEN COALESCE(ad.matched, FALSE) THEN 'Yes' ELSE 'No' END AS ad_matched,
+        COALESCE(NULLIF(ad.matched_product->>'title', ''), hero_snap.title, '') AS hero_product,
         COALESCE(ad.matched_card->>'link', '') AS shopping_ad_link,
         se.signal_type,
         se.observed AS signal_observed,
@@ -1156,6 +1164,7 @@ function mapUnifiedContactRow(row, shoppingAudit = false) {
     return {
         ...base,
         shopify_store: row.shopify_store || 'No',
+        ad_matched: row.ad_matched || 'No',
         hero_product: row.hero_product || '',
         shopping_ad_link: row.shopping_ad_link || '',
         signal: signalType,
