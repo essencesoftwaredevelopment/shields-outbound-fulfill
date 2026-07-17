@@ -12,6 +12,7 @@ export type JobStageCounts = {
         done?: number;
         skipped?: number;
         processable?: number;
+        queueActive?: number;
         dns?: {
             checked?: number;
             live?: number;
@@ -38,6 +39,7 @@ export type JobStageCounts = {
     };
     personalization?: { processed?: number; personalized?: number };
     costs?: Record<string, number>;
+    contacts?: { total?: number };
 };
 
 function num(value: unknown): number {
@@ -75,18 +77,23 @@ export function stageCountsToStages(
 
     const jobRunning = opts.jobRunning === true;
     const totalDomains = num(counts.domainPrep?.total);
+    // Domain-prep "processable" = input cohort after DNS (not post-waterfall leftovers).
+    // RPC returns dns-aware processable; fall back to total when DNS was skipped.
     const processable = num(counts.domainPrep?.processable) || totalDomains;
     const costs = counts.costs || {};
     const out: Partial<Record<PipelineStageKey, PipelineStageState>> = {};
 
     const dns = counts.domainPrep?.dns || {};
     const dnsChecked = num(dns.checked);
+    const dnsDead = num(dns.dead);
     const domainSkippedCheck = counts.domainCheckSkipped === true;
     const domainProcessed = domainSkippedCheck
         ? totalDomains
         : dnsChecked > 0
           ? dnsChecked
-          : num(counts.domainPrep?.done) + num(counts.domainPrep?.skipped);
+          : totalDomains > 0 && num(counts.domainPrep?.pending) + num(counts.domainPrep?.done) + num(counts.domainPrep?.skipped) >= totalDomains
+            ? totalDomains
+            : dnsChecked;
     const domainStatus = deriveStatus(domainProcessed, totalDomains, {
         skipped: domainSkippedCheck && totalDomains > 0,
         jobRunning,
@@ -97,14 +104,16 @@ export function stageCountsToStages(
         completedAt: domainStatus === "completed" ? prior?.domainPrep?.completedAt ?? new Date().toISOString() : null,
         error: null,
         summary: {
-            processable,
-            checked: dnsChecked,
-            live: num(dns.live),
-            dead: num(dns.dead),
+            // Hero number: domains that entered the job after DNS (or all when DNS skipped).
+            processable: domainSkippedCheck ? totalDomains : Math.max(processable, totalDomains - dnsDead),
+            checked: domainSkippedCheck ? 0 : dnsChecked,
+            live: domainSkippedCheck ? totalDomains : num(dns.live),
+            dead: dnsDead,
             unknown: num(dns.unknown),
-            skippedExisting: num(counts.domainPrep?.skipped),
+            skippedExisting: 0,
             domainCheckSkipped: domainSkippedCheck,
             processed: domainProcessed,
+            total: totalDomains,
             ...costSummary("domainPrep", costs),
         },
         progress: {
@@ -112,8 +121,8 @@ export function stageCountsToStages(
             processed: domainProcessed,
             total: totalDomains || processable,
             stats: {
-                live: num(dns.live),
-                dead: num(dns.dead),
+                live: domainSkippedCheck ? totalDomains : num(dns.live),
+                dead: dnsDead,
                 unknown: num(dns.unknown),
             },
         },
@@ -174,9 +183,13 @@ export function stageCountsToStages(
         };
     }
 
+    // Contact enrichment denominators: contacts on this job (CSV/import size), not
+    // post-waterfall queue leftovers.
+    const contactTotal = num(counts.contacts?.total) || processable || totalDomains;
+
     const foundersProcessed = num(counts.founders?.processed);
     const foundersFound = num(counts.founders?.found);
-    const foundersStatus = deriveStatus(foundersProcessed, processable || totalDomains, { jobRunning });
+    const foundersStatus = deriveStatus(foundersProcessed, contactTotal, { jobRunning });
     out.founders = {
         status: foundersStatus,
         startedAt: prior?.founders?.startedAt ?? null,
@@ -191,7 +204,7 @@ export function stageCountsToStages(
         progress: {
             stage: "founders",
             processed: foundersProcessed,
-            total: processable || totalDomains,
+            total: contactTotal,
             found: foundersFound,
             stats: { Found: foundersFound, Processed: foundersProcessed },
         },
@@ -199,7 +212,7 @@ export function stageCountsToStages(
 
     const emailProcessed = num(counts.emailDiscovery?.processed);
     const emailFound = num(counts.emailDiscovery?.found);
-    const emailStatus = deriveStatus(emailProcessed, processable || totalDomains, { jobRunning });
+    const emailStatus = deriveStatus(emailProcessed, contactTotal, { jobRunning });
     out.emailDiscovery = {
         status: emailStatus,
         startedAt: prior?.emailDiscovery?.startedAt ?? null,
@@ -214,14 +227,14 @@ export function stageCountsToStages(
         progress: {
             stage: "emailDiscovery",
             processed: emailProcessed,
-            total: processable || totalDomains,
+            total: contactTotal,
             found: emailFound,
             stats: { Found: emailFound },
         },
     };
 
     const verified = num(counts.verification?.verified);
-    const verifyStatus = deriveStatus(verified, emailFound || processable || totalDomains, { jobRunning });
+    const verifyStatus = deriveStatus(verified, emailFound || contactTotal, { jobRunning });
     out.verification = {
         status: verifyStatus,
         startedAt: prior?.verification?.startedAt ?? null,
@@ -244,7 +257,7 @@ export function stageCountsToStages(
         progress: {
             stage: "verification",
             processed: verified,
-            total: emailFound || processable || totalDomains,
+            total: emailFound || contactTotal,
             stats: {
                 valid: num(counts.verification?.valid),
                 invalid: num(counts.verification?.invalid),

@@ -20,6 +20,7 @@ import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics
 import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
     ALL_PIPELINE_STAGE_KEYS,
+    isLegacyShoppingAuditJob,
     isShoppingAuditPipelineJob,
     PipelineJob,
     PipelineStageKey,
@@ -862,7 +863,9 @@ const LEGACY_SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
 
 function resolveStageOrder(job?: PipelineJob | null): PipelineStageKey[] {
     if (isShoppingAuditPipelineJob(job)) {
-        return job?.stages?.shopifyCatalog
+        // Only show Catalog/Hero for jobs that actually ran those legacy stages.
+        // normalizeStages always creates empty shells — those must not flip the order.
+        return isLegacyShoppingAuditJob(job)
             ? LEGACY_SHOPPING_AUDIT_STAGE_ORDER
             : SHOPPING_AUDIT_STAGE_ORDER;
     }

@@ -33,6 +33,23 @@ export function isShoppingAuditPipelineJob(
     return false;
 }
 
+/** True only when a pre-serper-first job actually ran catalog/hero (not empty UI shells). */
+export function isLegacyShoppingAuditJob(
+    job?: Pick<PipelineJob, "stages"> | null
+): boolean {
+    const catalog = job?.stages?.shopifyCatalog;
+    if (!catalog) return false;
+    if (catalog.status && catalog.status !== "pending") return true;
+    if (catalog.startedAt) return true;
+    if (catalog.summary && Object.keys(catalog.summary).length > 0) return true;
+    const hero = job?.stages?.heroSelection;
+    if (!hero) return false;
+    if (hero.status && hero.status !== "pending") return true;
+    if (hero.startedAt) return true;
+    if (hero.summary && Object.keys(hero.summary).length > 0) return true;
+    return false;
+}
+
 export type PipelineStageStatus = "pending" | "running" | "completed" | "error";
 
 export type PipelineStageProgress = {
