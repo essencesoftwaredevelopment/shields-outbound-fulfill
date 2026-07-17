@@ -11,9 +11,8 @@ import {
     createStageLogger,
     resolveJobTotal,
     batchProgressOffset,
-    persistStageProgress
+    persistStageCostOnly
 } from '../stageProgress.js';
-import { pool } from '../../config/db.js';
 
 function resolveShoppingBatchSize(batchOpts = {}) {
     if (typeof batchOpts.batchSize === 'number' && batchOpts.batchSize > 0) {
@@ -41,41 +40,21 @@ function makeStageHooks(ctx, stageKey, batchOpts = {}) {
         setActivity: (message) => setJobActivity(ctx.jobId, ctx.agencyId, message),
         recordTiming: () => {},
         checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
+        // Progress lives on the spreadsheet (ad_observations / job_domains / …) and is
+        // read via get_job_stage_counts — do not RMW jobs.stages (lock hotspot).
         updateStage: async (key, handler) => {
-            await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
-                status: 'running',
-                startedAt: new Date().toISOString(),
-                error: null
-            });
             try {
                 const summary = await handler();
-                // Parallel child batches each finish their own slice — do not mark the
-                // job-level stage completed until cumulative processed covers jobTotal.
-                // (False "completed" at 625/1000 hid hung later waves.)
-                await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
-                    status: 'running',
-                    summary,
-                    error: null
-                });
-                const { rows } = await pool.query(
-                    `SELECT stages->$3 AS stage FROM jobs WHERE id = $1 AND agency_id = $2`,
-                    [ctx.jobId, ctx.agencyId, key]
-                );
-                const mergedSummary = rows[0]?.stage?.summary || summary || {};
-                const processed = Number(mergedSummary.processed ?? 0);
-                if (jobTotal > 0 && processed >= jobTotal) {
-                    await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
-                        status: 'completed',
-                        completedAt: new Date().toISOString(),
-                        error: null
-                    });
+                if (summary) {
+                    await persistStageCostOnly(ctx.jobId, ctx.agencyId, key, summary);
                 }
                 return summary;
             } catch (err) {
-                await persistStageProgress(ctx.jobId, ctx.agencyId, key, {
-                    status: 'error',
-                    error: err?.message || String(err)
-                });
+                await setJobActivity(
+                    ctx.jobId,
+                    ctx.agencyId,
+                    `${key} failed: ${err?.message || String(err)}`
+                );
                 throw err;
             }
         }

@@ -67,11 +67,77 @@ async function checkDomainDns(domain) {
     return { domain, status: 'unknown' };
 }
 
+const DNS_STATUS_FLUSH_SIZE = 100;
+
+/** Persist per-domain DNS cells so mid-run crashes leave a recoverable spreadsheet. */
+async function flushDnsStatusBatch(jobId, buckets) {
+    const entries = Object.entries(buckets).filter(([, domains]) => domains.length);
+    for (const [status, domains] of entries) {
+        const unique = [...new Set(domains)];
+        if (!unique.length) continue;
+        if (status === 'dead') {
+            await pool.query(
+                `UPDATE job_domains
+                    SET dns_status = 'dead',
+                        dns_checked_at = NOW(),
+                        status = 'skipped',
+                        updated_at = NOW()
+                  WHERE job_id = $1
+                    AND domain_normalized = ANY($2::text[])`,
+                [jobId, unique]
+            );
+        } else {
+            await pool.query(
+                `UPDATE job_domains
+                    SET dns_status = $3,
+                        dns_checked_at = NOW(),
+                        updated_at = NOW()
+                  WHERE job_id = $1
+                    AND domain_normalized = ANY($2::text[])`,
+                [jobId, unique, status]
+            );
+        }
+        buckets[status] = [];
+    }
+}
+
+async function markDnsSkippedForJob(jobId) {
+    await pool.query(
+        `UPDATE job_domains
+            SET dns_status = 'skipped',
+                dns_checked_at = NOW(),
+                updated_at = NOW()
+          WHERE job_id = $1
+            AND dns_status IS NULL`,
+        [jobId]
+    );
+}
+
 async function dnsFilterDomains(jobId, agencyId, onProgress) {
     const pending = await listPendingJobDomains(jobId);
-    const uniqueDomains = pending.map((r) => r.domain_normalized);
+    // Resume: only domains that still lack a DNS cell.
+    const uniqueDomains = pending
+        .filter((r) => !r.dns_status)
+        .map((r) => r.domain_normalized)
+        .filter(Boolean);
     if (!uniqueDomains.length) {
-        return { checked: 0, live: 0, dead: 0, unknown: 0, processable: 0 };
+        const counts = await countJobDomainsByStatus(jobId);
+        const { rows } = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE dns_status IS NOT NULL)::int AS checked,
+                COUNT(*) FILTER (WHERE dns_status = 'live')::int AS live,
+                COUNT(*) FILTER (WHERE dns_status = 'dead')::int AS dead,
+                COUNT(*) FILTER (WHERE dns_status = 'unknown')::int AS unknown
+             FROM job_domains WHERE job_id = $1`,
+            [jobId]
+        );
+        return {
+            checked: Number(rows[0]?.checked ?? 0),
+            live: Number(rows[0]?.live ?? 0),
+            dead: Number(rows[0]?.dead ?? 0),
+            unknown: Number(rows[0]?.unknown ?? 0),
+            processable: counts.pending || 0
+        };
     }
 
     // DNS is network-bound; DB checks must not run inside the concurrent worker loop
@@ -106,25 +172,25 @@ async function dnsFilterDomains(jobId, agencyId, onProgress) {
         }
     );
 
+    // Write spreadsheet cells in chunks (live/dead/unknown), not only dead→skipped.
+    const buckets = { live: [], dead: [], unknown: [] };
     let live = 0;
     let dead = 0;
     let unknown = 0;
-    const deadDomains = [];
     for (const result of checks) {
-        if (result?.status === 'live') live += 1;
-        else if (result?.status === 'dead') {
-            dead += 1;
-            if (result.domain) deadDomains.push(result.domain);
-        } else unknown += 1;
+        const status = result?.status || 'unknown';
+        const domain = result?.domain;
+        if (!domain) continue;
+        if (status === 'live') live += 1;
+        else if (status === 'dead') dead += 1;
+        else unknown += 1;
+        if (buckets[status]) buckets[status].push(domain);
+        const pendingCount = buckets.live.length + buckets.dead.length + buckets.unknown.length;
+        if (pendingCount >= DNS_STATUS_FLUSH_SIZE) {
+            await flushDnsStatusBatch(jobId, buckets);
+        }
     }
-
-    if (deadDomains.length) {
-        await pool.query(
-            `UPDATE job_domains SET status = 'skipped', updated_at = NOW()
-             WHERE job_id = $1 AND domain_normalized = ANY($2::text[])`,
-            [jobId, deadDomains]
-        );
-    }
+    await flushDnsStatusBatch(jobId, buckets);
 
     if (flushProgress) {
         await flushProgress(uniqueDomains.length, uniqueDomains.length);
@@ -211,7 +277,10 @@ export async function runDomainPrep(ctx) {
     }
 
     const dnsStats = domainCheckSkipped
-        ? { checked: 0, live: 0, dead: 0, unknown: 0, processable: dedupeResult.stats.new }
+        ? await (async () => {
+            await markDnsSkippedForJob(ctx.jobId);
+            return { checked: 0, live: 0, dead: 0, unknown: 0, processable: dedupeResult.stats.new };
+        })()
         : await dnsFilterDomains(ctx.jobId, ctx.agencyId, async (processed, total) => {
             if (processed % 25 === 0 || processed === total) {
                 await setJobActivity(

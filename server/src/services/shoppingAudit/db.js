@@ -291,6 +291,24 @@ export async function insertAdObservationsBatch({
                 matched, matched_product, matched_snapshot_id, seller_match_method,
                 match_similarity, catalog_pages_fetched, domain_normalized
             ) VALUES ${values.join(', ')}
+            ON CONFLICT (job_id, domain_normalized) WHERE domain_normalized IS NOT NULL
+            DO UPDATE SET
+                agency_id = EXCLUDED.agency_id,
+                client_id = EXCLUDED.client_id,
+                hero_selection_id = COALESCE(EXCLUDED.hero_selection_id, ad_observations.hero_selection_id),
+                branch = EXCLUDED.branch,
+                matched_card = EXCLUDED.matched_card,
+                all_cards = EXCLUDED.all_cards,
+                source = EXCLUDED.source,
+                geo = EXCLUDED.geo,
+                query_text = EXCLUDED.query_text,
+                observed_at = EXCLUDED.observed_at,
+                matched = EXCLUDED.matched,
+                matched_product = EXCLUDED.matched_product,
+                matched_snapshot_id = EXCLUDED.matched_snapshot_id,
+                seller_match_method = EXCLUDED.seller_match_method,
+                match_similarity = EXCLUDED.match_similarity,
+                catalog_pages_fetched = EXCLUDED.catalog_pages_fetched
             RETURNING id`,
             params
         );

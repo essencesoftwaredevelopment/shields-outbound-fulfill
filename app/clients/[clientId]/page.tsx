@@ -9,6 +9,7 @@ import {
     debounceFn,
     type JobRealtimeState,
 } from "@/lib/hooks/useJobRealtime";
+import { useJobStageCounts } from "@/lib/hooks/useJobStageCounts";
 import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAuth } from "@/hooks/use-auth";
 import { useAgencyId } from "@/lib/hooks/useAgencyId";
@@ -1846,13 +1847,50 @@ export default function ClientPage() {
                 if (prev?.id && state.id && prev.id !== state.id) {
                     return prev;
                 }
-                return mergeJobState(prev, state as Partial<PipelineJob> & { id: string });
+                // Lifecycle from Realtime; stage counters come from get_job_stage_counts RPC.
+                return mergeJobState(prev, {
+                    ...(state as Partial<PipelineJob> & { id: string }),
+                    stages: (prev?.stages ?? state.stages) as PipelineJob["stages"],
+                });
             });
         },
         [mergeJobState],
     );
 
     useJobRealtime(realtimeJobId, onJobRealtimeUpdate);
+
+    const onStageCountsUpdate = useCallback(
+        (update: { stages: Partial<Record<PipelineStageKey, PipelineStageState>>; cost?: number; pipelineMode?: string }) => {
+            setJobState((prev) => {
+                if (!prev?.id || !realtimeJobId || prev.id !== realtimeJobId) return prev;
+                const mergedStages = {
+                    ...prev.stages,
+                    ...update.stages,
+                } as PipelineJob["stages"];
+                return {
+                    ...prev,
+                    stages: mergedStages,
+                    cost: typeof update.cost === "number" && update.cost > 0 ? update.cost : prev.cost,
+                    pipelineMode:
+                        update.pipelineMode === "shopping_audit" || update.pipelineMode === "standard"
+                            ? update.pipelineMode
+                            : prev.pipelineMode,
+                };
+            });
+        },
+        [realtimeJobId]
+    );
+
+    useJobStageCounts(realtimeJobId, {
+        enabled: Boolean(realtimeJobId),
+        jobRunning: Boolean(
+            jobState?.id
+            && jobState.id === realtimeJobId
+            && (jobState.status === "running" || jobState.status === "queued" || jobState.paused)
+        ),
+        priorStages: jobState?.stages ?? null,
+        onUpdate: onStageCountsUpdate,
+    });
 
     const formatJobDate = useCallback((value: string | null | undefined) => {
         if (!value) {

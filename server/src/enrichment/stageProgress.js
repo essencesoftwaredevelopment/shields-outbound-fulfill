@@ -379,28 +379,15 @@ export async function persistStageProgress(jobId, agencyId, stageKey, patch) {
     });
 }
 
-/** Merge API-reported cost only — batches no longer own progress/status. */
+/** Merge API-reported cost only — batches no longer own progress/status.
+ * Writes to job_stage_costs (atomic increment) instead of jobs.stages JSON.
+ */
 export async function persistStageCostOnly(jobId, agencyId, stageKey, patch = {}) {
     const amount = extractStageCostAmount({ summary: patch, progress: patch });
     if (!(amount > 0)) return;
 
-    await updateJobStagesLocked(jobId, agencyId, (row) => {
-        const stages = { ...(row.stages || {}) };
-        const prior = stages[stageKey] || {};
-        const priorSummary = prior.summary || {};
-        const priorCost = extractStageCostAmount({ summary: priorSummary });
-        const totalCost = priorCost + amount;
-        if (totalCost <= priorCost) return null;
-
-        const summary = {
-            ...priorSummary,
-            cost: Number(totalCost.toFixed(6)),
-            Cost: `$${totalCost.toFixed(2)}`
-        };
-
-        stages[stageKey] = { ...prior, summary };
-        return stages;
-    });
+    const { addJobStageCost } = await import('../services/db/jobStageCosts.js');
+    await addJobStageCost(jobId, agencyId, stageKey, amount);
 }
 
 /**
@@ -415,11 +402,6 @@ export function createStageLogger(ctx, stageKey, options = {}) {
     return (message, meta) => {
         if (message) {
             console.log(`[${ctx.jobId}] [${label}] ${message}`);
-        }
-
-        const raw = meta?.progress;
-        if (raw) {
-            void persistStageCostOnly(ctx.jobId, ctx.agencyId, stageKey, raw).catch(() => {});
         }
 
         const now = Date.now();

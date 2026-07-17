@@ -24,7 +24,13 @@ export async function runFinalize(ctx) {
     const row = await getJobById(ctx.jobId, ctx.agencyId);
     const job = contextToJob({ ...ctx, stages: reconciledStages || row?.stages });
     const finishedCount = await countFinishedLeadsForJob(ctx.jobId);
-    const cost = computeJobCost(job);
+
+    const { getJobStageCosts } = await import('../services/db/jobStageCosts.js');
+    const stageCosts = await getJobStageCosts(ctx.jobId);
+    const ledgerTotal = Object.values(stageCosts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+    const cost = ledgerTotal > 0
+        ? Number(ledgerTotal.toFixed(6))
+        : (Number(row?.cost) > 0 ? Number(row.cost) : computeJobCost(job));
 
     await finalizeJobSuccess(ctx.jobId, ctx.agencyId, {
         cost: cost || 0,

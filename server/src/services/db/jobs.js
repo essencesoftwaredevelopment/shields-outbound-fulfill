@@ -204,7 +204,7 @@ export async function markJobDomainsSkipped(jobId, domains) {
  */
 export async function listPendingJobDomains(jobId, limit) {
     const params = [jobId];
-    let sql = `SELECT domain_normalized, raw_row, sort_order
+    let sql = `SELECT domain_normalized, raw_row, sort_order, dns_status, dns_checked_at
          FROM job_domains
          WHERE job_id = $1 AND status = 'pending'
          ORDER BY sort_order ASC`;
