@@ -20,8 +20,8 @@ import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics
 import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
     ALL_PIPELINE_STAGE_KEYS,
-    isLegacyShoppingAuditJob,
     isShoppingAuditPipelineJob,
+    resolveVisibleStageKeys,
     PipelineJob,
     PipelineStageKey,
     PipelineStageState,
@@ -838,38 +838,8 @@ type InstantlyCsvMergeResult = {    summary: {
 type JobStatus = PipelineJob["status"];
 type StageStatus = PipelineStageStatus;
 
-const STANDARD_STAGE_ORDER: PipelineStageKey[] = ["domainPrep", "founders", "emailDiscovery", "verification", "personalization"];
-const SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
-    "domainPrep",
-    "serperShopping",
-    "signalWaterfall",
-    "founders",
-    "emailDiscovery",
-    "verification",
-    "personalization",
-];
-/** Jobs created before the serper-first refactor still carry catalog/hero stages. */
-const LEGACY_SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
-    "domainPrep",
-    "shopifyCatalog",
-    "heroSelection",
-    "serperShopping",
-    "signalWaterfall",
-    "founders",
-    "emailDiscovery",
-    "verification",
-    "personalization",
-];
-
 function resolveStageOrder(job?: PipelineJob | null): PipelineStageKey[] {
-    if (isShoppingAuditPipelineJob(job)) {
-        // Only show Catalog/Hero for jobs that actually ran those legacy stages.
-        // normalizeStages always creates empty shells — those must not flip the order.
-        return isLegacyShoppingAuditJob(job)
-            ? LEGACY_SHOPPING_AUDIT_STAGE_ORDER
-            : SHOPPING_AUDIT_STAGE_ORDER;
-    }
-    return STANDARD_STAGE_ORDER;
+    return resolveVisibleStageKeys(job);
 }
 
 const STAGE_METADATA: Record<PipelineStageKey, { title: string; detail: string }> = {
@@ -3408,9 +3378,7 @@ export default function ClientPage() {
         const pipelineMode =
             data.pipelineMode === "shopping_audit"
                 ? "shopping_audit"
-                : isShoppingAuditPipelineJob({ stages })
-                    ? "shopping_audit"
-                    : "standard";
+                : "standard";
 
         return {
             id,
@@ -3421,6 +3389,11 @@ export default function ClientPage() {
             completedAt: data.completedAt == null ? null : toIso(data.completedAt),
             stages,
             pipelineMode,
+            skipFounderFinder: data.skipFounderFinder === true,
+            skipEmailFinder: data.skipEmailFinder === true,
+            skipVerification: data.skipVerification === true,
+            skipDomainCheck: data.skipDomainCheck === true,
+            personalizeFirstLine: data.personalizeFirstLine === true,
             cost: typeof data.cost === "number" ? data.cost : undefined,
             activityMessage: typeof data.activityMessage === 'string' ? data.activityMessage : null,
             activityUpdatedAt: typeof data.activityUpdatedAt === 'string' ? data.activityUpdatedAt : null,

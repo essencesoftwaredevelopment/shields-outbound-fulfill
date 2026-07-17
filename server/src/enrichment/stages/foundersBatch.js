@@ -43,7 +43,9 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
     });
 
     if (ctx.options.skipFounderFinder) {
-        const founderCol = ctx.options.columnMapping?.founder || 'founder_name';
+        // Empty string must NOT fall back to 'founder_name' — an unmapped founder
+        // column means pass-through (contacts already exist / verify-only jobs).
+        const founderCol = String(ctx.options.columnMapping?.founder || '').trim();
         const pending = await listPendingJobDomains(ctx.jobId);
         const inBatch = pending.filter((r) => batchSet.has(r.domain_normalized.toLowerCase()));
 
@@ -54,17 +56,23 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
         for (const row of inBatch) {
             await assertJobActive(ctx.jobId, ctx.agencyId);
             const raw = row.raw_row || {};
-            const founder = String(raw[founderCol] || raw.founder_name || '').trim();
+
+            if (!founderCol) {
+                // No founder column mapped: mark done without inventing "Not Found"
+                // exclusions that would empty the verify queue.
+                doneDomains.push(row.domain_normalized);
+                continue;
+            }
+
+            const founder = String(raw[founderCol] ?? '').trim();
             if (isNotFoundValue(founder)) {
                 excludedDomains.push(row.domain_normalized);
                 founderRows.push({ domain: row.domain_normalized, founder_name: '' });
                 doneDomains.push(row.domain_normalized);
                 continue;
             }
-            if (founder) {
-                founderRows.push({ domain: row.domain_normalized, founder_name: founder });
-                doneDomains.push(row.domain_normalized);
-            }
+            founderRows.push({ domain: row.domain_normalized, founder_name: founder });
+            doneDomains.push(row.domain_normalized);
         }
 
         if (doneDomains.length) {
@@ -81,10 +89,10 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
         }
 
         const summary = {
-            processed: founderRows.length,
+            processed: founderRows.length + (founderCol ? 0 : doneDomains.length),
             excluded: excludedDomains.length,
-            Found: founderRows.length,
-            imported: founderRows.length,
+            Found: founderRows.filter((r) => r.founder_name).length,
+            imported: founderRows.filter((r) => r.founder_name).length,
             cost: 0
         };
         await finishJobStage(ctx, 'founders', summary);

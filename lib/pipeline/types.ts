@@ -24,7 +24,9 @@ export function isShoppingAuditPipelineJob(
     job?: Pick<PipelineJob, "pipelineMode" | "stages"> | null
 ): boolean {
     if (job?.pipelineMode === "shopping_audit") return true;
-    // serperShopping is the audit marker; shopifyCatalog covers legacy jobs.
+    if (job?.pipelineMode === "standard") return false;
+    // Legacy rows without pipelineMode: serperShopping is the audit marker;
+    // shopifyCatalog covers pre-serper-first jobs. Ignore empty pending shells.
     const auditStage = job?.stages?.serperShopping ?? job?.stages?.shopifyCatalog;
     if (!auditStage) return false;
     if (auditStage.status && auditStage.status !== "pending") return true;
@@ -95,6 +97,10 @@ export interface PipelineJob {
         domainCheckSkipped?: boolean;
     } | null;
     skipDomainCheck?: boolean;
+    skipFounderFinder?: boolean;
+    skipEmailFinder?: boolean;
+    skipVerification?: boolean;
+    personalizeFirstLine?: boolean;
     cost?: number;
     clientId?: string;
     pipelineMode?: PipelineMode;
@@ -119,6 +125,70 @@ export interface PipelineJob {
         stage?: string;
         meta?: Record<string, unknown>;
     }>;
+}
+
+const STANDARD_STAGE_ORDER: PipelineStageKey[] = [
+    "domainPrep",
+    "founders",
+    "emailDiscovery",
+    "verification",
+    "personalization",
+];
+const SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
+    "domainPrep",
+    "serperShopping",
+    "signalWaterfall",
+    "founders",
+    "emailDiscovery",
+    "verification",
+    "personalization",
+];
+const LEGACY_SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
+    "domainPrep",
+    "shopifyCatalog",
+    "heroSelection",
+    "serperShopping",
+    "signalWaterfall",
+    "founders",
+    "emailDiscovery",
+    "verification",
+    "personalization",
+];
+
+/**
+ * Stage cards to show for a job — only selected / applicable enrichment steps.
+ */
+export function resolveVisibleStageKeys(
+    job?: Pick<
+        PipelineJob,
+        | "pipelineMode"
+        | "stages"
+        | "skipFounderFinder"
+        | "skipEmailFinder"
+        | "skipVerification"
+        | "personalizeFirstLine"
+    > | null
+): PipelineStageKey[] {
+    const order = isShoppingAuditPipelineJob(job)
+        ? isLegacyShoppingAuditJob(job)
+            ? LEGACY_SHOPPING_AUDIT_STAGE_ORDER
+            : SHOPPING_AUDIT_STAGE_ORDER
+        : STANDARD_STAGE_ORDER;
+
+    return order.filter((key) => {
+        switch (key) {
+            case "founders":
+                return job?.skipFounderFinder !== true;
+            case "emailDiscovery":
+                return job?.skipEmailFinder !== true;
+            case "verification":
+                return job?.skipVerification !== true;
+            case "personalization":
+                return job?.personalizeFirstLine === true;
+            default:
+                return true;
+        }
+    });
 }
 
 export type PipelineServerEvent =

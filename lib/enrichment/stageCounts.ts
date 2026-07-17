@@ -128,7 +128,11 @@ export function stageCountsToStages(
         },
     };
 
-    if (counts.pipelineMode === "shopping_audit" || counts.serperShopping) {
+    // Only emit shopping-audit stage shells for shopping_audit jobs.
+    // get_job_stage_counts always returns serperShopping/signalWaterfall objects
+    // (often zeros / domain-done mirrors) — treating those as truthy falsely flips
+    // standard jobs into the shopping-audit card layout.
+    if (counts.pipelineMode === "shopping_audit") {
         const processed = num(counts.serperShopping?.processed);
         const matched = num(counts.serperShopping?.matched);
         const none = num(counts.serperShopping?.none);

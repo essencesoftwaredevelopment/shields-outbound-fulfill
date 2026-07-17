@@ -855,7 +855,9 @@ async function processJob(job) {
 
         if (job.skipFounderFinder) {
             await runStageIfNeeded(job, 'founders', async () => {
-                const founderCol = job.columnMapping?.founder || 'founder_name';
+                // Empty string must NOT fall back to 'founder_name' — an unmapped founder
+                // column means pass-through (contacts already exist / verify-only jobs).
+                const founderCol = String(job.columnMapping?.founder || '').trim();
                 const pending = await timeJobOp(
                     job,
                     { label: 'misc:loadPendingDomains', category: 'misc', stage: 'founders' },
@@ -873,16 +875,18 @@ async function processJob(job) {
                     if (i % 100 === 0) await gate.checkpoint();
                     const row = pending[i];
                     const raw = row.raw_row || {};
-                    const founder = String(raw[founderCol] || raw.founder_name || '').trim();
-                    if (isNotFoundValue(founder)) {
-                        excludedDomains.push(row.domain_normalized);
-                        founderRows.push({ domain: row.domain_normalized, founder_name: '' });
+                    if (!founderCol) {
                         doneDomains.push(row.domain_normalized);
-                        continue;
-                    }
-                    if (founder) {
-                        founderRows.push({ domain: row.domain_normalized, founder_name: founder });
-                        doneDomains.push(row.domain_normalized);
+                    } else {
+                        const founder = String(raw[founderCol] ?? '').trim();
+                        if (isNotFoundValue(founder)) {
+                            excludedDomains.push(row.domain_normalized);
+                            founderRows.push({ domain: row.domain_normalized, founder_name: '' });
+                            doneDomains.push(row.domain_normalized);
+                        } else {
+                            founderRows.push({ domain: row.domain_normalized, founder_name: founder });
+                            doneDomains.push(row.domain_normalized);
+                        }
                     }
                     const processed = i + 1;
                     if (processed % progressEvery === 0 || processed === total) {
@@ -910,9 +914,9 @@ async function processJob(job) {
                     });
                 }
 
-                log(job, `Founders from CSV: upserted ${founderRows.length.toLocaleString()} founders`);
+                log(job, `Founders from CSV: upserted ${founderRows.filter((r) => r.founder_name).length.toLocaleString()} founders`);
                 return {
-                    processed: founderRows.length,
+                    processed: founderCol ? founderRows.length : doneDomains.length,
                     excluded: excludedDomains.length,
                     cost: 0
                 };
