@@ -576,7 +576,7 @@ function HomeContent() {
               <Label htmlFor="openai-key">OpenAI API Key</Label>
               <Input
                 id="openai-key"
-                type="password"
+                type="text"
                 placeholder="sk-..."
                 value={apiKeys.openai}
                 onChange={(event) => handleKeyChange(event, "openai")}
@@ -587,7 +587,7 @@ function HomeContent() {
               <Label htmlFor="serper-key">Serper API Key</Label>
               <Input
                 id="serper-key"
-                type="password"
+                type="text"
                 placeholder="serper_..."
                 value={apiKeys.serper}
                 onChange={(event) => handleKeyChange(event, "serper")}
@@ -618,7 +618,7 @@ function HomeContent() {
               </div>
               <Input
                 id="kitt-key"
-                type="password"
+                type="text"
                 placeholder="kitt_..."
                 value={apiKeys.kitt}
                 onChange={(event) => handleKeyChange(event, "kitt")}
@@ -699,7 +699,7 @@ function HomeContent() {
               <Label htmlFor="instantly-key">Instantly API Key</Label>
               <Input
                 id="instantly-key"
-                type="password"
+                type="text"
                 placeholder="instantly_..."
                 value={newClientInstantlyKey}
                 onChange={(e) => setNewClientInstantlyKey(e.target.value)}
