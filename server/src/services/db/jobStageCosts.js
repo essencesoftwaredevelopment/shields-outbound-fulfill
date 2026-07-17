@@ -1,4 +1,4 @@
-import { pool } from '../config/db.js';
+import { pool } from '../../config/db.js';
 
 /**
  * Atomic stage cost increment — one narrow row per (job_id, stage).
