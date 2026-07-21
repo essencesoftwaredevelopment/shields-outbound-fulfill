@@ -17,6 +17,25 @@ type ReviewDraft = {
     expiresAt: string | null;
 };
 
+/** Review-page preview: Vulcan public audit → admin edit; Essence links unchanged. */
+function extractReviewPreviewUrl(renderedText: string): string | null {
+    const essence = renderedText.match(
+        /https:\/\/essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+/i
+    )?.[0];
+    if (essence) return essence;
+
+    const vulcan = renderedText.match(
+        /https:\/\/(vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app)\/\?domain=([^\s"'<>&]+)/i
+    );
+    if (vulcan) {
+        const host = vulcan[1];
+        const domain = decodeURIComponent(vulcan[2]);
+        return `https://${host}/admin/edit?domain=${encodeURIComponent(domain)}`;
+    }
+
+    return null;
+}
+
 export default function InterestedAutoResponderReviewPage() {
     const params = useParams();
     const token = String(params?.token || "");
@@ -67,14 +86,8 @@ export default function InterestedAutoResponderReviewPage() {
                     lastSavedTextRef.current = preparedText;
                     setDraft(data.draft || null);
                     setRenderedText(preparedText);
-                    // console.log("Loaded draft:", data.draft);
-                    const preview = initialText.match(
-                        /https:\/\/(?:essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+|vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app\/\?domain=[^\s"'<>]+)/i
-                    )?.[0] || null;
-                    // console.log("Extracted preview URL:", preview);
+                    const preview = extractReviewPreviewUrl(initialText);
                     setPreviewUrl(preview);
-                   
-
                 }
             } catch (err) {
                 if (!cancelled) {
