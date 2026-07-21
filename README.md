@@ -363,7 +363,7 @@ The Next.js dev server rewrites `/api/*` to the Express backend, so the UI talks
 
 Create `.env` in project root:
 ```bash
-# Frontend
+# Frontend 
 NEXT_PUBLIC_PIPELINE_URL=http://localhost:4000
 NEXT_PUBLIC_FIREBASE_API_KEY=your_firebase_api_key
 NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
