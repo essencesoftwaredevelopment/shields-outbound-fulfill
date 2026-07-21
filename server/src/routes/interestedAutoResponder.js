@@ -4,7 +4,7 @@ import { pool } from '../config/db.js';
 import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
 import { resolveClientRow } from '../services/db/queries.js';
 import {
-    callPopupFormGenerate,
+    generateAuditPreviewUrl,
     fetchAgencyAndClientSettings,
     generateDraftReply,
     getInterestedAutoResponderDraftByToken,
@@ -223,7 +223,11 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                 [promptId, clientRow.id]
             ),
             pool.query(
-                `SELECT id, email FROM contacts WHERE id = $1 AND client_id = $2 LIMIT 1`,
+                `SELECT c.id, c.email, co.domain_normalized AS company_domain
+                 FROM contacts c
+                 LEFT JOIN companies co ON co.id = c.company_id
+                 WHERE c.id = $1 AND c.client_id = $2
+                 LIMIT 1`,
                 [contactId, clientRow.id]
             )
         ]);
@@ -233,8 +237,9 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         if (!contact) return res.status(404).json({ error: 'Contact not found.' });
 
         // Fetch thread context in parallel; template vars resolved after we know the eaccount
-        const [{ openaiKey, ntfyTopic }, threadResult, essenceAiPreviewUrl] = await Promise.all([
-            fetchAgencyAndClientSettings(req.agencyId, req.params.clientId),
+        const settingsPromise = fetchAgencyAndClientSettings(req.agencyId, req.params.clientId);
+        const [{ openaiKey, ntfyTopic }, threadResult, auditPreviewUrl] = await Promise.all([
+            settingsPromise,
             pool.query(
                 `SELECT
                     COALESCE(
@@ -253,7 +258,10 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                  LIMIT 5`,
                 [contactId, prompt.campaign_id]
             ),
-            callPopupFormGenerate(contact.email)
+            settingsPromise.then((settings) => generateAuditPreviewUrl(contact.email, {
+                domain: contact.company_domain || null,
+                useVulcanShoppingAudit: Boolean(settings.shoppingAudit)
+            }))
         ]);
 
         // Derive eaccount from most recent thread event that has one
@@ -286,7 +294,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             leadEmail: contact.email,
             threadSubject,
             previousLeadMessage,
-            essenceAiPreviewUrl
+            auditPreviewUrl
         });
 
         // Create a real pending_review draft so we can send a clickable review link
@@ -322,7 +330,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             model,
             promptVersion: prompt.version,
             reviewUrl,
-            previewUrl: essenceAiPreviewUrl || null,
+            previewUrl: auditPreviewUrl || null,
             debug: {
                 lead: {
                     email: contact.email,

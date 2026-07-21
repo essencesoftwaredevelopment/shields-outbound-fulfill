@@ -68,7 +68,9 @@ export default function InterestedAutoResponderReviewPage() {
                     setDraft(data.draft || null);
                     setRenderedText(preparedText);
                     // console.log("Loaded draft:", data.draft);
-                    const preview = initialText.match(/https:\/\/essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+/)?.[0] || null;
+                    const preview = initialText.match(
+                        /https:\/\/(?:essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+|vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app\/\?domain=[^\s"'<>]+)/i
+                    )?.[0] || null;
                     // console.log("Extracted preview URL:", preview);
                     setPreviewUrl(preview);
                    

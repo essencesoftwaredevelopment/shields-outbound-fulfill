@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
-import { getAgencySettings } from './db/agencySettings.js';
+import { getAgencySettings, hasShoppingAuditFeature } from './db/agencySettings.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import {
     fetchThreadReplyMetadata,
@@ -19,6 +19,27 @@ const POPUP_FORM_GENERATE_TIMEOUT_MS = Math.max(
     1
 );
 const POPUP_FORM_GENERATE_MAX_ATTEMPTS = 2;
+
+/** Vulcan shopping-ad profit audit (POST /api/audits → page /?domain=). */
+const VULCAN_SHOPPING_AUDIT_BASE_URL = String(
+    process.env.VULCAN_SHOPPING_AUDIT_BASE_URL || 'https://vulcan-shopping-audit.vercel.app'
+).trim().replace(/\/$/, '');
+const VULCAN_AUDITS_TRIGGER_SECRET = String(
+    process.env.VULCAN_AUDITS_TRIGGER_SECRET || process.env.AUDITS_TRIGGER_SECRET || ''
+).trim();
+const VULCAN_AUDIT_TRIGGER_TIMEOUT_MS = Math.max(
+    Number(process.env.VULCAN_AUDIT_TRIGGER_TIMEOUT_MS || 30_000) || 30_000,
+    1
+);
+const VULCAN_AUDIT_READY_WAIT_MS = Math.max(
+    Number(process.env.VULCAN_AUDIT_READY_WAIT_MS || 90_000) || 90_000,
+    0
+);
+const VULCAN_AUDIT_POLL_INTERVAL_MS = Math.max(
+    Number(process.env.VULCAN_AUDIT_POLL_INTERVAL_MS || 3_000) || 3_000,
+    500
+);
+
 const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
@@ -46,9 +67,129 @@ function isPopupFormGenerateRetryableError(error) {
     return error?.name === 'AbortError' || error instanceof TypeError;
 }
 
-export async function callPopupFormGenerate(leadEmail, options = {}) {
+/** Normalize to bare host (matches vulcan-shopping-audit `normalizeDomain`). */
+export function normalizeAuditDomain(raw) {
+    if (!raw) return null;
+    let s = String(raw).trim().toLowerCase();
+    if (!s) return null;
+    if (s.includes('://')) {
+        try {
+            s = new URL(s).hostname;
+        } catch {
+            // fall through
+        }
+    }
+    s = s.replace(/^www\./, '').split('/')[0].split('?')[0].split('#')[0].split(':')[0];
+    if (!/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(s)) return null;
+    return s;
+}
+
+export function domainFromLeadEmail(leadEmail) {
     const atIndex = String(leadEmail || '').indexOf('@');
-    const domain = atIndex !== -1 ? String(leadEmail).slice(atIndex + 1).trim() : '';
+    if (atIndex === -1) return null;
+    return normalizeAuditDomain(String(leadEmail).slice(atIndex + 1));
+}
+
+export function buildVulcanShoppingAuditUrl(domain) {
+    const normalized = normalizeAuditDomain(domain);
+    if (!normalized) return null;
+    return `${VULCAN_SHOPPING_AUDIT_BASE_URL}/?domain=${encodeURIComponent(normalized)}`;
+}
+
+/**
+ * Trigger Vulcan shopping-ad profit audit generation for a domain.
+ * POST /api/audits { domain } with Bearer AUDITS_TRIGGER_SECRET.
+ * Optionally polls GET /api/audit until ready (or timeout), then returns the public page URL.
+ */
+export async function triggerVulcanShoppingAudit(domain, options = {}) {
+    const normalized = normalizeAuditDomain(domain);
+    if (!normalized) {
+        console.log('[vulcan-audit] skipped — invalid domain:', domain);
+        return null;
+    }
+    if (!VULCAN_AUDITS_TRIGGER_SECRET) {
+        console.warn('[vulcan-audit] skipped — VULCAN_AUDITS_TRIGGER_SECRET / AUDITS_TRIGGER_SECRET not set');
+        return null;
+    }
+
+    const publicUrl = buildVulcanShoppingAuditUrl(normalized);
+    const waitForReady = options.waitForReady !== false;
+    const start = Date.now();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), VULCAN_AUDIT_TRIGGER_TIMEOUT_MS);
+
+    try {
+        console.log(`[vulcan-audit] POST /api/audits domain=${normalized}`);
+        const response = await fetch(`${VULCAN_SHOPPING_AUDIT_BASE_URL}/api/audits`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${VULCAN_AUDITS_TRIGGER_SECRET}`
+            },
+            body: JSON.stringify({ domain: normalized }),
+            signal: controller.signal
+        });
+        const elapsed = Date.now() - start;
+        if (response.status !== 202 && !response.ok) {
+            const bodyText = await response.text().catch(() => '');
+            console.warn(
+                `[vulcan-audit] trigger failed status=${response.status} domain=${normalized} elapsed=${elapsed}ms body=${bodyText.slice(0, 200)}`
+            );
+            return null;
+        }
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch {
+            payload = null;
+        }
+        console.log(
+            `[vulcan-audit] triggered status=${response.status} domain=${normalized} runId=${payload?.runId || 'n/a'} elapsed=${elapsed}ms`
+        );
+    } catch (err) {
+        const reason = err?.name === 'AbortError' ? 'timeout' : err.message;
+        console.error(`[vulcan-audit] trigger error domain=${normalized}: ${reason}`);
+        return null;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+
+    if (waitForReady && VULCAN_AUDIT_READY_WAIT_MS > 0) {
+        const ready = await waitForVulcanAuditReady(normalized, VULCAN_AUDIT_READY_WAIT_MS);
+        if (!ready) {
+            console.warn(
+                `[vulcan-audit] not ready within ${VULCAN_AUDIT_READY_WAIT_MS}ms domain=${normalized} — still returning page URL for review`
+            );
+        }
+    }
+
+    return publicUrl;
+}
+
+async function waitForVulcanAuditReady(domain, maxWaitMs) {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        try {
+            const response = await fetch(
+                `${VULCAN_SHOPPING_AUDIT_BASE_URL}/api/audit?domain=${encodeURIComponent(domain)}`,
+                { method: 'GET', cache: 'no-store' }
+            );
+            if (response.ok) {
+                console.log(`[vulcan-audit] ready domain=${domain}`);
+                return true;
+            }
+        } catch (err) {
+            console.warn(`[vulcan-audit] poll error domain=${domain}: ${err?.message || err}`);
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(VULCAN_AUDIT_POLL_INTERVAL_MS, remaining)));
+    }
+    return false;
+}
+
+export async function callPopupFormGenerate(leadEmail, options = {}) {
+    const domain = normalizeAuditDomain(options.domain) || domainFromLeadEmail(leadEmail);
     if (!domain) {
         console.log('[popup-form/generate] skipped — no domain extractable from leadEmail:', leadEmail);
         return null;
@@ -118,6 +259,22 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
     }
 
     return null;
+}
+
+/**
+ * Build the lead-magnet / audit preview URL for an interested reply.
+ * Shopping-audit agencies (Vulcan) → POST vulcan-shopping-audit /api/audits.
+ * Everyone else → legacy Essence popup-form generate.
+ */
+export async function generateAuditPreviewUrl(leadEmail, options = {}) {
+    const domain = normalizeAuditDomain(options.domain) || domainFromLeadEmail(leadEmail);
+    if (!domain) return null;
+
+    if (options.useVulcanShoppingAudit) {
+        return triggerVulcanShoppingAudit(domain, { waitForReady: options.waitForReady });
+    }
+
+    return callPopupFormGenerate(leadEmail, { ...options, domain });
 }
 
 function asTrimmedText(value) {
@@ -439,7 +596,8 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
     return {
         openaiKey: asTrimmedText(agencySettings?.openai_key),
         ntfyTopic: asTrimmedText(clientRow?.ntfy_topic),
-        instantlyKey: asTrimmedText(clientRow?.instantly_key)
+        instantlyKey: asTrimmedText(clientRow?.instantly_key),
+        shoppingAudit: hasShoppingAuditFeature(agencySettings)
     };
 }
 
@@ -450,7 +608,17 @@ async function resolveClientInstantlyKey(agencyId, clientId, cachedKey = null) {
     return asTrimmedText(clientRow?.instantly_key);
 }
 
-export async function generateDraftReply({ openaiKey, systemPrompt, campaignName, leadEmail, threadSubject, previousLeadMessage, essenceAiPreviewUrl }) {
+export async function generateDraftReply({
+    openaiKey,
+    systemPrompt,
+    campaignName,
+    leadEmail,
+    threadSubject,
+    previousLeadMessage,
+    auditPreviewUrl = null,
+    essenceAiPreviewUrl = null
+}) {
+    const previewUrl = auditPreviewUrl || essenceAiPreviewUrl || null;
     const client = new OpenAI({ apiKey: openaiKey });
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,
@@ -463,8 +631,8 @@ export async function generateDraftReply({ openaiKey, systemPrompt, campaignName
                     `Campaign: ${campaignName || 'Unknown campaign'}`,
                     `Lead email: ${leadEmail || 'Unknown lead'}`,
                     `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
-                    essenceAiPreviewUrl
-                        ? `Essence AI preview URL: ${essenceAiPreviewUrl}`
+                    previewUrl
+                        ? `Shopping audit URL: ${previewUrl}`
                         : '',
                     '',
                     'Write a plain-text reply to the interested lead.',
@@ -472,8 +640,8 @@ export async function generateDraftReply({ openaiKey, systemPrompt, campaignName
                     'Do not use markdown.',
                     'Preserve the conversational context from the lead message below.',
                     '',
-                    essenceAiPreviewUrl
-                        ? `CTA instruction: An Essence AI preview has already been generated for this prospect's store. Use the Essence AI preview URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
+                    previewUrl
+                        ? `CTA instruction: A personalized shopping ad audit has already been generated for this prospect's store. Use the Shopping audit URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
                         : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`,
                     '',
                     'Lead message/thread context:',
@@ -885,9 +1053,11 @@ export async function createInterestedAutoResponderDraftFromEvent({
             let signalRow = {};
             try {
                 const contactSignalResult = await client.query(
-                    `SELECT c.signal_emission_id, se.signal_type, se.observed, se.expected
+                    `SELECT c.signal_emission_id, se.signal_type, se.observed, se.expected,
+                            co.domain_normalized AS company_domain
                      FROM contacts c
                      LEFT JOIN signal_emissions se ON se.id = c.signal_emission_id
+                     LEFT JOIN companies co ON co.id = c.company_id
                      WHERE c.id = $1`,
                     [contactId]
                 );
@@ -895,8 +1065,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
             } catch (signalErr) {
                 console.warn('[interested-autoresponder] signal lookup skipped:', signalErr?.message || signalErr);
             }
-            const [essenceAiPreviewUrl, templateVars] = await Promise.all([
-                callPopupFormGenerate(normalizedLeadEmail, {
+            const auditDomain = normalizeAuditDomain(signalRow.company_domain)
+                || domainFromLeadEmail(normalizedLeadEmail);
+            const [auditPreviewUrl, templateVars] = await Promise.all([
+                generateAuditPreviewUrl(normalizedLeadEmail, {
+                    domain: auditDomain,
+                    useVulcanShoppingAudit: Boolean(settings.shoppingAudit),
                     signalEmissionId: signalRow.signal_emission_id || null,
                     signalType: signalRow.signal_type || null,
                     observed: signalRow.observed || null,
@@ -915,7 +1089,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 leadEmail: normalizedLeadEmail,
                 threadSubject,
                 previousLeadMessage,
-                essenceAiPreviewUrl
+                auditPreviewUrl
             });
         } catch (error) {
             const failedDraft = await insertDraftRow(client, {
