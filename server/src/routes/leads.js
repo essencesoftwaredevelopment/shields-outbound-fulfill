@@ -20,6 +20,7 @@ import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
 import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
 import { normalizeDomain } from '../utils/domain.js';
+import { SIGNAL_TYPES } from '../services/shoppingAudit/constants.js';
 
 const uploadVerification = multer({
     storage: multer.memoryStorage(),
@@ -453,6 +454,35 @@ function sqlFounderFindStateClause(state) {
     }
 }
 
+// ── Serper Shopping Audit helpers ───────────────────────────────────────────
+// Audit results are keyed by (job_id, domain_normalized), not by contact —
+// same join as SHOPPING_AUDIT_ROW_JOINS in services/db/jobs.js.
+const SQL_SHOPPING_AUDIT_RAN = `EXISTS (
+    SELECT 1 FROM ad_observations ao
+    WHERE ao.job_id = c.job_id AND ao.domain_normalized = co.domain_normalized
+)`;
+
+const SQL_SHOPPING_AUDIT_MATCHED = `EXISTS (
+    SELECT 1 FROM ad_observations ao
+    WHERE ao.job_id = c.job_id AND ao.domain_normalized = co.domain_normalized
+        AND ao.matched IS TRUE
+)`;
+
+function sqlShoppingAuditStateClause(state) {
+    switch (state) {
+        case 'ad_matched':
+            return SQL_SHOPPING_AUDIT_MATCHED;
+        case 'not_matched':
+            return `(${SQL_SHOPPING_AUDIT_RAN} AND NOT ${SQL_SHOPPING_AUDIT_MATCHED})`;
+        case 'not_run':
+            return `NOT ${SQL_SHOPPING_AUDIT_RAN}`;
+        default:
+            return null;
+    }
+}
+
+const SHOPPING_AUDIT_SIGNAL_VALUES = Object.values(SIGNAL_TYPES);
+
 const LEAD_FILTER_FIELDS = [
     // ── Contact fields ──────────────────────────────────────────────────────
     {
@@ -801,6 +831,47 @@ const LEAD_FILTER_FIELDS = [
             { key: 'not_in', label: 'Is None Of' },
             { key: 'is_empty', label: 'Not Imported' },
             { key: 'not_empty', label: 'Any Import' }
+        ]
+    },
+    // ── Serper Shopping Audit (ad_observations / signal_emissions) ──────────
+    {
+        key: 'shopping_audit_state',
+        label: 'Serper Shopping Audit',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' }
+        ],
+        options: [
+            { value: 'ad_matched', label: 'Ad Matched' },
+            { value: 'not_matched', label: 'Ran — No Ad Match' },
+            { value: 'not_run', label: 'Not Run' }
+        ]
+    },
+    {
+        key: 'shopping_audit_signal',
+        label: 'Shopping Audit Signal',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' },
+            { key: 'is_empty', label: 'No Signal' },
+            { key: 'not_empty', label: 'Any Signal' }
+        ],
+        options: [
+            { value: 'price_mismatch', label: 'Price Mismatch' },
+            { value: 'stock_mismatch', label: 'Stock Mismatch' },
+            { value: 'broken_page', label: 'Broken Page' },
+            { value: 'review_syndication_gap', label: 'Review Syndication Gap' },
+            { value: 'no_stars_vs_competitor', label: 'No Stars vs Competitor' },
+            { value: 'no_sale_vs_competitor', label: 'No Sale Price vs Competitor' },
+            { value: 'no_shipping_vs_competitor', label: 'No Shipping Info vs Competitor' },
+            { value: 'title_quality', label: 'Weak Product Title' },
+            { value: 'ad_match', label: 'Ad Match (No Issue Found)' }
         ]
     }
 ];
@@ -1330,6 +1401,10 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
         return normalizedText.toLowerCase();
     }
 
+    if (fieldKey === 'shopping_audit_state' || fieldKey === 'shopping_audit_signal') {
+        return normalizedText.toLowerCase();
+    }
+
     return normalizedText;
 }
 
@@ -1855,6 +1930,71 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
             else if (operatorKey === 'lte') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} <= ${ref}`); }
             else if (operatorKey === 'is_empty') clauses.push(`${col} IS NULL`);
             else if (operatorKey === 'not_empty') clauses.push(`${col} IS NOT NULL`);
+            continue;
+        }
+
+        // ── shopping_audit_state (ad_observations via job_id + domain) ─────
+        if (fieldKey === 'shopping_audit_state') {
+            const rawStates = operatorKey === 'in' || operatorKey === 'not_in'
+                ? (Array.isArray(normalizedValue) ? normalizedValue : [])
+                : [String(normalizedValue)];
+            const states = rawStates
+                .map((value) => String(value).toLowerCase())
+                .filter((value) => ['ad_matched', 'not_matched', 'not_run'].includes(value));
+            if (!states.length) continue;
+
+            const stateClauses = states
+                .map((state) => sqlShoppingAuditStateClause(state))
+                .filter(Boolean);
+            if (!stateClauses.length) continue;
+
+            if (operatorKey === 'eq') {
+                clauses.push(stateClauses[0]);
+            } else if (operatorKey === 'neq') {
+                clauses.push(`NOT (${stateClauses[0]})`);
+            } else if (operatorKey === 'in') {
+                clauses.push(`(${stateClauses.join(' OR ')})`);
+            } else if (operatorKey === 'not_in') {
+                clauses.push(`NOT (${stateClauses.join(' OR ')})`);
+            }
+            continue;
+        }
+
+        // ── shopping_audit_signal (signal_emissions.signal_type) ───────────
+        if (fieldKey === 'shopping_audit_signal') {
+            const signalExists = (condition) => `EXISTS (
+                SELECT 1 FROM signal_emissions se
+                WHERE se.job_id = c.job_id AND se.domain_normalized = co.domain_normalized${condition ? ` AND ${condition}` : ''}
+            )`;
+            if (operatorKey === 'is_empty') {
+                clauses.push(`NOT ${signalExists('')}`);
+                continue;
+            }
+            if (operatorKey === 'not_empty') {
+                clauses.push(signalExists(''));
+                continue;
+            }
+            const rawTypes = operatorKey === 'in' || operatorKey === 'not_in'
+                ? (Array.isArray(normalizedValue) ? normalizedValue : [])
+                : [String(normalizedValue)];
+            const types = rawTypes
+                .map((value) => String(value).toLowerCase())
+                .filter((value) => SHOPPING_AUDIT_SIGNAL_VALUES.includes(value));
+            if (!types.length) continue;
+
+            if (operatorKey === 'eq') {
+                const ref = bindParam(types[0]);
+                clauses.push(signalExists(`se.signal_type = ${ref}`));
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(types[0]);
+                clauses.push(`NOT ${signalExists(`se.signal_type = ${ref}`)}`);
+            } else if (operatorKey === 'in') {
+                const refs = bindArray(types);
+                clauses.push(signalExists(`se.signal_type = ANY(ARRAY[${refs.join(', ')}]::text[])`));
+            } else if (operatorKey === 'not_in') {
+                const refs = bindArray(types);
+                clauses.push(`NOT ${signalExists(`se.signal_type = ANY(ARRAY[${refs.join(', ')}]::text[])`)}`);
+            }
             continue;
         }
     }
