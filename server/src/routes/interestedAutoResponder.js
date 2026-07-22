@@ -243,9 +243,10 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             pool.query(
                 `SELECT
                     COALESCE(
-                        e.payload->>'subject',
-                        e.payload->>'email_subject',
-                        e.payload->>'thread_subject'
+                        NULLIF(BTRIM(e.payload->>'subject'), ''),
+                        NULLIF(BTRIM(e.payload->>'email_subject'), ''),
+                        NULLIF(BTRIM(e.payload->>'thread_subject'), ''),
+                        NULLIF(BTRIM(e.payload->>'reply_subject'), '')
                     ) AS thread_subject,
                     e.email_account,
                     e.message_text,

@@ -404,17 +404,19 @@ async function getEligibleProspects(db, clientId, sentForDate) {
             c.company_id,
             (
                 SELECT COALESCE(
-                    e.payload->>'subject',
-                    e.payload->>'email_subject',
-                    e.payload->>'thread_subject'
+                    NULLIF(BTRIM(e.payload->>'subject'), ''),
+                    NULLIF(BTRIM(e.payload->>'email_subject'), ''),
+                    NULLIF(BTRIM(e.payload->>'thread_subject'), ''),
+                    NULLIF(BTRIM(e.payload->>'reply_subject'), '')
                 )
                 FROM contact_instantly_events e
                 WHERE e.contact_id = cic.contact_id
                   AND e.campaign_id = cic.campaign_id
                   AND COALESCE(
-                      e.payload->>'subject',
-                      e.payload->>'email_subject',
-                      e.payload->>'thread_subject'
+                      NULLIF(BTRIM(e.payload->>'subject'), ''),
+                      NULLIF(BTRIM(e.payload->>'email_subject'), ''),
+                      NULLIF(BTRIM(e.payload->>'thread_subject'), ''),
+                      NULLIF(BTRIM(e.payload->>'reply_subject'), '')
                   ) IS NOT NULL
                 ORDER BY e.event_timestamp DESC
                 LIMIT 1
@@ -761,14 +763,13 @@ async function sendFollowUpForProspect({
     }
 
     try {
+        // Instantly requires `subject` on /emails/reply even when continuing a thread.
         const replyPayload = {
             reply_to_uuid: replyToUuid,
             eaccount,
+            subject: String(renderedSubject || '').trim() || 'Re:',
             body: { html: renderedHtml, text: renderedText },
         };
-        if (renderedSubject) {
-            replyPayload.subject = renderedSubject;
-        }
 
         const replyResult = await sendInstantlyReply(apiKey, replyPayload);
 

@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     isEligiblePostAutoresponderReplyCategory,
-    leadReplyMessageAsksOrEngages
+    leadReplyMessageAsksOrEngages,
+    resolveInstantlyReplySubject
 } from '../interestedAutoResponder.js';
 
 test('isEligiblePostAutoresponderReplyCategory accepts positive and neutral while interested', () => {
@@ -28,4 +29,10 @@ test('leadReplyMessageAsksOrEngages detects questions and substantive follow-ups
     assert.equal(leadReplyMessageAsksOrEngages(billFollowUp), true);
     assert.equal(leadReplyMessageAsksOrEngages('Thanks!'), false);
     assert.equal(leadReplyMessageAsksOrEngages('ok'), false);
+});
+
+test('resolveInstantlyReplySubject always returns a non-empty subject for Instantly', () => {
+    assert.equal(resolveInstantlyReplySubject('Re: Demo request'), 'Re: Demo request');
+    assert.equal(resolveInstantlyReplySubject('  '), 'Re:');
+    assert.equal(resolveInstantlyReplySubject(null), 'Re:');
 });

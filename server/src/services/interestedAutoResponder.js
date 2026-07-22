@@ -562,17 +562,19 @@ async function fetchLatestThreadMetadata(db, contactId, campaignId) {
     const [subjectResult, threadReply] = await Promise.all([
         db.query(
             `SELECT COALESCE(
-                e.payload->>'subject',
-                e.payload->>'email_subject',
-                e.payload->>'thread_subject'
+                NULLIF(BTRIM(e.payload->>'subject'), ''),
+                NULLIF(BTRIM(e.payload->>'email_subject'), ''),
+                NULLIF(BTRIM(e.payload->>'thread_subject'), ''),
+                NULLIF(BTRIM(e.payload->>'reply_subject'), '')
             ) AS thread_subject
              FROM contact_instantly_events e
              WHERE e.contact_id = $1
                AND e.campaign_id = $2
                AND COALESCE(
-                   e.payload->>'subject',
-                   e.payload->>'email_subject',
-                   e.payload->>'thread_subject'
+                   NULLIF(BTRIM(e.payload->>'subject'), ''),
+                   NULLIF(BTRIM(e.payload->>'email_subject'), ''),
+                   NULLIF(BTRIM(e.payload->>'thread_subject'), ''),
+                   NULLIF(BTRIM(e.payload->>'reply_subject'), '')
                ) IS NOT NULL
              ORDER BY e.event_timestamp DESC NULLS LAST, e.created_at DESC NULLS LAST
              LIMIT 1`,
@@ -686,6 +688,36 @@ async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl,
     }
 
     return { notified: true };
+}
+
+/** Instantly POST /emails/reply requires `subject`; use thread subject or a minimal fallback. */
+export function resolveInstantlyReplySubject(threadSubject) {
+    return asTrimmedText(threadSubject) || 'Re:';
+}
+
+async function fetchInstantlyEmailSubject(apiKey, emailId) {
+    const id = asTrimmedText(emailId);
+    if (!apiKey || !id) return null;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), INSTANTLY_REQUEST_TIMEOUT_MS);
+    try {
+        const response = await fetch(`${INSTANTLY_API_BASE_URL}/api/v2/emails/${encodeURIComponent(id)}`, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                Accept: 'application/json'
+            },
+            signal: controller.signal
+        });
+        if (!response.ok || response.status === 204) return null;
+        const email = await response.json().catch(() => null);
+        return asTrimmedText(email?.subject || email?.email_subject || email?.reply_subject || null);
+    } catch {
+        return null;
+    } finally {
+        clearTimeout(timeoutId);
+    }
 }
 
 async function sendInstantlyReplyDirect(apiKey, replyPayload) {
@@ -1326,19 +1358,33 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         throw error;
     }
 
+    // Instantly requires `subject` on /emails/reply. Backfilled / webhook events often omit it.
+    let resolvedSubject = threadSubject;
+    if (!resolvedSubject) {
+        resolvedSubject = await fetchInstantlyEmailSubject(clientInstantlyKey, replyToUuid);
+        if (resolvedSubject) {
+            await pool.query(
+                `UPDATE interested_autoresponder_drafts
+                 SET thread_subject = $2, updated_at = NOW()
+                 WHERE id = $1
+                   AND (thread_subject IS NULL OR BTRIM(thread_subject) = '')`,
+                [draft.id, resolvedSubject]
+            );
+        }
+    }
+    resolvedSubject = resolveInstantlyReplySubject(resolvedSubject);
+
     const outgoingText = normalizeOutgoingReplyText(draft.rendered_text);
     const renderedHtml = String(draft.rendered_text || '').trim();
     const isHtml = /<\/?[a-z][\s\S]*>/i.test(renderedHtml);
     const replyPayload = {
         reply_to_uuid: replyToUuid,
         eaccount,
+        subject: resolvedSubject,
         body: {
             html: isHtml ? decodeBasicHtmlEntities(renderedHtml) : plainTextToHtml(outgoingText)
         }
     };
-    if (threadSubject) {
-        replyPayload.subject = threadSubject;
-    }
 
     const replyResult = await sendInstantlyReplyDirect(clientInstantlyKey, replyPayload);
     const client = await pool.connect();
@@ -1354,7 +1400,7 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
             instantlyLeadId: draft.instantly_lead_id,
             leadEmail: draft.lead_email,
             eaccount,
-            threadSubject,
+            threadSubject: resolvedSubject,
             sentReplyId: replyResult?.id || replyResult?.email_id || null,
             parentReplyToUuid: replyToUuid,
             renderedText: outgoingText
