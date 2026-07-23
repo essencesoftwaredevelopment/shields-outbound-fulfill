@@ -839,6 +839,7 @@ router.post('/jobs/:id/resume', async (req, res) => {
             agencyId: uid,
             clientId: row.client_id,
             jobId,
+            skipEmailFinder: !!options.skipEmailFinder,
             skipVerification: !!options.skipVerification,
             personalizeFirstLine: !!options.personalizeFirstLine,
             dedupeStrategy: options.dedupeStrategy || 'skip',

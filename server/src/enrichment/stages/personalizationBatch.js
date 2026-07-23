@@ -17,11 +17,6 @@ function enrichmentMergeMode(ctx) {
         : 'preserve';
 }
 
-function filterToBatch(rows, batchDomains) {
-    const batchSet = new Set(batchDomains.map((d) => d.toLowerCase()));
-    return rows.filter((r) => batchSet.has(String(r.domain || '').toLowerCase()));
-}
-
 async function buildSignalMap(ctx, domains) {
     const map = new Map();
     for (const domain of domains) {
@@ -57,15 +52,15 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
     }
 
     const reprocessInclude = enrichmentMergeMode(ctx) === 'enrichment_b';
-    const queue = filterToBatch(
-        await getPersonalizeQueue(ctx.agencyId, ctx.clientId, ctx.jobId, {
-            reprocessInclude,
-            requireValidEmail: reprocessInclude,
-            limit: batchDomains.length + 500,
-            jobStartedAt: jobRow?.created_at || null
-        }),
-        batchDomains
-    );
+    // Scoped by batch domains in SQL: a global LIMIT window under parallel child
+    // runs could starve this batch while work remained for other domains (§5.2).
+    const queue = await getPersonalizeQueue(ctx.agencyId, ctx.clientId, ctx.jobId, {
+        reprocessInclude,
+        requireValidEmail: reprocessInclude,
+        limit: batchDomains.length + 500,
+        jobStartedAt: jobRow?.created_at || null,
+        domains: batchDomains
+    });
 
     if (!queue.length) {
         await finishJobStage(ctx, 'personalization', { processed: 0, personalized: 0, cost: 0 });

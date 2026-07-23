@@ -81,13 +81,17 @@ export async function setJobActivity(jobId, agencyId, message) {
 }
 
 export async function finalizeJobSuccess(jobId, agencyId, { cost = 0, finishedCount = 0 } = {}) {
+    // error = NULL: a successfully finalized job must not keep showing a stale
+    // stall/pause message (incident §5.5). The autoResumeAttempts counter also
+    // resets here so the next stall gets a fresh auto-resume budget.
     await pool.query(
         `UPDATE jobs SET
             status = 'completed',
             completed_at = NOW(),
             cost = $3,
             is_active = false,
-            options = COALESCE(options, '{}'::jsonb) || $4::jsonb,
+            error = NULL,
+            options = (COALESCE(options, '{}'::jsonb) - 'autoResumeAttempts') || $4::jsonb,
             updated_at = NOW()
          WHERE id = $1 AND agency_id = $2`,
         [
@@ -216,12 +220,24 @@ export async function clearWorkflowRunId(jobId) {
     );
 }
 
+/**
+ * Rejection messages thrown by guardWorkflowStart. The parent workflow catch
+ * matches these EXACT strings to end a duplicate run without touching job
+ * state (a custom error `code` does not survive the workflow step
+ * serialization boundary — only the message does). Mirrored in
+ * `lib/enrichment/startRejection.ts`; a unit test pins them in sync.
+ */
+export const START_REJECTION_ALREADY_RUNNING = 'Job already running on Vercel Workflows';
+export const START_REJECTION_ALREADY_COMPLETED = 'Job already completed';
+
 export async function guardWorkflowStart(jobId, agencyId) {
     const row = await getJobById(jobId, agencyId);
     if (!row) throw new Error('Job not found');
     const existingRunId = row.options?.workflowRunId;
     if (row.status === 'running' && existingRunId && !row.paused) {
-        throw new Error('Job already running on Vercel Workflows');
+        const err = new Error(START_REJECTION_ALREADY_RUNNING);
+        err.code = 'WORKFLOW_ALREADY_RUNNING';
+        throw err;
     }
     if (row.status === 'completed') {
         const { jobHasRemainingPipelineWork } = await import('../services/db/jobs.js');
@@ -230,13 +246,16 @@ export async function guardWorkflowStart(jobId, agencyId) {
             agencyId,
             clientId: row.client_id,
             jobId,
+            skipEmailFinder: !!options.skipEmailFinder,
             skipVerification: !!options.skipVerification,
             personalizeFirstLine: !!options.personalizeFirstLine,
             dedupeStrategy: options.dedupeStrategy || 'skip',
             jobStartedAt: row.created_at ? new Date(row.created_at).toISOString() : null
         });
         if (!hasRemaining) {
-            throw new Error('Job already completed');
+            const err = new Error(START_REJECTION_ALREADY_COMPLETED);
+            err.code = 'WORKFLOW_ALREADY_COMPLETED';
+            throw err;
         }
     }
 }

@@ -79,8 +79,39 @@ export function chunkDomains(
   return batches;
 }
 
+export type PlannedBatch = {
+  domains: string[];
+  resumeStagesOnly: boolean;
+};
+
+/**
+ * Two-list batch plan (C1): pending domains get the full pipeline; domains
+ * whose contacts still have queue work (but are past 'pending') get
+ * resume-stages-only batches. A domain in both lists is scheduled ONCE, as a
+ * full-pipeline batch — that pass runs the queue stages anyway, and double
+ * scheduling would race two children on the same domain's contacts.
+ */
+export function buildBatchLists(
+  pendingDomains: string[],
+  resumeStageDomains: string[],
+  batchSize: number
+): PlannedBatch[] {
+  const pendingSet = new Set(pendingDomains);
+  const resumeOnly = resumeStageDomains.filter((d) => !pendingSet.has(d));
+  return [
+    ...chunkDomains(pendingDomains, batchSize).map((domains) => ({
+      domains,
+      resumeStagesOnly: false,
+    })),
+    ...chunkDomains(resumeOnly, batchSize).map((domains) => ({
+      domains,
+      resumeStagesOnly: true,
+    })),
+  ];
+}
+
 export type BatchPlan = {
-  batches: string[][];
+  batches: PlannedBatch[];
   pipelineMode: PipelineMode;
   batchSize: number;
   waveConcurrency: number;

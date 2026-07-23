@@ -321,6 +321,70 @@ export async function insertAdObservationsBatch({
     return ids;
 }
 
+/**
+ * Load persisted ad observations for (job, domains) mapped back to the
+ * in-memory observation shape the signal waterfall consumes. Used by the
+ * serper stage's idempotency pre-filter: domains already observed for this
+ * job are never re-queried against Serper — their observations are reloaded
+ * from here instead (cards were slimmed before persist, which is the same
+ * shape the waterfall already receives from workflow step state).
+ */
+export async function loadAdObservationsForDomains(jobId, domains) {
+    const list = (domains || []).map((d) => String(d || '').toLowerCase()).filter(Boolean);
+    if (!jobId || !list.length) return [];
+
+    const observations = [];
+    for (const chunk of chunkArray(list, 500)) {
+        const result = await pool.query(
+            `SELECT domain_normalized, branch, matched_card, all_cards, source, geo,
+                    query_text, observed_at, matched, matched_product, matched_snapshot_id,
+                    seller_match_method, match_similarity, catalog_pages_fetched
+             FROM ad_observations
+             WHERE job_id = $1
+               AND domain_normalized = ANY($2::text[])`,
+            [jobId, chunk]
+        );
+        for (const row of result.rows) {
+            observations.push({
+                domain: row.domain_normalized,
+                branch: row.branch || 'none',
+                matched_card: row.matched_card || null,
+                all_cards: row.all_cards || [],
+                source: row.source || 'serper',
+                geo: row.geo || null,
+                query: row.query_text || null,
+                observed_at: row.observed_at,
+                matched: row.matched === true,
+                matched_product: row.matched_product || null,
+                matched_snapshot_id: row.matched_snapshot_id ?? null,
+                seller_match_method: row.seller_match_method ?? null,
+                match_similarity: row.match_similarity ?? null,
+                catalog_pages_fetched: row.catalog_pages_fetched ?? null,
+                fromDb: true
+            });
+        }
+    }
+    return observations;
+}
+
+/** Signal emissions already persisted for (job, domains) — waterfall idempotency pre-filter. */
+export async function loadSignalEmissionsForDomains(jobId, domains) {
+    const list = (domains || []).map((d) => String(d || '').toLowerCase()).filter(Boolean);
+    if (!jobId || !list.length) return [];
+
+    const rows = [];
+    for (const chunk of chunkArray(list, 500)) {
+        const result = await pool.query(
+            `SELECT * FROM signal_emissions
+             WHERE job_id = $1
+               AND domain_normalized = ANY($2::text[])`,
+            [jobId, chunk]
+        );
+        rows.push(...result.rows);
+    }
+    return rows;
+}
+
 export async function insertAdObservation(params) {
     const [id] = await insertAdObservationsBatch({
         agencyId: params.agencyId,

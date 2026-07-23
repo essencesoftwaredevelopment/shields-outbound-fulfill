@@ -551,6 +551,7 @@ async function hasRemainingPipelineWork(job) {
         agencyId: job.uid,
         clientId: job.sqlClientId,
         jobId: job.id,
+        skipEmailFinder: job.skipEmailFinder,
         skipVerification: job.skipVerification,
         personalizeFirstLine: job.personalizeFirstLine,
         dedupeStrategy: job.dedupeStrategy,

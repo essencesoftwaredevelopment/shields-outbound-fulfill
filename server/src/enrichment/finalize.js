@@ -22,6 +22,32 @@ export async function runFinalize(ctx) {
     await syncStagesBeforeFinalize(ctx.jobId, ctx.agencyId);
     const reconciledStages = await reconcileJobStagesFromDb(ctx);
     const row = await getJobById(ctx.jobId, ctx.agencyId);
+
+    // Completion guard: never mark a job completed while pipeline queues still
+    // hold work (the incident's "completed at 146/2,774 verified"). Pause with a
+    // clear error instead so the normal resume path (or the reaper's bounded
+    // auto-resume) schedules the remaining work as resumeStagesOnly batches.
+    const options = ctx.options || {};
+    const { jobHasRemainingPipelineWork } = await import('../services/db/jobs.js');
+    const hasRemaining = await jobHasRemainingPipelineWork({
+        agencyId: ctx.agencyId,
+        clientId: ctx.clientId,
+        jobId: ctx.jobId,
+        skipEmailFinder: !!options.skipEmailFinder,
+        skipVerification: !!options.skipVerification,
+        personalizeFirstLine: !!options.personalizeFirstLine,
+        dedupeStrategy: options.dedupeStrategy || 'skip',
+        jobStartedAt: row?.created_at ? new Date(row.created_at).toISOString() : null
+    });
+    if (hasRemaining) {
+        const message =
+            'Enrichment pass finished with unprocessed work remaining — resume the job to continue.';
+        await finalizeWorkflowError(ctx.jobId, ctx.agencyId, message);
+        const err = new Error(message);
+        err.code = 'JOB_INCOMPLETE';
+        throw err;
+    }
+
     const job = contextToJob({ ...ctx, stages: reconciledStages || row?.stages });
     const finishedCount = await countFinishedLeadsForJob(ctx.jobId);
 

@@ -16,11 +16,6 @@ function enrichmentMergeMode(ctx) {
         : 'preserve';
 }
 
-function filterToBatch(rows, batchDomains) {
-    const batchSet = new Set(batchDomains.map((d) => d.toLowerCase()));
-    return rows.filter((r) => batchSet.has(String(r.domain || '').toLowerCase()));
-}
-
 /**
  * @param {import('../context.js').EnrichmentContext} ctx
  * @param {string[]} batchDomains
@@ -46,14 +41,14 @@ export async function runEmailsBatch(ctx, batchDomains, batchOpts = {}) {
     }
 
     const reprocessInclude = enrichmentMergeMode(ctx) === 'enrichment_b';
-    const queue = filterToBatch(
-        await getEmailFindQueue(ctx.agencyId, ctx.clientId, ctx.jobId, {
-            reprocessInclude,
-            limit: batchDomains.length + 500,
-            jobStartedAt: jobRow?.created_at || null
-        }),
-        batchDomains
-    );
+    // Scoped by batch domains in SQL: a global LIMIT window under parallel child
+    // runs could starve this batch while work remained for other domains (§5.2).
+    const queue = await getEmailFindQueue(ctx.agencyId, ctx.clientId, ctx.jobId, {
+        reprocessInclude,
+        limit: batchDomains.length + 500,
+        jobStartedAt: jobRow?.created_at || null,
+        domains: batchDomains
+    });
 
     if (!queue.length) {
         await finishJobStage(ctx, 'emailDiscovery', { processed: 0, cost: 0 });

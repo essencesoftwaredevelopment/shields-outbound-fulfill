@@ -1,6 +1,7 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildBatchLists,
   chunkDomains,
   DEFAULT_BATCH_SIZE,
   DEFAULT_SHOPPING_AUDIT_BATCH_SIZE,
@@ -128,5 +129,41 @@ describe('chunkDomains', () => {
 
   it('returns no batches for an empty list', () => {
     assert.deepEqual(chunkDomains([], 25), []);
+  });
+});
+
+describe('buildBatchLists (two-list resume planner)', () => {
+  it('puts pending domains in full-pipeline batches and queue-work domains in resumeStagesOnly batches', () => {
+    const batches = buildBatchLists(['a', 'b', 'c'], ['x', 'y'], 2);
+    assert.deepEqual(batches, [
+      { domains: ['a', 'b'], resumeStagesOnly: false },
+      { domains: ['c'], resumeStagesOnly: false },
+      { domains: ['x', 'y'], resumeStagesOnly: true },
+    ]);
+  });
+
+  it('schedules a domain in both lists ONCE, as full pipeline', () => {
+    const batches = buildBatchLists(['a', 'b'], ['b', 'c'], 10);
+    assert.deepEqual(batches, [
+      { domains: ['a', 'b'], resumeStagesOnly: false },
+      { domains: ['c'], resumeStagesOnly: true },
+    ]);
+  });
+
+  it('fresh run: no resume batches', () => {
+    assert.deepEqual(buildBatchLists(['a'], [], 5), [
+      { domains: ['a'], resumeStagesOnly: false },
+    ]);
+  });
+
+  it('pure resume run: no pending, only resume batches', () => {
+    assert.deepEqual(buildBatchLists([], ['a', 'b', 'c'], 2), [
+      { domains: ['a', 'b'], resumeStagesOnly: true },
+      { domains: ['c'], resumeStagesOnly: true },
+    ]);
+  });
+
+  it('nothing to do: empty plan', () => {
+    assert.deepEqual(buildBatchLists([], [], 25), []);
   });
 });

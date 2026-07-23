@@ -6,6 +6,8 @@ import {
     upsertShopifySnapshotsBatch,
     insertAdObservationsBatch,
     insertSignalEmissionsBatch,
+    loadAdObservationsForDomains,
+    loadSignalEmissionsForDomains,
     loadSerperShoppingCacheMap,
     upsertSerperShoppingCacheBatch,
     updateCompanyLastAudit,
@@ -313,33 +315,54 @@ export async function runShoppingAuditPipelineStage({
     if (stage === 'serperShopping') {
         await upsertAuditCompanies({ job, domains, companyIdByDomain, recordTiming });
 
-        await updateStage('serperShopping', async () => {
-            const serperResult = await runSerperStageBody({
-                job,
-                domains,
-                features,
-                companyIdByDomain,
-                log,
-                setActivity,
-                checkpoint,
-                pricing,
-                recordTiming,
-                rateLimitHooks
-            });
+        // Idempotency (B3): domains that already have an ad_observations row for
+        // this job were fully processed by an earlier attempt/run — reload their
+        // observations from the DB and re-query Serper only for the missing ones,
+        // so a step retry or job resume never re-charges Serper for done domains.
+        const reloaded = await loadAdObservationsForDomains(job.id, domains);
+        const observedDomains = new Set(reloaded.map((obs) => obs.domain));
+        const missingDomains = domains.filter(
+            (d) => !observedDomains.has(String(d || '').toLowerCase())
+        );
+        if (reloaded.length) {
+            log(
+                `Serper Shopping: skipping ${reloaded.length}/${domains.length} already-observed domains (idempotent re-run)`
+            );
+        }
 
-            state.observations = serperResult.observations;
-            state.stats.serperMatched = serperResult.matched;
-            state.stats.serperClean = serperResult.clean;
-            state.stats.serperAmbiguous = serperResult.ambiguous;
-            state.stats.serperNone = serperResult.none;
+        await updateStage('serperShopping', async () => {
+            const serperResult = missingDomains.length
+                ? await runSerperStageBody({
+                    job,
+                    domains: missingDomains,
+                    features,
+                    companyIdByDomain,
+                    log,
+                    setActivity,
+                    checkpoint,
+                    pricing,
+                    recordTiming,
+                    rateLimitHooks
+                })
+                : { observations: [], matched: 0, clean: 0, ambiguous: 0, none: 0, cost: 0 };
+
+            state.observations = [...reloaded, ...serperResult.observations];
+            // Stats cover the whole batch (reloaded + fresh); cost covers only the
+            // fresh Serper calls — the reloaded domains' cost was recorded by the
+            // attempt that originally processed them.
+            const matched = state.observations.filter((obs) => obs.matched).length;
+            state.stats.serperMatched = matched;
+            state.stats.serperClean = matched;
+            state.stats.serperAmbiguous = 0;
+            state.stats.serperNone = state.observations.length - matched;
             state.stats.cost += serperResult.cost;
 
             return {
                 processed: state.observations.length,
-                matched: serperResult.matched,
-                clean: serperResult.clean,
-                ambiguous: serperResult.ambiguous,
-                none: serperResult.none,
+                matched,
+                clean: matched,
+                ambiguous: 0,
+                none: state.observations.length - matched,
                 headless: state.stats.headless,
                 cost: serperResult.cost
             };
@@ -350,29 +373,62 @@ export async function runShoppingAuditPipelineStage({
         const signalByDomain = new Map(Object.entries(state.signalByDomain || {}));
         const qualifiedDomains = [...state.qualifiedDomains];
 
+        // Idempotency (B3): domains whose signal emission already exists for this
+        // job are done — reload those emissions and run the waterfall only over the
+        // remaining observations. Observed domains WITHOUT an emission re-run the
+        // waterfall by design: "no emission" also means "did not qualify", which
+        // only the waterfall itself can re-decide (it is local compute, no paid APIs).
+        const emitted = await loadSignalEmissionsForDomains(
+            job.id,
+            state.observations.map((obs) => obs.domain)
+        );
+        const emittedDomains = new Set(emitted.map((row) => row.domain_normalized));
+        const pendingObservations = state.observations.filter(
+            (obs) => !emittedDomains.has(obs.domain)
+        );
+        if (emitted.length) {
+            log(
+                `Signal waterfall: skipping ${emitted.length}/${state.observations.length} already-emitted domains (idempotent re-run)`
+            );
+        }
+
         await updateStage('signalWaterfall', async () => {
-            const result = await runWaterfallStageBody({
-                job,
-                observations: state.observations,
-                features,
-                companyIdByDomain,
-                log,
-                recordTiming,
-                enableTier2,
-                enableBrokenPage
-            });
+            const result = pendingObservations.length
+                ? await runWaterfallStageBody({
+                    job,
+                    observations: pendingObservations,
+                    features,
+                    companyIdByDomain,
+                    log,
+                    recordTiming,
+                    enableTier2,
+                    enableBrokenPage
+                })
+                : { emissions: [], signalByDomain: new Map(), qualifiedDomains: [] };
 
             for (const [domain, entry] of result.signalByDomain.entries()) {
                 signalByDomain.set(domain, entry);
             }
-            qualifiedDomains.push(...result.qualifiedDomains);
+            // Same shape personalization's buildSignalMap produces from a DB row.
+            for (const row of emitted) {
+                if (signalByDomain.has(row.domain_normalized)) continue;
+                signalByDomain.set(row.domain_normalized, {
+                    signalId: row.id,
+                    signal: row,
+                    selection: null
+                });
+            }
 
-            state.stats.signals = result.emissions.length;
+            const qualified = new Set(qualifiedDomains);
+            for (const domain of result.qualifiedDomains) qualified.add(domain);
+            for (const row of emitted) qualified.add(row.domain_normalized);
+
+            state.stats.signals = signalByDomain.size;
             state.signalByDomain = Object.fromEntries(signalByDomain.entries());
-            state.qualifiedDomains = qualifiedDomains;
+            state.qualifiedDomains = [...qualified];
 
             return {
-                processed: result.emissions.length,
+                processed: result.emissions.length + emitted.length,
                 totalCandidates: state.observations.length,
                 cost: 0
             };

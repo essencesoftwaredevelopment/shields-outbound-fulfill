@@ -21,6 +21,12 @@ export type ChildBatchInput = {
   batchDomains: string[];
   batchIndex: number;
   pipelineMode: PipelineMode;
+  /**
+   * Resume batch (C1): the full pipeline already ran for these domains, only
+   * queue stages (emails → verify → personalize) still have work. The child
+   * skips the shopping-audit and founders stages entirely.
+   */
+  resumeStagesOnly?: boolean;
 };
 
 export type ParentWorkflowInput = {

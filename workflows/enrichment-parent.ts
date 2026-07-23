@@ -11,7 +11,7 @@ import { createHook } from 'workflow';
 import { start } from 'workflow/api';
 import type { ParentWorkflowInput } from '@/lib/enrichment/types';
 import {
-  chunkDomains,
+  buildBatchLists,
   resolveBatchSize,
   resolveWaveConcurrency,
 } from '@/lib/enrichment/batchPlan';
@@ -19,6 +19,7 @@ import type {
   ChildCompletionError,
   ChildCompletionPayload,
 } from '@/lib/enrichment/childCompletion';
+import { isStartRejection } from '@/lib/enrichment/startRejection';
 import { enrichmentChildRun, type ChildRunInput } from './enrichment-child';
 
 type EnrichmentModule = typeof import('../server/src/enrichment/index.js');
@@ -62,12 +63,13 @@ export async function enrichmentParentWorkflow(input: ParentWorkflowInput) {
         await spawnWaveChildrenStep(
           input,
           wave.map(
-            (batchDomains, waveIndex): ChildRunInput => ({
+            (batch, waveIndex): ChildRunInput => ({
               jobId: input.jobId,
               agencyId: input.agencyId,
-              batchDomains,
+              batchDomains: batch.domains,
               batchIndex: offset + waveIndex,
               pipelineMode: plan.pipelineMode,
+              resumeStagesOnly: batch.resumeStagesOnly,
               completionToken: waveHooks[waveIndex].token,
             })
           )
@@ -140,6 +142,12 @@ export async function enrichmentParentWorkflow(input: ParentWorkflowInput) {
 
     return finalizeStep(input, completedBatches);
   } catch (err) {
+    // A guardWorkflowStart rejection means THIS run is a duplicate (double
+    // trigger / auto-resume race). End it without touching job state: routing it
+    // through the failure handler would pause the healthy run's job.
+    if (isStartRejection(toErrorInfo(err))) {
+      return { stopped: 'duplicate' as const };
+    }
     // Keystone failure handler: an uncaught throw here would otherwise leave the job
     // stuck at status='running' forever. Record a recoverable terminal state instead.
     const { disposition } = await handleWorkflowFailureStep(input, toErrorInfo(err));
@@ -206,7 +214,13 @@ async function prepareBatchPlanStep(input: ParentWorkflowInput) {
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
 
-  const allDomains = await enrichment.listPendingDomainNames(input.jobId);
+  // Two lists (C1): pending domains run the full pipeline; domains past
+  // 'pending' whose contacts still hold queue work (the incident's verified-146
+  // -of-2,774 gap) run queue stages only. Same queue predicates as
+  // jobHasRemainingPipelineWork, so resume schedules exactly what would
+  // otherwise block finalize.
+  const pendingDomains = await enrichment.listPendingDomainNames(input.jobId);
+  const resumeStageDomains = await enrichment.listResumeStageDomainNames(ctx);
   const batchSize = resolveBatchSize(ctx.pipelineMode, ctx.options);
   const waveConcurrency = resolveWaveConcurrency(ctx.options);
 
@@ -214,7 +228,7 @@ async function prepareBatchPlanStep(input: ParentWorkflowInput) {
     pipelineMode: ctx.pipelineMode,
     batchSize,
     waveConcurrency,
-    batches: chunkDomains(allDomains, batchSize),
+    batches: buildBatchLists(pendingDomains, resumeStageDomains, batchSize),
   };
 }
 

@@ -301,7 +301,6 @@ export async function runSerperShoppingBatch({
     const serperLimit = createConcurrencyLimit(SERPER_CONCURRENCY);
     const paginationLimit = createConcurrencyLimit(CATALOG_PAGINATION_CONCURRENCY);
     const observations = [];
-    const cachePending = [];
     let serperRequests = 0;
     const costPerRequest = pricing?.request_cost ?? 0.001;
     const pending = [];
@@ -393,11 +392,15 @@ export async function runSerperShoppingBatch({
 
             observations.push(...batchResults.map(({ observation }) => observation));
 
+            // Flush this chunk's cache entries immediately (not once at the end):
+            // a crash mid-stage then keeps the paid Serper results for every chunk
+            // already fetched, so the retry hits cache instead of re-charging.
             if (saveCache) {
-                for (const { observation } of batchResults) {
-                    if (!observation.error) {
-                        cachePending.push(cacheEntryFromObservation(observation));
-                    }
+                const chunkEntries = batchResults
+                    .filter(({ observation }) => !observation.error)
+                    .map(({ observation }) => cacheEntryFromObservation(observation));
+                if (chunkEntries.length) {
+                    await saveCache(chunkEntries);
                 }
             }
 
@@ -410,10 +413,6 @@ export async function runSerperShoppingBatch({
     );
 
     await Promise.all(batchTasks);
-
-    if (saveCache && cachePending.length) {
-        await saveCache(cachePending);
-    }
 
     const matched = observations.filter((o) => o.matched).length;
     const cost = serperRequests * costPerRequest;

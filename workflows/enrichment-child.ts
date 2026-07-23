@@ -80,7 +80,9 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       ReturnType<EnrichmentModule['finalizeShoppingAuditStageBatch']>
     > | null = null;
 
-    if (input.pipelineMode === 'shopping_audit') {
+    // Resume batches (C1) carry domains whose full-pipeline pass already ran —
+    // only the queue stages (emails → verify → personalize) still have work.
+    if (input.pipelineMode === 'shopping_audit' && !input.resumeStagesOnly) {
       // Serper-first: bare-domain query + on-demand catalog reverse match,
       // then the waterfall. Only matched domains move forward to enrichment.
       let auditState = await serperShoppingStep(input, null);
@@ -88,7 +90,9 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       auditSummary = await finalizeShoppingAuditStep(input, auditState);
     }
 
-    await foundersStep(input);
+    if (!input.resumeStagesOnly) {
+      await foundersStep(input);
+    }
     await emailsStep(input);
     await verificationStep(input);
     await personalizationStep(input);
@@ -201,11 +205,14 @@ async function personalizationStep(input: ChildBatchInput) {
   });
 }
 
-// Shopping-audit steps thread serializable state between them and re-call Serper/Shopify
-// on re-run; leave at 0 until per-item idempotency (no double-charge) is verified.
-serperShoppingStep.maxRetries = 0;
-signalWaterfallStep.maxRetries = 0;
-finalizeShoppingAuditStep.maxRetries = 0;
+// Shopping-audit steps are per-domain idempotent since Phase 2: serper skips
+// domains with existing ad_observations (and hits the per-job response cache
+// for anything fetched before a crash), the waterfall skips domains with
+// existing signal_emissions, and finalize derives skips from merged state with
+// idempotent UPDATEs — a retry re-charges nothing, so one retry is safe.
+serperShoppingStep.maxRetries = 1;
+signalWaterfallStep.maxRetries = 1;
+finalizeShoppingAuditStep.maxRetries = 1;
 // Standard stages re-query the DB queue each run, so a retry only processes still-pending
 // rows (already-done items drop out) — safe to retry through transient provider failures.
 foundersStep.maxRetries = 2;
