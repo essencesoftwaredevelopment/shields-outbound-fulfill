@@ -17,8 +17,15 @@ export type JobStageCountsUpdate = {
 };
 
 /**
- * Poll get_job_stage_counts(job_id) while a job is active.
- * Spreadsheet progress — does not read jobs.stages for counters.
+ * Hydrate stage counters from get_job_stage_counts(job_id) — the spreadsheet
+ * tables are the source of truth for stage progression. jobs.stages JSONB is a
+ * deprecated write path (large-value updates were a row-lock hotspot) and its
+ * stored values are stale for workflow runs, so the UI must never rely on it.
+ *
+ * Polls on an interval while the job is active; when the job is idle
+ * (completed / paused / failed) the counts are static, so it takes a single
+ * snapshot instead. A status flip (e.g. auto-resume) re-runs the effect and
+ * resumes polling.
  */
 export function useJobStageCounts(
     jobId: string | null,
@@ -69,6 +76,14 @@ export function useJobStageCounts(
         };
 
         void tick();
+
+        // Idle jobs (completed/paused/failed) have static counts — one snapshot.
+        if (!jobRunning) {
+            return () => {
+                cancelled = true;
+            };
+        }
+
         const timer = setInterval(() => {
             void tick();
         }, intervalMs);

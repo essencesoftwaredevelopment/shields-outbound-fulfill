@@ -1832,10 +1832,17 @@ export default function ClientPage() {
 
     useJobRealtime(realtimeJobId, onJobRealtimeUpdate);
 
+    // Stage counters ALWAYS come from get_job_stage_counts over the spreadsheet
+    // tables — jobs.stages JSONB is a deprecated write path (row-lock hotspot)
+    // and holds stale values for workflow runs. Any viewed job (live-watched or
+    // selected from history) hydrates its cards from the RPC: polled while the
+    // job is active, a single snapshot once it is idle/completed.
+    const stageCountsJobId = realtimeJobId ?? jobState?.id ?? null;
+
     const onStageCountsUpdate = useCallback(
         (update: { stages: Partial<Record<PipelineStageKey, PipelineStageState>>; cost?: number; pipelineMode?: string }) => {
             setJobState((prev) => {
-                if (!prev?.id || !realtimeJobId || prev.id !== realtimeJobId) return prev;
+                if (!prev?.id || !stageCountsJobId || prev.id !== stageCountsJobId) return prev;
                 const mergedStages = {
                     ...prev.stages,
                     ...update.stages,
@@ -1851,14 +1858,14 @@ export default function ClientPage() {
                 };
             });
         },
-        [realtimeJobId]
+        [stageCountsJobId]
     );
 
-    useJobStageCounts(realtimeJobId, {
-        enabled: Boolean(realtimeJobId),
+    useJobStageCounts(stageCountsJobId, {
+        enabled: Boolean(stageCountsJobId),
         jobRunning: Boolean(
             jobState?.id
-            && jobState.id === realtimeJobId
+            && jobState.id === stageCountsJobId
             && (jobState.status === "running" || jobState.status === "queued" || jobState.paused)
         ),
         // Finalize only completes a job once no pipeline work remains, so a
@@ -1867,7 +1874,7 @@ export default function ClientPage() {
         // stages at "running" with a phantom ETA forever.
         jobCompleted: Boolean(
             jobState?.id
-            && jobState.id === realtimeJobId
+            && jobState.id === stageCountsJobId
             && jobState.status === "completed"
         ),
         priorStages: jobState?.stages ?? null,
