@@ -1861,6 +1861,15 @@ export default function ClientPage() {
             && jobState.id === realtimeJobId
             && (jobState.status === "running" || jobState.status === "queued" || jobState.paused)
         ),
+        // Finalize only completes a job once no pipeline work remains, so a
+        // completed job must render every stage as completed — the live count
+        // denominators (e.g. verification vs all contacts) would otherwise pin
+        // stages at "running" with a phantom ETA forever.
+        jobCompleted: Boolean(
+            jobState?.id
+            && jobState.id === realtimeJobId
+            && jobState.status === "completed"
+        ),
         priorStages: jobState?.stages ?? null,
         onUpdate: onStageCountsUpdate,
     });
@@ -9059,7 +9068,14 @@ export default function ClientPage() {
                                                 const serperCost = stageCostFromStage(stage);
                                                 if (serperCost !== null && serperCost > 0) costFooter = `Cost $${serperCost.toFixed(2)}`;
                                             } else if (stageKey === "signalWaterfall") {
-                                                const signals = (summary?.processed as number) ?? throughputNum ?? 0;
+                                                // summary.processed counts domains THROUGH the waterfall (incl. no-signal
+                                                // skips) — the emission count is summary.signals. PM2-written stage
+                                                // summaries predate the signals key; their processed IS the emission count.
+                                                const signals = (summary?.signals as number)
+                                                    ?? (stats?.signals as number)
+                                                    ?? (summary?.processed as number)
+                                                    ?? throughputNum
+                                                    ?? 0;
                                                 const candidates = (summary?.totalCandidates as number) ?? total ?? 0;
                                                 heroNumber = signals;
                                                 heroLabel = "Signals";
@@ -9140,18 +9156,20 @@ export default function ClientPage() {
                                                     extractNumberFrom(summary, ["Valid-Risky", "valid-risky"])
                                                     ?? extractNumberFrom(stats, ["valid-risky", "Valid-Risky"])
                                                     ?? 0;
-                                                const verified =
+                                                const checked =
                                                     typeof batchAgg?.processed === "number"
                                                         ? batchAgg.processed
                                                         : typeof stage?.progress?.processed === "number"
                                                         ? stage.progress.processed
                                                         : total ?? 0;
-                                                heroNumber = verified;
+                                                // "Verified" = deliverable emails (safe + risky); "checked" = every
+                                                // verification performed, including invalid/unknown outcomes.
+                                                heroNumber = safe + risky;
                                                 heroLabel = "Verified";
                                                 const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
                                                 subtext =
-                                                    verified > 0
-                                                        ? `${safe.toLocaleString()} safe • ${verified.toLocaleString()} checked${riskyText}`
+                                                    checked > 0
+                                                        ? `${safe.toLocaleString()} safe • ${checked.toLocaleString()} checked${riskyText}`
                                                         : "Awaiting...";
                                                 const verifyCost = stageCostFromStage(stage);
                                                 if (verifyCost !== null && verifyCost > 0) {

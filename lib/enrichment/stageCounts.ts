@@ -50,8 +50,14 @@ function num(value: unknown): number {
 function deriveStatus(
     processed: number,
     total: number,
-    opts: { skipped?: boolean; jobRunning?: boolean } = {}
+    opts: { skipped?: boolean; jobRunning?: boolean; jobCompleted?: boolean } = {}
 ): PipelineStageStatus {
+    // A completed job has no in-flight stages: finalize only marks a job
+    // completed once no pipeline work remains, so count-vs-denominator math
+    // (whose denominators over-count for shopping audits, e.g. verification's
+    // 110 eligible vs 500 contacts) must never resurrect a "running" badge
+    // and its phantom ETA.
+    if (opts.jobCompleted) return "completed";
     if (opts.skipped) return "completed";
     if (total > 0 && processed >= total) return "completed";
     if (processed > 0) return "running";
@@ -71,11 +77,12 @@ function costSummary(stageKey: string, costs?: Record<string, number>) {
 export function stageCountsToStages(
     counts: JobStageCounts | null | undefined,
     prior: Record<string, PipelineStageState> | null | undefined,
-    opts: { jobRunning?: boolean } = {}
+    opts: { jobRunning?: boolean; jobCompleted?: boolean } = {}
 ): Partial<Record<PipelineStageKey, PipelineStageState>> {
     if (!counts) return {};
 
     const jobRunning = opts.jobRunning === true;
+    const jobCompleted = opts.jobCompleted === true;
     const totalDomains = num(counts.domainPrep?.total);
     // Domain-prep "processable" = input cohort after DNS (not post-waterfall leftovers).
     // RPC returns dns-aware processable; fall back to total when DNS was skipped.
@@ -97,6 +104,7 @@ export function stageCountsToStages(
     const domainStatus = deriveStatus(domainProcessed, totalDomains, {
         skipped: domainSkippedCheck && totalDomains > 0,
         jobRunning,
+        jobCompleted,
     });
     out.domainPrep = {
         status: domainStatus,
@@ -136,7 +144,7 @@ export function stageCountsToStages(
         const processed = num(counts.serperShopping?.processed);
         const matched = num(counts.serperShopping?.matched);
         const none = num(counts.serperShopping?.none);
-        const status = deriveStatus(processed, totalDomains, { jobRunning });
+        const status = deriveStatus(processed, totalDomains, { jobRunning, jobCompleted });
         out.serperShopping = {
             status,
             startedAt: prior?.serperShopping?.startedAt ?? null,
@@ -165,6 +173,7 @@ export function stageCountsToStages(
         const waterfallProcessed = waterfallDone > 0 ? waterfallDone : signals;
         const wfStatus = deriveStatus(waterfallProcessed, waterfallTotal, {
             jobRunning,
+            jobCompleted,
             skipped: totalDomains > 0 && num(counts.signalWaterfall?.pending) === 0 && processed >= totalDomains,
         });
         out.signalWaterfall = {
@@ -193,7 +202,7 @@ export function stageCountsToStages(
 
     const foundersProcessed = num(counts.founders?.processed);
     const foundersFound = num(counts.founders?.found);
-    const foundersStatus = deriveStatus(foundersProcessed, contactTotal, { jobRunning });
+    const foundersStatus = deriveStatus(foundersProcessed, contactTotal, { jobRunning, jobCompleted });
     out.founders = {
         status: foundersStatus,
         startedAt: prior?.founders?.startedAt ?? null,
@@ -216,7 +225,7 @@ export function stageCountsToStages(
 
     const emailProcessed = num(counts.emailDiscovery?.processed);
     const emailFound = num(counts.emailDiscovery?.found);
-    const emailStatus = deriveStatus(emailProcessed, contactTotal, { jobRunning });
+    const emailStatus = deriveStatus(emailProcessed, contactTotal, { jobRunning, jobCompleted });
     out.emailDiscovery = {
         status: emailStatus,
         startedAt: prior?.emailDiscovery?.startedAt ?? null,
@@ -238,7 +247,7 @@ export function stageCountsToStages(
     };
 
     const verified = num(counts.verification?.verified);
-    const verifyStatus = deriveStatus(verified, emailFound || contactTotal, { jobRunning });
+    const verifyStatus = deriveStatus(verified, emailFound || contactTotal, { jobRunning, jobCompleted });
     out.verification = {
         status: verifyStatus,
         startedAt: prior?.verification?.startedAt ?? null,
@@ -278,7 +287,7 @@ export function stageCountsToStages(
         personalizeProcessed,
         num(counts.verification?.valid) + num(counts.verification?.validRisky)
     );
-    const personalizeStatus = deriveStatus(personalizeProcessed, personalizeTotal || verified, { jobRunning });
+    const personalizeStatus = deriveStatus(personalizeProcessed, personalizeTotal || verified, { jobRunning, jobCompleted });
     out.personalization = {
         status: personalizeStatus,
         startedAt: prior?.personalization?.startedAt ?? null,
