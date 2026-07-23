@@ -42,4 +42,4 @@ export {
     resolveJobTotal,
     syncStagesBeforeFinalize
 } from './stageProgress.js';
-export { stageHasRemainingWork } from './stageWork.js';
+export { stageHasRemainingWork, listResumeStageDomainNames } from './stageWork.js';

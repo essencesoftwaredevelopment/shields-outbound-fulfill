@@ -21,6 +21,12 @@ export type ChildBatchInput = {
   batchDomains: string[];
   batchIndex: number;
   pipelineMode: PipelineMode;
+  /**
+   * Resume batch (C1): the full pipeline already ran for these domains, only
+   * queue stages (emails → verify → personalize) still have work. The child
+   * skips the shopping-audit and founders stages entirely.
+   */
+  resumeStagesOnly?: boolean;
 };
 
 export type ParentWorkflowInput = {
@@ -29,17 +35,6 @@ export type ParentWorkflowInput = {
   /** Set by /internal/enrichment/start — persisted after guardWorkflowStart passes. */
   workflowRunId?: string;
 };
-
-export const BATCH_SIZE = 100;
-/** Smaller batches for shopping audit — keeps each workflow step under platform maxDuration. */
-export const SHOPPING_AUDIT_BATCH_SIZE = Math.max(
-  1,
-  parseInt(process.env.SHOPPING_AUDIT_BATCH_SIZE || '25', 10)
-);
-export const CHILD_WAVE_CONCURRENCY = Math.max(
-  1,
-  parseInt(process.env.ENRICHMENT_CHILD_WAVE_CONCURRENCY || '5', 10)
-);
 
 /** Serializable shopping-audit state passed between child workflow steps.
  * Serper-first: catalog snapshots are persisted to DB inside the serper stage

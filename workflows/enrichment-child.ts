@@ -1,14 +1,76 @@
 /**
  * Vercel Workflow — one batch of domains.
  * Shopping audit runs as separate steps so each stays under maxDuration.
+ *
+ * `enrichmentChildRun` is the entry the parent spawns via `start()`: each batch
+ * becomes an independent run with its own event log, and completion is reported
+ * back through the parent's completion hook instead of a thrown error.
  */
+import { resumeHook } from 'workflow/api';
 import type { ChildBatchInput, ShoppingAuditBatchState } from '@/lib/enrichment/types';
+import {
+  buildChildFailurePayload,
+  type ChildCompletionPayload,
+} from '@/lib/enrichment/childCompletion';
 
 type EnrichmentModule = typeof import('../server/src/enrichment/index.js');
 
 async function loadEnrichment(): Promise<EnrichmentModule> {
   return import('../server/src/enrichment/index.js');
 }
+
+export type ChildRunInput = ChildBatchInput & {
+  /** Token of the parent's completion hook for this batch. */
+  completionToken: string;
+};
+
+/**
+ * True child run: never throws pipeline errors to the platform. Success and
+ * failure alike are delivered to the parent as a completion-hook payload, so a
+ * failed batch can never take down in-flight siblings or the parent run.
+ */
+export async function enrichmentChildRun(input: ChildRunInput) {
+  'use workflow';
+
+  // Strip the token so step arguments stay identical to the pre-hook shape.
+  const { completionToken, ...batchInput } = input;
+
+  let payload: ChildCompletionPayload;
+  try {
+    const result = await enrichmentChildWorkflow(batchInput);
+    payload = {
+      batchIndex: input.batchIndex,
+      status: 'ok',
+      summary: {
+        domainCount: result.domainCount,
+        auditSignals: result.auditSignals,
+      },
+    };
+  } catch (err) {
+    // 'inactive' (job paused/cancelled) vs 'failed' — the parent never inspects
+    // errors (B2), so the classification must happen here.
+    payload = buildChildFailurePayload(input.batchIndex, err);
+  }
+
+  await reportCompletionStep(completionToken, payload);
+  return payload;
+}
+
+async function reportCompletionStep(
+  completionToken: string,
+  payload: ChildCompletionPayload
+) {
+  'use step';
+
+  await resumeHook(completionToken, payload);
+}
+
+// The parent is suspended on this hook — delivery must survive transient DB or
+// queue blips. If it still fails (parent run gone, hook disposed), throwing is
+// correct: the batch outcome is durable in the DB, nobody is listening for the
+// payload, and a failed child run is the honest breadcrumb for the Workflow UI.
+// The job itself is recovered by the stall reaper, as with any lost run.
+reportCompletionStep.maxRetries = 5;
 
 export async function enrichmentChildWorkflow(input: ChildBatchInput) {
   'use workflow';
@@ -18,7 +80,9 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       ReturnType<EnrichmentModule['finalizeShoppingAuditStageBatch']>
     > | null = null;
 
-    if (input.pipelineMode === 'shopping_audit') {
+    // Resume batches (C1) carry domains whose full-pipeline pass already ran —
+    // only the queue stages (emails → verify → personalize) still have work.
+    if (input.pipelineMode === 'shopping_audit' && !input.resumeStagesOnly) {
       // Serper-first: bare-domain query + on-demand catalog reverse match,
       // then the waterfall. Only matched domains move forward to enrichment.
       let auditState = await serperShoppingStep(input, null);
@@ -26,7 +90,9 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       auditSummary = await finalizeShoppingAuditStep(input, auditState);
     }
 
-    await foundersStep(input);
+    if (!input.resumeStagesOnly) {
+      await foundersStep(input);
+    }
     await emailsStep(input);
     await verificationStep(input);
     await personalizationStep(input);
@@ -37,10 +103,8 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       auditSignals: auditSummary?.stats?.signals ?? 0,
     };
   } catch (err) {
-    // Never swallow: re-throw so the parent's handleWorkflowFailureStep writes the
-    // authoritative job state. Log the batch index for diagnostics. (Per-batch
-    // isolation — letting healthy batches finish — is a separate change: Promise.all
-    // -> allSettled in the parent.)
+    // Never swallow: re-throw so enrichmentChildRun classifies the failure into
+    // the completion payload. Log the batch index for diagnostics.
     console.error(
       `[enrichment-child] batch ${input.batchIndex} failed:`,
       err instanceof Error ? err.message : String(err)
@@ -141,11 +205,14 @@ async function personalizationStep(input: ChildBatchInput) {
   });
 }
 
-// Shopping-audit steps thread serializable state between them and re-call Serper/Shopify
-// on re-run; leave at 0 until per-item idempotency (no double-charge) is verified.
-serperShoppingStep.maxRetries = 0;
-signalWaterfallStep.maxRetries = 0;
-finalizeShoppingAuditStep.maxRetries = 0;
+// Shopping-audit steps are per-domain idempotent since Phase 2: serper skips
+// domains with existing ad_observations (and hits the per-job response cache
+// for anything fetched before a crash), the waterfall skips domains with
+// existing signal_emissions, and finalize derives skips from merged state with
+// idempotent UPDATEs — a retry re-charges nothing, so one retry is safe.
+serperShoppingStep.maxRetries = 1;
+signalWaterfallStep.maxRetries = 1;
+finalizeShoppingAuditStep.maxRetries = 1;
 // Standard stages re-query the DB queue each run, so a retry only processes still-pending
 // rows (already-done items drop out) — safe to retry through transient provider failures.
 foundersStep.maxRetries = 2;

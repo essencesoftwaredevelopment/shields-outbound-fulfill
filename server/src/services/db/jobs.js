@@ -527,11 +527,22 @@ export async function listJobDomainsForJob(jobId, { emailCohortOnly = false, exc
     return result.rows;
 }
 
-/** True when enrichment stages still have rows to process (resume / recovery). */
+/**
+ * True when enrichment stages still have rows to process (resume / recovery).
+ *
+ * The predicates here MUST stay aligned with what the stages actually drain
+ * (`emailsBatch` / `verificationBatch` / `personalizationBatch`) and with the
+ * resume batch planner (`listResumeStageDomainNames`): a queue counted here
+ * that no stage ever processes would strand the job at finalize forever
+ * (the finalize guard refuses to mark completed while this returns true).
+ * That is why skipped stages are excluded and the personalize queue uses the
+ * same `requireValidEmail` rule as the stage.
+ */
 export async function jobHasRemainingPipelineWork({
     agencyId,
     clientId,
     jobId,
+    skipEmailFinder = false,
     skipVerification = false,
     personalizeFirstLine = false,
     dedupeStrategy = 'skip',
@@ -541,7 +552,9 @@ export async function jobHasRemainingPipelineWork({
     const limit = 1;
     const opts = { reprocessInclude, limit, jobStartedAt };
     const [emailRows, verifyRows, pending] = await Promise.all([
-        getEmailFindQueue(agencyId, clientId, jobId, opts),
+        skipEmailFinder
+            ? Promise.resolve([])
+            : getEmailFindQueue(agencyId, clientId, jobId, opts),
         skipVerification
             ? Promise.resolve([])
             : getVerifyQueue(agencyId, clientId, jobId, opts),
@@ -551,7 +564,10 @@ export async function jobHasRemainingPipelineWork({
         return true;
     }
     if (personalizeFirstLine) {
-        const personalizeRows = await getPersonalizeQueue(agencyId, clientId, jobId, opts);
+        const personalizeRows = await getPersonalizeQueue(agencyId, clientId, jobId, {
+            ...opts,
+            requireValidEmail: reprocessInclude
+        });
         if (personalizeRows.length) return true;
     }
     return false;
@@ -602,14 +618,14 @@ export async function getEmailFindQueue(
     agencyId,
     clientId,
     jobId,
-    { reprocessInclude = false, limit = 5000, jobStartedAt = null } = {}
+    { reprocessInclude = false, limit = 5000, jobStartedAt = null, domains = null, distinctDomains = false } = {}
 ) {
     const params = [agencyId, clientId, jobId, limit];
     let emailConstraint;
     if (reprocessInclude) {
         if (jobStartedAt) {
             params.push(jobStartedAt);
-            emailConstraint = `AND (c.email_find_completed_at IS NULL OR c.email_find_completed_at < $5::timestamptz)`;
+            emailConstraint = `AND (c.email_find_completed_at IS NULL OR c.email_find_completed_at < $${params.length}::timestamptz)`;
         } else {
             emailConstraint = '';
         }
@@ -617,22 +633,35 @@ export async function getEmailFindQueue(
         emailConstraint = `AND (c.email IS NULL OR BTRIM(c.email) = '') AND c.email_find_completed_at IS NULL`;
     }
 
+    // Batch scoping happens here in SQL (not by filtering a global queue in JS):
+    // under parallel child runs a global LIMIT window can starve batches whose
+    // rows sort past it while work remains for other domains (incident §5.2).
+    let domainConstraint = '';
+    if (Array.isArray(domains)) {
+        if (!domains.length) return [];
+        params.push(domains);
+        domainConstraint = `AND co.domain_normalized = ANY($${params.length}::text[])`;
+    }
+
     const result = await pool.query(
-        `SELECT DISTINCT ON (c.id)
+        `SELECT ${distinctDomains
+            ? 'DISTINCT co.domain_normalized AS domain'
+            : `DISTINCT ON (c.id)
                 c.id AS contact_id,
                 co.domain_normalized AS domain,
-                c.full_name AS founder_name
+                c.full_name AS founder_name`}
          FROM contacts c
          JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
          WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            ${emailConstraint}
+           ${domainConstraint}
            AND (c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '' AND LOWER(BTRIM(c.full_name)) <> 'not found')
            AND COALESCE(jd.raw_row->'_enrichment'->>'inFounderCohort', 'true') = 'true'
            ${COHORT_ELIGIBLE_SQL}
            ${skippedJobDomainSql()}
-         ORDER BY c.id ASC
+         ORDER BY ${distinctDomains ? 'co.domain_normalized ASC' : 'c.id ASC'}
          LIMIT $4`,
         params
     );
@@ -644,14 +673,14 @@ export async function getVerifyQueue(
     agencyId,
     clientId,
     jobId,
-    { reprocessInclude = false, limit = 5000, jobStartedAt = null } = {}
+    { reprocessInclude = false, limit = 5000, jobStartedAt = null, domains = null, distinctDomains = false } = {}
 ) {
     const params = [agencyId, clientId, jobId, limit];
     let freshnessConstraint;
     if (reprocessInclude) {
         if (jobStartedAt) {
             params.push(jobStartedAt);
-            freshnessConstraint = `AND (c.email_verify_completed_at IS NULL OR c.email_verify_completed_at < $5::timestamptz)`;
+            freshnessConstraint = `AND (c.email_verify_completed_at IS NULL OR c.email_verify_completed_at < $${params.length}::timestamptz)`;
         } else {
             freshnessConstraint = '';
         }
@@ -659,13 +688,23 @@ export async function getVerifyQueue(
         freshnessConstraint = `AND c.email_verify_completed_at IS NULL`;
     }
 
+    // SQL batch scoping — see getEmailFindQueue for why (incident §5.2 starvation).
+    let domainConstraint = '';
+    if (Array.isArray(domains)) {
+        if (!domains.length) return [];
+        params.push(domains);
+        domainConstraint = `AND co.domain_normalized = ANY($${params.length}::text[])`;
+    }
+
     const result = await pool.query(
-        `SELECT DISTINCT ON (c.id)
+        `SELECT ${distinctDomains
+            ? 'DISTINCT co.domain_normalized AS domain'
+            : `DISTINCT ON (c.id)
                 c.id AS contact_id,
                 co.domain_normalized AS domain,
                 c.full_name AS founder_name,
                 c.email,
-                c.email_status
+                c.email_status`}
          FROM contacts c
          JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
@@ -674,9 +713,10 @@ export async function getVerifyQueue(
            AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
            ${freshnessConstraint}
+           ${domainConstraint}
            ${COHORT_ELIGIBLE_SQL}
            ${skippedJobDomainSql()}
-         ORDER BY c.id ASC
+         ORDER BY ${distinctDomains ? 'co.domain_normalized ASC' : 'c.id ASC'}
          LIMIT $4`,
         params
     );
@@ -687,7 +727,7 @@ export async function getPersonalizeQueue(
     agencyId,
     clientId,
     jobId,
-    { reprocessInclude = false, requireValidEmail = false, limit = 5000, jobStartedAt = null } = {}
+    { reprocessInclude = false, requireValidEmail = false, limit = 5000, jobStartedAt = null, domains = null, distinctDomains = false } = {}
 ) {
     const params = [agencyId, clientId, jobId, limit];
     let personalizationFilter;
@@ -708,14 +748,24 @@ export async function getPersonalizeQueue(
         ? `AND LOWER(TRIM(COALESCE(c.email_status, ''))) IN ('valid', 'valid-risky', 'risky')`
         : '';
 
+    // SQL batch scoping — see getEmailFindQueue for why (incident §5.2 starvation).
+    let domainConstraint = '';
+    if (Array.isArray(domains)) {
+        if (!domains.length) return [];
+        params.push(domains);
+        domainConstraint = `AND co.domain_normalized = ANY($${params.length}::text[])`;
+    }
+
     const result = await pool.query(
-        `SELECT DISTINCT ON (c.id)
+        `SELECT ${distinctDomains
+            ? 'DISTINCT co.domain_normalized AS domain'
+            : `DISTINCT ON (c.id)
                 c.id AS contact_id,
                 co.domain_normalized AS domain,
                 c.full_name AS founder_name,
                 c.email,
                 c.email_status,
-                c.personalization_first_line
+                c.personalization_first_line`}
          FROM contacts c
          JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
          JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
@@ -725,9 +775,10 @@ export async function getPersonalizeQueue(
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
            ${personalizationFilter}
            ${emailStatusFilter}
+           ${domainConstraint}
            ${COHORT_ELIGIBLE_SQL}
            ${skippedJobDomainSql()}
-         ORDER BY c.id ASC
+         ORDER BY ${distinctDomains ? 'co.domain_normalized ASC' : 'c.id ASC'}
          LIMIT $4`,
         params
     );

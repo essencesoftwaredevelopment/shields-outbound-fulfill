@@ -53,8 +53,15 @@ Enrichment jobs can run on **PM2** (default) or **Vercel Workflows** (opt-in). I
 
 **Vercel path layout:**
 - `server/src/enrichment/` — shared context, hydrate, stage batch runners, rate limits
-- `workflows/enrichment-parent.ts` — domain prep → batch fan-out (100 domains, wave 15) → finalize
-- `workflows/enrichment-child.ts` — shopping audit (if applicable) → founders → emails → verify → personalization
+- `workflows/enrichment-parent.ts` — domain prep → wave fan-out of independent child runs
+  (`start()` from a step + one completion hook per child; batch size 25 shopping / 100 standard,
+  wave 5 — each tunable via `jobs.options.batchSize` / `.waveConcurrency`, then env
+  `SHOPPING_AUDIT_BATCH_SIZE` / `ENRICHMENT_BATCH_SIZE` / `ENRICHMENT_CHILD_WAVE_CONCURRENCY`) → finalize
+- `workflows/enrichment-child.ts` — shopping audit (if applicable) → founders → emails → verify →
+  personalization, then a final step reports `{ status: 'ok' | 'failed' | 'inactive' }` to the
+  parent's completion hook — pipeline errors never fail the child run to the platform. Batches
+  flagged `resumeStagesOnly` (domains past 'pending' whose contacts still hold queue work) skip
+  the audit + founders stages and run emails → verify → personalize only.
 - `app/internal/enrichment/start/route.ts` — secured trigger (`WORKFLOW_TRIGGER_SECRET`)
 - `app/internal/enrichment/reap/route.ts` — stalled-job watchdog, hit by Vercel Cron (`vercel.json`)
 
@@ -62,11 +69,20 @@ Enrichment jobs can run on **PM2** (default) or **Vercel Workflows** (opt-in). I
 catch → `handleWorkflowFailure` (`finalize.js`). Any throw resolves the job to a recoverable
 terminal state — **cancelled** (`status='failed'`), **paused** (user stop), or **paused-with-error**
 (`paused=true` + `jobs.error`, resumable via the normal resume route). Disposition is driven by the
-DB control flags, not the error's `.code` (which may not survive the step boundary). Batches run
-under `Promise.allSettled` so one bad batch never cancels its siblings; if **any** batch fails the
+DB control flags, not the error's `.code` (which may not survive the step boundary). Each batch is
+an independent child run reporting `ok`/`failed`/`inactive` through its completion hook, so one bad
+batch never cancels its siblings (a whole-`failed` wave still aborts early as a systemic-outage
+guard, and an `inactive` child stops further waves); if **any** batch fails the
 run is paused-with-error (never silently finalized), and a resume reprocesses only still-pending
-domains via the idempotent queues. Queue-based stages (founders/emails/verify/personalization) carry
-`maxRetries=2`; shopping-audit steps stay at 0 until per-item idempotency is verified.
+domains via the idempotent queues. Finalize refuses to mark a job completed while
+`jobHasRemainingPipelineWork` still finds queue rows — it pauses-with-error instead, and a
+successful finalize clears `jobs.error` (and the auto-resume counter). Queue-based stages
+(founders/emails/verify/personalization) carry `maxRetries=2`; shopping-audit steps carry
+`maxRetries=1` — they are per-domain idempotent (serper skips domains with existing
+`ad_observations` and hits the per-job response cache; the waterfall skips domains with existing
+`signal_emissions`), so a retry or resume never re-charges Serper for processed domains. The
+verify/email/personalize queues are scoped by the batch's domain list **in SQL**, so parallel
+child runs cannot starve each other out of a global LIMIT window.
 
 **Credit exhaustion (TryKitt):** a 402 whose body signals out-of-credits (or a 402 that
 persists past retries) is detected in `services/trykittCredits.js` and raised as a
@@ -79,7 +95,10 @@ this routes through `handleWorkflowFailure` → paused-with-error (`jobs.error` 
 **Watchdog:** Vercel Cron hits `/internal/enrichment/reap` every 10 min. It flips Vercel-runner jobs
 stuck at `status='running'` with no `updated_at` movement for `ENRICHMENT_STALL_MINUTES` (default 20)
 into paused-with-error — the backstop for a workflow that dies before its catch runs (eviction/OOM).
-It does **not** auto-retrigger (would double-run a slow-but-alive job); recovery is via resume.
+When pipeline queues still hold work it then **auto-resumes** the job (re-triggers the workflow
+start route), at most `jobs.options.autoResumeAttempts = 2` times per successful finalize — after
+that the job stays paused-with-error for a human. A duplicate start is rejected by
+`guardWorkflowStart` and the parent ends that run without touching job state.
 
 **Required env (Vercel + Express):** Postgres vars, `APP_URL`, `WORKFLOW_TRIGGER_SECRET`. Optional `SERPER_MAX_CONCURRENT_BATCHES` / `SERPER_RPM_LIMIT` for Postgres API throttling, `CRON_SECRET` to authenticate the reap cron, `ENRICHMENT_STALL_MINUTES` to tune the watchdog threshold.
 
