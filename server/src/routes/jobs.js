@@ -522,7 +522,7 @@ router.post('/jobs', uploadFields, async (req, res) => {
         const industry = (req.body.industry || req.body.nicheId || '').toString().trim();
         const nicheId = (req.body.nicheId || '').toString().trim();
         const nicheLabel = (req.body.nicheLabel || '').toString().trim();
-        const personalizeFirstLine = String(req.body.personalizeFirstLine || '').toLowerCase() === 'true';
+        let personalizeFirstLine = String(req.body.personalizeFirstLine || '').toLowerCase() === 'true';
         const productPromptVersionRaw = (req.body.productPromptVersion || '').toString().trim().toLowerCase();
         const productPromptVersion = productPromptVersionRaw === 'new_gpt5mini' ? 'new_gpt5mini' : 'old';
         const productPromptProductsParsed = parseInt(req.body.productPromptProducts || '3', 10);
@@ -538,6 +538,8 @@ router.post('/jobs', uploadFields, async (req, res) => {
         if (pipelineMode === 'shopping_audit' && !hasShoppingAuditFeature(settings)) {
             return res.status(403).json({ error: 'Shopping audit pipeline is not enabled for this agency.' });
         }
+        // Shopping audit does not run first-line personalization.
+        if (pipelineMode === 'shopping_audit') personalizeFirstLine = false;
 
         let seedEntries = null;
         let jobFileName = file?.originalname || null;

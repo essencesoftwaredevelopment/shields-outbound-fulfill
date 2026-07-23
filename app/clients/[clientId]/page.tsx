@@ -5087,7 +5087,7 @@ export default function ClientPage() {
                 verifyEmail,
                 skipVerification: !verifyEmail, // Invert: unchecked verifyEmail means skip verification
                 skipDomainCheck: !runDomainCheck,
-                personalizeFirstLine: pipelineMode === 'shopping_audit' ? true : personalizeFirstLine,
+                personalizeFirstLine: pipelineMode === 'shopping_audit' ? false : personalizeFirstLine,
                 productPromptVersion: selectedProductPromptVersion,
                 productPromptProducts: selectedProductPromptProducts,
                 domainColumn,
