@@ -10,6 +10,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "node --test \"lib/**/__tests__/*.test.ts\"",
     "deploy:server": "bash scripts/deploy-server.sh"
   },
   "dependencies": {

@@ -30,17 +30,6 @@ export type ParentWorkflowInput = {
   workflowRunId?: string;
 };
 
-export const BATCH_SIZE = 100;
-/** Smaller batches for shopping audit — keeps each workflow step under platform maxDuration. */
-export const SHOPPING_AUDIT_BATCH_SIZE = Math.max(
-  1,
-  parseInt(process.env.SHOPPING_AUDIT_BATCH_SIZE || '25', 10)
-);
-export const CHILD_WAVE_CONCURRENCY = Math.max(
-  1,
-  parseInt(process.env.ENRICHMENT_CHILD_WAVE_CONCURRENCY || '5', 10)
-);
-
 /** Serializable shopping-audit state passed between child workflow steps.
  * Serper-first: catalog snapshots are persisted to DB inside the serper stage
  * and never carried in step state; observations hold slim cards only.
