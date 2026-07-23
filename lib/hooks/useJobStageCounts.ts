@@ -26,6 +26,7 @@ export function useJobStageCounts(
         enabled?: boolean;
         intervalMs?: number;
         jobRunning?: boolean;
+        jobCompleted?: boolean;
         priorStages?: Record<string, PipelineStageState> | null;
         onUpdate: (update: JobStageCountsUpdate) => void;
     }
@@ -38,6 +39,7 @@ export function useJobStageCounts(
     const enabled = opts.enabled !== false && Boolean(jobId);
     const intervalMs = opts.intervalMs ?? DEFAULT_POLL_MS;
     const jobRunning = opts.jobRunning === true;
+    const jobCompleted = opts.jobCompleted === true;
 
     useEffect(() => {
         if (!enabled || !jobId) return;
@@ -57,6 +59,7 @@ export function useJobStageCounts(
             const counts = data as JobStageCounts;
             const stages = stageCountsToStages(counts, priorRef.current as PipelineJob["stages"], {
                 jobRunning,
+                jobCompleted,
             });
             onUpdateRef.current({
                 stages,
@@ -74,5 +77,5 @@ export function useJobStageCounts(
             cancelled = true;
             clearInterval(timer);
         };
-    }, [enabled, jobId, intervalMs, jobRunning]);
+    }, [enabled, jobId, intervalMs, jobRunning, jobCompleted]);
 }
