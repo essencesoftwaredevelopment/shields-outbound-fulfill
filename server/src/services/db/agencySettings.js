@@ -76,6 +76,21 @@ export function hasShoppingAuditFeature(settings) {
 }
 
 /**
+ * Whether the interested autoresponder builds the Vulcan shopping-audit
+ * preview for this agency's replies. Deliberately per-agency ONLY:
+ * - independent of `features.shoppingAudit` (which gates running the audit
+ *   PIPELINE and is enabled for several agencies) — reply behavior must not
+ *   piggyback on pipeline access;
+ * - never overridden by the global SHOPPING_AUDIT_ENABLED env, which would
+ *   silently flip every agency's replies to audit previews (the bug that sent
+ *   audit previews for Essence/Active Fungi leads). Agencies without this
+ *   flag get the legacy Essence list-growth popup preview.
+ */
+export function hasInterestedReplyShoppingAuditFeature(settings) {
+    return agencyFeaturesFromSettings(settings).autoresponderShoppingAudit === true;
+}
+
+/**
  * Caps applied to an agency whose TryKitt key is on the free tier. Free keys throttle
  * far below the paid ~15-concurrent allowance; without these the pipeline hammers
  * TryKitt, every request retries through its backoff, and the stage crawls.

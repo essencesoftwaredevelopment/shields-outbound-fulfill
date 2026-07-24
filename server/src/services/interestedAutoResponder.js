@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
-import { getAgencySettings, hasShoppingAuditFeature } from './db/agencySettings.js';
+import { getAgencySettings, hasInterestedReplyShoppingAuditFeature } from './db/agencySettings.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import {
     fetchThreadReplyMetadata,
@@ -599,7 +599,10 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
         openaiKey: asTrimmedText(agencySettings?.openai_key),
         ntfyTopic: asTrimmedText(clientRow?.ntfy_topic),
         instantlyKey: asTrimmedText(clientRow?.instantly_key),
-        shoppingAudit: hasShoppingAuditFeature(agencySettings)
+        // Reply preview mechanism, NOT pipeline access: only agencies with
+        // features.autoresponderShoppingAudit (Vulcan) build audit previews;
+        // everyone else gets the legacy list-growth popup.
+        shoppingAuditReply: hasInterestedReplyShoppingAuditFeature(agencySettings)
     };
 }
 
@@ -1099,14 +1102,22 @@ export async function createInterestedAutoResponderDraftFromEvent({
             }
             const auditDomain = normalizeAuditDomain(signalRow.company_domain)
                 || domainFromLeadEmail(normalizedLeadEmail);
+            const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);
             const [auditPreviewUrl, templateVars] = await Promise.all([
                 generateAuditPreviewUrl(normalizedLeadEmail, {
                     domain: auditDomain,
-                    useVulcanShoppingAudit: Boolean(settings.shoppingAudit),
-                    signalEmissionId: signalRow.signal_emission_id || null,
-                    signalType: signalRow.signal_type || null,
-                    observed: signalRow.observed || null,
-                    expected: signalRow.expected || null
+                    useVulcanShoppingAudit: useShoppingAuditReply,
+                    // Signal context only for shopping-audit reply agencies: passing it
+                    // for anyone else flips the popup-form call into the shopping-
+                    // preview ad, which list-growth agencies must never send.
+                    ...(useShoppingAuditReply
+                        ? {
+                            signalEmissionId: signalRow.signal_emission_id || null,
+                            signalType: signalRow.signal_type || null,
+                            observed: signalRow.observed || null,
+                            expected: signalRow.expected || null
+                        }
+                        : {})
                 }),
                 resolveTemplateVars(client, contactId, campaignId, {
                     clientId,

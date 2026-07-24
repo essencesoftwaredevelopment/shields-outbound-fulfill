@@ -261,7 +261,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             ),
             settingsPromise.then((settings) => generateAuditPreviewUrl(contact.email, {
                 domain: contact.company_domain || null,
-                useVulcanShoppingAudit: Boolean(settings.shoppingAudit)
+                useVulcanShoppingAudit: Boolean(settings.shoppingAuditReply)
             }))
         ]);
 
