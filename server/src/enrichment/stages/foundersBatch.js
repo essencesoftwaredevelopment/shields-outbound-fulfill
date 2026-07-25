@@ -18,6 +18,7 @@ import {
     resolveJobTotal,
     batchProgressOffset
 } from '../stageProgress.js';
+import { shouldScheduleChildReconcile } from '../reconcilePolicy.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -84,7 +85,8 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
                 clientId: ctx.clientId,
                 rows: founderRows,
                 jobId: ctx.jobId,
-                mergeMode: enrichmentMergeMode(ctx)
+                mergeMode: enrichmentMergeMode(ctx),
+                reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
             });
         }
 
@@ -122,7 +124,8 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
                 clientId: ctx.clientId,
                 rows,
                 jobId: ctx.jobId,
-                mergeMode: enrichmentMergeMode(ctx)
+                mergeMode: enrichmentMergeMode(ctx),
+                reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
             });
         },
         totalDomainCount: jobTotal || batchDomains.length,

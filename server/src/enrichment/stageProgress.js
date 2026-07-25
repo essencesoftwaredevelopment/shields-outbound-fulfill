@@ -1,5 +1,6 @@
 import { pool } from '../config/db.js';
 import { normalizeStageSummary, extractStageCostAmount } from '../utils/pricing.js';
+import { shouldScheduleChildReconcile } from './reconcilePolicy.js';
 
 export const WORKFLOW_BATCH_SIZE = 100;
 
@@ -408,11 +409,11 @@ export function createStageLogger(ctx, stageKey, options = {}) {
         if (now - lastReconcileAt < MIN_RECONCILE_MS) return;
         lastReconcileAt = now;
 
-        void import('./stageReconcileScheduler.js').then(({ scheduleStageReconcile }) => {
-            // Debounce across parallel child isolates — immediate (0) reconciles used to
-            // stampede countJobStageStats while holding the jobs row lock.
-            scheduleStageReconcile(ctx.jobId, ctx.agencyId);
-        }).catch(() => {});
+        if (shouldScheduleChildReconcile(ctx)) {
+            void import('./stageReconcileScheduler.js').then(({ scheduleStageReconcile }) => {
+                scheduleStageReconcile(ctx.jobId, ctx.agencyId);
+            }).catch(() => {});
+        }
     };
 }
 
@@ -422,8 +423,10 @@ export async function beginJobStage(ctx, stageKey, { activity } = {}) {
         const { setJobActivity } = await import('./persist.js');
         await setJobActivity(ctx.jobId, ctx.agencyId, activity);
     }
-    const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
-    scheduleStageReconcile(ctx.jobId, ctx.agencyId);
+    if (shouldScheduleChildReconcile(ctx)) {
+        const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
+        scheduleStageReconcile(ctx.jobId, ctx.agencyId);
+    }
 }
 
 /** Cost merge + reconcile — batches no longer set status/summary/progress. */
@@ -432,8 +435,10 @@ export async function finishJobStage(ctx, stageKey, batchSummary) {
         const normalized = normalizeStageSummary(batchSummary);
         await persistStageCostOnly(ctx.jobId, ctx.agencyId, stageKey, normalized);
     }
-    const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
-    scheduleStageReconcile(ctx.jobId, ctx.agencyId, 0);
+    if (shouldScheduleChildReconcile(ctx)) {
+        const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
+        scheduleStageReconcile(ctx.jobId, ctx.agencyId, 0);
+    }
 }
 
 /**
