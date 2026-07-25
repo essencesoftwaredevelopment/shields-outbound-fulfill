@@ -12,6 +12,7 @@ import {
     updateInterestedAutoResponderDraftTextByToken,
     cancelInterestedAutoResponderDraftByToken,
     cancelStalePendingReviewDraftsForClient,
+    applyActiveFungiStoryUrlToTemplateVars,
     INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES
 } from '../services/interestedAutoResponder.js';
 import { resolveTemplateVars, renderTemplate } from '../services/followUpSender.js';
@@ -238,7 +239,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
 
         // Fetch thread context in parallel; template vars resolved after we know the eaccount
         const settingsPromise = fetchAgencyAndClientSettings(req.agencyId, req.params.clientId);
-        const [{ openaiKey, ntfyTopic }, threadResult, auditPreviewUrl] = await Promise.all([
+        const [{ openaiKey, ntfyTopic, useActiveFungiStoryUrl }, threadResult, auditPreviewUrl] = await Promise.all([
             settingsPromise,
             pool.query(
                 `SELECT
@@ -261,16 +262,22 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             ),
             settingsPromise.then((settings) => generateAuditPreviewUrl(contact.email, {
                 domain: contact.company_domain || null,
-                useVulcanShoppingAudit: Boolean(settings.shoppingAuditReply)
+                useVulcanShoppingAudit: Boolean(settings.shoppingAuditReply),
+                skipPopupPreview: Boolean(settings.skipPopupPreview)
             }))
         ]);
 
         // Derive eaccount from most recent thread event that has one
         const previewEaccount = threadResult.rows.find(r => r.email_account)?.email_account || null;
-        const templateVars = await resolveTemplateVars(pool, contactId, prompt.campaign_id, {
+        let templateVars = await resolveTemplateVars(pool, contactId, prompt.campaign_id, {
             clientId: clientRow.id,
             emailAccount: previewEaccount
         });
+        if (useActiveFungiStoryUrl) {
+            templateVars = applyActiveFungiStoryUrlToTemplateVars(templateVars, {
+                domain: contact.company_domain || null
+            });
+        }
 
         if (!openaiKey) {
             return res.status(400).json({ error: 'No OpenAI API key configured for this agency.' });
@@ -295,7 +302,8 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             leadEmail: contact.email,
             threadSubject,
             previousLeadMessage,
-            auditPreviewUrl
+            auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
+            systemPromptOwnsCta: Boolean(useActiveFungiStoryUrl)
         });
 
         // Create a real pending_review draft so we can send a clickable review link
@@ -331,7 +339,9 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             model,
             promptVersion: prompt.version,
             reviewUrl,
-            previewUrl: auditPreviewUrl || null,
+            previewUrl: useActiveFungiStoryUrl
+                ? (templateVars.story_url || null)
+                : (auditPreviewUrl || null),
             debug: {
                 lead: {
                     email: contact.email,
@@ -346,6 +356,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                     lastName: templateVars.email_account_last_name || null,
                 },
                 threadSubject: threadSubject || null,
+                storyUrl: templateVars.story_url || null,
                 renderedSystemPrompt,
                 contextSentToAI: {
                     campaignName: prompt.campaign_name,
