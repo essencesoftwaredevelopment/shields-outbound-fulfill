@@ -23,6 +23,13 @@ const POPUP_FORM_GENERATE_TIMEOUT_MS = Math.max(
     1
 );
 const POPUP_FORM_GENERATE_MAX_ATTEMPTS = 2;
+/** Active Fungi only — story-page personalization; never run Essence popup generate. */
+const ACTIVE_FUNGI_CLIENT_SLUG = 'active-fungi';
+const ACTIVE_FUNGI_STORY_BASE_URL = String(
+    process.env.ACTIVE_FUNGI_STORY_BASE_URL || 'https://active-fungi.vercel.app'
+).trim().replace(/\/$/, '');
+const ACTIVE_FUNGI_STORY_GOALS = new Set(['focus', 'calm', 'creativity', 'energy']);
+const POPUP_PREVIEW_SKIP_CLIENT_SLUGS = new Set([ACTIVE_FUNGI_CLIENT_SLUG]);
 
 /** Vulcan shopping-ad profit audit (POST /api/audits → page /?domain=). */
 const VULCAN_SHOPPING_AUDIT_BASE_URL = String(
@@ -92,6 +99,75 @@ export function domainFromLeadEmail(leadEmail) {
     const atIndex = String(leadEmail || '').indexOf('@');
     if (atIndex === -1) return null;
     return normalizeAuditDomain(String(leadEmail).slice(atIndex + 1));
+}
+
+/** Turn `wildorchard.com` → `Wildorchard` when no company display name exists. */
+export function humanizeDomainAsCompanyName(domain) {
+    const normalized = normalizeAuditDomain(domain);
+    if (!normalized) return '';
+    const label = normalized.split('.')[0] || '';
+    if (!label) return '';
+    return label
+        .replace(/[-_]+/g, ' ')
+        .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+/**
+ * Active Fungi story page URL (`?name=&company=&logo=&cta=&goal=`).
+ * Only used for the active-fungi client — see `useActiveFungiStoryUrl`.
+ */
+export function buildActiveFungiStoryUrl({
+    name = '',
+    company = '',
+    domain = '',
+    goal = '',
+    cta = ''
+} = {}) {
+    const params = new URLSearchParams();
+    const trimmedName = String(name || '').trim();
+    const normalizedDomain = normalizeAuditDomain(domain);
+    const trimmedCompany = String(company || '').trim()
+        || humanizeDomainAsCompanyName(normalizedDomain);
+    const trimmedGoal = String(goal || '').trim().toLowerCase();
+    const trimmedCta = String(cta || '').trim();
+
+    if (trimmedName) params.set('name', trimmedName);
+    if (trimmedCompany) params.set('company', trimmedCompany);
+    if (normalizedDomain) {
+        params.set(
+            'logo',
+            `https://www.google.com/s2/favicons?domain=${normalizedDomain}&sz=128`
+        );
+    }
+    if (ACTIVE_FUNGI_STORY_GOALS.has(trimmedGoal)) params.set('goal', trimmedGoal);
+    if (trimmedCta) params.set('cta', trimmedCta);
+
+    const qs = params.toString();
+    return qs ? `${ACTIVE_FUNGI_STORY_BASE_URL}/?${qs}` : `${ACTIVE_FUNGI_STORY_BASE_URL}/`;
+}
+
+/** Attach `story_url` for Active Fungi templates (`{{story_url}}`). No-op otherwise. */
+export function applyActiveFungiStoryUrlToTemplateVars(templateVars = {}, options = {}) {
+    const pick = (...values) => {
+        for (const value of values) {
+            const text = value === null || value === undefined ? '' : String(value).trim();
+            if (text) return text;
+        }
+        return '';
+    };
+    const name = pick(templateVars.first_name, templateVars.firstName);
+    const company = pick(templateVars.companyName, templateVars.company_name);
+    const domain = pick(options.domain, templateVars.company_domain);
+    return {
+        ...templateVars,
+        story_url: buildActiveFungiStoryUrl({
+            name,
+            company,
+            domain,
+            goal: options.goal,
+            cta: options.cta
+        })
+    };
 }
 
 export function buildVulcanShoppingAuditUrl(domain) {
@@ -268,6 +344,7 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
 /**
  * Build the lead-magnet / audit preview URL for an interested reply.
  * Shopping-audit agencies (Vulcan) → POST vulcan-shopping-audit /api/audits.
+ * Active Fungi → no Essence popup (story URL is built separately via template vars).
  * Everyone else → legacy Essence popup-form generate.
  */
 export async function generateAuditPreviewUrl(leadEmail, options = {}) {
@@ -276,6 +353,13 @@ export async function generateAuditPreviewUrl(leadEmail, options = {}) {
 
     if (options.useVulcanShoppingAudit) {
         return triggerVulcanShoppingAudit(domain, { waitForReady: options.waitForReady });
+    }
+
+    if (options.skipPopupPreview) {
+        console.log(
+            `[popup-form/generate] skipped — client opted out of Essence AI popup preview domain=${domain}`
+        );
+        return null;
     }
 
     return callPopupFormGenerate(leadEmail, { ...options, domain });
@@ -599,14 +683,22 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
         getAgencySettings(agencyId),
         resolveClientRow(agencyId, clientIdOrSlug)
     ]);
+    const clientSlug = String(clientRow?.slug || '').trim().toLowerCase();
+    const useActiveFungiStoryUrl = clientSlug === ACTIVE_FUNGI_CLIENT_SLUG;
     return {
         openaiKey: asTrimmedText(agencySettings?.openai_key),
         ntfyTopic: asTrimmedText(clientRow?.ntfy_topic),
         instantlyKey: asTrimmedText(clientRow?.instantly_key),
+        clientSlug: clientSlug || null,
         // Reply preview mechanism, NOT pipeline access: only agencies with
         // features.autoresponderShoppingAudit (Vulcan) build audit previews;
-        // everyone else gets the legacy list-growth popup.
-        shoppingAuditReply: hasInterestedReplyShoppingAuditFeature(agencySettings)
+        // everyone else gets the legacy list-growth popup (unless the client
+        // is explicitly opted out — e.g. Active Fungi).
+        shoppingAuditReply: hasInterestedReplyShoppingAuditFeature(agencySettings),
+        skipPopupPreview: POPUP_PREVIEW_SKIP_CLIENT_SLUGS.has(clientSlug),
+        // Active Fungi only: personalized story page via {{story_url}} — never
+        // for other clients on this agency (Essence Retention, Vulcan, etc.).
+        useActiveFungiStoryUrl
     };
 }
 
@@ -625,10 +717,19 @@ export async function generateDraftReply({
     threadSubject,
     previousLeadMessage,
     auditPreviewUrl = null,
-    essenceAiPreviewUrl = null
+    essenceAiPreviewUrl = null,
+    // When true, the system prompt already owns the CTA (Active Fungi story URL).
+    // Skip shopping-audit / Essence Calendly CTA instructions so they don't fight it.
+    systemPromptOwnsCta = false
 }) {
     const previewUrl = auditPreviewUrl || essenceAiPreviewUrl || null;
     const client = new OpenAI({ apiKey: openaiKey });
+    let ctaBlock = '';
+    if (!systemPromptOwnsCta) {
+        ctaBlock = previewUrl
+            ? `CTA instruction: A personalized shopping ad audit has already been generated for this prospect's store. Use the Shopping audit URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
+            : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`;
+    }
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,
         // temperature: 0.6,
@@ -640,7 +741,7 @@ export async function generateDraftReply({
                     `Campaign: ${campaignName || 'Unknown campaign'}`,
                     `Lead email: ${leadEmail || 'Unknown lead'}`,
                     `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
-                    previewUrl
+                    previewUrl && !systemPromptOwnsCta
                         ? `Shopping audit URL: ${previewUrl}`
                         : '',
                     '',
@@ -649,9 +750,7 @@ export async function generateDraftReply({
                     'Do not use markdown.',
                     'Preserve the conversational context from the lead message below.',
                     '',
-                    previewUrl
-                        ? `CTA instruction: A personalized shopping ad audit has already been generated for this prospect's store. Use the Shopping audit URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
-                        : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`,
+                    ctaBlock,
                     '',
                     'Lead message/thread context:',
                     previousLeadMessage || '(no message text available)'
@@ -670,7 +769,7 @@ async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl,
     if (!topic) return { notified: false, reason: 'missing_topic' };
 
     const titlePrefix = isFollowUp
-        ? 'Interested lead follow-up review'
+        ? 'New Response Follow-up Review'
         : 'Interested lead reply review';
 
     const response = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
@@ -1107,10 +1206,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
             const auditDomain = normalizeAuditDomain(signalRow.company_domain)
                 || domainFromLeadEmail(normalizedLeadEmail);
             const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);
-            const [auditPreviewUrl, templateVars] = await Promise.all([
+            const useActiveFungiStoryUrl = Boolean(settings.useActiveFungiStoryUrl);
+            const [auditPreviewUrl, resolvedTemplateVars] = await Promise.all([
                 generateAuditPreviewUrl(normalizedLeadEmail, {
                     domain: auditDomain,
                     useVulcanShoppingAudit: useShoppingAuditReply,
+                    skipPopupPreview: Boolean(settings.skipPopupPreview),
                     // Signal context only for shopping-audit reply agencies: passing it
                     // for anyone else flips the popup-form call into the shopping-
                     // preview ad, which list-growth agencies must never send.
@@ -1128,6 +1229,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
                     emailAccount: eaccount
                 })
             ]);
+            const templateVars = useActiveFungiStoryUrl
+                ? applyActiveFungiStoryUrlToTemplateVars(resolvedTemplateVars, { domain: auditDomain })
+                : resolvedTemplateVars;
+            if (useActiveFungiStoryUrl) {
+                logger(`[interested-autoresponder] active-fungi story_url=${templateVars.story_url}`);
+            }
             const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
             generation = await generateDraftReply({
                 openaiKey: settings.openaiKey,
@@ -1136,7 +1243,9 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 leadEmail: normalizedLeadEmail,
                 threadSubject,
                 previousLeadMessage,
-                auditPreviewUrl
+                // Never feed the Active Fungi story URL into the shopping-audit CTA path.
+                auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
+                systemPromptOwnsCta: useActiveFungiStoryUrl
             });
         } catch (error) {
             const failedDraft = await insertDraftRow(client, {
