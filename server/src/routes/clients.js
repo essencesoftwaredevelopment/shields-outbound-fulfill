@@ -26,11 +26,13 @@ import {
     buildInstantlyWebhookTargetUrl,
     getInstantlySyncRun,
     getLatestInstantlySyncRun,
+    listInstantlyLeadLabels,
     requestStopInstantlySyncRun,
     registerInstantlyWebhook
     ,
     syncClientEmailAccounts
 } from '../services/instantlyState.js';
+import { normalizeLeadLabels } from '../services/warmFollowUpStatus.js';
 import {
     choosePreferredCampaign,
     extractCampaignApiItems,
@@ -586,6 +588,62 @@ router.post('/clients/:id/instantly/email-accounts/sync', async (req, res) => {
     } catch (error) {
         console.error('Error syncing Instantly email accounts:', error);
         res.status(500).json({ error: 'Failed to sync Instantly email accounts.' });
+    }
+});
+
+// List the client's Instantly lead labels (interest statuses) for the
+// Warm Follow Ups status picker.
+router.get('/clients/:clientId/instantly/lead-labels', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const { instantlyKey } = await requireClientWithInstantly(req.agencyId, req.params.clientId);
+        const rawLabels = await listInstantlyLeadLabels(instantlyKey);
+        res.json({ labels: normalizeLeadLabels(rawLabels) });
+    } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 502;
+        console.error('GET instantly lead-labels error:', error?.message || error);
+        res.status(statusCode).json({ error: error?.statusCode ? error.message : 'Failed to fetch Instantly lead labels.' });
+    }
+});
+
+// Persist which Instantly status is applied after an autoresponder send.
+// Body: { interest_value: number, label: string } to set, or both null to clear.
+router.put('/clients/:clientId/warm-follow-up-status', requireAuth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const rawValue = body.interest_value;
+        const rawLabel = body.label;
+
+        let interestValue = null;
+        let label = null;
+        if (rawValue !== null && rawValue !== undefined) {
+            interestValue = Number(rawValue);
+            if (!Number.isInteger(interestValue)) {
+                return res.status(400).json({ error: 'interest_value must be an integer or null.' });
+            }
+            label = String(rawLabel || '').trim();
+            if (!label) {
+                return res.status(400).json({ error: 'label is required when interest_value is set.' });
+            }
+        }
+
+        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+
+        await pool.query(
+            `UPDATE clients
+             SET warm_follow_up_interest_value = $1,
+                 warm_follow_up_interest_label = $2,
+                 updated_at = NOW()
+             WHERE id = $3`,
+            [interestValue, label, clientRow.id]
+        );
+        res.json({
+            warm_follow_up_status: interestValue === null ? null : { interest_value: interestValue, label }
+        });
+    } catch (error) {
+        console.error('PUT warm-follow-up-status error:', error);
+        res.status(500).json({ error: 'Failed to save warm follow-up status.' });
     }
 });
 
@@ -1399,7 +1457,14 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
              ORDER BY script_order ASC`,
             [sqlClientId]
         );
-        res.json({ scripts: result.rows, send_days: sendDays });
+        const warmFollowUpStatus = clientRow.warm_follow_up_interest_value !== null
+            && clientRow.warm_follow_up_interest_value !== undefined
+            ? {
+                interest_value: Number(clientRow.warm_follow_up_interest_value),
+                label: clientRow.warm_follow_up_interest_label || null
+            }
+            : null;
+        res.json({ scripts: result.rows, send_days: sendDays, warm_follow_up_status: warmFollowUpStatus });
     } catch (err) {
         console.error('GET follow-up-scripts error:', err);
         res.status(500).json({ error: 'Internal server error' });

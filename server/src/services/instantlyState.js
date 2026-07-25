@@ -3112,3 +3112,62 @@ export async function sendInstantlyReply(apiKey, replyPayload) {
         body: replyPayload
     });
 }
+
+const LEAD_LABELS_PAGE_LIMIT = 100;
+const LEAD_LABELS_MAX_PAGES = 10;
+
+/**
+ * List the workspace's custom lead labels (interest statuses) via
+ * GET /api/v2/lead-labels, following pagination. Returns raw label objects
+ * ({ label, interest_status, interest_status_label, description, ... }).
+ *
+ * @param {string} apiKey Client Instantly API key.
+ */
+export async function listInstantlyLeadLabels(apiKey) {
+    const labels = [];
+    let startingAfter = null;
+
+    for (let page = 0; page < LEAD_LABELS_MAX_PAGES; page += 1) {
+        const params = new URLSearchParams({ limit: String(LEAD_LABELS_PAGE_LIMIT) });
+        if (startingAfter) params.set('starting_after', startingAfter);
+
+        const data = await instantlyRequest({
+            apiKey,
+            path: `/api/v2/lead-labels?${params.toString()}`,
+            method: 'GET'
+        });
+
+        const items = Array.isArray(data?.items)
+            ? data.items
+            : (Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []));
+        labels.push(...items);
+
+        const nextCursor = asNullableText(data?.next_starting_after);
+        if (items.length < LEAD_LABELS_PAGE_LIMIT || !nextCursor || nextCursor === startingAfter) {
+            break;
+        }
+        startingAfter = nextCursor;
+    }
+
+    return labels;
+}
+
+/**
+ * Set a lead's interest status via POST /api/v2/leads/update-interest-status.
+ * interestValue is the workspace-specific numeric value (custom labels included).
+ *
+ * @param {string} apiKey Client Instantly API key.
+ * @param {object} params { campaignId, leadEmail, interestValue }
+ */
+export async function updateInstantlyLeadInterestStatus(apiKey, { campaignId, leadEmail, interestValue }) {
+    return instantlyRequest({
+        apiKey,
+        path: '/api/v2/leads/update-interest-status',
+        method: 'POST',
+        body: {
+            campaign_id: campaignId,
+            lead_email: leadEmail,
+            interest_value: interestValue
+        }
+    });
+}

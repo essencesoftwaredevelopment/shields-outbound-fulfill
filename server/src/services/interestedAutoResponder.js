@@ -9,6 +9,10 @@ import {
     resolveTemplateVars,
     renderTemplate
 } from './followUpSender.js';
+import {
+    applyWarmFollowUpStatusAfterAutoresponderSend,
+    resolveWarmFollowUpStatusConfig
+} from './warmFollowUpStatus.js';
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1211,7 +1215,9 @@ async function loadPendingReviewDraft(token) {
                 ic.name AS campaign_name,
                 ic.instantly_campaign_id,
                 c.slug AS client_slug,
-                c.instantly_key AS client_instantly_key
+                c.instantly_key AS client_instantly_key,
+                c.warm_follow_up_interest_value AS client_warm_follow_up_interest_value,
+                c.warm_follow_up_interest_label AS client_warm_follow_up_interest_label
          FROM interested_autoresponder_drafts d
          JOIN instantly_campaigns ic ON ic.id = d.campaign_id
          JOIN clients c ON c.id = d.client_id AND c.agency_id = d.agency_id
@@ -1438,6 +1444,29 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
             [draft.id, sentEventId]
         );
         await client.query('COMMIT');
+
+        // Best-effort Instantly status update ("Warm Follow Up" label) after the
+        // send is committed: never blocks the response; outcome markers/logs are
+        // handled inside the service.
+        applyWarmFollowUpStatusAfterAutoresponderSend({
+            draftId: draft.id,
+            agencyId: draft.agency_id,
+            clientId: draft.client_id,
+            contactId: draft.contact_id,
+            campaignId: draft.campaign_id,
+            instantlyCampaignId: draft.instantly_campaign_id,
+            instantlyLeadId: draft.instantly_lead_id,
+            leadEmail: draft.lead_email,
+            apiKey: clientInstantlyKey,
+            statusConfig: resolveWarmFollowUpStatusConfig({
+                warm_follow_up_interest_value: draft.client_warm_follow_up_interest_value,
+                warm_follow_up_interest_label: draft.client_warm_follow_up_interest_label
+            }),
+            logger: (message) => console.log(message)
+        }).catch((error) => {
+            console.error(`[warm-follow-up-label] unexpected error draft=${draft.id}:`, error?.message || error);
+        });
+
         return { sent: true, sentEventId };
     } catch (error) {
         await client.query('ROLLBACK');
