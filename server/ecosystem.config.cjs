@@ -54,6 +54,21 @@ const baseEnv = {
     : {}),
   ...(envOrUnset('VULCAN_AUDIT_READY_WAIT_MS')
     ? { VULCAN_AUDIT_READY_WAIT_MS: process.env.VULCAN_AUDIT_READY_WAIT_MS }
+    : {}),
+  ...(envOrUnset('CRON_SECRET')
+    ? { CRON_SECRET: process.env.CRON_SECRET }
+    : {}),
+  ...(envOrUnset('WORKFLOW_TRIGGER_SECRET')
+    ? { WORKFLOW_TRIGGER_SECRET: process.env.WORKFLOW_TRIGGER_SECRET }
+    : {}),
+  ...(envOrUnset('ENRICHMENT_RUNNER')
+    ? { ENRICHMENT_RUNNER: process.env.ENRICHMENT_RUNNER }
+    : {}),
+  ...(envOrUnset('APP_URL')
+    ? { APP_URL: process.env.APP_URL }
+    : {}),
+  ...(envOrUnset('VERCEL_PROTECTION_BYPASS')
+    ? { VERCEL_PROTECTION_BYPASS: process.env.VERCEL_PROTECTION_BYPASS }
     : {})
 };
 
