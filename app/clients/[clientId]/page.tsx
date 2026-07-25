@@ -789,6 +789,18 @@ type FollowUpScript = {
     updated_at: string;
 };
 
+type WarmFollowUpStatusConfig = {
+    interest_value: number;
+    label: string | null;
+};
+
+type InstantlyLeadLabelOption = {
+    value: number;
+    label: string;
+    sentiment: string | null;
+    description: string | null;
+};
+
 type InterestedAutoResponderPrompt = {
     id: number;
     agency_id: string;
@@ -1334,6 +1346,10 @@ export default function ClientPage() {
     // Follow-up schedule (DOW: 0=Sun … 6=Sat). Weekdays by default.
     const [followUpSendDays, setFollowUpSendDays] = useState<number[]>([1, 2, 3, 4, 5]);
     const [savingFollowUpSchedule, setSavingFollowUpSchedule] = useState(false);
+    const [warmFollowUpStatus, setWarmFollowUpStatus] = useState<WarmFollowUpStatusConfig | null>(null);
+    const [instantlyLeadLabels, setInstantlyLeadLabels] = useState<InstantlyLeadLabelOption[] | null>(null);
+    const [instantlyLeadLabelsLoading, setInstantlyLeadLabelsLoading] = useState(false);
+    const [savingWarmFollowUpStatus, setSavingWarmFollowUpStatus] = useState(false);
     const [followUpPreviewLeadSearch, setFollowUpPreviewLeadSearch] = useState('');
     const [debouncedFollowUpPreviewLeadSearch, setDebouncedFollowUpPreviewLeadSearch] = useState('');
     const [followUpPreviewLeadResults, setFollowUpPreviewLeadResults] = useState<Lead[]>([]);
@@ -4545,6 +4561,7 @@ export default function ClientPage() {
                     if (Array.isArray(scriptData.send_days) && scriptData.send_days.length > 0) {
                         setFollowUpSendDays(scriptData.send_days);
                     }
+                    setWarmFollowUpStatus(scriptData.warm_follow_up_status ?? null);
                     setInterestedAutoResponderPrompts(prompts || []);
                     setAutoResponderCampaigns(campaignOptions || []);
                 }
@@ -5535,6 +5552,62 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setSavingFollowUpSchedule(false);
+        }
+    };
+
+    const loadInstantlyLeadLabels = async () => {
+        if (!user || !clientId || instantlyLeadLabelsLoading) return;
+        setInstantlyLeadLabelsLoading(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/instantly/lead-labels`,
+                { headers: { Authorization: `Bearer ${idToken}` } }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to load Instantly statuses');
+            setInstantlyLeadLabels(data.labels || []);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to load Instantly statuses');
+            setToastVisible(true);
+        } finally {
+            setInstantlyLeadLabelsLoading(false);
+        }
+    };
+
+    const handleSaveWarmFollowUpStatus = async (selection: WarmFollowUpStatusConfig | null) => {
+        if (!user || !clientId) return;
+        setSavingWarmFollowUpStatus(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/warm-follow-up-status`,
+                {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify(
+                        selection
+                            ? { interest_value: selection.interest_value, label: selection.label }
+                            : { interest_value: null, label: null }
+                    )
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to save Instantly status');
+            setWarmFollowUpStatus(data.warm_follow_up_status ?? null);
+            setToastMessage(
+                data.warm_follow_up_status
+                    ? `Leads will be marked "${data.warm_follow_up_status.label}" in Instantly after autoresponder sends.`
+                    : 'Instantly status updates after autoresponder sends are disabled.'
+            );
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save Instantly status');
+            setToastVisible(true);
+        } finally {
+            setSavingWarmFollowUpStatus(false);
         }
     };
 
@@ -10123,6 +10196,83 @@ export default function ClientPage() {
                                     </div>
                                 );
                             })()}
+
+                            {/* Instantly status applied after autoresponder sends */}
+                            <div style={{
+                                padding: '0.9rem 1rem',
+                                borderRadius: '10px',
+                                background: 'var(--app-surface-3)',
+                                border: '1px solid var(--app-border)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '1rem',
+                                flexWrap: 'wrap'
+                            }}>
+                                <div style={{ flexShrink: 0 }}>
+                                    <span style={{ fontSize: '0.8rem', color: 'var(--app-text-ghost)', fontWeight: 500, display: 'block' }}>
+                                        Instantly status after autoresponder
+                                    </span>
+                                    <span style={{ fontSize: '0.75rem', color: 'var(--app-text-faint)' }}>
+                                        Applied to the lead in Instantly right after each autoresponder send.
+                                    </span>
+                                </div>
+                                {warmFollowUpStatus ? (
+                                    <span className="status-badge status-badge--active" style={{ flexShrink: 0 }}>
+                                        {warmFollowUpStatus.label || `Status ${warmFollowUpStatus.interest_value}`}
+                                    </span>
+                                ) : (
+                                    <span className="status-badge status-badge--inactive" style={{ flexShrink: 0 }}>
+                                        Not set — status stays unchanged
+                                    </span>
+                                )}
+                                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginLeft: 'auto', flexWrap: 'wrap' }}>
+                                    <select
+                                        value={warmFollowUpStatus ? String(warmFollowUpStatus.interest_value) : ''}
+                                        disabled={savingWarmFollowUpStatus || instantlyLeadLabelsLoading}
+                                        onFocus={() => {
+                                            if (instantlyLeadLabels === null) loadInstantlyLeadLabels();
+                                        }}
+                                        onChange={(e) => {
+                                            const raw = e.target.value;
+                                            if (raw === '') {
+                                                handleSaveWarmFollowUpStatus(null);
+                                                return;
+                                            }
+                                            const option = (instantlyLeadLabels || []).find((item) => String(item.value) === raw);
+                                            if (option) {
+                                                handleSaveWarmFollowUpStatus({ interest_value: option.value, label: option.label });
+                                            }
+                                        }}
+                                    >
+                                        <option value="">
+                                            {instantlyLeadLabelsLoading
+                                                ? 'Loading statuses…'
+                                                : (instantlyLeadLabels === null ? 'Choose status…' : 'Disabled (no status)')}
+                                        </option>
+                                        {(instantlyLeadLabels || (warmFollowUpStatus
+                                            ? [{
+                                                value: warmFollowUpStatus.interest_value,
+                                                label: warmFollowUpStatus.label || `Status ${warmFollowUpStatus.interest_value}`,
+                                                sentiment: null,
+                                                description: null
+                                            }]
+                                            : [])).map((item) => (
+                                            <option key={item.value} value={String(item.value)}>
+                                                {item.label}{item.sentiment ? ` (${item.sentiment})` : ''}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        type="button"
+                                        className="secondary-button"
+                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                        onClick={() => loadInstantlyLeadLabels()}
+                                        disabled={instantlyLeadLabelsLoading}
+                                    >
+                                        {instantlyLeadLabelsLoading ? '…' : 'Refresh'}
+                                    </button>
+                                </div>
+                            </div>
 
                             {followUpScriptsLoading ? (
                                 <p style={{ color: 'var(--app-text-faint)', fontSize: '0.875rem' }}>Loading scripts…</p>
