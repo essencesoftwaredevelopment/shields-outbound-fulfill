@@ -740,7 +740,12 @@ export async function getPersonalizeQueue(
             personalizationFilter = ''; // legacy full reprocess
         }
     } else {
-        personalizationFilter = `AND (c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')`;
+        // The completed_at guard matches getEmailFindQueue's skip-mode semantics:
+        // a row attempted this-or-any run (any outcome — see
+        // markPersonalizationAttempted) must not re-enter the queue, or a contact
+        // that never yields a first line livelocks finalize's completion guard.
+        personalizationFilter = `AND (c.personalization_first_line IS NULL OR BTRIM(c.personalization_first_line) = '')
+           AND c.personalization_completed_at IS NULL`;
     }
     const emailStatusFilter = requireValidEmail
         // `contacts.email_status` is normalized to `risky` (see normalizeEmailStatus in `services/leads.js`),
@@ -783,6 +788,39 @@ export async function getPersonalizeQueue(
         params
     );
     return result.rows;
+}
+
+/**
+ * Stamp `personalization_completed_at` for contacts a personalization pass
+ * ATTEMPTED, regardless of outcome — mirroring `email_find_completed_at`'s
+ * "any outcome" semantics.
+ *
+ * Without this, a contact whose personalization fails or yields no line is
+ * never stamped (the upsert path only stamps rows WITH a non-empty first
+ * line), so `getPersonalizeQueue` re-serves it forever and finalize's
+ * completion guard pauses the job with "unprocessed work remaining" on every
+ * resume — a livelock (job 1785076206274-7530hn, 2026-07-26: 579 such rows).
+ *
+ * Failed rows are still redone by a future include-mode job: their stamp is
+ * older than that job's `created_at`, so its queue picks them up again.
+ */
+export async function markPersonalizationAttempted(agencyId, clientId, contactIds, jobStartedAt = null) {
+    if (!Array.isArray(contactIds) || contactIds.length === 0) return 0;
+    const params = [agencyId, clientId, contactIds];
+    let staleGuard = 'c.personalization_completed_at IS NULL';
+    if (jobStartedAt) {
+        params.push(jobStartedAt);
+        staleGuard = `(c.personalization_completed_at IS NULL OR c.personalization_completed_at < $${params.length}::timestamptz)`;
+    }
+    const result = await pool.query(
+        `UPDATE contacts c
+            SET personalization_completed_at = NOW()
+          WHERE c.agency_id = $1 AND c.client_id = $2
+            AND c.id = ANY($3::bigint[])
+            AND ${staleGuard}`,
+        params
+    );
+    return result.rowCount ?? 0;
 }
 
 /** Count finished leads for a job without materializing every row. */

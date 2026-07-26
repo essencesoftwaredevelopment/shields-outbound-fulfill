@@ -1,4 +1,4 @@
-import { getPersonalizeQueue, getJobById } from '../../services/db/jobs.js';
+import { getPersonalizeQueue, getJobById, markPersonalizationAttempted } from '../../services/db/jobs.js';
 import { upsertLeadRowsBatch } from '../../services/leads.js';
 import { runPersonalizationFromRows } from '../../services/personalization/index.js';
 import { runPersonalization as runShoppingAuditPersonalization } from '../../services/personalization/strategies/shoppingAudit.js';
@@ -83,7 +83,7 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
     if (ctx.pipelineMode === 'shopping_audit') {
         const signalEmissionByDomain = await buildSignalMap(ctx, rows.map((r) => r.domain));
         const rateLimitHooks = createRateLimitHooks(ctx);
-        const summary = await runShoppingAuditPersonalization({
+        const auditSummary = await runShoppingAuditPersonalization({
             rows,
             apiKeys: ctx.apiKeys,
             log: stageLog,
@@ -109,11 +109,22 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
             }
         });
 
+        // Attempted-any-outcome stamp (see markPersonalizationAttempted): rows the
+        // strategy failed or skipped must leave the queue, or finalize's completion
+        // guard re-pauses the job forever. Runs only on normal completion — a
+        // pause/cancel throw above skips it, so unattempted rows stay queued.
+        await markPersonalizationAttempted(
+            ctx.agencyId,
+            ctx.clientId,
+            queue.map((r) => r.contact_id).filter(Boolean),
+            jobRow?.created_at || null
+        );
+
         await finishJobStage(ctx, 'personalization', {
-            personalized: summary.processed,
-            ...summary
+            personalized: auditSummary.processed,
+            ...auditSummary
         });
-        return summary;
+        return auditSummary;
     }
 
     const summary = await runPersonalizationFromRows({
@@ -139,6 +150,14 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
             });
         }
     });
+
+    // Same attempted-any-outcome stamp as the shopping-audit path above.
+    await markPersonalizationAttempted(
+        ctx.agencyId,
+        ctx.clientId,
+        queue.map((r) => r.contact_id).filter(Boolean),
+        jobRow?.created_at || null
+    );
 
     await finishJobStage(ctx, 'personalization', {
         personalized: summary.processed ?? summary.personalized ?? 0,
