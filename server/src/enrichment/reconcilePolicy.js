@@ -11,3 +11,10 @@ export function shouldScheduleChildReconcile(ctx) {
     const runner = String(ctx?.options?.executionRunner || 'pm2').toLowerCase();
     return runner !== 'vercel';
 }
+
+/**
+ * Throttle for the Vercel liveness ping that replaces the suppressed reconcile
+ * tick. Must stay well under `reapStalledWorkflows`' 20-minute stall window;
+ * 30s keeps `jobs.updated_at` fresh at ~2 indexed UPDATEs per minute per child.
+ */
+export const CHILD_HEARTBEAT_MS = 30_000;

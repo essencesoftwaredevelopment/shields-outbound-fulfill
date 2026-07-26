@@ -18,6 +18,7 @@ import * as leadsService from '../services/leads.js';
 import * as leadImportService from '../services/leadImport.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
+import { queryWithStatementTimeout } from '../config/db.js';
 import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
 import { normalizeDomain } from '../utils/domain.js';
 import { SIGNAL_TYPES } from '../services/shoppingAudit/constants.js';
@@ -945,7 +946,28 @@ function parseLeadFiltersInput(rawFilters) {
     return { clauses: [] };
 }
 
-function buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilterInsights) {
+/**
+ * `filter_campaign_stats` aggregates every campaign membership for the tenant
+ * (78k contacts / 116k rows on the largest client), so its shape decides the cost
+ * of the whole leads list. Two things keep it cheap:
+ *
+ * 1. `COUNT(*)` instead of `COUNT(DISTINCT cic.campaign_id)`. The primary key is
+ *    `(contact_id, campaign_id)`, so within a `GROUP BY cic.contact_id` group
+ *    campaign_id is already unique — the DISTINCT is provably redundant, and it
+ *    was forcing a sort.
+ * 2. The two `ARRAY_AGG(DISTINCT LOWER(...))` columns are built only when an
+ *    `instantly_status` filter actually reads them. They are the only other
+ *    per-group sort in the aggregate.
+ *
+ * Together those flip the plan from a disk-spilling GroupAggregate to a
+ * HashAggregate: measured 3,559 ms → 586 ms on agency HoPJjMpaKjMqw6TCjlzz9jYEoFM2
+ * / client 2, identical 78,277 output rows.
+ */
+function buildLeadListBaseWithClause(
+    requiresFilterCampaignStats,
+    requiresFilterInsights,
+    { requiresStatusLabels = true } = {}
+) {
     return `
             WITH scoped_companies AS (
                 SELECT
@@ -968,11 +990,11 @@ function buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilter
             filter_campaign_stats AS (
                 SELECT
                     cic.contact_id,
-                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
-                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    COUNT(*)::int AS campaign_count_all_time,
+                    COUNT(*) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
                     MAX(cic.added_at) AS last_campaign_added_at,
                     MAX(cic.timestamp_last_reply) AS last_reply_at,
-                    BOOL_OR(cic.email_reply_count > 0) AS has_replied,
+                    BOOL_OR(cic.email_reply_count > 0) AS has_replied${requiresStatusLabels ? `,
                     ARRAY_REMOVE(
                         ARRAY_AGG(DISTINCT LOWER(cic.lead_status_label)) FILTER (
                             WHERE cic.active = TRUE
@@ -986,7 +1008,7 @@ function buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilter
                             AND cic.interest_status_label IS NOT NULL
                         ),
                         NULL
-                    ) AS active_interest_status_labels
+                    ) AS active_interest_status_labels` : ''}
                 FROM contact_instantly_campaigns cic
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 GROUP BY cic.contact_id
@@ -1308,7 +1330,11 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
     paramIndex = paramsState.paramIndex;
 
     const filterParams = [...params];
-    const baseWithClause = buildLeadListBaseWithClause(requiresFilterCampaignStats, requiresFilterInsights);
+    const baseWithClause = buildLeadListBaseWithClause(
+        requiresFilterCampaignStats,
+        requiresFilterInsights,
+        { requiresStatusLabels: leadFiltersRequireStatusLabels(dynamicFilters) }
+    );
     const filterJoins = `
             ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
             ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}`;
@@ -1340,6 +1366,17 @@ function leadFiltersRequireCampaignStats(filters) {
         const fieldKey = normalizeOptionalText(filter?.field)?.toLowerCase() || '';
         return CAMPAIGN_STATS_FILTER_FIELDS.has(fieldKey);
     });
+}
+
+/**
+ * Only an `instantly_status` filter reads `active_lead_status_labels` /
+ * `active_interest_status_labels`. Every other campaign-stats filter can skip
+ * the two ARRAY_AGG(DISTINCT …) columns — see buildLeadListBaseWithClause.
+ */
+function leadFiltersRequireStatusLabels(filters) {
+    return filters.some(
+        (filter) => normalizeOptionalText(filter?.field)?.toLowerCase() === 'instantly_status'
+    );
 }
 
 function leadFiltersRequireInsights(filters) {
@@ -2109,7 +2146,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         }
 
         if (isCountOnly) {
-            const countResult = await pool.query(countQuery, filterParams);
+            const countResult = await queryWithStatementTimeout(countQuery, filterParams);
             const total = parseInt(countResult.rows[0]?.count || 0, 10);
             return res.json({
                 leads: [],
@@ -2156,8 +2193,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             paged_campaign_stats AS (
                 SELECT
                     cic.contact_id,
-                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
-                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    COUNT(*)::int AS campaign_count_all_time,
+                    COUNT(*) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
                     MAX(cic.added_at) AS last_campaign_added_at,
                     json_agg(
                         json_build_object(
@@ -2254,13 +2291,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         `;
         params.push(parsedLimit + 1, parsedOffset);
 
-        const result = await pool.query(contactsQuery, params);
+        const result = await queryWithStatementTimeout(contactsQuery, params);
         const hasMore = result.rows.length > parsedLimit;
         const pagedRows = hasMore ? result.rows.slice(0, parsedLimit) : result.rows;
         let total = null;
 
         if (shouldIncludeTotal) {
-            const countResult = await pool.query(countQuery, filterParams);
+            const countResult = await queryWithStatementTimeout(countQuery, filterParams);
             total = parseInt(countResult.rows[0]?.count || 0, 10);
         }
 
@@ -3471,8 +3508,8 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
             campaign_stats AS (
                 SELECT
                     cic.contact_id,
-                    COUNT(DISTINCT cic.campaign_id)::int AS campaign_count_all_time,
-                    COUNT(DISTINCT cic.campaign_id) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
+                    COUNT(*)::int AS campaign_count_all_time,
+                    COUNT(*) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
                     MAX(cic.added_at) AS last_campaign_added_at,
                     MAX(cic.timestamp_last_reply) AS last_reply_at,
                     BOOL_OR(cic.email_reply_count > 0) AS has_replied,
