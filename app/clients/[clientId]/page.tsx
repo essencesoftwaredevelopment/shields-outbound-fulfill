@@ -16,6 +16,7 @@ import { useAgencyId } from "@/lib/hooks/useAgencyId";
 import { apiFetch, apiJson } from "@/lib/api/http";
 import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
+import { AnimatedNumber } from "@/components/animated-number";
 import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
 import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
@@ -9060,15 +9061,15 @@ export default function ClientPage() {
                                                     fontVariantNumeric: 'tabular-nums'
                                                 }}>
                                                     <span style={{ opacity: 0.5, fontSize: '0.75rem' }}>Pipeline flow:</span>
-                                                    <span style={{ fontWeight: '600' }}>{foundersProcessed.toLocaleString()}</span>
+                                                    <span style={{ fontWeight: '600' }}><AnimatedNumber value={foundersProcessed} /></span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}>{foundersFoundDisplay.toLocaleString()}</span>
+                                                    <span style={{ fontWeight: '600' }}><AnimatedNumber value={foundersFoundDisplay} /></span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}>{emailsFound.toLocaleString()}</span>
+                                                    <span style={{ fontWeight: '600' }}><AnimatedNumber value={emailsFound} /></span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: '#22c55e' }}>{safe.toLocaleString()}</span>
+                                                    <span style={{ fontWeight: '600', color: '#22c55e' }}><AnimatedNumber value={safe} /></span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: '#3b82f6' }}>{personalized.toLocaleString()}</span>
+                                                    <span style={{ fontWeight: '600', color: '#3b82f6' }}><AnimatedNumber value={personalized} /></span>
                                                 </div>
                                             );
                                         })()}
@@ -9084,7 +9085,7 @@ export default function ClientPage() {
                                                 fontVariantNumeric: "tabular-nums",
                                             }}>
                                                 <span style={{ opacity: 0.65 }}>Estimated run cost </span>
-                                                <strong>${displayJobCost.toFixed(2)}</strong>
+                                                <strong><AnimatedNumber value={displayJobCost} decimals={2} prefix="$" /></strong>
                                             </div>
                                         )}
                                         
@@ -9340,7 +9341,7 @@ export default function ClientPage() {
                                                         <>
                                                             <div style={{ marginTop: '0.75rem' }}>
                                                                 <div style={{ fontSize: '2.25rem', fontWeight: '700', lineHeight: '1' }}>
-                                                                    {heroNumber.toLocaleString()}
+                                                                    <AnimatedNumber value={heroNumber} />
                                                                     <span style={{ fontSize: '1rem', fontWeight: '500', marginLeft: '0.5rem', opacity: 0.7 }}>{heroLabel}</span>
                                                                 </div>
                                                                 <div style={{ fontSize: '0.875rem', marginTop: '0.5rem', opacity: 0.65 }}>
