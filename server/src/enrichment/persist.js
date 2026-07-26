@@ -80,6 +80,26 @@ export async function setJobActivity(jobId, agencyId, message) {
     );
 }
 
+/**
+ * Cheap liveness ping for the stall reaper.
+ *
+ * Vercel child batches no longer run live reconciles (see `reconcilePolicy.js`),
+ * and `jobs.updated_at` is what `reapStalledWorkflows` uses to decide a job is
+ * dead. Its second signal — "no `api_rate_limit_events` in 90s" — is not a
+ * reliable fallback: TryKitt runs concurrency-only whenever no per-agency RPM is
+ * configured (`DEFAULT_RPM.trykitt` is null), so `runWithProviderLimit` skips the
+ * RPM gate and writes no events at all. A wave sitting in a long verification
+ * stage would then look dead on both signals and be reaped mid-flight.
+ *
+ * One indexed UPDATE by primary key, throttled by the caller — no cohort scan.
+ */
+export async function touchJobHeartbeat(jobId, agencyId) {
+    await pool.query(
+        `UPDATE jobs SET updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
+        [jobId, agencyId]
+    );
+}
+
 export async function finalizeJobSuccess(jobId, agencyId, { cost = 0, finishedCount = 0 } = {}) {
     // error = NULL: a successfully finalized job must not keep showing a stale
     // stall/pause message (incident §5.5). The autoResumeAttempts counter also

@@ -1,5 +1,6 @@
 import { pool } from '../config/db.js';
 import { normalizeStageSummary, extractStageCostAmount } from '../utils/pricing.js';
+import { shouldScheduleChildReconcile, CHILD_HEARTBEAT_MS } from './reconcilePolicy.js';
 
 export const WORKFLOW_BATCH_SIZE = 100;
 
@@ -397,6 +398,7 @@ export function createStageLogger(ctx, stageKey, options = {}) {
     const { label = stageKey } = options;
 
     let lastReconcileAt = 0;
+    let lastHeartbeatAt = 0;
     const MIN_RECONCILE_MS = 1500;
 
     return (message, meta) => {
@@ -405,14 +407,23 @@ export function createStageLogger(ctx, stageKey, options = {}) {
         }
 
         const now = Date.now();
-        if (now - lastReconcileAt < MIN_RECONCILE_MS) return;
-        lastReconcileAt = now;
 
-        void import('./stageReconcileScheduler.js').then(({ scheduleStageReconcile }) => {
-            // Debounce across parallel child isolates — immediate (0) reconciles used to
-            // stampede countJobStageStats while holding the jobs row lock.
-            scheduleStageReconcile(ctx.jobId, ctx.agencyId);
-        }).catch(() => {});
+        if (shouldScheduleChildReconcile(ctx)) {
+            if (now - lastReconcileAt < MIN_RECONCILE_MS) return;
+            lastReconcileAt = now;
+            void import('./stageReconcileScheduler.js').then(({ scheduleStageReconcile }) => {
+                scheduleStageReconcile(ctx.jobId, ctx.agencyId);
+            }).catch(() => {});
+            return;
+        }
+
+        // Vercel children skip the reconcile, but the stall reaper still reads
+        // jobs.updated_at as its liveness signal — keep it moving cheaply.
+        if (now - lastHeartbeatAt < CHILD_HEARTBEAT_MS) return;
+        lastHeartbeatAt = now;
+        void import('./persist.js')
+            .then(({ touchJobHeartbeat }) => touchJobHeartbeat(ctx.jobId, ctx.agencyId))
+            .catch(() => {});
     };
 }
 
@@ -422,8 +433,10 @@ export async function beginJobStage(ctx, stageKey, { activity } = {}) {
         const { setJobActivity } = await import('./persist.js');
         await setJobActivity(ctx.jobId, ctx.agencyId, activity);
     }
-    const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
-    scheduleStageReconcile(ctx.jobId, ctx.agencyId);
+    if (shouldScheduleChildReconcile(ctx)) {
+        const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
+        scheduleStageReconcile(ctx.jobId, ctx.agencyId);
+    }
 }
 
 /** Cost merge + reconcile — batches no longer set status/summary/progress. */
@@ -432,8 +445,16 @@ export async function finishJobStage(ctx, stageKey, batchSummary) {
         const normalized = normalizeStageSummary(batchSummary);
         await persistStageCostOnly(ctx.jobId, ctx.agencyId, stageKey, normalized);
     }
-    const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
-    scheduleStageReconcile(ctx.jobId, ctx.agencyId, 0);
+    if (shouldScheduleChildReconcile(ctx)) {
+        const { scheduleStageReconcile } = await import('./stageReconcileScheduler.js');
+        scheduleStageReconcile(ctx.jobId, ctx.agencyId, 0);
+        return;
+    }
+    // Stage boundary on Vercel: no reconcile, so ping liveness instead. A stage
+    // that finishes without ever logging (empty queue) would otherwise leave
+    // jobs.updated_at untouched for the whole batch.
+    const { touchJobHeartbeat } = await import('./persist.js');
+    await touchJobHeartbeat(ctx.jobId, ctx.agencyId).catch(() => {});
 }
 
 /**

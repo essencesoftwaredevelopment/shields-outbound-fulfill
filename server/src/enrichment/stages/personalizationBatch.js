@@ -10,6 +10,7 @@ import {
     finishJobStage,
     createStageLogger
 } from '../stageProgress.js';
+import { shouldScheduleChildReconcile } from '../reconcilePolicy.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -102,7 +103,8 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
                     })),
                     type: 'personalization',
                     jobId: ctx.jobId,
-                    mergeMode: enrichmentMergeMode(ctx)
+                    mergeMode: enrichmentMergeMode(ctx),
+                    reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
                 });
             }
         });
@@ -132,7 +134,8 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
                 rows: batchRows,
                 type: 'personalization',
                 jobId: ctx.jobId,
-                mergeMode: enrichmentMergeMode(ctx)
+                mergeMode: enrichmentMergeMode(ctx),
+                reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
             });
         }
     });

@@ -11,6 +11,7 @@ import {
     resolveJobTotal,
     batchProgressOffset
 } from '../stageProgress.js';
+import { shouldScheduleChildReconcile } from '../reconcilePolicy.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -86,7 +87,8 @@ export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
                 rows,
                 type: 'verification',
                 jobId: ctx.jobId,
-                mergeMode: enrichmentMergeMode(ctx)
+                mergeMode: enrichmentMergeMode(ctx),
+                reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
             });
         }
     });

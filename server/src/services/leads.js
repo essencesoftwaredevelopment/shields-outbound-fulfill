@@ -109,7 +109,8 @@ export async function upsertFounderSearchBatch({
     jobId,
     rows,
     mergeMode = 'preserve',
-    onTiming = null
+    onTiming = null,
+    reconcileAfterWrite = true
 }) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     if (!agencyId || !clientId) return;
@@ -143,7 +144,8 @@ export async function upsertFounderSearchBatch({
             type: 'founders',
             jobId,
             mergeMode,
-            onTiming
+            onTiming,
+            reconcileAfterWrite
         });
     }
 }
@@ -158,7 +160,8 @@ export async function upsertLeadRowsBatch({
     type,
     jobId = null,
     mergeMode = 'preserve',
-    onTiming = null
+    onTiming = null,
+    reconcileAfterWrite = true
 }) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     if (!agencyId || !clientId) return;
@@ -253,7 +256,7 @@ export async function upsertLeadRowsBatch({
         });
     }
 
-    if (jobId && agencyId) {
+    if (reconcileAfterWrite && jobId && agencyId) {
         void import('../enrichment/stageReconcileScheduler.js')
             .then(({ scheduleStageReconcile }) => scheduleStageReconcile(jobId, agencyId))
             .catch(() => {});
