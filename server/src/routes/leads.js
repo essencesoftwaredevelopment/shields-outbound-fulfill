@@ -962,6 +962,12 @@ function parseLeadFiltersInput(rawFilters) {
  * Together those flip the plan from a disk-spilling GroupAggregate to a
  * HashAggregate: measured 3,559 ms → 586 ms on agency HoPJjMpaKjMqw6TCjlzz9jYEoFM2
  * / client 2, identical 78,277 output rows.
+ *
+ * MATERIALIZED is load-bearing: the CTE is referenced once, so without it the
+ * planner inlines the aggregate — and when the outer row estimate collapses to 1
+ * (e.g. expression filters it has no stats for), it happily nested-loops the
+ * whole aggregate per outer row. That exact plan took the vulcan-digital export
+ * from ~190 ms to 41.7 s (statement timeout).
  */
 function buildLeadListBaseWithClause(
     requiresFilterCampaignStats,
@@ -987,7 +993,7 @@ function buildLeadListBaseWithClause(
                 AND client_id = $2
             )
             ${requiresFilterCampaignStats ? `,
-            filter_campaign_stats AS (
+            filter_campaign_stats AS MATERIALIZED (
                 SELECT
                     cic.contact_id,
                     COUNT(*)::int AS campaign_count_all_time,
@@ -2058,7 +2064,7 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
  *   - jobId: Filter by exact job_id
  *   - createdAfter: Filter leads created after date (ISO 8601 format)
  *   - createdBefore: Filter leads created before date (ISO 8601 format)
- *   - limit: Max results (default 200, max 500)
+ *   - limit: Max results (default 200, max 5000)
  *   - offset: Pagination offset (default 0)
  *
  * Authorization: Bearer <idToken> (required)
@@ -2189,10 +2195,21 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 WHERE ${whereClause}
                 ORDER BY ${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC, c.id DESC
                 LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
-            ),
-            paged_campaign_stats AS (
+            )
+        `;
+
+        /*
+         * Per-contact campaign stats via LATERAL instead of a GROUP BY CTE joined
+         * on contact_id. The join form left the planner free to nested-loop the
+         * whole aggregate per paged contact when it misestimated the page at 1 row
+         * (5.5M rows removed by join filter, 41.7 s on the vulcan-digital export).
+         * The lateral pins that decision: one indexed probe per paged contact,
+         * bounded by the page size. HAVING keeps old LEFT JOIN semantics —
+         * contacts with no campaign memberships get NULL stats, not zeroes.
+         */
+        const pagedCampaignStatsLateralJoin = `
+            LEFT JOIN LATERAL (
                 SELECT
-                    cic.contact_id,
                     COUNT(*)::int AS campaign_count_all_time,
                     COUNT(*) FILTER (WHERE cic.active = TRUE)::int AS campaign_count_active,
                     MAX(cic.added_at) AS last_campaign_added_at,
@@ -2214,10 +2231,9 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     ) FILTER (WHERE cic.active = TRUE) AS campaigns_data
                 FROM contact_instantly_campaigns cic
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
-                JOIN paged_contacts pc_scope ON pc_scope.id = cic.contact_id
-                GROUP BY cic.contact_id
-            )
-        `;
+                WHERE cic.contact_id = pc.id
+                HAVING COUNT(*) > 0
+            ) pcs ON TRUE`;
 
         const latestEventSelect = shouldIncludeLatestEvent
             ? `
@@ -2284,7 +2300,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 ${latestEventSelect}
                 pcs.campaigns_data
             FROM paged_contacts pc
-            LEFT JOIN paged_campaign_stats pcs ON pcs.contact_id = pc.id
+            ${pagedCampaignStatsLateralJoin}
             LEFT JOIN contact_insights ci ON ci.contact_id = pc.id
             ${latestEventJoin}
             ORDER BY ${requiresFilterCampaignStats ? 'pc.last_campaign_added_at DESC NULLS LAST, ' : ''}pc.created_at DESC, pc.id DESC
@@ -3505,7 +3521,7 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
                 WHERE agency_id = $1
                 AND client_id = $2
             ),
-            campaign_stats AS (
+            campaign_stats AS MATERIALIZED (
                 SELECT
                     cic.contact_id,
                     COUNT(*)::int AS campaign_count_all_time,
