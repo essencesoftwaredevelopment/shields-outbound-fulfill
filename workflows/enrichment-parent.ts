@@ -6,8 +6,22 @@
  * O(children × steps). Direct-await composition flattened every child step into
  * this run's event log and hit the platform's 240s REPLAY_TIMEOUT at ~11k domains
  * (see server/docs/shopping-audit-replay-timeout-2026-07-21.md).
+ *
+ * Scheduling is a SLIDING WINDOW, not waves: `waveConcurrency` children stay in
+ * flight at all times, and the next batch spawns the moment one completes. The
+ * previous wave barrier made the whole job wait on each wave's slowest child
+ * (e.g. a TryKitt verification tail) and cold-started every wave's children
+ * simultaneously — the synchronized herd behind the wave-boundary pg-pool
+ * connect-timeout bursts (see
+ * server/docs/wave-boundary-connection-storms-2026-07-26.md). Spawning one
+ * child per step also serializes cold-starts naturally.
+ *
+ * `Promise.race` over completion hooks is replay-safe on workflow@4.5: the
+ * runtime hands hook resolutions to workflow code in strict event-log order
+ * (see awaitEarlierDeliveries in @workflow/core), so the race winner is
+ * deterministic and independent of race-argument order.
  */
-import { createHook } from 'workflow';
+import { createHook, type Hook } from 'workflow';
 import { start } from 'workflow/api';
 import type { ParentWorkflowInput } from '@/lib/enrichment/types';
 import {
@@ -19,6 +33,13 @@ import type {
   ChildCompletionError,
   ChildCompletionPayload,
 } from '@/lib/enrichment/childCompletion';
+import {
+  applyCompletion,
+  applySpawn,
+  createWindowState,
+  haltScheduling,
+  nextAction,
+} from '@/lib/enrichment/slidingWindow';
 import { isStartRejection } from '@/lib/enrichment/startRejection';
 import { enrichmentChildRun, type ChildRunInput } from './enrichment-child';
 
@@ -36,111 +57,115 @@ export async function enrichmentParentWorkflow(input: ParentWorkflowInput) {
     await domainPrepStep(input);
 
     const plan = await prepareBatchPlanStep(input);
-    const completedBatches: ChildCompletionPayload[] = [];
-    let failedBatches = 0;
-    let firstFailure: ChildCompletionError | null = null;
+    const state = createWindowState(plan.batches.length, plan.waveConcurrency);
 
     if (plan.batches.length) {
-      for (
-        let offset = 0;
-        offset < plan.batches.length;
-        offset += plan.waveConcurrency
-      ) {
-        await assertJobActiveStep(input);
+      // One completion hook per child, created just before its spawn.
+      // Auto-generated (random) tokens: they are handed to each child via its
+      // input, and unlike deterministic tokens they can never collide with a
+      // lingering hook of a previous run for this job. The SDK commits hook
+      // registrations at suspension BEFORE queueing steps, so each hook is
+      // durably registered before its spawn step runs — a child can never
+      // report to an unregistered hook. Hooks are not explicitly disposed:
+      // run-end cleanup releases them without spending an extra hook_disposed
+      // event per child on this log.
+      const inFlightHooks = new Map<number, Hook<ChildCompletionPayload>>();
+      // On a spawn-step failure (job paused, start() error) we stop scheduling
+      // but DRAIN in-flight children before rethrowing, so no child ends up
+      // reporting to a released hook of an already-ended parent run.
+      let spawnFailure: unknown = null;
+      let completionsSinceReconcile = 0;
 
-        const wave = plan.batches.slice(offset, offset + plan.waveConcurrency);
+      for (;;) {
+        const action = nextAction(state);
+        if (action.kind === 'done') break;
 
-        // One completion hook per child. Auto-generated (random) tokens: they are
-        // handed to each child via its input, and unlike deterministic tokens they
-        // can never collide with a lingering hook of a previous run for this job.
-        // The SDK commits hook registrations at suspension BEFORE queueing steps,
-        // so every hook below is durably registered before the spawn step runs —
-        // a child can never report to an unregistered hook. Hooks are not
-        // explicitly disposed: run-end cleanup releases them without spending an
-        // extra hook_disposed event per child on this log.
-        const waveHooks = wave.map(() => createHook<ChildCompletionPayload>());
-
-        await spawnWaveChildrenStep(
-          input,
-          wave.map(
-            (batch, waveIndex): ChildRunInput => ({
+        if (action.kind === 'spawn') {
+          const batch = plan.batches[action.batchIndex];
+          const hook = createHook<ChildCompletionPayload>();
+          try {
+            await spawnChildStep(input, {
               jobId: input.jobId,
               agencyId: input.agencyId,
               batchDomains: batch.domains,
-              batchIndex: offset + waveIndex,
+              batchIndex: action.batchIndex,
               pipelineMode: plan.pipelineMode,
               resumeStagesOnly: batch.resumeStagesOnly,
-              completionToken: waveHooks[waveIndex].token,
-            })
-          )
-        );
-
-        // Children never reject their hook — failures arrive as payload statuses
-        // (allSettled semantics live in the payload, per B2), so Promise.all is
-        // safe and one bad batch cannot cancel its in-flight siblings.
-        const waveResults = await Promise.all(waveHooks);
-
-        let waveFailed = 0;
-        let waveInactive = 0;
-        for (const result of waveResults) {
-          if (result.status === 'ok') {
-            completedBatches.push(result);
-          } else if (result.status === 'inactive') {
-            waveInactive += 1;
-          } else {
-            waveFailed += 1;
-            failedBatches += 1;
-            if (firstFailure === null) {
-              firstFailure = result.error ?? {
-                message: `Enrichment batch ${result.batchIndex} failed`,
-                code: null,
-              };
-            }
+              completionToken: hook.token,
+            });
+          } catch (err) {
+            spawnFailure = err;
+            haltScheduling(state);
+            continue;
           }
+          applySpawn(state, action.batchIndex);
+          inFlightHooks.set(action.batchIndex, hook);
+          continue;
         }
 
-        // Systemic failure (whole wave down — e.g. provider quota/outage): stop now
-        // instead of burning the remaining waves. Surface the first reason so the
-        // catch classifies it (pause/cancel/error) from the authoritative DB flags.
-        if (wave.length > 0 && waveFailed === wave.length) {
-          throw toWorkflowError(firstFailure);
-        }
-
-        // A child saw the job paused/cancelled mid-batch: stop scheduling further
-        // waves. handleWorkflowFailureStep classifies the terminal state from the
-        // DB flags — the parent never interprets child errors itself.
-        if (waveInactive > 0) {
-          throw toWorkflowError(
-            firstFailure ?? {
-              message:
-                'Job is no longer active — stopped scheduling enrichment batches.',
-              code: null,
-            }
+        // awaitCompletion — children never reject their hook (failures arrive
+        // as payload statuses, per B2), so the race settles only with payloads
+        // and one bad batch cannot cancel its in-flight siblings.
+        const result = await Promise.race([...inFlightHooks.values()]);
+        if (!inFlightHooks.delete(result.batchIndex)) {
+          // A payload for a batch we don't have in flight can only be a child
+          // echoing the wrong index — abort loudly instead of racing the same
+          // resolved hook forever.
+          throw new Error(
+            `Child completion reported unknown batch index ${result.batchIndex}`
           );
         }
+        applyCompletion(state, result);
 
-        // Progress reconcile is best-effort: a stale UI must never fail the job.
-        try {
-          await reconcileStagesStep(input);
-        } catch {
-          /* ignore — finalize runs an authoritative reconcile anyway */
+        // Progress reconcile is best-effort: a stale UI must never fail the
+        // job. Same average cadence as the old once-per-wave reconcile.
+        completionsSinceReconcile += 1;
+        if (completionsSinceReconcile >= state.windowSize) {
+          completionsSinceReconcile = 0;
+          try {
+            await reconcileStagesStep(input);
+          } catch {
+            /* ignore — finalize runs an authoritative reconcile anyway */
+          }
         }
+      }
+
+      // In-flight children have drained — safe to surface terminal causes now.
+      if (spawnFailure !== null) {
+        throw spawnFailure;
+      }
+      // Systemic failure (windowSize consecutive failures, zero successes
+      // between — e.g. provider quota/outage): don't burn the remaining
+      // batches. Surface the first reason so the catch classifies it
+      // (pause/cancel/error) from the authoritative DB flags.
+      //
+      // 'inactive': a child saw the job paused/cancelled mid-batch — the
+      // parent never interprets child errors itself; handleWorkflowFailureStep
+      // classifies the terminal state from the DB flags.
+      if (state.stopReason === 'systemic' || state.stopReason === 'inactive') {
+        throw toWorkflowError(
+          state.firstFailure ?? {
+            message:
+              'Job is no longer active — stopped scheduling enrichment batches.',
+            code: null,
+          }
+        );
       }
     }
 
     // Never report success while a batch failed: pause-with-error (resumable) so a resume
     // reprocesses only the still-pending domains via the idempotent DB queues. A clean run
     // (no failures) falls through to finalize.
-    if (failedBatches > 0) {
+    if (state.failedBatches > 0) {
       // Surface the real reason (e.g. credit exhaustion) so it reaches jobs.error;
       // fall back to a generic message only if no reason was captured.
-      if (firstFailure) throw toWorkflowError(firstFailure);
+      if (state.firstFailure) throw toWorkflowError(state.firstFailure);
       throw new Error(
-        `${failedBatches} enrichment batch(es) failed — resume the job to retry the affected domains.`
+        `${state.failedBatches} enrichment batch(es) failed — resume the job to retry the affected domains.`
       );
     }
 
-    return finalizeStep(input, completedBatches);
+    return finalizeStep(input, state.completedOk);
   } catch (err) {
     // A guardWorkflowStart rejection means THIS run is a duplicate (double
     // trigger / auto-resume race). End it without touching job state: routing it
@@ -233,34 +258,30 @@ async function prepareBatchPlanStep(input: ParentWorkflowInput) {
 }
 
 /**
- * Spawn every batch of the wave as an independent child run (`wrun_`). One step
- * per wave keeps spawning chunked (wave size caps the `start()` calls per step)
- * and the child run ids land in this step's result for the Workflow UI.
+ * Spawn ONE batch as an independent child run (`wrun_`). One child per step
+ * serializes cold-starts (no synchronized herd) and removes the old
+ * partial-wave ambiguity: with a single `start()` per step, a failed spawn
+ * step can never leave an unknown number of siblings running.
+ *
+ * The activity assert lives inside the step (one indexed SELECT next to the
+ * far heavier `start()`): a paused/cancelled job fails the next spawn attempt,
+ * and the workflow drains in-flight children before classifying the stop.
  */
-async function spawnWaveChildrenStep(
+async function spawnChildStep(
   input: ParentWorkflowInput,
-  children: ChildRunInput[]
+  child: ChildRunInput
 ) {
-  'use step';
-
-  const childRunIds: string[] = [];
-  for (const child of children) {
-    const run = await start(enrichmentChildRun, [child]);
-    childRunIds.push(run.runId);
-  }
-  console.log(
-    `[enrichment-parent] job ${input.jobId} spawned ${childRunIds.length} child run(s) ` +
-      `(batches ${children[0]?.batchIndex}–${children[children.length - 1]?.batchIndex}): ` +
-      childRunIds.join(', ')
-  );
-  return childRunIds;
-}
-
-async function assertJobActiveStep(input: ParentWorkflowInput) {
   'use step';
 
   const enrichment = await loadEnrichment();
   await enrichment.assertJobActive(input.jobId, input.agencyId);
+
+  const run = await start(enrichmentChildRun, [child]);
+  console.log(
+    `[enrichment-parent] job ${input.jobId} spawned child run ${run.runId} ` +
+      `(batch ${child.batchIndex} of ${child.batchDomains.length} domains)`
+  );
+  return run.runId;
 }
 
 async function reconcileStagesStep(input: ParentWorkflowInput) {
@@ -299,15 +320,15 @@ async function handleWorkflowFailureStep(
 // guardWorkflowStart + assertJobActive throw INTENTIONALLY (already-running / paused /
 // cancelled) — retrying those just delays propagation, so keep them at 0.
 hydrateAndStartStep.maxRetries = 0;
-assertJobActiveStep.maxRetries = 0;
 // Idempotent reads/work — safe to retry through a transient DB/provider blip.
 domainPrepStep.maxRetries = 1;
 prepareBatchPlanStep.maxRetries = 2;
-// A retry after a partial spawn would start duplicate child runs for the same
-// batches (start() has no idempotency key on workflow@4.5), double-charging
-// Serper/OpenAI until Phase 2 lands per-domain idempotency. A failed spawn
-// surfaces as paused-with-error, resumable like any batch failure.
-spawnWaveChildrenStep.maxRetries = 0;
+// A retry could double-spawn the batch (start() has no idempotency key on
+// workflow@4.5), double-charging Serper/OpenAI until Phase 2 lands per-domain
+// idempotency — and the embedded assertJobActive throws intentionally. A
+// failed spawn drains in-flight children, then surfaces as paused-with-error,
+// resumable like any batch failure.
+spawnChildStep.maxRetries = 0;
 reconcileStagesStep.maxRetries = 0; // best-effort (wrapped in try/catch above)
 finalizeStep.maxRetries = 2;
 // Recording the failure state must itself be resilient — this is the last line of

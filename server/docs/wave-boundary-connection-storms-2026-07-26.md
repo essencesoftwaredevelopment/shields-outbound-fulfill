@@ -48,20 +48,27 @@ is an acceptable steady state.
 
 ## Levers if we want the noise gone (ranked)
 
-1. **Stagger child spawns** — in `workflows/enrichment-parent.ts`, jitter each
-   `start()` in a wave by ~2–3 s × index. Desynchronizes the cold-start herd at
-   the source. Small PR, no env change, biggest effect.
+1. ✅ **SHIPPED — sliding-window child scheduling** (same change-set as this
+   doc's update). `workflows/enrichment-parent.ts` no longer runs waves at all:
+   `waveConcurrency` children stay in flight continuously, each spawned by its
+   own step the moment a slot frees (`lib/enrichment/slidingWindow.ts` holds
+   the pure scheduler; `Promise.race` over completion hooks is replay-safe on
+   workflow@4.5 — the runtime delivers hook resolutions in strict event-log
+   order, see `awaitEarlierDeliveries` in `@workflow/core`). This removes the
+   synchronized wave-boundary cold-start herd (spawns serialize through parent
+   steps and thereafter follow completion events) AND stops the whole job
+   waiting on each wave's slowest child (e.g. TryKitt verification tails).
 2. **Amortize the rate-gate polling** — per-isolate token dispenser so N finder
    workers share one in-flight lease query instead of N concurrent polls.
    Bigger change; the per-call SQL gate exists for cross-isolate correctness,
    so touch carefully.
 3. **`PGPOOL_MAX` 4 → 8** — txn pooler multiplexes, so backend-side this is
-   safe; relieves intra-step acquire contention (the actual 30 s queue) at the
-   price of a larger handshake herd. Pair with lever 1, not instead of it.
+   safe; relieves intra-step acquire contention (the actual 30 s queue), and
+   the herd concern shrinks now that cold-starts are staggered.
 4. **Supavisor pool size bump** (dashboard → Database → Connection pooling) —
    more backend headroom per user+db during bursts. Secondary.
 5. **Raise `connectionTimeoutMillis` for the enrichment path** (30 s → 60 s) —
-   waits out the herd instead of erroring into retries. Pure symptom
+   waits out stragglers instead of erroring into retries. Pure symptom
    suppression; last resort.
 
 ## Monitoring recipe
