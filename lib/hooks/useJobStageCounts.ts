@@ -35,6 +35,11 @@ export function useJobStageCounts(
         jobRunning?: boolean;
         jobCompleted?: boolean;
         priorStages?: Record<string, PipelineStageState> | null;
+        /** Job skip options — lets the mapper mark skipped stages and pick real denominators. */
+        job?: Pick<
+            PipelineJob,
+            "skipFounderFinder" | "skipEmailFinder" | "skipVerification" | "personalizeFirstLine"
+        > | null;
         onUpdate: (update: JobStageCountsUpdate) => void;
     }
 ) {
@@ -42,6 +47,8 @@ export function useJobStageCounts(
     onUpdateRef.current = opts.onUpdate;
     const priorRef = useRef(opts.priorStages);
     priorRef.current = opts.priorStages;
+    const jobRef = useRef(opts.job);
+    jobRef.current = opts.job;
 
     const enabled = opts.enabled !== false && Boolean(jobId);
     const intervalMs = opts.intervalMs ?? DEFAULT_POLL_MS;
@@ -67,6 +74,7 @@ export function useJobStageCounts(
             const stages = stageCountsToStages(counts, priorRef.current as PipelineJob["stages"], {
                 jobRunning,
                 jobCompleted,
+                job: jobRef.current ?? null,
             });
             onUpdateRef.current({
                 stages,

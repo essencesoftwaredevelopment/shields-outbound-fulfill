@@ -43,6 +43,11 @@ function isPoolExhausted(err) {
     const msg = String(err?.message || err?.code || '');
     return msg.includes('EMAXCONNSESSION')
         || msg.includes('max clients reached')
+        // pg-pool's connectionTimeoutMillis expiry. Fires in bursts when a wave of
+        // child isolates cold-starts (792 in one minute on 2026-07-26) — transient
+        // connection pressure, not a query failure, so ride it out with the same
+        // backoff as server-side pool exhaustion.
+        || msg.includes('timeout exceeded when trying to connect')
         || err?.code === 'XX000';
 }
 

@@ -77,12 +77,34 @@ function costSummary(stageKey: string, costs?: Record<string, number>) {
 export function stageCountsToStages(
     counts: JobStageCounts | null | undefined,
     prior: Record<string, PipelineStageState> | null | undefined,
-    opts: { jobRunning?: boolean; jobCompleted?: boolean } = {}
+    opts: {
+        jobRunning?: boolean;
+        jobCompleted?: boolean;
+        /**
+         * Job skip options. Without them, skipped stages read as forever-"pending"
+         * (their processed count never moves), which breaks two things: the status
+         * line announces "Preparing Email Discovery…" for a stage that will never
+         * run, and verification's denominator falls back to emailFound — which on
+         * skipEmailFinder jobs grows in lockstep with verified, pinning the card
+         * at "Completed" from the first batch onward.
+         */
+        job?: {
+            skipFounderFinder?: boolean;
+            skipEmailFinder?: boolean;
+            skipVerification?: boolean;
+            personalizeFirstLine?: boolean;
+        } | null;
+    } = {}
 ): Partial<Record<PipelineStageKey, PipelineStageState>> {
     if (!counts) return {};
 
     const jobRunning = opts.jobRunning === true;
     const jobCompleted = opts.jobCompleted === true;
+    const skipFounders = opts.job?.skipFounderFinder === true;
+    const skipEmails = opts.job?.skipEmailFinder === true;
+    const skipVerify = opts.job?.skipVerification === true;
+    // Only meaningful when job options are provided at all.
+    const skipPersonalize = opts.job ? opts.job.personalizeFirstLine !== true : false;
     const totalDomains = num(counts.domainPrep?.total);
     // Domain-prep "processable" = input cohort after DNS (not post-waterfall leftovers).
     // RPC returns dns-aware processable; fall back to total when DNS was skipped.
@@ -202,7 +224,7 @@ export function stageCountsToStages(
 
     const foundersProcessed = num(counts.founders?.processed);
     const foundersFound = num(counts.founders?.found);
-    const foundersStatus = deriveStatus(foundersProcessed, contactTotal, { jobRunning, jobCompleted });
+    const foundersStatus = deriveStatus(foundersProcessed, contactTotal, { skipped: skipFounders, jobRunning, jobCompleted });
     out.founders = {
         status: foundersStatus,
         startedAt: prior?.founders?.startedAt ?? null,
@@ -212,6 +234,7 @@ export function stageCountsToStages(
             processed: foundersProcessed,
             Found: foundersFound,
             found: foundersFound,
+            ...(skipFounders ? { skipped: true } : {}),
             ...costSummary("founders", costs),
         },
         progress: {
@@ -225,7 +248,7 @@ export function stageCountsToStages(
 
     const emailProcessed = num(counts.emailDiscovery?.processed);
     const emailFound = num(counts.emailDiscovery?.found);
-    const emailStatus = deriveStatus(emailProcessed, contactTotal, { jobRunning, jobCompleted });
+    const emailStatus = deriveStatus(emailProcessed, contactTotal, { skipped: skipEmails, jobRunning, jobCompleted });
     out.emailDiscovery = {
         status: emailStatus,
         startedAt: prior?.emailDiscovery?.startedAt ?? null,
@@ -235,6 +258,7 @@ export function stageCountsToStages(
             processed: emailProcessed,
             Found: emailFound,
             found: emailFound,
+            ...(skipEmails ? { skipped: true } : {}),
             ...costSummary("emailDiscovery", costs),
         },
         progress: {
@@ -247,7 +271,13 @@ export function stageCountsToStages(
     };
 
     const verified = num(counts.verification?.verified);
-    const verifyStatus = deriveStatus(verified, emailFound || contactTotal, { jobRunning, jobCompleted });
+    // skipEmailFinder: emails came from the upload, so emailFound only counts
+    // contacts from already-processed domains — it tracks `verified` in lockstep
+    // and can never be a denominator. The stable cohort size is processable.
+    const verifyTotal = skipEmails
+        ? (processable || contactTotal)
+        : (emailFound || contactTotal);
+    const verifyStatus = deriveStatus(verified, verifyTotal, { skipped: skipVerify, jobRunning, jobCompleted });
     out.verification = {
         status: verifyStatus,
         startedAt: prior?.verification?.startedAt ?? null,
@@ -265,12 +295,13 @@ export function stageCountsToStages(
             "valid-risky": num(counts.verification?.validRisky),
             "Valid-Risky": num(counts.verification?.validRisky),
             processed: verified,
+            ...(skipVerify ? { skipped: true } : {}),
             ...costSummary("verification", costs),
         },
         progress: {
             stage: "verification",
             processed: verified,
-            total: emailFound || contactTotal,
+            total: verifyTotal,
             stats: {
                 valid: num(counts.verification?.valid),
                 invalid: num(counts.verification?.invalid),
@@ -287,7 +318,11 @@ export function stageCountsToStages(
         personalizeProcessed,
         num(counts.verification?.valid) + num(counts.verification?.validRisky)
     );
-    const personalizeStatus = deriveStatus(personalizeProcessed, personalizeTotal || verified, { jobRunning, jobCompleted });
+    const personalizeStatus = deriveStatus(personalizeProcessed, personalizeTotal || verified, {
+        skipped: skipPersonalize,
+        jobRunning,
+        jobCompleted,
+    });
     out.personalization = {
         status: personalizeStatus,
         startedAt: prior?.personalization?.startedAt ?? null,
