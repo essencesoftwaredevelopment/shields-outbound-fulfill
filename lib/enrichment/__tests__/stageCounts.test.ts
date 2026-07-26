@@ -69,3 +69,69 @@ describe('stageCountsToStages (shopping audit)', () => {
     assert.equal(stages.verification?.status, 'running');
   });
 });
+
+/** RPC payload shape of the 5,923-domain CSV-import job (1785076206274-7530hn)
+ *  mid-run: skipFounderFinder + skipEmailFinder, emails from the upload,
+ *  wave 1 done (1,200 domains verified), 4,723 still pending. */
+function skipFlagsCounts(): JobStageCounts {
+  return {
+    jobId: 'test-skip-job',
+    pipelineMode: 'standard',
+    domainCheckSkipped: true,
+    domainPrep: {
+      total: 5923,
+      pending: 4723,
+      processing: 0,
+      done: 1200,
+      skipped: 0,
+      processable: 5923,
+      dns: { checked: 0, live: 0, dead: 0, unknown: 0, skipped: 0 },
+    },
+    founders: { processed: 1200, found: 1200 },
+    // Email discovery is skipped: `found` only counts contacts from processed
+    // domains, so it tracks `verified` in lockstep — the incident's bad denominator.
+    emailDiscovery: { processed: 0, found: 1200 },
+    verification: { verified: 1200, valid: 628, invalid: 4, unknown: 14, validRisky: 554 },
+    personalization: { processed: 1063, personalized: 1063 },
+    contacts: { total: 1200 },
+  };
+}
+
+const SKIP_JOB = {
+  skipFounderFinder: true,
+  skipEmailFinder: true,
+  skipVerification: false,
+  personalizeFirstLine: true,
+};
+
+describe('stageCountsToStages (skip-flag jobs)', () => {
+  it('marks skipped stages completed so the status line never announces "Preparing Email Discovery…"', () => {
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: SKIP_JOB });
+    assert.equal(stages.emailDiscovery?.status, 'completed');
+    assert.equal((stages.emailDiscovery?.summary as Record<string, unknown>)?.skipped, true);
+    assert.equal(stages.founders?.status, 'completed');
+    assert.equal((stages.founders?.summary as Record<string, unknown>)?.skipped, true);
+  });
+
+  it('verification uses the cohort denominator on skipEmailFinder jobs — never lockstep emailFound', () => {
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: SKIP_JOB });
+    // 1,200/1,200 vs emailFound read "Completed" from the first wave; the real
+    // shape is 1,200 of 5,923.
+    assert.equal(stages.verification?.status, 'running');
+    assert.equal(stages.verification?.progress?.total, 5923);
+    assert.equal(stages.verification?.progress?.processed, 1200);
+  });
+
+  it('personalization is not marked skipped when personalizeFirstLine is on', () => {
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: SKIP_JOB });
+    assert.notEqual(stages.personalization?.status, 'pending');
+    assert.equal((stages.personalization?.summary as Record<string, unknown>)?.skipped, undefined);
+  });
+
+  it('without job options the legacy shape is unchanged', () => {
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true });
+    // Legacy fallback keeps emailFound as the verification denominator.
+    assert.equal(stages.verification?.progress?.total, 1200);
+    assert.equal(stages.emailDiscovery?.status, 'pending');
+  });
+});

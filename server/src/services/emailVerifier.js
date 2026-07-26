@@ -331,16 +331,27 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
     let stageCost = 0;
     const controller = new AbortController();
 
-    // In-flight batch for incremental upserts
+    // In-flight batch for incremental upserts. Size-only flushing made UI
+    // progress move in 50-row jumps with multi-minute gaps (each child held
+    // results until 50 piled up); the age gate flushes whatever is pending
+    // within FLUSH_INTERVAL_MS so counters trickle in near-real time without
+    // multiplying upsert round-trips during fast stretches.
     const pendingBatch = [];
     let flushPromise = Promise.resolve();
     const BATCH_SIZE = 50;
+    const FLUSH_INTERVAL_MS = 2000;
+    let lastFlushAt = Date.now();
 
     const flushBatch = async (force = false) => {
         if (!onBatch) return;
-        if (!force && pendingBatch.length < BATCH_SIZE) return;
+        if (
+            !force
+            && pendingBatch.length < BATCH_SIZE
+            && Date.now() - lastFlushAt < FLUSH_INTERVAL_MS
+        ) return;
         const batch = pendingBatch.splice(0, pendingBatch.length);
         if (batch.length === 0) return;
+        lastFlushAt = Date.now();
         flushPromise = flushPromise.then(() => onBatch(batch));
         try {
             await flushPromise;
@@ -488,6 +499,10 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
                     log(`Verify: aborting (${reason}) at ${completed}/${toVerify.length}`);
                     controller.abort();
                     await flushAllPending();
+                } else if (pendingBatch.length && Date.now() - lastFlushAt >= FLUSH_INTERVAL_MS) {
+                    // Age-based flush for slow stretches: without it a sub-50 remainder
+                    // sits invisible until the next completion arrives.
+                    await flushBatch(true);
                 }
             } catch (err) {
                 console.warn(`[emailVerifier] pause poll failed: ${err?.message || err}`);

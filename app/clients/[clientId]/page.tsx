@@ -1894,6 +1894,7 @@ export default function ClientPage() {
             && jobState.status === "completed"
         ),
         priorStages: jobState?.stages ?? null,
+        job: jobState ?? null,
         onUpdate: onStageCountsUpdate,
     });
 
