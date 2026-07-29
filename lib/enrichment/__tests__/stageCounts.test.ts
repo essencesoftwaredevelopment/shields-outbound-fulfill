@@ -21,7 +21,7 @@ function shoppingAuditCounts(): JobStageCounts {
     serperShopping: { processed: 500, matched: 110, none: 390 },
     signalWaterfall: { signals: 110, done: 110, skipped: 390, pending: 0 },
     founders: { processed: 110, found: 110 },
-    emailDiscovery: { processed: 500, found: 500 },
+    emailDiscovery: { processed: 500, found: 500, notFound: 0 },
     verification: { verified: 110, valid: 54, invalid: 18, unknown: 5, validRisky: 33 },
     personalization: { processed: 0, personalized: 0 },
     contacts: { total: 500 },
@@ -133,5 +133,44 @@ describe('stageCountsToStages (skip-flag jobs)', () => {
     // Legacy fallback keeps emailFound as the verification denominator.
     assert.equal(stages.verification?.progress?.total, 1200);
     assert.equal(stages.emailDiscovery?.status, 'pending');
+  });
+});
+
+/** Job 1785083216354-82fzda mid-run shape: finds ran, many not-founds.
+ *  Without notFound on the payload the card showed "2374 checked • 100% hit rate". */
+function emailHitRateCounts(): JobStageCounts {
+  return {
+    jobId: '1785083216354-82fzda',
+    pipelineMode: 'standard',
+    domainPrep: {
+      total: 22940,
+      pending: 0,
+      processing: 0,
+      done: 10061,
+      skipped: 12879,
+      processable: 22940,
+    },
+    founders: { processed: 10061, found: 9357 },
+    emailDiscovery: { processed: 8219, found: 2377, notFound: 5842 },
+    verification: { verified: 2279, valid: 1171, invalid: 20, unknown: 6, validRisky: 1082 },
+    personalization: { processed: 2163, personalized: 1772 },
+    contacts: { total: 10061 },
+  };
+}
+
+describe('stageCountsToStages (email discovery hit rate)', () => {
+  it('passes notFound through summary and progress so the card can compute hit rate', () => {
+    const stages = stageCountsToStages(emailHitRateCounts(), null, { jobRunning: true });
+    const summary = stages.emailDiscovery?.summary as Record<string, unknown>;
+    const stats = stages.emailDiscovery?.progress?.stats as Record<string, number>;
+    assert.equal(summary?.found, 2377);
+    assert.equal(summary?.notFound, 5842);
+    assert.equal(summary?.['Not Found'], 5842);
+    assert.equal(summary?.processed, 8219);
+    assert.equal(stats?.Found, 2377);
+    assert.equal(stats?.['Not Found'], 5842);
+    assert.equal(stages.emailDiscovery?.progress?.notFound, 5842);
+    // Attempted finds = found + notFound (= processed when errors are 0).
+    assert.equal(2377 + 5842, 8219);
   });
 });

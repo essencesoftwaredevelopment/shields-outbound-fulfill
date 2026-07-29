@@ -1056,7 +1056,11 @@ const aggregateBatchProgress = (
         for (const [key, val] of Object.entries(slotStats)) {
             if (typeof val !== "number" || !Number.isFinite(val)) continue;
             const mode =
-                key === "Found" || key === "found" || key === "personalized" || key === "Personalized" || key === "valid" || key === "Valid"
+                key === "Found" || key === "found"
+                || key === "Not Found" || key === "notFound" || key === "not_found"
+                || key === "errors" || key === "Errors"
+                || key === "personalized" || key === "Personalized"
+                || key === "valid" || key === "Valid"
                     ? "sum"
                     : "max";
             mergedStats[key] =
@@ -4054,7 +4058,16 @@ export default function ClientPage() {
             const payload = await response.json();
             if (payload?.job) {
                 const raw = payload.job as Record<string, unknown>;
-                setJobState((prev) => mergeJobState(prev, mapApiJobToJob(raw)));
+                const mapped = mapApiJobToJob(raw);
+                setJobState((prev) =>
+                    mergeJobState(prev, {
+                        ...mapped,
+                        // Lifecycle/flags from the API snapshot; stage counters come from
+                        // get_job_stage_counts. Merging jobs.stages JSONB here re-fights the
+                        // RPC hydrate and can flip the email hit-rate card after first paint.
+                        stages: (prev?.stages ?? mapped.stages) as PipelineJob["stages"],
+                    })
+                );
             }
         } catch (error: any) {
             console.error('❌ [JOB SNAPSHOT ERROR]:', {
@@ -9194,36 +9207,40 @@ export default function ClientPage() {
                                                     ?? throughputNum
                                                     ?? 0);
                                                 const found = imported;
-                                                // `stage.progress.processed` is job-wide: it includes the offset for
-                                                // founders that had no name (or were already done) and were never
-                                                // actually email-checked. Using it as the denominator inflates "checked"
-                                                // and crushes the hit rate. The lookup outcomes (Found / Not Found /
-                                                // errors) are scoped to THIS run — the same scope as `found` — so they
-                                                // give the true number of emails checked this run.
+                                                // Attempted finds = emailDone (`processed`), not `found` alone.
+                                                // Outcome split (Found / Not Found / errors) is preferred when
+                                                // present; otherwise processed is the spreadsheet truth. Using
+                                                // found as the denominator is what produced the fake 100% hit rate.
                                                 const notFound =
                                                     extractNumberFrom(stats, ["Not Found", "not_found", "notFound"])
                                                     ?? extractNumberFrom(summary, ["Not Found", "not_found", "notFound"])
+                                                    ?? (typeof stage?.progress?.notFound === "number"
+                                                        ? stage.progress.notFound
+                                                        : null)
                                                     ?? 0;
                                                 const errored =
                                                     extractNumberFrom(stats, ["errors", "Errors"])
                                                     ?? extractNumberFrom(summary, ["errors", "Errors"])
                                                     ?? 0;
-                                                const checkedThisRun = found + notFound + errored;
-                                                const attempted = checkedThisRun > 0
-                                                    ? checkedThisRun
-                                                    : (typeof stage?.progress?.processed === "number"
+                                                const processedCount =
+                                                    typeof stage?.progress?.processed === "number"
                                                         ? stage.progress.processed
-                                                        : total ?? 0);
+                                                        : extractNumberFrom(summary, ["processed"])
+                                                        ?? 0;
+                                                const outcomeChecked = found + notFound + errored;
+                                                const attempted = skippedImport
+                                                    ? found
+                                                    : Math.max(processedCount, outcomeChecked);
                                                 heroNumber = found;
-                                                heroLabel = skippedImport || (found > 0 && checkedThisRun === 0 && attempted > 0)
+                                                heroLabel = skippedImport || (found > 0 && outcomeChecked === 0 && attempted > 0 && processedCount === 0)
                                                     ? "Emails Imported"
                                                     : "Emails Found";
                                                 subtext = skippedImport && found > 0
                                                     ? `${found.toLocaleString()} imported from CSV`
+                                                    : attempted > 0 && !skippedImport
+                                                    ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
                                                     : attempted > 0
-                                                    ? checkedThisRun > 0
-                                                        ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
-                                                        : `${attempted.toLocaleString()} imported from CSV`
+                                                    ? `${attempted.toLocaleString()} imported from CSV`
                                                     : "Awaiting...";
                                                 const emailCost = stageCostFromStage(stage);
                                                 if (emailCost !== null && emailCost > 0) {

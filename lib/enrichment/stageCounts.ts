@@ -29,7 +29,7 @@ export type JobStageCounts = {
         pending?: number;
     };
     founders?: { processed?: number; found?: number };
-    emailDiscovery?: { processed?: number; found?: number };
+    emailDiscovery?: { processed?: number; found?: number; notFound?: number; errors?: number };
     verification?: {
         verified?: number;
         valid?: number;
@@ -248,6 +248,8 @@ export function stageCountsToStages(
 
     const emailProcessed = num(counts.emailDiscovery?.processed);
     const emailFound = num(counts.emailDiscovery?.found);
+    const emailNotFound = num(counts.emailDiscovery?.notFound);
+    const emailErrors = num(counts.emailDiscovery?.errors);
     const emailStatus = deriveStatus(emailProcessed, contactTotal, { skipped: skipEmails, jobRunning, jobCompleted });
     out.emailDiscovery = {
         status: emailStatus,
@@ -258,6 +260,9 @@ export function stageCountsToStages(
             processed: emailProcessed,
             Found: emailFound,
             found: emailFound,
+            "Not Found": emailNotFound,
+            notFound: emailNotFound,
+            errors: emailErrors,
             ...(skipEmails ? { skipped: true } : {}),
             ...costSummary("emailDiscovery", costs),
         },
@@ -266,7 +271,12 @@ export function stageCountsToStages(
             processed: emailProcessed,
             total: contactTotal,
             found: emailFound,
-            stats: { Found: emailFound },
+            notFound: emailNotFound,
+            stats: {
+                Found: emailFound,
+                "Not Found": emailNotFound,
+                errors: emailErrors,
+            },
         },
     };
 
