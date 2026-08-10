@@ -1,7 +1,16 @@
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
-import { getAgencySettings, hasInterestedReplyShoppingAuditFeature } from './db/agencySettings.js';
+import {
+    getAgencySettings,
+    hasInterestedReplyShoppingAuditFeature,
+    hasReplyResearchAgentFeature
+} from './db/agencySettings.js';
+import { formatResearchBriefForPrompt } from './interestedResearch/briefUtils.js';
+import {
+    isInterestedResearchWorkflowConfigured,
+    triggerInterestedResearchWorkflow
+} from './interestedResearch/trigger.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import {
     fetchThreadReplyMetadata,
@@ -51,7 +60,7 @@ const VULCAN_AUDIT_POLL_INTERVAL_MS = Math.max(
     500
 );
 
-const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread'];
+const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread', 'researching'];
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -371,7 +380,7 @@ function asTrimmedText(value) {
     return text || null;
 }
 
-function getPublicAppBaseUrl() {
+export function getPublicAppBaseUrl() {
     const baseUrl = String(
         process.env.NEXT_PUBLIC_APP_URL
         || process.env.APP_BASE_URL
@@ -381,11 +390,11 @@ function getPublicAppBaseUrl() {
     return baseUrl.replace(/\/$/, '');
 }
 
-function buildReviewUrl(token) {
+export function buildReviewUrl(token) {
     return `${getPublicAppBaseUrl()}/interested-autoresponder/${encodeURIComponent(token)}`;
 }
 
-function generateReviewToken() {
+export function generateReviewToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
@@ -481,7 +490,7 @@ function buildReplySnippet(text = '') {
     return firstLine || null;
 }
 
-async function fetchPromptConfig(db, clientId, campaignId) {
+export async function fetchPromptConfig(db, clientId, campaignId) {
     const result = await db.query(
         `SELECT p.id, p.campaign_id, p.version, p.system_prompt, p.active,
                 ic.name AS campaign_name
@@ -696,6 +705,8 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
         // is explicitly opted out — e.g. Active Fungi).
         shoppingAuditReply: hasInterestedReplyShoppingAuditFeature(agencySettings),
         skipPopupPreview: POPUP_PREVIEW_SKIP_CLIENT_SLUGS.has(clientSlug),
+        // Durable research workflow before drafting — per-agency opt-in.
+        replyResearchAgent: hasReplyResearchAgentFeature(agencySettings),
         // Active Fungi only: personalized story page via {{story_url}} — never
         // for other clients on this agency (Essence Retention, Vulcan, etc.).
         useActiveFungiStoryUrl
@@ -718,6 +729,9 @@ export async function generateDraftReply({
     previousLeadMessage,
     auditPreviewUrl = null,
     essenceAiPreviewUrl = null,
+    // Structured research brief ({ company, domain, summary, talkingPoints, risks, sources })
+    // produced by the interested-research workflow. Optional — inline drafts pass nothing.
+    researchBrief = null,
     // When true, the system prompt already owns the CTA (Active Fungi story URL).
     // Skip shopping-audit / Essence Calendly CTA instructions so they don't fight it.
     systemPromptOwnsCta = false
@@ -730,6 +744,7 @@ export async function generateDraftReply({
             ? `CTA instruction: A personalized shopping ad audit has already been generated for this prospect's store. Use the Shopping audit URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
             : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`;
     }
+    const briefBlock = formatResearchBriefForPrompt(researchBrief);
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,
         // temperature: 0.6,
@@ -752,6 +767,15 @@ export async function generateDraftReply({
                     '',
                     ctaBlock,
                     '',
+                    briefBlock
+                        ? [
+                            'Research brief on the lead\'s company (verified via web research).',
+                            'Use it to make the reply specific to their business — reference at most',
+                            'one or two of these facts naturally; never invent facts beyond the brief:',
+                            briefBlock,
+                            ''
+                        ].join('\n')
+                        : '',
                     'Lead message/thread context:',
                     previousLeadMessage || '(no message text available)'
                 ].filter(Boolean).join('\n')
@@ -765,7 +789,7 @@ export async function generateDraftReply({
     };
 }
 
-async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false }) {
+export async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false }) {
     if (!topic) return { notified: false, reason: 'missing_topic' };
 
     const titlePrefix = isFollowUp
@@ -1053,6 +1077,28 @@ export async function maybeCreatePostAutoresponderFollowUpDraft({
     });
 }
 
+/**
+ * Precomputed shopping-audit signal + company domain for a contact. Best-effort:
+ * the joins are optional and a lookup failure must never block a draft.
+ */
+export async function resolveContactSignalContext(db, contactId) {
+    try {
+        const result = await db.query(
+            `SELECT c.signal_emission_id, se.signal_type, se.observed, se.expected,
+                    co.domain_normalized AS company_domain
+             FROM contacts c
+             LEFT JOIN signal_emissions se ON se.id = c.signal_emission_id
+             LEFT JOIN companies co ON co.id = c.company_id
+             WHERE c.id = $1`,
+            [contactId]
+        );
+        return result.rows[0] || {};
+    } catch (signalErr) {
+        console.warn('[interested-autoresponder] signal lookup skipped:', signalErr?.message || signalErr);
+        return {};
+    }
+}
+
 async function insertDraftRow(db, draft) {
     const result = await db.query(
         `INSERT INTO interested_autoresponder_drafts (
@@ -1186,23 +1232,64 @@ export async function createInterestedAutoResponderDraftFromEvent({
             return { created: false, reason: 'missing_openai_key', draftId: failedDraft?.id || null };
         }
 
+        // Durable research path (per-agency flag): insert the draft shell as
+        // 'researching' and hand off to the Vercel Workflow, which researches the
+        // lead, stores the brief, builds the popup, generates the reply, and
+        // promotes the draft to pending_review (+ ntfy). Trigger failure falls
+        // back to the inline path below — an interested lead must never lose its
+        // draft to an unreachable workflow runtime.
+        if (settings.replyResearchAgent && isInterestedResearchWorkflowConfigured()) {
+            const researchDraft = await insertDraftRow(client, {
+                agency_id: agencyId,
+                client_id: clientId,
+                campaign_id: campaignId,
+                contact_id: contactId,
+                instantly_lead_id: instantlyLeadId || null,
+                source_event_id: sourceEventId,
+                review_token: null,
+                review_token_expires_at: null,
+                status: 'researching',
+                blocked_reason: null,
+                reply_to_uuid: replyToUuid,
+                eaccount,
+                thread_subject: threadSubject,
+                lead_email: normalizedLeadEmail,
+                previous_lead_message: previousLeadMessage,
+                system_prompt_version: promptConfig.version,
+                model: DEFAULT_MODEL,
+                rendered_text: null
+            });
+            try {
+                await triggerInterestedResearchWorkflow({
+                    draftId: researchDraft.id,
+                    agencyId,
+                    isFollowUp
+                });
+                logger(
+                    `[interested-autoresponder] research workflow started draft=${researchDraft.id}`
+                    + ` contact=${contactId} campaign=${campaignId}`
+                );
+                return { created: true, researching: true, draftId: researchDraft.id, reviewUrl: null };
+            } catch (error) {
+                logger(
+                    `[interested-autoresponder] research workflow trigger failed draft=${researchDraft.id}`
+                    + ` — falling back to inline generation: ${error.message}`
+                );
+                // Free the open-thread slot so the inline insert below succeeds.
+                await client.query(
+                    `UPDATE interested_autoresponder_drafts
+                     SET status = 'cancelled',
+                         blocked_reason = 'research_trigger_failed',
+                         updated_at = NOW()
+                     WHERE id = $1 AND status = 'researching'`,
+                    [researchDraft.id]
+                );
+            }
+        }
+
         let generation;
         try {
-            let signalRow = {};
-            try {
-                const contactSignalResult = await client.query(
-                    `SELECT c.signal_emission_id, se.signal_type, se.observed, se.expected,
-                            co.domain_normalized AS company_domain
-                     FROM contacts c
-                     LEFT JOIN signal_emissions se ON se.id = c.signal_emission_id
-                     LEFT JOIN companies co ON co.id = c.company_id
-                     WHERE c.id = $1`,
-                    [contactId]
-                );
-                signalRow = contactSignalResult.rows[0] || {};
-            } catch (signalErr) {
-                console.warn('[interested-autoresponder] signal lookup skipped:', signalErr?.message || signalErr);
-            }
+            const signalRow = await resolveContactSignalContext(client, contactId);
             const auditDomain = normalizeAuditDomain(signalRow.company_domain)
                 || domainFromLeadEmail(normalizedLeadEmail);
             const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);

@@ -42,6 +42,11 @@ Key files:
 
 Enrichment jobs can run on **PM2** (default) or **Vercel Workflows** (opt-in). Instantly sync, follow-ups, and webhooks always stay on PM2.
 
+A second, independent Workflows use exists on the reply path: the **interested-reply
+research workflow** (see "Interested-reply research workflow" below). It shares the
+Workflows runtime and trigger pattern with enrichment but nothing else — it is
+per-event and human-gated, never part of the enrichment parent/child fan-out.
+
 | Runner | Trigger | Worker |
 |--------|---------|--------|
 | `pm2` (default) | `POST /api/jobs` → `job_queue` | `src/worker/queueWorker.js` → `runJobChild.js` |
@@ -111,6 +116,45 @@ that the job stays paused-with-error for a human. A duplicate start is rejected 
 - Child PID is stored on `job_queue.runner_pid` for hybrid stop (cooperative cancel, then SIGTERM/SIGKILL).
 - Local dev: `npm run dev:all` in `server/` (API + worker), or run `npm run dev` and `npm run worker` in two terminals.
 - Production: PM2 must run **both** `shields-outbound-server` and `shields-outbound-worker` (see `ecosystem.config.cjs`).
+
+### Interested-reply research workflow (Vercel Workflows, reply path)
+
+When Instantly marks a lead interested, the autoresponder normally drafts inline
+(`createInterestedAutoResponderDraftFromEvent` in
+`src/services/interestedAutoResponder.js`). Agencies with
+`features.replyResearchAgent: true` instead get a **durable research run** on the
+Workflows runtime before the draft is written:
+
+1. Express (webhook / sync reconcile) inserts the draft shell at
+   `status='researching'` and POSTs `/internal/interested-research/start`
+   (`src/services/interestedResearch/trigger.js`, secured by
+   `WORKFLOW_TRIGGER_SECRET` — same pattern as the enrichment trigger).
+2. `workflows/interested-research.ts` runs one linear pipeline per draft:
+   hydrate → homepage fetch + Serper sweep (agency's own Serper key, both
+   best-effort) → LLM-synthesized brief persisted to
+   `interested_autoresponder_drafts.research_brief`
+   (`{ company, domain, summary, talkingPoints, risks, sources }`) → external
+   popup/audit URL (Essence popup or Vulcan audit, exactly as the inline path) →
+   `generateDraftReply` with the brief → promote to `pending_review` + ntfy.
+3. Human review / send / warm follow-ups proceed unchanged.
+
+Design rules:
+- **Not enrichment.** No parent/child fan-out, no `job_queue`, no shared
+  orchestrator — only libraries are shared. The Instantly webhook itself stays on
+  PM2 and never blocks on research.
+- **Draft row is the idempotency anchor.** Every step re-checks
+  `status='researching'`; a superseded/cancelled draft ends the run cleanly
+  (`RESEARCH_DRAFT_SUPERSEDED`). A crash marks the draft `generation_failed`
+  via the keystone failure step — never stranded at `researching`.
+- **Graceful degradation.** Trigger failure falls back to the inline draft path;
+  thin research yields no brief but still a normal draft; a failed popup or brief
+  never kills the run.
+- **Statuses.** `researching` is an open status (counts toward the one-open-draft
+  per contact+campaign invariant, cancelled when the lead leaves interested).
+  Migration: `migrations/0048_interested_reply_research.sql`.
+- Env: `WORKFLOW_TRIGGER_SECRET` + `APP_URL` required to trigger;
+  `INTERESTED_RESEARCH_WORKFLOW_DISABLED=true` kills the path globally;
+  `INTERESTED_RESEARCH_MODEL` overrides the brief model.
 
 ## Job Lifecycle
 

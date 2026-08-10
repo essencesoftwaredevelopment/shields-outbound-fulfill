@@ -91,6 +91,17 @@ export function hasInterestedReplyShoppingAuditFeature(settings) {
 }
 
 /**
+ * Whether interested replies run the durable lead-research workflow (Vercel
+ * Workflows) before drafting: web research → structured brief → popup → draft.
+ * Per-agency opt-in only — research spends Serper + OpenAI per interested lead,
+ * so it must never default on. Without the flag the inline draft path runs
+ * exactly as before.
+ */
+export function hasReplyResearchAgentFeature(settings) {
+    return agencyFeaturesFromSettings(settings).replyResearchAgent === true;
+}
+
+/**
  * Caps applied to an agency whose TryKitt key is on the free tier. Free keys throttle
  * far below the paid ~15-concurrent allowance; without these the pipeline hammers
  * TryKitt, every request retries through its backoff, and the stage crawls.
