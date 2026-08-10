@@ -432,7 +432,9 @@ export async function runPopupGeneration({ draftId, agencyId }) {
 
 /**
  * Step 5 — generate the reply (brief-aware) and promote the draft to
- * pending_review with a fresh review token, then ntfy the human reviewer.
+ * pending_review. Reuses an existing review_token when present (regenerate
+ * from the review page) so the reviewer's URL stays valid; otherwise mints a
+ * fresh token. ntfy is skipped on regenerate — the reviewer is already on the page.
  * The UPDATE is guarded on status='researching' so a draft cancelled while
  * this run was in flight is never resurrected.
  *
@@ -440,10 +442,17 @@ export async function runPopupGeneration({ draftId, agencyId }) {
  *   draftId: number,
  *   agencyId: string,
  *   auditPreviewUrl?: string | null,
- *   isFollowUp?: boolean
+ *   isFollowUp?: boolean,
+ *   skipNtfy?: boolean
  * }} args
  */
-export async function finalizeResearchDraft({ draftId, agencyId, auditPreviewUrl = null, isFollowUp = false }) {
+export async function finalizeResearchDraft({
+    draftId,
+    agencyId,
+    auditPreviewUrl = null,
+    isFollowUp = false,
+    skipNtfy = false
+}) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
     const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
     if (!settings.openaiKey) {
@@ -477,7 +486,8 @@ export async function finalizeResearchDraft({ draftId, agencyId, auditPreviewUrl
         systemPromptOwnsCta: useActiveFungiStoryUrl
     });
 
-    const reviewToken = generateReviewToken();
+    const existingToken = String(draft.review_token || '').trim();
+    const reviewToken = existingToken || generateReviewToken();
     const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();
     const updateResult = await pool.query(
         `UPDATE interested_autoresponder_drafts
@@ -507,7 +517,7 @@ export async function finalizeResearchDraft({ draftId, agencyId, auditPreviewUrl
     }
 
     const reviewUrl = buildReviewUrl(reviewToken);
-    if (settings.ntfyTopic) {
+    if (!skipNtfy && settings.ntfyTopic) {
         try {
             await sendNtfyNotification(settings.ntfyTopic, {
                 leadEmail: draft.lead_email,
@@ -527,10 +537,32 @@ export async function finalizeResearchDraft({ draftId, agencyId, auditPreviewUrl
 
 /**
  * Keystone failure handler — without it a workflow crash strands the draft at
- * 'researching' forever. Mirrors the inline path's generation_failed outcome.
+ * 'researching' forever. Regenerates-from-review keep their prior reply + token,
+ * so restore those to pending_review instead of killing the review link.
+ * Fresh first-run shells (no token/text) still mark generation_failed.
  */
 export async function handleResearchFailure({ draftId, agencyId }, errorInfo) {
     const message = String(errorInfo?.message || 'research_failed').slice(0, 500);
+    const restored = await pool.query(
+        `UPDATE interested_autoresponder_drafts
+         SET status = 'pending_review',
+             blocked_reason = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+           AND agency_id = $2
+           AND status = 'researching'
+           AND review_token IS NOT NULL
+           AND COALESCE(BTRIM(rendered_text), '') <> ''
+         RETURNING id`,
+        [draftId, agencyId]
+    );
+    if (restored.rowCount) {
+        console.error(
+            `[interested-research] run failed draft=${draftId} restored to pending_review: ${message}`
+        );
+        return { marked: false, restored: true };
+    }
+
     const result = await pool.query(
         `UPDATE interested_autoresponder_drafts
          SET status = 'generation_failed',

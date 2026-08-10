@@ -15,6 +15,7 @@ type ReviewDraft = {
     previousLeadMessage: string | null;
     renderedText: string;
     expiresAt: string | null;
+    status?: "pending_review" | "researching" | string;
 };
 
 /** Review-page preview: Vulcan public audit → admin edit; Essence links unchanged. */
@@ -44,6 +45,7 @@ export default function InterestedAutoResponderReviewPage() {
     const [loading, setLoading] = useState(true);
     const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
     const [sending, setSending] = useState(false);
+    const [regenerating, setRegenerating] = useState(false);
     const [archiving, setArchiving] = useState(false);
     const [archived, setArchived] = useState(false);
     const [archiveModalOpen, setArchiveModalOpen] = useState(false);
@@ -66,6 +68,23 @@ export default function InterestedAutoResponderReviewPage() {
     const linkInputRef = useRef<HTMLInputElement>(null);
     const linkPopupRef = useRef<HTMLDivElement>(null);
 
+    const applyLoadedDraft = useCallback((loaded: ReviewDraft | null) => {
+        if (!loaded) {
+            setDraft(null);
+            return;
+        }
+        const initialText = loaded.renderedText || "";
+        const preparedText = prepareReplyEditorContent(initialText);
+        lastSavedTextRef.current = preparedText;
+        setDraft(loaded);
+        setRenderedText(preparedText);
+        setPreviewUrl(extractReviewPreviewUrl(initialText));
+        if (editorRef.current) {
+            editorRef.current.innerHTML = preparedText;
+        }
+        setRegenerating(loaded.status === "researching");
+    }, []);
+
     useEffect(() => {
         if (!token) return;
         let cancelled = false;
@@ -81,13 +100,7 @@ export default function InterestedAutoResponderReviewPage() {
                     throw new Error(data.error || `Failed to load review draft (${draftResponse.status})`);
                 }
                 if (!cancelled) {
-                    const initialText = data.draft?.renderedText || "";
-                    const preparedText = prepareReplyEditorContent(initialText);
-                    lastSavedTextRef.current = preparedText;
-                    setDraft(data.draft || null);
-                    setRenderedText(preparedText);
-                    const preview = extractReviewPreviewUrl(initialText);
-                    setPreviewUrl(preview);
+                    applyLoadedDraft(data.draft || null);
                 }
             } catch (err) {
                 if (!cancelled) {
@@ -100,11 +113,53 @@ export default function InterestedAutoResponderReviewPage() {
             }
         })();
         return () => { cancelled = true; };
-    }, [token]);
+    }, [token, applyLoadedDraft]);
+
+    // Poll while a regenerate research run is in flight (same review token).
+    useEffect(() => {
+        if (!token || !regenerating || sendSuccess || archived) return;
+        let cancelled = false;
+        const poll = async () => {
+            try {
+                const response = await fetch(
+                    `${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}`,
+                    { cache: "no-store" }
+                );
+                const data = await response.json().catch(() => ({}));
+                if (cancelled) return;
+                if (!response.ok) {
+                    setRegenerating(false);
+                    setError(data.error || `Regeneration failed (${response.status})`);
+                    return;
+                }
+                const next = data.draft as ReviewDraft | undefined;
+                if (!next) return;
+                if (next.status === "researching") return;
+                applyLoadedDraft(next);
+                setError(null);
+            } catch (err) {
+                if (!cancelled) {
+                    setRegenerating(false);
+                    setError(err instanceof Error ? err.message : "Failed while waiting for regeneration");
+                }
+            }
+        };
+        const intervalId = setInterval(poll, 3000);
+        const timeoutId = setTimeout(() => {
+            if (cancelled) return;
+            setRegenerating(false);
+            setError("Regeneration is taking longer than expected. Refresh this page in a minute.");
+        }, 5 * 60 * 1000);
+        return () => {
+            cancelled = true;
+            clearInterval(intervalId);
+            clearTimeout(timeoutId);
+        };
+    }, [token, regenerating, sendSuccess, archived, applyLoadedDraft]);
 
     // Sync editor innerHTML when draft first loads
     useEffect(() => {
-        if (editorRef.current && draft) {
+        if (editorRef.current && draft && !regenerating) {
             editorRef.current.innerHTML = prepareReplyEditorContent(draft.renderedText || "");
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -121,7 +176,7 @@ export default function InterestedAutoResponderReviewPage() {
 
     // Debounced auto-save
     useEffect(() => {
-        if (archived || !draft) return;
+        if (archived || regenerating || !draft) return;
         if (renderedText === lastSavedTextRef.current) return;
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
         saveTimerRef.current = setTimeout(async () => {
@@ -150,7 +205,7 @@ export default function InterestedAutoResponderReviewPage() {
             }
         }, 1500);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-    }, [renderedText, token, archived, draft]);
+    }, [renderedText, token, archived, regenerating, draft]);
 
     // Close archive modal on Escape
     useEffect(() => {
@@ -315,6 +370,38 @@ export default function InterestedAutoResponderReviewPage() {
             setError(err instanceof Error ? err.message : "Failed to send reply");
         } finally {
             setSending(false);
+        }
+    };
+
+    const handleRegenerate = async () => {
+        setError(null);
+        if (saveTimerRef.current) {
+            clearTimeout(saveTimerRef.current);
+            saveTimerRef.current = null;
+        }
+        setRegenerating(true);
+        try {
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}/regenerate`,
+                { method: "POST" }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to regenerate (${response.status})`);
+            }
+            if (data.regenerating) {
+                // Async research workflow — keep polling until pending_review.
+                setRegenerating(true);
+                return;
+            }
+            if (data.draft) {
+                applyLoadedDraft(data.draft);
+            } else {
+                setRegenerating(false);
+            }
+        } catch (err) {
+            setRegenerating(false);
+            setError(err instanceof Error ? err.message : "Failed to regenerate draft");
         }
     };
 
@@ -561,7 +648,7 @@ export default function InterestedAutoResponderReviewPage() {
                             </div>
                             <div
                                 ref={editorRef}
-                                contentEditable={!sendSuccess}
+                                contentEditable={!sendSuccess && !regenerating}
                                 suppressContentEditableWarning
                                 onInput={handleEditorInput}
                                 onBlur={handleEditorBlur}
@@ -578,21 +665,44 @@ export default function InterestedAutoResponderReviewPage() {
                                     outline: "none",
                                     lineHeight: 1.65,
                                     fontSize: "0.9rem",
-                                    cursor: sendSuccess ? "default" : "text",
+                                    cursor: sendSuccess || regenerating ? "default" : "text",
                                     wordBreak: "break-word",
                                     transition: "box-shadow 0.15s",
-                                    opacity: sendSuccess ? 0.7 : 1,
+                                    opacity: sendSuccess || regenerating ? 0.7 : 1,
                                 }}
                             />
                             <p style={{ margin: 0, fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
-                                Click to edit — changes are saved automatically. Press <kbd style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "4px", padding: "0 4px", fontSize: "0.72rem" }}>⌘K</kbd> to edit a link.
+                                {regenerating
+                                    ? "Regenerating research, popup, and reply… this can take a minute."
+                                    : <>Click to edit — changes are saved automatically. Press <kbd style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "4px", padding: "0 4px", fontSize: "0.72rem" }}>⌘K</kbd> to edit a link.</>}
                             </p>
                             <div style={{ display: "flex", flexDirection: "column", gap: "0.65rem" }}>
+                                {!sendSuccess && (
+                                    <button
+                                        type="button"
+                                        onClick={handleRegenerate}
+                                        disabled={sending || regenerating || archiving}
+                                        style={{
+                                            width: "100%",
+                                            padding: "0.85rem",
+                                            borderRadius: "10px",
+                                            border: "1px solid rgba(96,165,250,0.45)",
+                                            background: regenerating ? "rgba(37,99,235,0.25)" : "rgba(37,99,235,0.14)",
+                                            color: "#93c5fd",
+                                            cursor: sending || regenerating || archiving ? "default" : "pointer",
+                                            fontWeight: 600,
+                                            fontSize: "0.95rem",
+                                            opacity: sending || regenerating || archiving ? 0.7 : 1,
+                                        }}
+                                    >
+                                        {regenerating ? "Regenerating…" : "Regenerate"}
+                                    </button>
+                                )}
                                 <button
                                     type="button"
                                     onClick={handleSendReply}
-                                    disabled={sending || !renderedText.trim() || sendSuccess}
-                                    style={{ width: "100%", padding: "0.9rem", borderRadius: "10px", border: "none", background: sendSuccess ? "rgba(34,197,94,0.25)" : "#16a34a", color: "#fff", cursor: sending || sendSuccess ? "default" : "pointer", fontWeight: 600, fontSize: "1rem" }}
+                                    disabled={sending || regenerating || !renderedText.trim() || sendSuccess}
+                                    style={{ width: "100%", padding: "0.9rem", borderRadius: "10px", border: "none", background: sendSuccess ? "rgba(34,197,94,0.25)" : "#16a34a", color: "#fff", cursor: sending || regenerating || sendSuccess ? "default" : "pointer", fontWeight: 600, fontSize: "1rem", opacity: regenerating ? 0.55 : 1 }}
                                 >
                                     {sending ? "Sending…" : sendSuccess ? "Sent ✓" : "Send Reply"}
                                 </button>
@@ -600,7 +710,7 @@ export default function InterestedAutoResponderReviewPage() {
                                     <button
                                         type="button"
                                         onClick={() => setArchiveModalOpen(true)}
-                                        disabled={sending || archiving}
+                                        disabled={sending || regenerating || archiving}
                                         style={{
                                             width: "100%",
                                             padding: "0.75rem",
@@ -608,10 +718,10 @@ export default function InterestedAutoResponderReviewPage() {
                                             border: "1px solid rgba(239,68,68,0.45)",
                                             background: "rgba(239,68,68,0.12)",
                                             color: "#fca5a5",
-                                            cursor: sending || archiving ? "default" : "pointer",
+                                            cursor: sending || regenerating || archiving ? "default" : "pointer",
                                             fontWeight: 600,
                                             fontSize: "0.95rem",
-                                            opacity: sending || archiving ? 0.55 : 1,
+                                            opacity: sending || regenerating || archiving ? 0.55 : 1,
                                         }}
                                     >
                                         Archive Draft

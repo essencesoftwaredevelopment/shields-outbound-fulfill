@@ -12,7 +12,12 @@ export function isInterestedResearchWorkflowConfigured() {
     return Boolean(String(process.env.WORKFLOW_TRIGGER_SECRET || '').trim());
 }
 
-export async function triggerInterestedResearchWorkflow({ draftId, agencyId, isFollowUp = false }) {
+export async function triggerInterestedResearchWorkflow({
+    draftId,
+    agencyId,
+    isFollowUp = false,
+    skipNtfy = false
+}) {
     const baseUrl = (
         process.env.APP_URL
         || process.env.NEXT_PUBLIC_APP_URL
@@ -38,7 +43,7 @@ export async function triggerInterestedResearchWorkflow({ draftId, agencyId, isF
     const res = await fetch(`${baseUrl}/internal/interested-research/start`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ draftId, agencyId, isFollowUp })
+        body: JSON.stringify({ draftId, agencyId, isFollowUp, skipNtfy: Boolean(skipNtfy) })
     });
 
     if (!res.ok) {

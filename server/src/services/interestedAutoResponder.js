@@ -1423,7 +1423,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
     }
 }
 
-async function loadPendingReviewDraft(token) {
+async function loadDraftByReviewToken(token) {
     const result = await pool.query(
         `SELECT d.*,
                 ic.name AS campaign_name,
@@ -1456,6 +1456,16 @@ async function loadPendingReviewDraft(token) {
         error.statusCode = 410;
         throw error;
     }
+    return draft;
+}
+
+async function loadPendingReviewDraft(token) {
+    const draft = await loadDraftByReviewToken(token);
+    if (draft.status === 'researching') {
+        const error = new Error('Draft is regenerating. Please wait for it to finish.');
+        error.statusCode = 409;
+        throw error;
+    }
     if (draft.status !== 'pending_review') {
         const error = new Error('Review draft is no longer available.');
         error.statusCode = 409;
@@ -1464,16 +1474,26 @@ async function loadPendingReviewDraft(token) {
     return draft;
 }
 
-export async function getInterestedAutoResponderDraftByToken(token) {
-    const draft = await loadPendingReviewDraft(token);
+function serializeReviewDraft(draft) {
     return {
         id: draft.id,
         leadEmail: draft.lead_email,
         campaignName: draft.campaign_name,
         previousLeadMessage: draft.previous_lead_message,
         renderedText: draft.rendered_text,
-        expiresAt: draft.review_token_expires_at
+        expiresAt: draft.review_token_expires_at,
+        status: draft.status
     };
+}
+
+export async function getInterestedAutoResponderDraftByToken(token) {
+    const draft = await loadDraftByReviewToken(token);
+    if (draft.status !== 'pending_review' && draft.status !== 'researching') {
+        const error = new Error('Review draft is no longer available.');
+        error.statusCode = 409;
+        throw error;
+    }
+    return serializeReviewDraft(draft);
 }
 
 export async function updateInterestedAutoResponderDraftTextByToken({ token, renderedText }) {
@@ -1702,4 +1722,161 @@ export async function cancelInterestedAutoResponderDraftByToken({ token }) {
         [draft.id]
     );
     return { cancelled: true, id: draft.id };
+}
+
+/**
+ * Re-run research + popup + reply generation for a pending_review draft, keeping
+ * the same review token/URL. Prefer the durable research workflow when enabled;
+ * otherwise regenerate inline (popup generate + draft reply).
+ */
+export async function regenerateInterestedAutoResponderDraftByToken({ token }) {
+    const draft = await loadPendingReviewDraft(token);
+    const settings = await fetchAgencyAndClientSettings(draft.agency_id, draft.client_id);
+    if (!settings.openaiKey) {
+        const error = new Error('No OpenAI API key configured for this agency.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const promptConfig = await fetchPromptConfig(pool, draft.client_id, draft.campaign_id);
+    if (!promptConfig) {
+        const error = new Error('No active auto-responder prompt for this campaign.');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const useResearchPath = Boolean(settings.replyResearchAgent)
+        && isInterestedResearchWorkflowConfigured();
+
+    if (useResearchPath) {
+        const reset = await pool.query(
+            `UPDATE interested_autoresponder_drafts
+             SET status = 'researching',
+                 research_brief = NULL,
+                 research_completed_at = NULL,
+                 blocked_reason = NULL,
+                 updated_at = NOW()
+             WHERE id = $1 AND status = 'pending_review'
+             RETURNING id`,
+            [draft.id]
+        );
+        if (!reset.rowCount) {
+            const error = new Error('Draft is no longer available to regenerate.');
+            error.statusCode = 409;
+            throw error;
+        }
+
+        try {
+            await triggerInterestedResearchWorkflow({
+                draftId: draft.id,
+                agencyId: draft.agency_id,
+                skipNtfy: true
+            });
+            return {
+                regenerating: true,
+                status: 'researching',
+                draftId: draft.id,
+                draft: serializeReviewDraft({ ...draft, status: 'researching' })
+            };
+        } catch (error) {
+            console.error(
+                `[interested-autoresponder] regenerate workflow trigger failed draft=${draft.id}`
+                + ` — falling back to inline: ${error?.message || error}`
+            );
+            // Fall through to inline regen below (draft is still 'researching').
+        }
+    }
+
+    const regenerated = await regenerateDraftInline({
+        draft,
+        settings,
+        promptConfig
+    });
+    return {
+        regenerating: false,
+        regenerated: true,
+        status: 'pending_review',
+        draftId: draft.id,
+        draft: regenerated
+    };
+}
+
+/** Popup (or Vulcan/story) + reply generation in-process; restores pending_review. */
+async function regenerateDraftInline({ draft, settings, promptConfig }) {
+    const signalRow = await resolveContactSignalContext(pool, draft.contact_id);
+    const auditDomain = normalizeAuditDomain(signalRow.company_domain)
+        || domainFromLeadEmail(draft.lead_email);
+    const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);
+    const useActiveFungiStoryUrl = Boolean(settings.useActiveFungiStoryUrl);
+
+    const [auditPreviewUrl, resolvedTemplateVars] = await Promise.all([
+        generateAuditPreviewUrl(draft.lead_email, {
+            domain: auditDomain,
+            useVulcanShoppingAudit: useShoppingAuditReply,
+            skipPopupPreview: Boolean(settings.skipPopupPreview),
+            ...(useShoppingAuditReply
+                ? {
+                    signalEmissionId: signalRow.signal_emission_id || null,
+                    signalType: signalRow.signal_type || null,
+                    observed: signalRow.observed || null,
+                    expected: signalRow.expected || null
+                }
+                : {})
+        }),
+        resolveTemplateVars(pool, draft.contact_id, draft.campaign_id, {
+            clientId: draft.client_id,
+            emailAccount: draft.eaccount
+        })
+    ]);
+
+    const templateVars = useActiveFungiStoryUrl
+        ? applyActiveFungiStoryUrlToTemplateVars(resolvedTemplateVars, { domain: auditDomain })
+        : resolvedTemplateVars;
+    const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
+    const generation = await generateDraftReply({
+        openaiKey: settings.openaiKey,
+        systemPrompt: renderedSystemPrompt,
+        campaignName: promptConfig.campaign_name,
+        leadEmail: draft.lead_email,
+        threadSubject: draft.thread_subject,
+        previousLeadMessage: draft.previous_lead_message,
+        auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
+        researchBrief: null,
+        systemPromptOwnsCta: useActiveFungiStoryUrl
+    });
+
+    const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();
+    const result = await pool.query(
+        `UPDATE interested_autoresponder_drafts
+         SET status = 'pending_review',
+             review_token_expires_at = $2,
+             model = $3,
+             rendered_text = $4,
+             system_prompt_version = $5,
+             research_brief = NULL,
+             research_completed_at = NULL,
+             blocked_reason = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+           AND status = ANY($6::text[])
+         RETURNING *`,
+        [
+            draft.id,
+            reviewTokenExpiresAt,
+            generation.model,
+            generation.renderedText,
+            promptConfig.version,
+            ['pending_review', 'researching']
+        ]
+    );
+    if (!result.rowCount) {
+        const error = new Error('Draft is no longer available to regenerate.');
+        error.statusCode = 409;
+        throw error;
+    }
+
+    return serializeReviewDraft({
+        ...result.rows[0],
+        campaign_name: draft.campaign_name
+    });
 }

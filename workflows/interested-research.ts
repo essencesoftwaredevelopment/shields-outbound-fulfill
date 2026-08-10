@@ -29,6 +29,8 @@ export interface InterestedResearchInput {
   draftId: number;
   agencyId: string;
   isFollowUp?: boolean;
+  /** When true, finalize skips the ntfy push (review-page regenerate). */
+  skipNtfy?: boolean;
 }
 
 export async function interestedResearchWorkflow(input: InterestedResearchInput) {
@@ -156,6 +158,7 @@ async function finalizeStep(
     ...input,
     auditPreviewUrl,
     isFollowUp: Boolean(input.isFollowUp),
+    skipNtfy: Boolean(input.skipNtfy),
   });
 }
 

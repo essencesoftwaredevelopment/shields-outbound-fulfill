@@ -11,6 +11,7 @@ import {
     sendInterestedAutoResponderDraftByToken,
     updateInterestedAutoResponderDraftTextByToken,
     cancelInterestedAutoResponderDraftByToken,
+    regenerateInterestedAutoResponderDraftByToken,
     cancelStalePendingReviewDraftsForClient,
     applyActiveFungiStoryUrlToTemplateVars,
     INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES
@@ -459,6 +460,20 @@ router.post('/interested-autoresponder/review/:token/send', async (req, res) => 
     } catch (error) {
         const statusCode = Number(error?.statusCode || 500);
         res.status(statusCode).json({ error: error?.message || 'Failed to send review draft.' });
+    }
+});
+
+router.post('/interested-autoresponder/review/:token/regenerate', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const result = await regenerateInterestedAutoResponderDraftByToken({
+            token: String(req.params.token || '')
+        });
+        res.json(result);
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        console.error('POST interested autoresponder regenerate error:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to regenerate review draft.' });
     }
 });
 

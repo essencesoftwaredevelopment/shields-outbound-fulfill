@@ -23,7 +23,7 @@ export async function POST(request: Request) {
     }
   }
 
-  let body: { draftId?: number; agencyId?: string; isFollowUp?: boolean };
+  let body: { draftId?: number; agencyId?: string; isFollowUp?: boolean; skipNtfy?: boolean };
   try {
     body = await request.json();
   } catch {
@@ -40,7 +40,12 @@ export async function POST(request: Request) {
   }
 
   const run = await start(interestedResearchWorkflow, [
-    { draftId, agencyId, isFollowUp: Boolean(body.isFollowUp) },
+    {
+      draftId,
+      agencyId,
+      isFollowUp: Boolean(body.isFollowUp),
+      skipNtfy: Boolean(body.skipNtfy),
+    },
   ]);
 
   return NextResponse.json({
