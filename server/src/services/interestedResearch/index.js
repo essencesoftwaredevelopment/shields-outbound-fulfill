@@ -125,10 +125,8 @@ export async function hydrateResearchContext({ draftId, agencyId }) {
     };
 }
 
-/** Step 2a — fetch and distill the company homepage. Best-effort: null on any failure. */
-export async function runHomepageResearch({ draftId, agencyId }) {
-    const draft = await loadResearchingDraft(pool, draftId, agencyId);
-    const { domain } = await resolveDraftResearchTarget(pool, draft);
+/** Fetch and distill a company homepage. Draft-independent; null on any failure. */
+export async function fetchHomepageForDomain(domain) {
     if (!domain) return null;
 
     const url = `https://${domain}/`;
@@ -162,19 +160,16 @@ export async function runHomepageResearch({ draftId, agencyId }) {
     }
 }
 
-/**
- * Step 2b — Serper sweep (company overview + recent news) using the agency's
- * own Serper key. Best-effort: null when no key, no domain, or the call fails.
- */
-export async function runSerperResearch({ draftId, agencyId }) {
+/** Step 2a — fetch and distill the company homepage. Best-effort: null on any failure. */
+export async function runHomepageResearch({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
-    const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
-    const agencySettings = await getAgencySettings(agencyId);
-    const serperKey = apiKeysFromSettings(agencySettings).serper;
-    if (!serperKey) {
-        console.warn(`[interested-research] no Serper key for agency=${agencyId} — skipping web sweep`);
-        return null;
-    }
+    const { domain } = await resolveDraftResearchTarget(pool, draft);
+    return fetchHomepageForDomain(domain);
+}
+
+/** Serper sweep for one target. Draft-independent; null when no key/queries/results. */
+export async function fetchSerperForTarget({ companyName, domain, serperKey }) {
+    if (!serperKey) return null;
 
     const queries = buildSerperQueries({ companyName, domain });
     if (!queries.length) return null;
@@ -211,32 +206,45 @@ export async function runSerperResearch({ draftId, agencyId }) {
 }
 
 /**
- * Step 3 — synthesize the structured brief from homepage + Serper context and
- * persist it on the draft (research_brief JSONB). Returns the brief, or null
- * when research was too thin to say anything grounded.
+ * Step 2b — Serper sweep (company overview + recent news) using the agency's
+ * own Serper key. Best-effort: null when no key, no domain, or the call fails.
+ */
+export async function runSerperResearch({ draftId, agencyId }) {
+    const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
+    const agencySettings = await getAgencySettings(agencyId);
+    const serperKey = apiKeysFromSettings(agencySettings).serper;
+    if (!serperKey) {
+        console.warn(`[interested-research] no Serper key for agency=${agencyId} — skipping web sweep`);
+        return null;
+    }
+    return fetchSerperForTarget({ companyName, domain, serperKey });
+}
+
+/**
+ * Synthesize the structured brief from research context. Draft-independent and
+ * side-effect free; returns the normalized brief, or null when research was too
+ * thin to say anything grounded.
  *
  * @param {{
- *   draftId: number,
- *   agencyId: string,
+ *   openaiKey: string,
+ *   companyName?: string,
+ *   domain?: string,
+ *   leadEmail?: string,
  *   homepage?: { url: string, title: string, description: string, text: string } | null,
  *   serper?: { results: Array<{ title: string, link: string | null, snippet: string, date: string | null }> } | null
  * }} args
  */
-export async function synthesizeResearchBrief({ draftId, agencyId, homepage = null, serper = null }) {
-    const draft = await loadResearchingDraft(pool, draftId, agencyId);
-    const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
-
+export async function synthesizeBriefFromContext({
+    openaiKey,
+    companyName = '',
+    domain = '',
+    leadEmail = '',
+    homepage = null,
+    serper = null
+}) {
     const hasSignal = Boolean(homepage?.text || homepage?.description || serper?.results?.length);
-    if (!hasSignal) {
-        console.log(`[interested-research] no research signal for draft=${draftId} — skipping brief`);
-        return null;
-    }
-
-    const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
-    if (!settings.openaiKey) {
-        console.warn(`[interested-research] missing OpenAI key for agency=${agencyId} — skipping brief`);
-        return null;
-    }
+    if (!hasSignal) return null;
 
     const contextBlocks = [];
     if (homepage) {
@@ -259,7 +267,7 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
         ].join('\n'));
     }
 
-    const openaiClient = new OpenAI({ apiKey: settings.openaiKey });
+    const openaiClient = new OpenAI({ apiKey: openaiKey });
     const response = await openaiClient.chat.completions.create({
         model: RESEARCH_MODEL,
         response_format: { type: 'json_object' },
@@ -291,10 +299,10 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
                 content: [
                     `Company: ${companyName || '(unknown)'}`,
                     `Domain: ${domain || '(unknown)'}`,
-                    `Lead email: ${draft.lead_email}`,
+                    leadEmail ? `Lead email: ${leadEmail}` : '',
                     '',
                     contextBlocks.join('\n\n')
-                ].join('\n')
+                ].filter(Boolean).join('\n')
             }
         ]
     });
@@ -305,7 +313,39 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
     } catch {
         parsed = null;
     }
-    const brief = normalizeResearchBrief(parsed, { company: companyName, domain });
+    return normalizeResearchBrief(parsed, { company: companyName, domain });
+}
+
+/**
+ * Step 3 — synthesize the structured brief from homepage + Serper context and
+ * persist it on the draft (research_brief JSONB). Returns the brief, or null
+ * when research was too thin to say anything grounded.
+ *
+ * @param {{
+ *   draftId: number,
+ *   agencyId: string,
+ *   homepage?: { url: string, title: string, description: string, text: string } | null,
+ *   serper?: { results: Array<{ title: string, link: string | null, snippet: string, date: string | null }> } | null
+ * }} args
+ */
+export async function synthesizeResearchBrief({ draftId, agencyId, homepage = null, serper = null }) {
+    const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
+
+    const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
+    if (!settings.openaiKey) {
+        console.warn(`[interested-research] missing OpenAI key for agency=${agencyId} — skipping brief`);
+        return null;
+    }
+
+    const brief = await synthesizeBriefFromContext({
+        openaiKey: settings.openaiKey,
+        companyName,
+        domain,
+        leadEmail: draft.lead_email,
+        homepage,
+        serper
+    });
     if (!brief) {
         console.log(`[interested-research] brief too thin for draft=${draftId}`);
         return null;
