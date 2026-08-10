@@ -301,6 +301,10 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
             console.log(
                 `[popup-form/generate] calling for domain=${domain} attempt=${attempt + 1}/${POPUP_FORM_GENERATE_MAX_ATTEMPTS} timeoutMs=${POPUP_FORM_GENERATE_TIMEOUT_MS}`
             );
+            const siteTrafficRaw = options.siteTraffic ?? options.estimatedVisitors;
+            const siteTraffic = Number.isFinite(Number(siteTrafficRaw)) && Number(siteTrafficRaw) > 0
+                ? Math.round(Number(siteTrafficRaw))
+                : null;
             const bodyPayload = {
                 domain,
                 // Research-brief context (interested-research workflow only —
@@ -312,10 +316,9 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
                 ...(Array.isArray(options.talkingPoints) && options.talkingPoints.length
                     ? { talkingPoints: options.talkingPoints }
                     : {}),
-                ...(Number.isFinite(Number(options.estimatedVisitors))
-                    && Number(options.estimatedVisitors) > 0
-                    ? { estimatedVisitors: Math.round(Number(options.estimatedVisitors)) }
-                    : {}),
+                // Popup API key is siteTraffic → popup_leads.site_traffic.
+                // Research brief keeps estimatedVisitors internally; map here.
+                ...(siteTraffic ? { siteTraffic } : {}),
                 ...(Number.isFinite(Number(options.reviewCount))
                     && Number(options.reviewCount) > 0
                     ? { reviewCount: Math.round(Number(options.reviewCount)) }

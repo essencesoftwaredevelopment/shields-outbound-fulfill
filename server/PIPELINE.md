@@ -134,7 +134,7 @@ Workflows runtime before the draft is written:
    best-effort) → LLM-synthesized brief persisted to
    `interested_autoresponder_drafts.research_brief`
    (`{ company, domain, industry, summary, talkingPoints, risks, sources,
-   reviewCount, estimatedVisitors }`) → external
+   reviewCount, siteTraffic }`) → external
    popup/audit URL (Essence popup or Vulcan audit, exactly as the inline path) →
    `generateDraftReply` with the brief → promote to `pending_review` + ntfy.
 3. Human review / send / warm follow-ups proceed unchanged.

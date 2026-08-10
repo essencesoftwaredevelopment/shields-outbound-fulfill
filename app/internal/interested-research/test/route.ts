@@ -106,7 +106,7 @@ export async function POST(request: Request) {
         ...(brief.company ? { companyName: brief.company } : {}),
         ...(brief.summary ? { summary: brief.summary } : {}),
         ...(brief.talkingPoints?.length ? { talkingPoints: brief.talkingPoints } : {}),
-        ...(brief.estimatedVisitors ? { estimatedVisitors: brief.estimatedVisitors } : {}),
+        ...(brief.estimatedVisitors ? { siteTraffic: brief.estimatedVisitors } : {}),
         ...(brief.reviewCount ? { reviewCount: brief.reviewCount } : {}),
       }
     : { domain };

@@ -41,7 +41,7 @@ No URL, auth, or response-contract changes. This is a request-body extension onl
     "Featured in Food & Wine"
   ],
   "reviewCount": 1240,
-  "estimatedVisitors": 124000
+  "siteTraffic": 124000
 }
 ```
 
@@ -63,7 +63,7 @@ No URL, auth, or response-contract changes. This is a request-body extension onl
 | `summary` | string | optional | 2–4 sentences: what they sell, to whom, anything notable/recent. Max 2,000 chars. LLM-written from scraped homepage + search results — treat as informative, not verbatim marketing copy. |
 | `talkingPoints` | string[] | optional | Up to 6 short, specific, research-verified hooks. Only sent when non-empty. |
 | `reviewCount` | number | optional | Published site/store review total when research found an explicit count (Trustpilot / Google / on-site aggregate). Omitted when unknown — never invented. |
-| `estimatedVisitors` | number | optional | Rough current-visitor estimate: `reviewCount × 100`. Only sent when `reviewCount` is known. Use for traffic-tier / offer sizing; treat as an order-of-magnitude proxy, not analytics. |
+| `siteTraffic` | number | optional | Rough monthly visit estimate: `reviewCount × 100` (research brief field `estimatedVisitors`). Only sent when a review count is known. Stored on `popup_leads.site_traffic` for the preview growth calculator; treat as an order-of-magnitude proxy, not analytics. |
 
 Every optional field is **independently** optional — you may receive `domain` +
 `industry` with nothing else, or `domain` + `summary` without an industry.
@@ -114,8 +114,8 @@ the signal fields rarely or never. No action needed.
    - `companyName` → headline and copy (instead of a capitalized domain label).
    - `summary` / `talkingPoints` → offer copy, incentive phrasing, or your own
      generation prompt context.
-   - `estimatedVisitors` (and optionally `reviewCount`) → traffic-tier /
-     personalization sizing when present; fall back to your existing defaults
+   - `siteTraffic` (and optionally `reviewCount`) → seed `popup_leads.site_traffic`
+     / growth calculator when present; fall back to your existing defaults
      when absent.
 4. **Idempotency / duplicates:** shields retries on 429/5xx/network failure
    (max 2 attempts, 1–2s backoff, 90s timeout per attempt). The same domain may
