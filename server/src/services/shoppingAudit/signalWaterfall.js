@@ -9,6 +9,7 @@ import {
     evaluateTitleQuality,
     extractCardFields,
     formatPriceUsd,
+    humanizeProductShort,
     isCheckableDestination,
     lowestInStockPrice,
     parsePriceValue,
@@ -172,7 +173,8 @@ const DETECTORS = {
 
 /**
  * Cold-email variables for the results CSV / Instantly upload.
- * product_short is patched in later by the personalization stage (LLM).
+ * product_short is the humanized title (junk stripped, <35 chars) — built
+ * inline so it never depends on the personalization stage running.
  */
 export function buildSignalExportVars({ signalType, observed = {}, expected = {}, snapshot, adCard }) {
     const card = adCard ? extractCardFields(adCard.raw || adCard) : null;
@@ -181,6 +183,7 @@ export function buildSignalExportVars({ signalType, observed = {}, expected = {}
     const product = snapshot?.title || observed.ad_title || observed.feed_title || card?.title || '';
     return {
         product,
+        product_short: humanizeProductShort(product),
         issue: SIGNAL_ISSUE_LABELS[signalType] ?? '',
         ad_price: formatPriceUsd(adPriceValue),
         page_price: formatPriceUsd(pagePriceValue),

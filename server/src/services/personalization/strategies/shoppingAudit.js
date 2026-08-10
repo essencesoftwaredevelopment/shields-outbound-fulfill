@@ -1,7 +1,6 @@
-import OpenAI from 'openai';
 import { createConcurrencyLimit } from '../../../lib/concurrency.js';
 import { DEFAULT_SIGNAL_TEMPLATES } from '../../shoppingAudit/constants.js';
-import { normalizeProductTitle } from '../../shoppingAudit/utils.js';
+import { humanizeProductShort } from '../../shoppingAudit/utils.js';
 import { getSignalEmissionById, updateSignalEmissionExportVars } from '../../shoppingAudit/db.js';
 
 function parsePositiveInt(raw, fallback) {
@@ -44,72 +43,27 @@ function buildSignalVars(signal, snapshot) {
     };
 }
 
-function sanitizeProductShort(raw, fallbackTitle) {
-    const cleaned = String(raw || '')
-        .toLowerCase()
-        .replace(/["'`.,;:!?]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .split(' ')
-        .slice(0, 3)
-        .join(' ');
-    if (cleaned) return cleaned;
-    return normalizeProductTitle(fallbackTitle || '').toLowerCase();
-}
-
 /**
- * {{product_short}} — the name a customer would use for the product ("socks",
- * not "Merino Wool Crew Sock 3-Pack"). Used across subjects and bodies of the
- * shopping-audit emails, so it must read like a shopper wrote it.
+ * {{product_short}} — the humanized ad/product title used across subjects and
+ * bodies of the shopping-audit emails: marketing junk stripped, sentence-cased
+ * when ALL CAPS, truncated below 35 characters. Deterministic — formerly an
+ * LLM call (generic "socks"-style names), now humanizeProductShort().
  */
-async function generateProductShort({ productTitle, apiKey }) {
-    if (!productTitle) {
-        return { product_short: '', inputTokens: 0, outputTokens: 0 };
-    }
-
-    const client = new OpenAI({ apiKey });
-    const response = await client.chat.completions.create({
-        model: process.env.SHOPPING_AUDIT_PERSONALIZATION_MODEL || 'gpt-4o-mini',
-        temperature: 0.3,
-        max_tokens: 16,
-        messages: [
-            {
-                role: 'system',
-                content: `You turn e-commerce product titles into the short generic name a customer would use when complaining about the product's ad. Reply with the name only: lowercase, 1-3 words, plural where natural, no brand names, no quotes.
-Examples:
-Merino Wool Crew Sock 3-Pack -> socks
-Osprey Daylite 26L Backpack - Black -> backpack
-Chocolate Sea Salt Protein Bar (12ct) -> protein bars`
-            },
-            { role: 'user', content: String(productTitle) }
-        ]
-    });
-
-    const raw = response.choices?.[0]?.message?.content?.trim() || '';
-    const usage = response.usage || {};
-    return {
-        product_short: sanitizeProductShort(raw, productTitle),
-        inputTokens: usage.prompt_tokens || 0,
-        outputTokens: usage.completion_tokens || 0
-    };
+function generateProductShort(productTitle) {
+    if (!productTitle) return '';
+    return humanizeProductShort(productTitle);
 }
 
 export async function runPersonalization({
     rows,
-    apiKeys,
     log,
-    recordTiming,
     signalEmissionByDomain,
     templates,
     onBatch,
     checkpoint,
-    concurrency = PERSONALIZATION_CONCURRENCY,
-    rateLimitHooks = null
+    concurrency = PERSONALIZATION_CONCURRENCY
 }) {
     let processed = 0;
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    let llmMs = 0;
     const outputRows = [];
     const exportVarPatches = [];
     const total = rows.length;
@@ -157,17 +111,9 @@ export async function runPersonalization({
                     const baseTemplate = templateMap[signal.signal_type] || templateMap.title_quality;
                     const first_line = renderTemplate(baseTemplate, vars);
 
-                    const generate = () => generateProductShort({
-                        productTitle: vars.product === 'your product' ? '' : vars.product,
-                        apiKey: apiKeys.openai
-                    });
-                    const llmStart = Date.now();
-                    const { product_short, inputTokens, outputTokens } = rateLimitHooks?.openai
-                        ? await rateLimitHooks.openai(generate)
-                        : await generate();
-                    llmMs += Date.now() - llmStart;
-                    totalInputTokens += inputTokens;
-                    totalOutputTokens += outputTokens;
+                    const product_short = generateProductShort(
+                        vars.product === 'your product' ? '' : vars.product
+                    );
 
                     const signalEmissionId = emissionRef?.signalId || row.signal_emission_id || signal.id || null;
                     if (signalEmissionId && product_short) {
@@ -208,20 +154,10 @@ export async function runPersonalization({
         await onBatch(outputRows);
     }
 
-    if (llmMs > 0) {
-        recordTiming?.({
-            label: 'fetch:personalizationLlm',
-            category: 'fetch',
-            durationMs: llmMs,
-            rows: outputRows.length,
-            stage: 'personalization'
-        });
-    }
-
     return {
         processed: outputRows.length,
         total,
-        inputTokens: totalInputTokens,
-        outputTokens: totalOutputTokens
+        inputTokens: 0,
+        outputTokens: 0
     };
 }

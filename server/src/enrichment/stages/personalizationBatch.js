@@ -4,7 +4,6 @@ import { runPersonalizationFromRows } from '../../services/personalization/index
 import { runPersonalization as runShoppingAuditPersonalization } from '../../services/personalization/strategies/shoppingAudit.js';
 import { getSignalEmissionByDomain } from '../../services/shoppingAudit/db.js';
 import { assertJobActive } from '../persist.js';
-import { createRateLimitHooks } from '../rateLimit.js';
 import {
     beginJobStage,
     finishJobStage,
@@ -82,15 +81,12 @@ export async function runPersonalizationBatch(ctx, batchDomains, batchOpts = {})
 
     if (ctx.pipelineMode === 'shopping_audit') {
         const signalEmissionByDomain = await buildSignalMap(ctx, rows.map((r) => r.domain));
-        const rateLimitHooks = createRateLimitHooks(ctx);
         const auditSummary = await runShoppingAuditPersonalization({
             rows,
-            apiKeys: ctx.apiKeys,
             log: stageLog,
             signalEmissionByDomain,
             templates: ctx.auditFeatures?.signalTemplates,
             checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
-            rateLimitHooks,
             onBatch: async (batchRows) => {
                 if (!batchRows?.length) return;
                 await upsertLeadRowsBatch({

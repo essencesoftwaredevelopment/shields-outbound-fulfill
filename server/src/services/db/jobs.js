@@ -7,7 +7,7 @@ import { normalizeDomain } from '../../utils/domain.js';
 import { parse as csvParse } from 'csv-parse/sync';
 import { mergeEnrichmentIntoRawRow } from '../enrichmentCohort.js';
 import { SIGNAL_ISSUE_LABELS } from '../shoppingAudit/constants.js';
-import { formatPriceUsd } from '../shoppingAudit/utils.js';
+import { formatPriceUsd, humanizeProductShort } from '../shoppingAudit/utils.js';
 
 /** Domains eligible for enrichment stages (cohort + not founder-excluded this job). */
 const COHORT_ELIGIBLE_SQL = `
@@ -1258,7 +1258,11 @@ function mapUnifiedContactRow(row, shoppingAudit = false) {
         shopping_ad_link: row.shopping_ad_link || '',
         signal: signalType,
         issue: exportVars.issue ?? (SIGNAL_ISSUE_LABELS[signalType] || ''),
-        product_short: exportVars.product_short || '',
+        // Humanized at read time so jobs whose emissions predate the stored
+        // product_short (e.g. personalization skipped) still export one.
+        product_short: humanizeProductShort(exportVars.product_short)
+            || humanizeProductShort(exportVars.product)
+            || humanizeProductShort(row.hero_product),
         ad_price: exportVars.ad_price || formatPriceUsd(observed.ad_price),
         page_price: exportVars.page_price || formatPriceUsd(expected.page_price),
         other_signals: secondary.map((s) => s?.signal_type).filter(Boolean).join('; ')

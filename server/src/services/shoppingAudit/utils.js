@@ -37,6 +37,124 @@ export function normalizeProductTitle(title) {
         .trim();
 }
 
+/** "below 35 characters" per the cold-email variable spec. */
+const PRODUCT_SHORT_MAX_LENGTH = 34;
+
+/**
+ * Promotional noise that never distinguishes a product. Multiword phrases are
+ * matched before the truncation pass; bare "free"/"hot"/"original"/"premium"
+ * are deliberately absent — they are often product identity ("Talc Free Body
+ * Powder", "Hot Sauce", "Original Bag Organizer").
+ */
+const PRODUCT_SHORT_JUNK_PHRASES = [
+    'free shipping', 'free gift', 'free returns', 'free delivery', 'ships free',
+    'back in stock', 'restocked', 'in stock',
+    'pre-order', 'preorder',
+    'new arrivals', 'new arrival', 'brand new', 'new generation',
+    'on sale', 'flash sale', 'final sale', 'sale',
+    'clearance', 'limited drop', 'limited time',
+    'while supplies last', 'while stocks last',
+    'buy one get one', 'bogo', 'special offer',
+    'best price', 'lowest price', 'shop now', 'buy now', 'order now'
+];
+
+/** Brand collocations where a mid-title "New" is identity, not marketing. */
+const NEW_BRAND_GUARDS = new Set([
+    'era', 'balance', 'york', 'jersey', 'england', 'zealand',
+    'orleans', 'mexico', 'hampshire', 'wave', 'west', 'look'
+]);
+
+/** Words a truncated name must not dangle on ("Locsanity Loc Cleanse and"). */
+const TRAILING_DANGLERS = new Set([
+    'and', 'or', 'with', 'for', 'of', 'in', 'on', 'at', 'to',
+    'the', 'a', 'an', 'by', 'from', 'plus', 'x', '&', '+'
+]);
+
+const JUNK_PHRASE_REGEXES = PRODUCT_SHORT_JUNK_PHRASES.map(
+    (phrase) => new RegExp(`\\b${phrase.replace(/[-\s]/g, '[-\\s]')}\\b`, 'gi')
+);
+
+function stripTrailingDanglers(text) {
+    let out = text;
+    for (let i = 0; i < 10; i += 1) {
+        const before = out;
+        out = out.replace(/[\s\-|,:;&+*]+$/g, '');
+        // Keep a final "." only when it closes an acronym ("G.O.A.T.").
+        if (/\.$/.test(out) && !/(?:^|\s)[A-Za-z](?:\.[A-Za-z])+\.$/.test(out)) {
+            out = out.replace(/\.+$/, '');
+        }
+        const lastWord = out.slice(out.lastIndexOf(' ') + 1).toLowerCase();
+        if (TRAILING_DANGLERS.has(lastWord)) {
+            out = out.slice(0, out.lastIndexOf(' '));
+        }
+        if (out === before) break;
+    }
+    return out.trim();
+}
+
+/**
+ * {{product_short}} — the humanized form of the hero-product / ad title used
+ * in the cold-email variables: marketing junk and bracketed variant noise
+ * stripped, sentence-cased when the title is ALL CAPS (existing casing kept
+ * otherwise), and word-boundary truncated below 35 characters. Deterministic
+ * and idempotent — safe to apply at export time to already-stored values.
+ */
+export function humanizeProductShort(title) {
+    let text = String(title || '')
+        .replace(/[™®©]/g, '')
+        .replace(/[‘’‚]/g, "'")
+        .replace(/[“”„″]/g, '"')
+        .replace(/[–—―]/g, '-')
+        .replace(/[\u00a0\u200b\u200c\u200d\ufeff]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!text) return '';
+
+    // Bracketed segments are overwhelmingly variant/marketing noise in feed
+    // titles: "(Stripe Burgundy)", "(12ct)", "(FREE Shipping)", "[2-Pack]".
+    text = text.replace(/\([^)]*\)|\[[^\]]*\]|\{[^}]*\}/g, ' ');
+
+    for (const regex of JUNK_PHRASE_REGEXES) {
+        text = text.replace(regex, ' ');
+    }
+    text = text
+        .replace(/\b\d+(?:\.\d+)?\s*%\s*off\b/gi, ' ')
+        .replace(/\$\d+(?:\.\d+)?\s*off\b/gi, ' ')
+        .replace(/\bsave\s+\$?\d+(?:\.\d+)?%?\b/gi, ' ');
+
+    // "New" is junk as a leading token ("NEW Hoodie") and mid-title filler
+    // ("Colored New Wine Glass Set") but identity inside brand collocations
+    // ("New Era 59Fifty", "New Balance") — guarded wherever it appears.
+    text = text.replace(/\bnew\b[\s:!-]+(\w+)/gi, (match, next) =>
+        NEW_BRAND_GUARDS.has(next.toLowerCase()) ? match : next);
+
+    text = text
+        .replace(/(^|\s)\*+(?=\s|$)/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/([|,:;-]\s*){2,}/g, '$1')
+        .replace(/\s+([,:;])/g, '$1')
+        .replace(/^[\s\-|,:;&+*.!]+/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    text = stripTrailingDanglers(text);
+    if (!text) return '';
+
+    // ALL CAPS reads like shouting — sentence-case it. Any lowercase present
+    // means the merchant chose the casing; keep it.
+    if (!/[a-z]/.test(text) && /[A-Z]/.test(text)) {
+        text = text.toLowerCase().replace(/[a-z]/, (c) => c.toUpperCase());
+    }
+
+    if (text.length > PRODUCT_SHORT_MAX_LENGTH) {
+        const head = text.slice(0, PRODUCT_SHORT_MAX_LENGTH + 1);
+        const lastSpace = head.lastIndexOf(' ');
+        text = lastSpace > 0 ? head.slice(0, lastSpace) : text.slice(0, PRODUCT_SHORT_MAX_LENGTH);
+        text = stripTrailingDanglers(text);
+    }
+
+    return text;
+}
+
 /**
  * Serper Shopping search query: "{domain} {hero product title}".
  * @deprecated Hero-first path removed from production (2026-07) — the pipeline
