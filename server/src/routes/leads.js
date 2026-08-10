@@ -10,6 +10,7 @@
  * No Firestore lead storage.
  */
 
+import crypto from 'crypto';
 import express from 'express';
 import multer from 'multer';
 import { parse as csvParse } from 'csv-parse';
@@ -22,6 +23,10 @@ import { queryWithStatementTimeout } from '../config/db.js';
 import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
 import { normalizeDomain } from '../utils/domain.js';
 import { SIGNAL_TYPES } from '../services/shoppingAudit/constants.js';
+import {
+    mapInterestStatusToEventType,
+    updateInstantlyLeadInterestStatus
+} from '../services/instantlyState.js';
 
 const uploadVerification = multer({
     storage: multer.memoryStorage(),
@@ -3235,6 +3240,182 @@ router.get('/leads/:contactId/events', verifyFirebaseToken, async (req, res) => 
     } catch (error) {
         console.error('Error fetching lead events:', error);
         res.status(500).json({ error: 'Failed to fetch lead events' });
+    }
+});
+
+/**
+ * POST /leads/:contactId/instantly-interest-status
+ *
+ * Manually set Instantly interest status for a lead+campaign, then mirror it
+ * locally (campaign row + timeline event) so UI / warm follow-ups do not wait
+ * on delayed Instantly webhooks.
+ *
+ * Body: { clientId, campaignId (Instantly UUID), interestValue, label }
+ */
+router.post('/leads/:contactId/instantly-interest-status', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        const clientIdOrSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        const instantlyCampaignId = typeof req.body?.campaignId === 'string'
+            ? req.body.campaignId.trim()
+            : String(req.body?.campaignId || '').trim();
+        const interestValue = Number(req.body?.interestValue);
+        const label = String(req.body?.label || '').trim();
+
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        if (!clientIdOrSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+        if (!instantlyCampaignId) {
+            return res.status(400).json({ error: 'campaignId is required.' });
+        }
+        if (!Number.isInteger(interestValue)) {
+            return res.status(400).json({ error: 'interestValue must be an integer.' });
+        }
+        if (!label) {
+            return res.status(400).json({ error: 'label is required.' });
+        }
+
+        const clientRow = await queries.resolveClientRow(agencyId, clientIdOrSlug);
+        if (!clientRow) {
+            return res.status(404).json({ error: 'Client not found.' });
+        }
+        const instantlyKey = String(clientRow.instantly_key || '').trim();
+        if (!instantlyKey) {
+            return res.status(400).json({ error: 'Client is missing Instantly API key.' });
+        }
+
+        const membershipResult = await pool.query(
+            `SELECT
+                c.id AS contact_id,
+                c.email AS lead_email,
+                c.client_id,
+                ic.id AS campaign_id,
+                ic.instantly_campaign_id,
+                cic.instantly_lead_id
+             FROM contacts c
+             JOIN instantly_campaigns ic
+               ON ic.client_id = c.client_id
+              AND ic.agency_id = c.agency_id
+              AND ic.instantly_campaign_id = $3
+             JOIN contact_instantly_campaigns cic
+               ON cic.contact_id = c.id
+              AND cic.campaign_id = ic.id
+             WHERE c.id = $1
+               AND c.agency_id = $2
+               AND c.client_id = $4
+             LIMIT 1`,
+            [contactId, agencyId, instantlyCampaignId, clientRow.id]
+        );
+
+        if (!membershipResult.rows.length) {
+            return res.status(404).json({
+                error: 'Lead is not a member of that Instantly campaign for this client.'
+            });
+        }
+
+        const membership = membershipResult.rows[0];
+        const leadEmail = String(membership.lead_email || '').trim().toLowerCase();
+        if (!leadEmail) {
+            return res.status(400).json({ error: 'Lead has no email address.' });
+        }
+
+        await updateInstantlyLeadInterestStatus(instantlyKey, {
+            campaignId: membership.instantly_campaign_id,
+            leadEmail,
+            interestValue
+        });
+
+        const mappedEventType = mapInterestStatusToEventType(interestValue);
+        // Never write "Warm Follow Up" as event_type — that re-enrolls follow-ups.
+        const eventType = mappedEventType || 'interest_status_set';
+        const interestStatusLabel = label;
+        const eventTimestamp = new Date().toISOString();
+        const fingerprint = crypto
+            .createHash('sha256')
+            .update([
+                'manual_interest_status',
+                String(contactId),
+                String(membership.campaign_id),
+                String(interestValue),
+                eventTimestamp
+            ].join('|'))
+            .digest('hex');
+
+        const payload = {
+            event_type: eventType,
+            source: 'manual',
+            interest_value: interestValue,
+            label,
+            interest_status_label: interestStatusLabel,
+            previous_interest_status: null,
+            next_interest_status: interestValue
+        };
+
+        const insertEventResult = await pool.query(
+            `INSERT INTO contact_instantly_events (
+                agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
+                event_type, lead_email, message_text, event_timestamp, fingerprint, source, payload
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'manual', $12::jsonb)
+            ON CONFLICT (source, fingerprint) DO NOTHING
+            RETURNING id, event_type, campaign_id, instantly_campaign_id, lead_email,
+                      message_text, event_timestamp, source, payload, created_at`,
+            [
+                agencyId,
+                clientRow.id,
+                contactId,
+                membership.campaign_id,
+                membership.instantly_campaign_id,
+                membership.instantly_lead_id || null,
+                eventType,
+                leadEmail,
+                label,
+                eventTimestamp,
+                fingerprint,
+                JSON.stringify(payload)
+            ]
+        );
+
+        await pool.query(
+            `UPDATE contact_instantly_campaigns
+             SET interest_status = $3,
+                 interest_status_label = $4,
+                 timestamp_last_interest_change = $5::timestamptz,
+                 last_event_type = $6,
+                 last_synced_at = NOW()
+             WHERE contact_id = $1
+               AND campaign_id = $2`,
+            [
+                contactId,
+                membership.campaign_id,
+                interestValue,
+                interestStatusLabel,
+                eventTimestamp,
+                eventType
+            ]
+        );
+
+        const eventRow = insertEventResult.rows[0] || null;
+        res.json({
+            interest_status: interestValue,
+            interest_status_label: interestStatusLabel,
+            label,
+            campaign_id: membership.instantly_campaign_id,
+            event: eventRow
+        });
+    } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        console.error('Error setting Instantly interest status:', error?.message || error);
+        res.status(statusCode).json({
+            error: error?.statusCode
+                ? (error.message || 'Failed to update Instantly interest status.')
+                : 'Failed to update Instantly interest status.'
+        });
     }
 });
 

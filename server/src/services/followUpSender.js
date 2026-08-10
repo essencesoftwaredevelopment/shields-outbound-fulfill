@@ -4,7 +4,9 @@
  * Automated follow-up sender driven by Warm Follow Up events in
  * contact_instantly_events. Sequence continues through email_sent events
  * (including those produced by our own sends) and stops only when a blocking
- * event (reply, status-change) appears after the last Warm Follow Up anchor.
+ * event (reply, status-change, meeting booked, etc.) appears after the last
+ * Warm Follow Up anchor. Blockers are matched by contact (not campaign), so
+ * Calendly bookings with a null campaign_id still suppress follow-ups.
  *
  * Key entry points:
  *   runFollowUpsOnce({ dryRun, filterAgencyId, filterClientSlug, logger })
@@ -20,9 +22,11 @@ import crypto from 'crypto';
 export const WARM_FOLLOW_UP_EVENT = 'Warm Follow Up';
 
 /**
- * Events that stop the follow-up sequence for a contact+campaign, provided
- * they appear AFTER the latest Warm Follow Up anchor event. email_sent is
- * intentionally absent — it must never block sequence progression.
+ * Events that stop the follow-up sequence for a contact, provided they appear
+ * AFTER the latest Warm Follow Up anchor for that campaign. Matched by
+ * contact_id only (not campaign_id) so Calendly / cross-campaign blockers
+ * with a null or different campaign_id still suppress follow-ups. email_sent
+ * is intentionally absent — it must never block sequence progression.
  */
 const BLOCKER_EVENT_TYPES = [
     'reply_received',
@@ -387,7 +391,8 @@ async function getNextScriptForProspect(db, clientId, contactId, campaignId) {
  * Eligibility requires:
  *   1. Active campaign/contact row with a non-null email.
  *   2. At least one Warm Follow Up event exists.
- *   3. No blocking event appears AFTER the latest Warm Follow Up anchor.
+ *   3. No blocking event appears AFTER the latest Warm Follow Up anchor
+ *      for this contact (any campaign_id, including null — e.g. Calendly).
  *      (email_sent is explicitly excluded from blockers.)
  *   4. No successful follow_up_send exists for today.
  *   5. At least one active follow_up_script remains in the sequence
@@ -439,11 +444,11 @@ async function getEligibleProspects(db, clientId, sentForDate) {
                  AND wfu.event_type = $2
            )
            -- No blocker event after the latest Warm Follow Up anchor
+           -- (contact-scoped: ignore blocker.campaign_id so Calendly bookings count)
            AND NOT EXISTS (
                SELECT 1
                FROM contact_instantly_events blocker
                WHERE blocker.contact_id = cic.contact_id
-                 AND blocker.campaign_id = cic.campaign_id
                  AND blocker.event_type = ANY($3::text[])
                  AND blocker.event_timestamp > (
                      SELECT MAX(anchor.event_timestamp)
@@ -489,22 +494,22 @@ async function getEligibleProspects(db, clientId, sentForDate) {
  * arrives between eligibility scan and the actual API call.
  */
 async function recheckProspect(db, contactId, campaignId, sentForDate) {
-    // Check for blocking event after latest Warm Follow Up anchor
+    // Contact-scoped blocker check after latest Warm Follow Up for this campaign
+    // (no blocker.campaign_id filter — Calendly / null-campaign events still block)
     const blockerResult = await db.query(
         `SELECT 1
          FROM contact_instantly_events blocker
          WHERE blocker.contact_id = $1
-           AND blocker.campaign_id = $2
-           AND blocker.event_type = ANY($3::text[])
+           AND blocker.event_type = ANY($2::text[])
            AND blocker.event_timestamp > (
                SELECT MAX(anchor.event_timestamp)
                FROM contact_instantly_events anchor
                WHERE anchor.contact_id = $1
-                 AND anchor.campaign_id = $2
+                 AND anchor.campaign_id = $3
                  AND anchor.event_type = $4
            )
          LIMIT 1`,
-        [contactId, campaignId, BLOCKER_EVENT_TYPES, WARM_FOLLOW_UP_EVENT]
+        [contactId, BLOCKER_EVENT_TYPES, campaignId, WARM_FOLLOW_UP_EVENT]
     );
     if (blockerResult.rows.length > 0) {
         return { blocked: true, reason: 'blocker_event_appeared' };

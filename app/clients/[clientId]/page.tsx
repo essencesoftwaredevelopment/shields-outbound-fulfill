@@ -475,6 +475,14 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
     if (normalized === "lead neutral") return "Neutral";
     if (normalized === "lead no show") return "No show";
     if (normalized === "warm follow up") return "Marked as warm follow up";
+    if (String(eventType || "").toLowerCase() === "interest_status_set") {
+        const customLabel = String(fallbackLabel || "").trim();
+        const customNormalized = customLabel.toLowerCase().replace(/[_ ]+/g, " ");
+        if (customLabel && customNormalized !== "interest status set") {
+            return `Marked as ${customLabel}`;
+        }
+        return "Instantly status updated";
+    }
     if (String(eventType || "").toLowerCase() === "interest_change") {
         return `Marked as ${normalized}`;
     }
@@ -2119,8 +2127,11 @@ export default function ClientPage() {
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [emailCopied, setEmailCopied] = useState(false);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
-    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string }>>([]);
+    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string; source?: string }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
+    const [leadStatusCampaignId, setLeadStatusCampaignId] = useState<string>('');
+    const [leadStatusInterestValue, setLeadStatusInterestValue] = useState<string>('');
+    const [savingLeadInstantlyStatus, setSavingLeadInstantlyStatus] = useState(false);
     const [activityReplyPopup, setActivityReplyPopup] = useState<{ html: string; isHtml: boolean; x: number; y: number } | null>(null);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
@@ -2149,6 +2160,9 @@ export default function ClientPage() {
         setLeadModalTab('detail');
         setShowLeadAdvanced(false);
         setEmailCopied(false);
+        const campaigns = selectedLead?.campaignsData || [];
+        setLeadStatusCampaignId(campaigns[0]?.campaignId || '');
+        setLeadStatusInterestValue('');
     }, [selectedLead?.id]);
 
     useEffect(() => {
@@ -5623,6 +5637,95 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setSavingWarmFollowUpStatus(false);
+        }
+    };
+
+    const refreshLeadEvents = async (contactId: string | number) => {
+        const idToken = await getAccessToken();
+        if (!idToken) return;
+        const res = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/${contactId}/events?limit=50`, {
+            headers: { Authorization: `Bearer ${idToken}` }
+        });
+        if (!res.ok) throw new Error(`Failed to fetch events: ${res.statusText}`);
+        const data = await res.json();
+        setLeadEvents(data.events || []);
+    };
+
+    const handleSaveLeadInstantlyStatus = async () => {
+        if (!user || !clientId || !selectedLead?.id) return;
+        const campaigns = selectedLead.campaignsData || [];
+        const campaignId = leadStatusCampaignId || campaigns[0]?.campaignId || '';
+        if (!campaignId) {
+            setToastMessage('This lead has no Instantly campaign to update.');
+            setToastVisible(true);
+            return;
+        }
+        const option = (instantlyLeadLabels || []).find((item) => String(item.value) === leadStatusInterestValue);
+        if (!option) {
+            setToastMessage('Choose an Instantly status first.');
+            setToastVisible(true);
+            return;
+        }
+
+        setSavingLeadInstantlyStatus(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/${selectedLead.id}/instantly-interest-status`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({
+                        clientId,
+                        campaignId,
+                        interestValue: option.value,
+                        label: option.label
+                    })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to update Instantly status');
+
+            const nextLabel = data.interest_status_label || option.label;
+            setSelectedLead((prev) => {
+                if (!prev) return prev;
+                return {
+                    ...prev,
+                    campaignsData: (prev.campaignsData || []).map((campaign) =>
+                        campaign.campaignId === campaignId
+                            ? {
+                                ...campaign,
+                                interestStatus: nextLabel,
+                                timestampLastInterestChange: data.event?.event_timestamp || new Date().toISOString()
+                            }
+                            : campaign
+                    )
+                };
+            });
+            setLeads((prev) => prev.map((lead) => {
+                if (lead.id !== selectedLead.id) return lead;
+                return {
+                    ...lead,
+                    campaignsData: (lead.campaignsData || []).map((campaign) =>
+                        campaign.campaignId === campaignId
+                            ? {
+                                ...campaign,
+                                interestStatus: nextLabel,
+                                timestampLastInterestChange: data.event?.event_timestamp || new Date().toISOString()
+                            }
+                            : campaign
+                    )
+                };
+            }));
+            await refreshLeadEvents(selectedLead.id);
+            setToastMessage(`Marked as "${option.label}" in Instantly.`);
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to update Instantly status');
+            setToastVisible(true);
+        } finally {
+            setSavingLeadInstantlyStatus(false);
         }
     };
 
@@ -13556,6 +13659,76 @@ export default function ClientPage() {
                                 </div>
                             )}
 
+                            {/* Manual Instantly status — above activity so ops can mark without waiting on webhooks */}
+                            {(selectedLead.campaignsData || []).length > 0 && (
+                                <div style={{
+                                    borderTop: '1px solid var(--app-border)',
+                                    paddingTop: '0.75rem',
+                                    marginBottom: '1rem',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '0.45rem'
+                                }}>
+                                    <p style={{
+                                        margin: 0,
+                                        fontSize: '0.75rem',
+                                        fontWeight: 600,
+                                        textTransform: 'uppercase',
+                                        letterSpacing: '0.06em',
+                                        color: 'var(--app-text-ghost)'
+                                    }}>Instantly status</p>
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.45rem', alignItems: 'center' }}>
+                                        {(selectedLead.campaignsData || []).length > 1 && (
+                                            <select
+                                                value={leadStatusCampaignId || selectedLead.campaignsData?.[0]?.campaignId || ''}
+                                                disabled={savingLeadInstantlyStatus}
+                                                onChange={(e) => setLeadStatusCampaignId(e.target.value)}
+                                                style={{ flex: '1 1 140px', minWidth: 0 }}
+                                            >
+                                                {(selectedLead.campaignsData || []).map((campaign) => (
+                                                    <option key={campaign.campaignId} value={campaign.campaignId}>
+                                                        {campaign.campaignName || campaign.campaignId}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        )}
+                                        <select
+                                            value={leadStatusInterestValue}
+                                            disabled={savingLeadInstantlyStatus || instantlyLeadLabelsLoading}
+                                            onFocus={() => {
+                                                if (instantlyLeadLabels === null) loadInstantlyLeadLabels();
+                                            }}
+                                            onChange={(e) => setLeadStatusInterestValue(e.target.value)}
+                                            style={{ flex: '1 1 160px', minWidth: 0 }}
+                                        >
+                                            <option value="">
+                                                {instantlyLeadLabelsLoading
+                                                    ? 'Loading statuses…'
+                                                    : (instantlyLeadLabels === null ? 'Choose status…' : 'Choose status…')}
+                                            </option>
+                                            {(instantlyLeadLabels || []).map((item) => (
+                                                <option key={item.value} value={String(item.value)}>
+                                                    {item.label}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <button
+                                            type="button"
+                                            className="secondary-button"
+                                            disabled={
+                                                savingLeadInstantlyStatus
+                                                || !leadStatusInterestValue
+                                                || instantlyLeadLabelsLoading
+                                            }
+                                            onClick={handleSaveLeadInstantlyStatus}
+                                            style={{ flexShrink: 0, padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                        >
+                                            {savingLeadInstantlyStatus ? 'Saving…' : 'Apply'}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
                             {/* Events Timeline */}
                             <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: '0.75rem', marginBottom: '0.75rem' }}>
                                 <p style={{
@@ -13659,7 +13832,11 @@ export default function ClientPage() {
                                             event_type: evt.event_type || 'unknown',
                                             displayLabel: evt.event_type === 'email_sent' && evt.step != null
                                                 ? `email ${evt.step} sent`
-                                                : (evt.event_type || 'unknown').replace(/_/g, ' '),
+                                                : evt.event_type === 'interest_status_set' && evt.message_text
+                                                    ? evt.message_text
+                                                    : evt.source === 'manual' && evt.message_text
+                                                        ? evt.message_text
+                                                        : (evt.event_type || 'unknown').replace(/_/g, ' '),
                                             event_timestamp: evt.event_timestamp,
                                             campaign_name: evt.campaign_name || null,
                                             lead_email: evt.lead_email || selectedLead.email || null,

@@ -283,6 +283,24 @@ test('eligibility: not eligible when lead_meeting_booked appears after anchor', 
     assert.equal(isEligible(events), false);
 });
 
+test('eligibility: not eligible when Calendly lead_meeting_booked has no campaign_id', () => {
+    // Mirrors production: Calendly inserts lead_meeting_booked with campaign_id=null.
+    // Blockers are contact-scoped, so missing campaign_id must still suppress.
+    const events = [
+        { type: 'Warm Follow Up', ts: 1000, campaignId: 134 },
+        { type: 'lead_meeting_booked', ts: 2000, campaignId: null },
+    ];
+    assert.equal(isEligible(events), false);
+});
+
+test('eligibility: not eligible when meeting booked on a different campaign than the Warm Follow Up', () => {
+    const events = [
+        { type: 'Warm Follow Up', ts: 1000, campaignId: 134 },
+        { type: 'lead_meeting_booked', ts: 2000, campaignId: 999 },
+    ];
+    assert.equal(isEligible(events), false);
+});
+
 test('eligibility: not eligible when lead_wrong_person appears after anchor', () => {
     const events = [
         { type: 'Warm Follow Up', ts: 1000 },
