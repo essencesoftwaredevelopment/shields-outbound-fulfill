@@ -61,8 +61,18 @@ export class ResearchDraftSupersededError extends Error {
     }
 }
 
+/** In-process check (custom `code` still present). Workflow code must use the
+ * shared detector in lib/interested-research/superseded.ts — step boundaries
+ * strip `code` and only name/message survive. */
 export function isResearchSupersededError(errorInfo) {
-    return errorInfo?.code === 'RESEARCH_DRAFT_SUPERSEDED';
+    if (errorInfo?.code === 'RESEARCH_DRAFT_SUPERSEDED') return true;
+    if (errorInfo?.name === 'ResearchDraftSupersededError') return true;
+    const msg = String(errorInfo?.message || '');
+    return (
+        msg.includes('— superseded or cancelled') ||
+        msg.includes('was superseded before research finalize') ||
+        /^Draft \d+ not found for agency /.test(msg)
+    );
 }
 
 async function loadResearchingDraft(db, draftId, agencyId) {

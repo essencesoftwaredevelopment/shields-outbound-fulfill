@@ -16,8 +16,19 @@
  * The draft row is the idempotency anchor: every step re-checks
  * status='researching' and a superseded draft (new inbound event cancelled it,
  * lead flipped to not-interested, duplicate trigger) ends the run cleanly via
- * RESEARCH_DRAFT_SUPERSEDED instead of failing or resurrecting old state.
+ * a serializable `{ status: 'superseded' }` sentinel — steps must not throw for
+ * that case, because the platform records thrown step errors as failures even
+ * when the parent would catch them. A message/name-based catch remains as a
+ * safety net for any throw that still crosses the boundary.
  */
+
+import {
+  isResearchSupersededError,
+  isResearchSupersededResult,
+  researchSupersededResult,
+  toResearchErrorInfo,
+  type ResearchSupersededResult,
+} from '@/lib/interested-research/superseded';
 
 type ResearchModule = typeof import('../server/src/services/interestedResearch/index.js');
 
@@ -38,16 +49,33 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
 
   try {
     const ctx = await hydrateStep(input);
+    if (isResearchSupersededResult(ctx)) {
+      return { status: 'superseded' as const, draftId: input.draftId };
+    }
 
     // Research sources are independent and best-effort — either may be null.
     const [homepage, serper] = await Promise.all([
       homepageStep(input),
       serperStep(input),
     ]);
+    if (isResearchSupersededResult(homepage) || isResearchSupersededResult(serper)) {
+      return { status: 'superseded' as const, draftId: input.draftId };
+    }
 
     const brief = await synthesizeBriefStep(input, homepage, serper);
+    if (isResearchSupersededResult(brief)) {
+      return { status: 'superseded' as const, draftId: input.draftId };
+    }
+
     const popup = await popupStep(input);
+    if (isResearchSupersededResult(popup)) {
+      return { status: 'superseded' as const, draftId: input.draftId };
+    }
+
     const result = await finalizeStep(input, popup?.auditPreviewUrl ?? null);
+    if (isResearchSupersededResult(result)) {
+      return { status: 'superseded' as const, draftId: input.draftId };
+    }
 
     return {
       status: 'promoted' as const,
@@ -56,8 +84,8 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
       hadBrief: brief !== null,
     };
   } catch (err) {
-    const errorInfo = toErrorInfo(err);
-    if (errorInfo.code === 'RESEARCH_DRAFT_SUPERSEDED') {
+    const errorInfo = toResearchErrorInfo(err);
+    if (isResearchSupersededError(errorInfo)) {
       // Duplicate trigger or the draft moved on (cancelled / superseded by a
       // newer event) — expected control flow, never touch the row.
       return { status: 'superseded' as const, draftId: input.draftId };
@@ -70,22 +98,16 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
   }
 }
 
-function toErrorInfo(err: unknown): { message: string; code: string | null } {
-  if (err && typeof err === 'object') {
-    const e = err as { message?: unknown; code?: unknown };
-    return {
-      message: typeof e.message === 'string' ? e.message : String(err),
-      code: typeof e.code === 'string' ? e.code : null,
-    };
-  }
-  return { message: String(err), code: null };
-}
-
 async function hydrateStep(input: InterestedResearchInput) {
   'use step';
 
   const research = await loadResearch();
-  return research.hydrateResearchContext(input);
+  try {
+    return await research.hydrateResearchContext(input);
+  } catch (err) {
+    if (isResearchSupersededError(err)) return researchSupersededResult();
+    throw err;
+  }
 }
 
 async function homepageStep(input: InterestedResearchInput) {
@@ -95,9 +117,9 @@ async function homepageStep(input: InterestedResearchInput) {
   try {
     return await research.runHomepageResearch(input);
   } catch (err) {
-    if (toErrorInfo(err).code === 'RESEARCH_DRAFT_SUPERSEDED') throw err;
+    if (isResearchSupersededError(err)) return researchSupersededResult();
     // Research sources are best-effort — a flaky site must not fail the run.
-    console.warn('[interested-research] homepage step failed:', toErrorInfo(err).message);
+    console.warn('[interested-research] homepage step failed:', toResearchErrorInfo(err).message);
     return null;
   }
 }
@@ -109,8 +131,8 @@ async function serperStep(input: InterestedResearchInput) {
   try {
     return await research.runSerperResearch(input);
   } catch (err) {
-    if (toErrorInfo(err).code === 'RESEARCH_DRAFT_SUPERSEDED') throw err;
-    console.warn('[interested-research] serper step failed:', toErrorInfo(err).message);
+    if (isResearchSupersededError(err)) return researchSupersededResult();
+    console.warn('[interested-research] serper step failed:', toResearchErrorInfo(err).message);
     return null;
   }
 }
@@ -126,9 +148,9 @@ async function synthesizeBriefStep(
   try {
     return await research.synthesizeResearchBrief({ ...input, homepage, serper });
   } catch (err) {
-    if (toErrorInfo(err).code === 'RESEARCH_DRAFT_SUPERSEDED') throw err;
+    if (isResearchSupersededError(err)) return researchSupersededResult();
     // A failed brief degrades to the pre-research draft quality, not a dead lead.
-    console.warn('[interested-research] brief synthesis failed:', toErrorInfo(err).message);
+    console.warn('[interested-research] brief synthesis failed:', toResearchErrorInfo(err).message);
     return null;
   }
 }
@@ -140,9 +162,9 @@ async function popupStep(input: InterestedResearchInput) {
   try {
     return await research.runPopupGeneration(input);
   } catch (err) {
-    if (toErrorInfo(err).code === 'RESEARCH_DRAFT_SUPERSEDED') throw err;
+    if (isResearchSupersededError(err)) return researchSupersededResult();
     // Popup is external and optional — the inline path treats it the same way.
-    console.warn('[interested-research] popup step failed:', toErrorInfo(err).message);
+    console.warn('[interested-research] popup step failed:', toResearchErrorInfo(err).message);
     return null;
   }
 }
@@ -150,16 +172,24 @@ async function popupStep(input: InterestedResearchInput) {
 async function finalizeStep(
   input: InterestedResearchInput,
   auditPreviewUrl: string | null
-) {
+): Promise<
+  | Awaited<ReturnType<ResearchModule['finalizeResearchDraft']>>
+  | ResearchSupersededResult
+> {
   'use step';
 
   const research = await loadResearch();
-  return research.finalizeResearchDraft({
-    ...input,
-    auditPreviewUrl,
-    isFollowUp: Boolean(input.isFollowUp),
-    skipNtfy: Boolean(input.skipNtfy),
-  });
+  try {
+    return await research.finalizeResearchDraft({
+      ...input,
+      auditPreviewUrl,
+      isFollowUp: Boolean(input.isFollowUp),
+      skipNtfy: Boolean(input.skipNtfy),
+    });
+  } catch (err) {
+    if (isResearchSupersededError(err)) return researchSupersededResult();
+    throw err;
+  }
 }
 
 async function handleFailureStep(
@@ -172,7 +202,7 @@ async function handleFailureStep(
   return research.handleResearchFailure(input, errorInfo);
 }
 
-// The superseded guard throws INTENTIONALLY — retrying only delays the clean stop.
+// The superseded path returns a sentinel — no throw, no retries needed.
 hydrateStep.maxRetries = 0;
 // Research sources already degrade to null inside the step; one retry covers
 // transient network blips without double-spending Serper/fetch budgets.
