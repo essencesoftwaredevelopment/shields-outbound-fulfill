@@ -128,7 +128,7 @@ Shields **ignores your response body**; it checks only the HTTP status
 (2xx = success). The preview URL is constructed on the shields side as:
 
 ```
-https://essence-ai.app/preview?domain=<domain>
+https://essence-ai.app/preview-popup?domain=<domain>
 ```
 
 and placed in the reply email. So the contract remains: *by the time a 2xx is

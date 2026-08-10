@@ -288,7 +288,7 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
     const signalType = options.signalType || null;
     const previewBase = signalEmissionId
         ? `https://essence-ai.app/shopping-preview?domain=${encodeURIComponent(domain)}&signalId=${encodeURIComponent(String(signalEmissionId))}`
-        : `https://essence-ai.app/preview?domain=${encodeURIComponent(domain)}`;
+        : `https://essence-ai.app/preview-popup?domain=${encodeURIComponent(domain)}`;
     const previewUrl = signalType
         ? `${previewBase}&signalType=${encodeURIComponent(String(signalType))}`
         : previewBase;

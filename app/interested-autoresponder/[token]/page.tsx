@@ -21,7 +21,7 @@ type ReviewDraft = {
 /** Review-page preview: Vulcan public audit → admin edit; Essence links unchanged. */
 function extractReviewPreviewUrl(renderedText: string): string | null {
     const essence = renderedText.match(
-        /https:\/\/essence-ai\.app\/(?:shopping-preview|preview)\?[^\s"'<>]+/i
+        /https:\/\/essence-ai\.app\/(?:shopping-preview|preview-popup|preview)\?[^\s"'<>]+/i
     )?.[0];
     if (essence) return essence;
 
