@@ -35,7 +35,8 @@ import {
     buildSerperQueries,
     compactSerperResults,
     extractHomepageSummary,
-    normalizeResearchBrief
+    normalizeResearchBrief,
+    RESEARCH_INDUSTRIES
 } from './briefUtils.js';
 
 const RESEARCH_MODEL = String(process.env.INTERESTED_RESEARCH_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
@@ -274,6 +275,7 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
                     '{',
                     '  "company": string,            // display name',
                     '  "domain": string,',
+                    `  "industry": string,           // exactly one of: ${RESEARCH_INDUSTRIES.join(', ')}`,
                     '  "summary": string,            // 2-4 sentences: what they sell, who to, anything notable/recent',
                     '  "talkingPoints": string[],    // up to 5 specific, verifiable hooks for the reply',
                     '  "risks": string[],            // up to 3 things to avoid claiming or assuming',
@@ -339,10 +341,26 @@ export async function runPopupGeneration({ draftId, agencyId }) {
         return { auditPreviewUrl: null, auditDomain };
     }
 
+    // Brief was persisted by the synthesize step (which runs before this one);
+    // pass its popup-relevant fields so the external generator can pick
+    // vertical/template/copy instead of rediscovering the company from the
+    // bare domain. Absent brief (thin research) → payload identical to before.
+    const brief = draft.research_brief && typeof draft.research_brief === 'object'
+        ? draft.research_brief
+        : null;
+
     const auditPreviewUrl = await generateAuditPreviewUrl(draft.lead_email, {
         domain: auditDomain,
         useVulcanShoppingAudit: useShoppingAuditReply,
         skipPopupPreview: Boolean(settings.skipPopupPreview),
+        ...(brief
+            ? {
+                industry: brief.industry || null,
+                companyName: brief.company || null,
+                researchSummary: brief.summary || null,
+                talkingPoints: Array.isArray(brief.talkingPoints) ? brief.talkingPoints : null
+            }
+            : {}),
         ...(useShoppingAuditReply
             ? {
                 signalEmissionId: signalRow.signal_emission_id || null,

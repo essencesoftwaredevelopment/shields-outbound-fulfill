@@ -4,6 +4,34 @@
  */
 
 export const RESEARCH_HOMEPAGE_TEXT_LIMIT = 8_000;
+
+/**
+ * Industry enum for the research brief. Drives popup-creator template/vertical
+ * selection downstream, so values must stay in sync with what the popup-form
+ * generate API branches on — extend the list there first, then here.
+ */
+export const RESEARCH_INDUSTRIES = Object.freeze([
+    'beauty_skincare',
+    'fashion_apparel',
+    'food_beverage',
+    'health_wellness',
+    'home_garden',
+    'electronics',
+    'pets',
+    'sports_outdoors',
+    'jewelry_accessories',
+    'kids_baby',
+    'b2b_services',
+    'other'
+]);
+
+const RESEARCH_INDUSTRY_SET = new Set(RESEARCH_INDUSTRIES);
+
+/** Coerce an LLM-emitted industry to the enum; anything off-list becomes 'other'. */
+export function normalizeResearchIndustry(raw) {
+    const normalized = String(raw || '').trim().toLowerCase().replace(/[\s/-]+/g, '_');
+    return RESEARCH_INDUSTRY_SET.has(normalized) ? normalized : 'other';
+}
 export const RESEARCH_SERPER_RESULT_LIMIT = 8;
 export const RESEARCH_BRIEF_MAX_TALKING_POINTS = 6;
 export const RESEARCH_BRIEF_MAX_SOURCES = 8;
@@ -126,6 +154,7 @@ export function normalizeResearchBrief(raw, { company = '', domain = '' } = {}) 
     return {
         company: asText(raw.company) || asText(company),
         domain: asText(raw.domain) || asText(domain),
+        industry: normalizeResearchIndustry(raw.industry),
         summary: summary.slice(0, 2_000),
         talkingPoints: toStringList(raw.talkingPoints, RESEARCH_BRIEF_MAX_TALKING_POINTS),
         risks: toStringList(raw.risks, RESEARCH_BRIEF_MAX_TALKING_POINTS),

@@ -6,6 +6,8 @@ import {
     extractHomepageSummary,
     formatResearchBriefForPrompt,
     normalizeResearchBrief,
+    normalizeResearchIndustry,
+    RESEARCH_INDUSTRIES,
     stripHtmlToText
 } from '../briefUtils.js';
 
@@ -76,6 +78,32 @@ test('normalizeResearchBrief rejects empty summaries and fills fallbacks', () =>
     assert.equal(brief.domain, 'wildorchard.com');
     assert.deepEqual(brief.talkingPoints, ['Jeju sourcing', '42']);
     assert.deepEqual(brief.sources, [{ title: 'https://a.com', url: 'https://a.com' }]);
+});
+
+test('normalizeResearchIndustry coerces to the enum with other as fallback', () => {
+    assert.equal(normalizeResearchIndustry('beauty_skincare'), 'beauty_skincare');
+    assert.equal(normalizeResearchIndustry('Beauty Skincare'), 'beauty_skincare');
+    assert.equal(normalizeResearchIndustry('food/beverage'), 'food_beverage');
+    assert.equal(normalizeResearchIndustry('quantum computing'), 'other');
+    assert.equal(normalizeResearchIndustry(''), 'other');
+    assert.equal(normalizeResearchIndustry(null), 'other');
+    for (const industry of RESEARCH_INDUSTRIES) {
+        assert.equal(normalizeResearchIndustry(industry), industry);
+    }
+});
+
+test('normalizeResearchBrief always carries a valid industry', () => {
+    const withIndustry = normalizeResearchBrief(
+        { summary: 'Sells tea.', industry: 'food_beverage' },
+        { company: 'Wild Orchard', domain: 'wildorchard.com' }
+    );
+    assert.equal(withIndustry.industry, 'food_beverage');
+
+    const withoutIndustry = normalizeResearchBrief(
+        { summary: 'Sells tea.' },
+        { company: 'Wild Orchard', domain: 'wildorchard.com' }
+    );
+    assert.equal(withoutIndustry.industry, 'other');
 });
 
 test('formatResearchBriefForPrompt renders sections and skips empty briefs', () => {

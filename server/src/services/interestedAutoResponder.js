@@ -303,6 +303,15 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
             );
             const bodyPayload = {
                 domain,
+                // Research-brief context (interested-research workflow only —
+                // inline drafts have none). Additive: the generate API ignores
+                // unknown keys until it branches on them.
+                ...(options.industry ? { industry: options.industry } : {}),
+                ...(options.companyName ? { companyName: options.companyName } : {}),
+                ...(options.researchSummary ? { summary: options.researchSummary } : {}),
+                ...(Array.isArray(options.talkingPoints) && options.talkingPoints.length
+                    ? { talkingPoints: options.talkingPoints }
+                    : {}),
                 ...(options.signalEmissionId ? { signalEmissionId: options.signalEmissionId } : {}),
                 ...(options.signalType ? { signalType: options.signalType } : {}),
                 ...(options.observed ? { observed: options.observed } : {}),
