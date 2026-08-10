@@ -80,19 +80,20 @@ test('normalizeResearchBrief rejects empty summaries and fills fallbacks', () =>
     assert.deepEqual(brief.sources, [{ title: 'https://a.com', url: 'https://a.com' }]);
 });
 
-test('normalizeResearchIndustry coerces to the enum with other as fallback', () => {
+test('normalizeResearchIndustry coerces to the enum with null as fallback', () => {
     assert.equal(normalizeResearchIndustry('beauty_skincare'), 'beauty_skincare');
     assert.equal(normalizeResearchIndustry('Beauty Skincare'), 'beauty_skincare');
     assert.equal(normalizeResearchIndustry('food/beverage'), 'food_beverage');
-    assert.equal(normalizeResearchIndustry('quantum computing'), 'other');
-    assert.equal(normalizeResearchIndustry(''), 'other');
-    assert.equal(normalizeResearchIndustry(null), 'other');
+    assert.equal(normalizeResearchIndustry('quantum computing'), null);
+    assert.equal(normalizeResearchIndustry('other'), null);
+    assert.equal(normalizeResearchIndustry(''), null);
+    assert.equal(normalizeResearchIndustry(null), null);
     for (const industry of RESEARCH_INDUSTRIES) {
         assert.equal(normalizeResearchIndustry(industry), industry);
     }
 });
 
-test('normalizeResearchBrief always carries a valid industry', () => {
+test('normalizeResearchBrief carries a valid industry or null', () => {
     const withIndustry = normalizeResearchBrief(
         { summary: 'Sells tea.', industry: 'food_beverage' },
         { company: 'Wild Orchard', domain: 'wildorchard.com' }
@@ -103,7 +104,7 @@ test('normalizeResearchBrief always carries a valid industry', () => {
         { summary: 'Sells tea.' },
         { company: 'Wild Orchard', domain: 'wildorchard.com' }
     );
-    assert.equal(withoutIndustry.industry, 'other');
+    assert.equal(withoutIndustry.industry, null);
 });
 
 test('formatResearchBriefForPrompt renders sections and skips empty briefs', () => {

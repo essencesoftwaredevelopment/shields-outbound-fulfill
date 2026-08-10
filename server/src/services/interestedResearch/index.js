@@ -275,7 +275,7 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
                     '{',
                     '  "company": string,            // display name',
                     '  "domain": string,',
-                    `  "industry": string,           // exactly one of: ${RESEARCH_INDUSTRIES.join(', ')}`,
+                    `  "industry": string|null,      // exactly one of: ${RESEARCH_INDUSTRIES.join(', ')} — or null if none clearly fits`,
                     '  "summary": string,            // 2-4 sentences: what they sell, who to, anything notable/recent',
                     '  "talkingPoints": string[],    // up to 5 specific, verifiable hooks for the reply',
                     '  "risks": string[],            // up to 3 things to avoid claiming or assuming',

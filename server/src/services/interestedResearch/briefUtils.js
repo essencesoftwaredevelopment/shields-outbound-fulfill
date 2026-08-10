@@ -6,9 +6,10 @@
 export const RESEARCH_HOMEPAGE_TEXT_LIMIT = 8_000;
 
 /**
- * Industry enum for the research brief. Drives popup-creator template/vertical
- * selection downstream, so values must stay in sync with what the popup-form
- * generate API branches on — extend the list there first, then here.
+ * Industry enum for the research brief — the popup-creation API's allowed
+ * values, verbatim (see docs/popup-form-generate-brief-payload.md). There is
+ * deliberately no catch-all: a company that fits none of these gets NO
+ * industry (field omitted from brief and popup payload), never a wrong guess.
  */
 export const RESEARCH_INDUSTRIES = Object.freeze([
     'beauty_skincare',
@@ -17,20 +18,20 @@ export const RESEARCH_INDUSTRIES = Object.freeze([
     'health_wellness',
     'home_garden',
     'electronics',
+    'automotive',
     'pets',
     'sports_outdoors',
     'jewelry_accessories',
     'kids_baby',
-    'b2b_services',
-    'other'
+    'gifts_collectibles'
 ]);
 
 const RESEARCH_INDUSTRY_SET = new Set(RESEARCH_INDUSTRIES);
 
-/** Coerce an LLM-emitted industry to the enum; anything off-list becomes 'other'. */
+/** Coerce an LLM-emitted industry to the enum; anything off-list becomes null. */
 export function normalizeResearchIndustry(raw) {
     const normalized = String(raw || '').trim().toLowerCase().replace(/[\s/-]+/g, '_');
-    return RESEARCH_INDUSTRY_SET.has(normalized) ? normalized : 'other';
+    return RESEARCH_INDUSTRY_SET.has(normalized) ? normalized : null;
 }
 export const RESEARCH_SERPER_RESULT_LIMIT = 8;
 export const RESEARCH_BRIEF_MAX_TALKING_POINTS = 6;
