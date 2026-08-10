@@ -133,7 +133,8 @@ Workflows runtime before the draft is written:
    hydrate → homepage fetch + Serper sweep (agency's own Serper key, both
    best-effort) → LLM-synthesized brief persisted to
    `interested_autoresponder_drafts.research_brief`
-   (`{ company, domain, summary, talkingPoints, risks, sources }`) → external
+   (`{ company, domain, industry, summary, talkingPoints, risks, sources,
+   reviewCount, estimatedVisitors }`) → external
    popup/audit URL (Essence popup or Vulcan audit, exactly as the inline path) →
    `generateDraftReply` with the brief → promote to `pending_review` + ntfy.
 3. Human review / send / warm follow-ups proceed unchanged.

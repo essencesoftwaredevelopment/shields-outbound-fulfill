@@ -35,6 +35,7 @@ import {
     buildSerperQueries,
     compactSerperResults,
     extractHomepageSummary,
+    extractReviewCountFromSerper,
     normalizeResearchBrief,
     RESEARCH_INDUSTRIES
 } from './briefUtils.js';
@@ -287,7 +288,10 @@ export async function synthesizeBriefFromContext({
                     '  "summary": string,            // 2-4 sentences: what they sell, who to, anything notable/recent',
                     '  "talkingPoints": string[],    // up to 5 specific, verifiable hooks for the reply',
                     '  "risks": string[],            // up to 3 things to avoid claiming or assuming',
-                    '  "sources": [{"title": string, "url": string}]',
+                    '  "sources": [{"title": string, "url": string}],',
+                    '  "reviewCount": number|null    // total published site/store reviews if explicitly stated',
+                    '                                // (Trustpilot, Google, on-site aggregate). null if unknown.',
+                    '                                // Never invent or estimate this number.',
                     '}',
                     '',
                     'Only state facts supported by the research below. If the research is too',
@@ -313,7 +317,12 @@ export async function synthesizeBriefFromContext({
     } catch {
         parsed = null;
     }
-    return normalizeResearchBrief(parsed, { company: companyName, domain });
+    const fallbackReviewCount = extractReviewCountFromSerper(serper?.results);
+    return normalizeResearchBrief(parsed, {
+        company: companyName,
+        domain,
+        fallbackReviewCount
+    });
 }
 
 /**
@@ -398,7 +407,15 @@ export async function runPopupGeneration({ draftId, agencyId }) {
                 industry: brief.industry || null,
                 companyName: brief.company || null,
                 researchSummary: brief.summary || null,
-                talkingPoints: Array.isArray(brief.talkingPoints) ? brief.talkingPoints : null
+                talkingPoints: Array.isArray(brief.talkingPoints) ? brief.talkingPoints : null,
+                estimatedVisitors: Number.isFinite(Number(brief.estimatedVisitors))
+                    && Number(brief.estimatedVisitors) > 0
+                    ? Math.round(Number(brief.estimatedVisitors))
+                    : null,
+                reviewCount: Number.isFinite(Number(brief.reviewCount))
+                    && Number(brief.reviewCount) > 0
+                    ? Math.round(Number(brief.reviewCount))
+                    : null
             }
             : {}),
         ...(useShoppingAuditReply

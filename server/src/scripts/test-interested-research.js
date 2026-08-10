@@ -14,7 +14,7 @@
  *                         Default: first agency_settings row with both keys.
  *   --company=<name>      Company display name (default: humanized domain).
  *
- * Costs: one Serper call (2 queries) + one OpenAI call on the chosen agency's
+ * Costs: one Serper call (3 queries) + one OpenAI call on the chosen agency's
  * keys — the same spend as one real research run, minus the reply generation.
  */
 import { pool } from '../config/db.js';
@@ -112,7 +112,9 @@ if (!brief) {
         ...(brief.industry ? { industry: brief.industry } : {}),
         ...(brief.company ? { companyName: brief.company } : {}),
         ...(brief.summary ? { summary: brief.summary } : {}),
-        ...(brief.talkingPoints?.length ? { talkingPoints: brief.talkingPoints } : {})
+        ...(brief.talkingPoints?.length ? { talkingPoints: brief.talkingPoints } : {}),
+        ...(brief.estimatedVisitors ? { estimatedVisitors: brief.estimatedVisitors } : {}),
+        ...(brief.reviewCount ? { reviewCount: brief.reviewCount } : {})
     };
     console.log('\n--- Popup-form generate payload (NOT sent) ---');
     console.log(JSON.stringify(popupPayload, null, 2));

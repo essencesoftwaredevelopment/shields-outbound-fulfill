@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import {
     buildSerperQueries,
     compactSerperResults,
+    estimateVisitorsFromReviewCount,
     extractHomepageSummary,
+    extractReviewCountFromSerper,
     formatResearchBriefForPrompt,
     normalizeResearchBrief,
     normalizeResearchIndustry,
+    normalizeReviewCount,
     RESEARCH_INDUSTRIES,
-    stripHtmlToText
+    stripHtmlToText,
+    VISITORS_PER_REVIEW
 } from '../briefUtils.js';
 
 test('stripHtmlToText removes markup, scripts, and entities', () => {
@@ -34,12 +38,13 @@ test('extractHomepageSummary pulls title, meta description, and bounded text', (
     assert.ok(summary.text.length <= 100);
 });
 
-test('buildSerperQueries needs a subject and includes news query', () => {
+test('buildSerperQueries needs a subject and includes news + review queries', () => {
     assert.deepEqual(buildSerperQueries({ companyName: '', domain: '' }), []);
     const queries = buildSerperQueries({ companyName: 'Wild Orchard', domain: 'wildorchard.com' });
-    assert.equal(queries.length, 2);
+    assert.equal(queries.length, 3);
     assert.equal(queries[0].q, 'Wild Orchard wildorchard.com');
     assert.ok(queries[1].q.includes('news'));
+    assert.ok(queries[2].q.includes('Trustpilot'));
 });
 
 test('compactSerperResults dedupes links and truncates snippets', () => {
@@ -61,6 +66,35 @@ test('compactSerperResults dedupes links and truncates snippets', () => {
     assert.ok(results[2].title.startsWith('Knowledge graph:'));
 });
 
+test('normalizeReviewCount and estimateVisitorsFromReviewCount', () => {
+    assert.equal(normalizeReviewCount(null), null);
+    assert.equal(normalizeReviewCount(0), null);
+    assert.equal(normalizeReviewCount(-3), null);
+    assert.equal(normalizeReviewCount(1240), 1240);
+    assert.equal(normalizeReviewCount('1,234'), 1234);
+    assert.equal(normalizeReviewCount('1.2k'), 1200);
+    assert.equal(normalizeReviewCount('890 reviews'), 890);
+    assert.equal(estimateVisitorsFromReviewCount(12), 12 * VISITORS_PER_REVIEW);
+    assert.equal(estimateVisitorsFromReviewCount(null), null);
+});
+
+test('extractReviewCountFromSerper prefers explicit review totals', () => {
+    assert.equal(extractReviewCountFromSerper([]), null);
+    assert.equal(
+        extractReviewCountFromSerper([
+            { title: 'Wild Orchard Trustpilot', snippet: 'Based on 1,240 reviews' },
+            { title: 'Other', snippet: '12 reviews on a blog' }
+        ]),
+        1240
+    );
+    assert.equal(
+        extractReviewCountFromSerper([
+            { title: 'Brand', snippet: '4.8 · 892 reviews on Trustpilot' }
+        ]),
+        892
+    );
+});
+
 test('normalizeResearchBrief rejects empty summaries and fills fallbacks', () => {
     assert.equal(normalizeResearchBrief(null), null);
     assert.equal(normalizeResearchBrief({ summary: '   ' }), null);
@@ -78,6 +112,24 @@ test('normalizeResearchBrief rejects empty summaries and fills fallbacks', () =>
     assert.equal(brief.domain, 'wildorchard.com');
     assert.deepEqual(brief.talkingPoints, ['Jeju sourcing', '42']);
     assert.deepEqual(brief.sources, [{ title: 'https://a.com', url: 'https://a.com' }]);
+    assert.equal(brief.reviewCount, null);
+    assert.equal(brief.estimatedVisitors, null);
+});
+
+test('normalizeResearchBrief derives estimatedVisitors from reviewCount', () => {
+    const fromLlm = normalizeResearchBrief(
+        { summary: 'Sells tea.', reviewCount: 250 },
+        { company: 'Wild Orchard', domain: 'wildorchard.com' }
+    );
+    assert.equal(fromLlm.reviewCount, 250);
+    assert.equal(fromLlm.estimatedVisitors, 250 * VISITORS_PER_REVIEW);
+
+    const fromFallback = normalizeResearchBrief(
+        { summary: 'Sells tea.' },
+        { company: 'Wild Orchard', domain: 'wildorchard.com', fallbackReviewCount: 80 }
+    );
+    assert.equal(fromFallback.reviewCount, 80);
+    assert.equal(fromFallback.estimatedVisitors, 80 * VISITORS_PER_REVIEW);
 });
 
 test('normalizeResearchIndustry coerces to the enum with null as fallback', () => {
@@ -117,10 +169,15 @@ test('formatResearchBriefForPrompt renders sections and skips empty briefs', () 
         summary: 'Sells tea.',
         talkingPoints: ['Jeju sourcing'],
         risks: ['Avoid pricing claims'],
-        sources: [{ title: 'Site', url: 'https://a.com' }]
+        sources: [{ title: 'Site', url: 'https://a.com' }],
+        reviewCount: 100,
+        estimatedVisitors: 10_000
     });
     assert.ok(block.includes('Company: Wild Orchard (wildorchard.com)'));
     assert.ok(block.includes('Summary: Sells tea.'));
     assert.ok(block.includes('- Jeju sourcing'));
     assert.ok(block.includes('Avoid / be careful with:'));
+    assert.ok(block.includes('Published reviews: 100'));
+    assert.ok(block.includes('Estimated site visitors'));
+    assert.ok(block.includes('10000'));
 });

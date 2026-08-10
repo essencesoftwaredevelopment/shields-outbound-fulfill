@@ -312,6 +312,14 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
                 ...(Array.isArray(options.talkingPoints) && options.talkingPoints.length
                     ? { talkingPoints: options.talkingPoints }
                     : {}),
+                ...(Number.isFinite(Number(options.estimatedVisitors))
+                    && Number(options.estimatedVisitors) > 0
+                    ? { estimatedVisitors: Math.round(Number(options.estimatedVisitors)) }
+                    : {}),
+                ...(Number.isFinite(Number(options.reviewCount))
+                    && Number(options.reviewCount) > 0
+                    ? { reviewCount: Math.round(Number(options.reviewCount)) }
+                    : {}),
                 ...(options.signalEmissionId ? { signalEmissionId: options.signalEmissionId } : {}),
                 ...(options.signalType ? { signalType: options.signalType } : {}),
                 ...(options.observed ? { observed: options.observed } : {}),
@@ -738,7 +746,8 @@ export async function generateDraftReply({
     previousLeadMessage,
     auditPreviewUrl = null,
     essenceAiPreviewUrl = null,
-    // Structured research brief ({ company, domain, summary, talkingPoints, risks, sources })
+    // Structured research brief ({ company, domain, industry, summary, talkingPoints,
+    // risks, sources, reviewCount, estimatedVisitors })
     // produced by the interested-research workflow. Optional — inline drafts pass nothing.
     researchBrief = null,
     // When true, the system prompt already owns the CTA (Active Fungi story URL).
