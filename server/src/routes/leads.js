@@ -721,6 +721,7 @@ const LEAD_FILTER_FIELDS = [
             { value: 'unsubscribed', label: 'Unsubscribed' },
             { value: 'skipped', label: 'Skipped' },
             { value: 'interested', label: 'Interested' },
+            { value: 'warm follow up', label: 'Warm Follow Up' },
             { value: 'meeting_booked', label: 'Meeting Booked' },
             { value: 'meeting_completed', label: 'Meeting Completed' },
             { value: 'won', label: 'Won' },
