@@ -2127,7 +2127,7 @@ export default function ClientPage() {
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [emailCopied, setEmailCopied] = useState(false);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
-    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string; source?: string }>>([]);
+    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string; source?: string; unibox_url?: string | null; instantly_lead_id?: string | null }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
     const [leadStatusCampaignId, setLeadStatusCampaignId] = useState<string>('');
     const [leadStatusInterestValue, setLeadStatusInterestValue] = useState<string>('');
@@ -13470,6 +13470,41 @@ export default function ClientPage() {
                                             <span className={`lead-pastel-chip lead-pastel-chip--status-${v.variant}`} style={{ fontSize: '0.7rem', padding: '0.1rem 0.45rem', flexShrink: 0 }}>
                                                 {v.label}
                                             </span>
+                                        );
+                                    })()}
+                                    {(() => {
+                                        const storedUniboxUrl = leadEvents.find((event) => typeof event.unibox_url === 'string' && event.unibox_url.trim())?.unibox_url?.trim() || null;
+                                        const email = selectedLead.email?.trim() || '';
+                                        const hasCampaign = (selectedLead.campaignsData || []).length > 0;
+                                        const instantlyUrl = storedUniboxUrl
+                                            || (email && (hasCampaign || leadEvents.length > 0)
+                                                ? `https://app.instantly.ai/app/unibox?thread_search=${encodeURIComponent(email)}`
+                                                : null);
+                                        if (!instantlyUrl) return null;
+                                        return (
+                                            <a
+                                                href={instantlyUrl}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                title={storedUniboxUrl ? 'Open this thread in Instantly Unibox' : 'Search this email in Instantly Unibox'}
+                                                className="secondary-button"
+                                                style={{
+                                                    flexShrink: 0,
+                                                    padding: '0.2rem 0.55rem',
+                                                    fontSize: '0.72rem',
+                                                    textDecoration: 'none',
+                                                    display: 'inline-flex',
+                                                    alignItems: 'center',
+                                                    gap: '0.3rem'
+                                                }}
+                                            >
+                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                                    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                                                    <polyline points="15 3 21 3 21 9"/>
+                                                    <line x1="10" y1="14" x2="21" y2="3"/>
+                                                </svg>
+                                                Instantly
+                                            </a>
                                         );
                                     })()}
                                 </div>
