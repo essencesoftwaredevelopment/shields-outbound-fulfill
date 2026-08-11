@@ -1020,7 +1020,14 @@ function buildLeadListBaseWithClause(
                             AND cic.interest_status_label IS NOT NULL
                         ),
                         NULL
-                    ) AS active_interest_status_labels` : ''}
+                    ) AS active_interest_status_labels,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT cic.interest_status) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.interest_status IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_interest_status_values` : ''}
                 FROM contact_instantly_campaigns cic
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 GROUP BY cic.contact_id
@@ -1039,6 +1046,19 @@ function buildLeadListBaseWithClause(
                 AND client_id = $2
             )` : ''}
         `;
+}
+
+/** Normalize Instantly status filter tokens ("Warm_Follow-Up" → "warm follow up"). */
+function normalizeInstantlyStatusFilterToken(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[_-]+/g, ' ')
+        .replace(/\s+/g, ' ');
+}
+
+function isWarmFollowUpFilterValue(value) {
+    return normalizeInstantlyStatusFilterToken(value) === 'warm follow up';
 }
 
 function emptyEnrichPreview() {
@@ -1156,6 +1176,18 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         searchField: explicitSearchFieldRaw
     } = queryInput;
 
+    const warmFollowUpConfigResult = await pool.query(
+        `SELECT warm_follow_up_interest_value
+         FROM clients
+         WHERE id = $1
+         LIMIT 1`,
+        [clientId]
+    );
+    const warmFollowUpInterestValueRaw = warmFollowUpConfigResult.rows[0]?.warm_follow_up_interest_value;
+    const warmFollowUpInterestValue = Number.isFinite(Number(warmFollowUpInterestValueRaw))
+        ? Number(warmFollowUpInterestValueRaw)
+        : null;
+
     const { clauses: dynamicFilters } = parseLeadFiltersInput(rawFilters);
     const rawSearchTerm = typeof search === 'string' ? search.trim() : '';
     const searchClassification = classifyLeadSearch(rawSearchTerm);
@@ -1270,6 +1302,8 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
 
     if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
         const normalizedInstantlyStatus = instantlyStatus.trim().toLowerCase();
+        const matchWarmFollowUpValue = isWarmFollowUpFilterValue(normalizedInstantlyStatus)
+            && warmFollowUpInterestValue !== null;
         whereClause += ` AND EXISTS (
                 SELECT 1
                 FROM contact_instantly_campaigns cic_status
@@ -1278,10 +1312,15 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
                 AND (
                     LOWER(COALESCE(cic_status.interest_status_label, '')) = $${paramIndex}
                     OR LOWER(COALESCE(cic_status.lead_status_label, '')) = $${paramIndex}
+                    ${matchWarmFollowUpValue ? `OR cic_status.interest_status = $${paramIndex + 1}` : ''}
                 )
             )`;
         params.push(normalizedInstantlyStatus);
         paramIndex++;
+        if (matchWarmFollowUpValue) {
+            params.push(warmFollowUpInterestValue);
+            paramIndex++;
+        }
         paramsState.paramIndex = paramIndex;
     }
 
@@ -1334,7 +1373,9 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         paramsState.paramIndex = paramIndex;
     }
 
-    const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
+    const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState, {
+        warmFollowUpInterestValue
+    });
     const dynamicWhere = joinDynamicClauses(dynamicClauses, dynamicFilters);
     if (dynamicWhere) {
         whereClause += ` AND ${dynamicWhere}`;
@@ -1487,7 +1528,7 @@ function joinDynamicClauses(sqlClauses, rawFilters) {
     return `(${groupSql.join(' OR ')})`;
 }
 
-function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
+function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpInterestValue = null } = {}) {
     const clauses = [];
     const bindParam = (value) => {
         paramsState.params.push(value);
@@ -1500,6 +1541,20 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
     const bindArray = (arr) => arr.map((v) => bindParam(v));
 
     const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid']);
+
+    const buildInstantlyStatusMatch = (rawStatusValue) => {
+        const labelToken = normalizeInstantlyStatusFilterToken(rawStatusValue);
+        const labelRef = bindParam(labelToken);
+        const parts = [
+            `${labelRef} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))`,
+            `${labelRef} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))`
+        ];
+        if (isWarmFollowUpFilterValue(labelToken) && warmFollowUpInterestValue !== null) {
+            const valueRef = bindParam(warmFollowUpInterestValue);
+            parts.push(`${valueRef} = ANY(COALESCE(cs.active_interest_status_values, '{}'::int[]))`);
+        }
+        return `(${parts.join(' OR ')})`;
+    };
 
     for (const rawFilter of rawFilters) {
         if (!rawFilter || typeof rawFilter !== 'object' || Array.isArray(rawFilter)) continue;
@@ -1903,34 +1958,18 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState) {
         }
 
         // ── instantly_status ───────────────────────────────────────────────
+        // Labels are matched as today. Warm Follow Up also matches the client's
+        // configured interest_status value — custom Instantly labels often have
+        // a numeric status but a missing/stale local label after sync.
         if (fieldKey === 'instantly_status') {
-            const buildStatusCheck = (vals) => {
-                const refs = bindArray(vals.map((v) => String(v).toLowerCase()));
-                return refs.map((ref) => `(
-                    ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
-                    OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
-                )`).join(' OR ');
-            };
             if (operatorKey === 'eq') {
-                const ref = bindParam(String(normalizedValue));
-                clauses.push(`(
-                    ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
-                    OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
-                )`);
+                clauses.push(buildInstantlyStatusMatch(normalizedValue));
             } else if (operatorKey === 'neq') {
-                const ref = bindParam(String(normalizedValue));
-                clauses.push(`(
-                    ${ref} <> ALL(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
-                    AND ${ref} <> ALL(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
-                )`);
+                clauses.push(`NOT ${buildInstantlyStatusMatch(normalizedValue)}`);
             } else if (operatorKey === 'in') {
-                clauses.push(`(${buildStatusCheck(normalizedValue)})`);
+                clauses.push(`(${normalizedValue.map((value) => buildInstantlyStatusMatch(value)).join(' OR ')})`);
             } else if (operatorKey === 'not_in') {
-                const refs = bindArray(normalizedValue.map((v) => String(v).toLowerCase()));
-                clauses.push(`NOT (${refs.map((ref) => `(
-                    ${ref} = ANY(COALESCE(cs.active_interest_status_labels, '{}'::text[]))
-                    OR ${ref} = ANY(COALESCE(cs.active_lead_status_labels, '{}'::text[]))
-                )`).join(' OR ')})`);
+                clauses.push(`NOT (${normalizedValue.map((value) => buildInstantlyStatusMatch(value)).join(' OR ')})`);
             }
             continue;
         }
@@ -3492,6 +3531,17 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
         const queryInput = req.body?.query || {};
 
         const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
+        const warmFollowUpConfigResult = await pool.query(
+            `SELECT warm_follow_up_interest_value
+             FROM clients
+             WHERE id = $1
+             LIMIT 1`,
+            [clientId]
+        );
+        const warmFollowUpInterestValueRaw = warmFollowUpConfigResult.rows[0]?.warm_follow_up_interest_value;
+        const warmFollowUpInterestValue = Number.isFinite(Number(warmFollowUpInterestValueRaw))
+            ? Number(warmFollowUpInterestValueRaw)
+            : null;
         const {
             emailStatus,
             emailStatusMulti,
@@ -3601,6 +3651,8 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
 
         if (typeof instantlyStatus === 'string' && instantlyStatus.trim()) {
             const normalizedInstantlyStatus = instantlyStatus.trim().toLowerCase();
+            const matchWarmFollowUpValue = isWarmFollowUpFilterValue(normalizedInstantlyStatus)
+                && warmFollowUpInterestValue !== null;
             whereClause += ` AND EXISTS (
                 SELECT 1
                 FROM contact_instantly_campaigns cic_status
@@ -3609,10 +3661,15 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
                 AND (
                     LOWER(COALESCE(cic_status.interest_status_label, '')) = $${paramIndex}
                     OR LOWER(COALESCE(cic_status.lead_status_label, '')) = $${paramIndex}
+                    ${matchWarmFollowUpValue ? `OR cic_status.interest_status = $${paramIndex + 1}` : ''}
                 )
             )`;
             params.push(normalizedInstantlyStatus);
             paramIndex++;
+            if (matchWarmFollowUpValue) {
+                params.push(warmFollowUpInterestValue);
+                paramIndex++;
+            }
             paramsState.paramIndex = paramIndex;
         }
 
@@ -3677,7 +3734,9 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
             paramsState.paramIndex = paramIndex;
         }
 
-        const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState);
+        const dynamicClauses = buildDynamicLeadFilterClauses(dynamicFilters, paramsState, {
+            warmFollowUpInterestValue
+        });
         const dynamicWhere = joinDynamicClauses(dynamicClauses, dynamicFilters);
         if (dynamicWhere) {
             whereClause += ` AND ${dynamicWhere}`;
@@ -3724,7 +3783,14 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
                             AND cic.interest_status_label IS NOT NULL
                         ),
                         NULL
-                    ) AS active_interest_status_labels
+                    ) AS active_interest_status_labels,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(DISTINCT cic.interest_status) FILTER (
+                            WHERE cic.active = TRUE
+                            AND cic.interest_status IS NOT NULL
+                        ),
+                        NULL
+                    ) AS active_interest_status_values
                 FROM contact_instantly_campaigns cic
                 JOIN scoped_campaigns sc_scope ON sc_scope.id = cic.campaign_id
                 GROUP BY cic.contact_id

@@ -161,7 +161,7 @@ test('apply: missing campaign id → skip marker with reason', async () => {
     assert.equal(payload.reason, 'missing_campaign_id');
 });
 
-test('apply: success → API called with configured value, no marker written', async () => {
+test('apply: success → API called with configured value, local label persisted, no marker written', async () => {
     const db = makeFakeDb();
     const updateFn = makeFakeUpdateFn();
 
@@ -178,7 +178,12 @@ test('apply: success → API called with configured value, no marker written', a
         leadEmail: 'lead@example.com',
         interestValue: 51
     });
-    assert.equal(db.calls.length, 0);
+    assert.equal(db.calls.length, 1);
+    assert.match(db.calls[0].sql, /UPDATE contact_instantly_campaigns/i);
+    assert.equal(db.calls[0].params[0], 1719683); // contactId
+    assert.equal(db.calls[0].params[1], 134); // campaignId
+    assert.equal(db.calls[0].params[2], 51);
+    assert.equal(db.calls[0].params[3], 'Warm Follow Up');
 });
 
 test('apply: API failure → failed marker with error message, does not throw', async () => {

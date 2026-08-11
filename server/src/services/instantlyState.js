@@ -400,9 +400,13 @@ function mergeMetadataPatch(existingMetadata, patchMetadata) {
     };
 }
 
-function deriveSnapshotFromLead(lead, syncedAt) {
+function deriveSnapshotFromLead(lead, syncedAt, customInterestLabels = null) {
     const leadStatus = asNullableInt(lead?.status);
     const interestStatus = asNullableInt(lead?.lt_interest_status);
+    const mappedInterestLabel = mapInterestStatusLabel(interestStatus);
+    const customInterestLabel = (interestStatus !== null && customInterestLabels instanceof Map)
+        ? (customInterestLabels.get(interestStatus) || null)
+        : null;
     return {
         instantlyLeadId: asNullableText(lead?.id),
         addedAt: asNullableTimestamp(
@@ -417,7 +421,7 @@ function deriveSnapshotFromLead(lead, syncedAt) {
         leadStatus,
         leadStatusLabel: mapLeadStatusLabel(leadStatus),
         interestStatus,
-        interestStatusLabel: mapInterestStatusLabel(interestStatus),
+        interestStatusLabel: mappedInterestLabel || customInterestLabel || null,
         verificationStatus: asNullableInt(lead?.verification_status),
         emailOpenCount: Number.parseInt(lead?.email_open_count || 0, 10) || 0,
         emailReplyCount: Number.parseInt(lead?.email_reply_count || 0, 10) || 0,
@@ -2142,6 +2146,24 @@ export async function syncClientInstantlyState({
 }) {
     const sqlClientId = await getOrCreateClient(agencyId, clientSlug);
     const syncStartedAt = new Date().toISOString();
+    const customInterestLabels = new Map();
+    try {
+        const warmFollowUpConfigResult = await pool.query(
+            `SELECT warm_follow_up_interest_value, warm_follow_up_interest_label
+             FROM clients
+             WHERE id = $1
+             LIMIT 1`,
+            [sqlClientId]
+        );
+        const warmFollowUpRow = warmFollowUpConfigResult.rows[0] || null;
+        const warmFollowUpValue = asNullableInt(warmFollowUpRow?.warm_follow_up_interest_value);
+        const warmFollowUpLabel = asNullableText(warmFollowUpRow?.warm_follow_up_interest_label);
+        if (warmFollowUpValue !== null && warmFollowUpLabel) {
+            customInterestLabels.set(warmFollowUpValue, warmFollowUpLabel);
+        }
+    } catch (error) {
+        logger(`[instantly-sync] failed loading custom interest labels: ${error?.message || error}`);
+    }
 
     try {
         if (syncRunId) {
@@ -2336,7 +2358,7 @@ export async function syncClientInstantlyState({
 
                 matchedLeads += 1;
                 matchedLeadsInCampaign += 1;
-                const snapshot = deriveSnapshotFromLead(lead, syncStartedAt);
+                const snapshot = deriveSnapshotFromLead(lead, syncStartedAt, customInterestLabels);
                 matchedSnapshots.push({
                     contact_id: contactId,
                     campaign_id: sqlCampaignId,

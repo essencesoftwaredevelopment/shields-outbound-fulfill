@@ -180,6 +180,24 @@ export async function applyWarmFollowUpStatusAfterAutoresponderSend({
             leadEmail,
             interestValue: statusConfig.interestValue
         });
+
+        // Mirror Instantly locally so All Leads filters (label + interest_status)
+        // see Warm Follow Up without waiting on a later sync.
+        if (contactId && campaignId) {
+            const localLabel = statusConfig.label || 'Warm Follow Up';
+            await db.query(
+                `UPDATE contact_instantly_campaigns
+                 SET interest_status = $3,
+                     interest_status_label = $4,
+                     timestamp_last_interest_change = NOW(),
+                     last_event_type = 'interest_status_set',
+                     last_synced_at = NOW()
+                 WHERE contact_id = $1
+                   AND campaign_id = $2`,
+                [contactId, campaignId, statusConfig.interestValue, localLabel]
+            );
+        }
+
         logger(
             `[warm-follow-up-label] applied draft=${draftId} lead=${leadEmail}`
             + ` value=${statusConfig.interestValue}${statusConfig.label ? ` (${statusConfig.label})` : ''}`
