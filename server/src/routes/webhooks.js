@@ -2,6 +2,7 @@ import express from 'express';
 import { searchLead, sendToClay } from '../services/leadWebhook.js';
 import { processInstantlyWebhookEvent, validateInstantlyWebhookSecret } from '../services/instantlyState.js';
 import { processCalendlyWebhookForClient } from '../services/calendlyWebhook.js';
+import { processProspectActivityWebhook } from '../services/prospectActivityWebhook.js';
 import { upsertLead } from '../services/leads.js';
 import { resolveClientRow } from '../services/db/queries.js';
 import { getAgencySettings, apiKeysFromSettings } from '../services/db/agencySettings.js';
@@ -265,5 +266,47 @@ async function handleCalendlyWebhookEvent(req, res) {
 
 router.post('/webhook/calendly/:userId/:clientId', handleCalendlyWebhookEvent);
 router.post('/calendly/:userId/:clientId', handleCalendlyWebhookEvent);
+
+// ---------------------------------------------------------------------------
+// Generic prospect activity webhook – any title/description on lead timeline
+// ---------------------------------------------------------------------------
+
+async function handleProspectActivityWebhook(req, res) {
+    const { userId, clientId } = req.params;
+    const secret = (req.headers['x-shields-webhook-secret'] || '').toString().trim();
+
+    try {
+        const validation = await validateInstantlyWebhookSecret(userId, clientId, secret);
+        if (!validation.valid) {
+            return res.status(validation.statusCode).json({ error: validation.message });
+        }
+    } catch (error) {
+        console.error(`[prospect-activity-webhook][${userId}/${clientId}] validation error:`, error?.message || error);
+        return res.status(500).json({ error: 'Webhook validation failed.' });
+    }
+
+    try {
+        const result = await processProspectActivityWebhook({
+            agencyId: userId,
+            clientSlug: clientId,
+            body: req.body || {},
+            logger: (message) => console.log(`[prospect-activity-webhook][${userId}/${clientId}] ${message}`)
+        });
+        return res.status(200).json(result);
+    } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        if (statusCode >= 500) {
+            console.error(`[prospect-activity-webhook][${userId}/${clientId}] error:`, error?.message || error);
+        }
+        return res.status(statusCode).json({
+            error: error?.statusCode
+                ? (error.message || 'Failed to record prospect activity.')
+                : 'Failed to record prospect activity.'
+        });
+    }
+}
+
+router.post('/webhook/activity/:userId/:clientId', handleProspectActivityWebhook);
+router.post('/activity/:userId/:clientId', handleProspectActivityWebhook);
 
 export default router;
