@@ -44,6 +44,10 @@ test('summary query scans the base table directly without analytics CTE bundle',
     assert.doesNotMatch(sql, /InitPlan/);
     assert.match(sql, /COUNT\(DISTINCT cie\.contact_id\)/);
     assert.match(sql, /COUNT\(DISTINCT cie\.contact_id\) FILTER \(\s*WHERE LOWER\(COALESCE\(cie\.event_type, ''\)\) = 'email_sent'\s*\)::int AS contacts_emailed/);
+    assert.match(
+        sql,
+        /COUNT\(DISTINCT cie\.contact_id\) FILTER \(\s*WHERE LOWER\(COALESCE\(cie\.event_type, ''\)\) = 'lead_meeting_booked'\s+AND cie\.contact_id IS NOT NULL\s*\)::int AS meetings_booked/
+    );
 });
 
 test('bucket and event-type queries use direct grouped scans', () => {
@@ -56,13 +60,23 @@ test('bucket and event-type queries use direct grouped scans', () => {
     assert.match(eventTypeSql, /GROUP BY 1/);
 });
 
-test('meetings booked bucket query filters by period and event type', () => {
+test('meetings booked bucket query counts unique contacts by earliest booking', () => {
     const sql = buildMeetingsBookedByBucketQuery(PERIOD_CONFIG_7D);
 
-    assert.match(sql, /FROM contact_instantly_events cie/);
+    assert.match(sql, /WITH first_meeting_per_contact AS/);
+    assert.match(sql, /SELECT DISTINCT ON \(cie\.contact_id\)/);
     assert.match(sql, /cie\.client_id = \$2/);
     assert.match(sql, /lead_meeting_booked/);
+    assert.match(sql, /cie\.contact_id IS NOT NULL/);
+    assert.match(sql, /ORDER BY cie\.contact_id, cie\.event_timestamp ASC, cie\.id ASC/);
+    assert.match(sql, /DATE_TRUNC\('day', fmc\.booked_at\)/);
     assert.match(sql, /GROUP BY 1/);
+});
+
+test('meetings booked bucket query uses hour truncation for 24h period', () => {
+    const sql = buildMeetingsBookedByBucketQuery(PERIOD_CONFIG_24H);
+
+    assert.match(sql, /DATE_TRUNC\('hour', fmc\.booked_at\)/);
 });
 
 test('emails sent bucket query filters by period and event type', () => {

@@ -45,8 +45,9 @@ export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilter
             COUNT(DISTINCT cie.contact_id) FILTER (
                 WHERE LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
             )::int AS contacts_emailed,
-            COUNT(*) FILTER (
+            COUNT(DISTINCT cie.contact_id) FILTER (
                 WHERE LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
+                  AND cie.contact_id IS NOT NULL
             )::int AS meetings_booked,
             COUNT(*) FILTER (
                 WHERE LOWER(COALESCE(cie.event_type, '')) IN ('reply', 'replied')
@@ -61,17 +62,30 @@ export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilter
     `;
 }
 
+/**
+ * Count unique contacts with a meeting booked in the period.
+ * Multiple sources (Calendly + Instantly status/webhook/manual/reconcile) for the
+ * same lead collapse to one booking, attributed to the earliest event timestamp.
+ */
 export function buildMeetingsBookedByBucketQuery(periodConfig) {
     const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
-    const bucketTruncSql = periodConfig.bucketTruncSql;
+    const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
 
     return `
+        WITH first_meeting_per_contact AS (
+            SELECT DISTINCT ON (cie.contact_id)
+                cie.contact_id,
+                cie.event_timestamp AS booked_at
+            FROM contact_instantly_events cie
+            WHERE ${periodFilterSql}
+              AND LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
+              AND cie.contact_id IS NOT NULL
+            ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
+        )
         SELECT
-            TO_CHAR(${bucketTruncSql}, 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
+            TO_CHAR(DATE_TRUNC('${bucketUnit}', fmc.booked_at), 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
             COUNT(*)::int AS count
-        FROM contact_instantly_events cie
-        WHERE ${periodFilterSql}
-          AND LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
+        FROM first_meeting_per_contact fmc
         GROUP BY 1
         ORDER BY 1 ASC
     `;

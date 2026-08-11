@@ -13487,15 +13487,19 @@ export default function ClientPage() {
                                                 target="_blank"
                                                 rel="noopener noreferrer"
                                                 title={storedUniboxUrl ? 'Open this thread in Instantly Unibox' : 'Search this email in Instantly Unibox'}
-                                                className="secondary-button"
+                                                className="secondary-button secondary-button--active"
                                                 style={{
+                                                    flex: '0 0 auto',
                                                     flexShrink: 0,
+                                                    height: 'auto',
+                                                    minHeight: 0,
                                                     padding: '0.2rem 0.55rem',
                                                     fontSize: '0.72rem',
                                                     textDecoration: 'none',
                                                     display: 'inline-flex',
                                                     alignItems: 'center',
-                                                    gap: '0.3rem'
+                                                    gap: '0.3rem',
+                                                    cursor: 'pointer'
                                                 }}
                                             >
                                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
