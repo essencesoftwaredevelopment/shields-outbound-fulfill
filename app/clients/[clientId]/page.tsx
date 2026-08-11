@@ -2966,15 +2966,7 @@ export default function ClientPage() {
             const setArrayValue = (arr: string[]) => updateLeadFilter(filter.id, { value: JSON.stringify(arr) });
 
             return (
-                <div
-                    key={filter.id}
-                    style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(220px, 1.4fr) auto',
-                        gap: '0.75rem',
-                        alignItems: 'end'
-                    }}
-                >
+                <div key={filter.id} className="lead-filter-row">
                     <label className="settings-field">
                         <span className="settings-field__label">Field</span>
                         <select
@@ -12045,7 +12037,7 @@ export default function ClientPage() {
                                                 </select>
                                             </label>
                                             {columnMapping[field]?.isCustom && (
-                                                <div style={{ marginTop: '0.75rem', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                                                <div style={{ marginTop: '0.75rem', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '0.75rem' }}>
                                                     <label className="settings-field">
                                                         <span className="settings-field__label">Custom variable label</span>
                                                         <input
@@ -14178,13 +14170,7 @@ export default function ClientPage() {
                                         return (
                                             <>
                                                 {populatedRows.length > 0 && (
-                                                    <div style={{
-                                                        display: 'grid',
-                                                        gridTemplateColumns: '200px 1fr',
-                                                        gap: '0.45rem 0.8rem',
-                                                        fontSize: '0.9rem',
-                                                        lineHeight: 1.5
-                                                    }}>
+                                                    <div className="kv-grid">
                                                         {populatedRows.map((row) => (
                                                             <div key={row.label} style={{ display: 'contents' }}>
                                                                 <span style={{ color: 'var(--app-text-faint)' }}>{row.label}</span>
@@ -14206,13 +14192,7 @@ export default function ClientPage() {
                                                         }}>
                                                             Attributes
                                                         </p>
-                                                        <div style={{
-                                                            display: 'grid',
-                                                            gridTemplateColumns: '200px 1fr',
-                                                            gap: '0.45rem 0.8rem',
-                                                            fontSize: '0.9rem',
-                                                            lineHeight: 1.5
-                                                        }}>
+                                                        <div className="kv-grid">
                                                             {attributeEntries.map(([key, value]) => (
                                                                 <div key={key} style={{ display: 'contents' }}>
                                                                     <span style={{ color: 'var(--app-text-faint)' }}>{key}</span>

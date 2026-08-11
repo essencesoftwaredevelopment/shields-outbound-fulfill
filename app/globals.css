@@ -167,6 +167,11 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 body {
   margin: 0;
   background: var(--app-bg);
@@ -206,6 +211,11 @@ body {
 }
 
 .sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100vh;
+  overflow: hidden;
   width: var(--app-sidebar-width);
   padding: 1.5rem 1rem;
   background: var(--app-bg-sidebar);
@@ -213,14 +223,25 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
-  min-height: 100vh;
   transition: width 0.2s ease, padding 0.2s ease;
   z-index: 40;
 }
 
+.sidebar__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 36px;
+}
+
+.sidebar--collapsed .sidebar__header {
+  justify-content: center;
+}
+
 .sidebar--collapsed .sidebar__btn {
   justify-content: center;
-  padding: 0.85rem 0.5rem;
+  padding: 0.6rem 0.5rem;
 }
 
 .sidebar--collapsed .sidebar__btn-label,
@@ -229,7 +250,6 @@ body {
 }
 
 .sidebar__toggle {
-  align-self: flex-end;
   width: 36px;
   height: 36px;
   border-radius: 10px;
@@ -250,64 +270,73 @@ body {
   color: var(--app-text);
 }
 
-.sidebar--collapsed .sidebar__toggle {
-  align-self: center;
-}
 
-.sidebar__brand h2 {
-  margin: 0.2rem 0 0;
-  font-size: 1.5rem;
+.sidebar__wordmark {
+  display: block;
+  font-size: 0.95rem;
   font-weight: 600;
-}
-
-.sidebar__tag {
-  display: inline-block;
-  font-size: 0.75rem;
-  letter-spacing: 0.3em;
-  text-transform: uppercase;
-  color: var(--app-text-faint);
+  letter-spacing: -0.01em;
+  color: var(--app-text);
+  white-space: nowrap;
+  padding: 0 0.25rem;
 }
 
 .sidebar__nav {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 0;
   flex: 1;
+}
+
+.sidebar__nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.sidebar__nav-group--bottom {
+  margin-top: auto;
 }
 
 .sidebar__btn {
   width: 100%;
-  border-radius: 16px;
-  border: 1px solid var(--app-border-strong);
-  background: var(--app-surface-1);
-  color: var(--app-text);
-  padding: 0.85rem 1rem;
-  font-size: 0.95rem;
-  font-weight: 600;
+  border-radius: 10px;
+  border: none;
+  background: transparent;
+  color: var(--app-text-muted);
+  padding: 0.6rem 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 500;
   text-align: left;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
-  transition: border-color 0.2s ease, background 0.2s ease;
-  box-shadow: var(--app-shadow-button);
+  gap: 0.65rem;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .sidebar__btn:hover {
-  border-color: var(--app-border-highlight);
-  background: var(--app-surface-hover);
-}
-
-.sidebar__btn--active {
-  border-color: var(--app-border-highlight);
   background: var(--app-surface-hover);
   color: var(--app-text);
 }
 
+.sidebar__btn--active {
+  background: var(--app-surface-hover);
+  color: var(--app-text);
+  font-weight: 600;
+}
+
 .sidebar__btn-icon {
   flex-shrink: 0;
-  width: 1.25rem;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sidebar__btn-icon svg {
+  display: block;
 }
 
 .sidebar__btn-label {
@@ -1741,6 +1770,23 @@ body {
   box-shadow: none;
 }
 
+/* Lead filter clause row: field / operator / value / actions */
+.lead-filter-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(220px, 1.4fr) auto;
+  gap: 0.75rem;
+  align-items: end;
+}
+
+/* Label/value detail grids (lead insights, attributes) */
+.kv-grid {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 0.45rem 0.8rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
 .leads-table td {
   color: var(--app-text);
   padding: 0.75rem 1rem;
@@ -1760,26 +1806,143 @@ body {
     padding: 1rem 0.75rem;
   }
 
+  .dashboard__content {
+    gap: 1.5rem;
+  }
+
+  /* Sidebar becomes a sticky top bar */
   .sidebar {
+    position: sticky;
+    top: 0;
+    left: auto;
     width: 100%;
+    height: auto;
+    min-height: 0;
+    overflow: visible;
     flex-direction: row;
     align-items: center;
-    gap: 1rem;
-    min-height: auto;
-    position: relative;
-    height: auto;
+    gap: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    padding-top: calc(0.5rem + env(safe-area-inset-top));
+    border-right: none;
+    border-bottom: 1px solid var(--app-border);
+  }
+
+  .sidebar__header {
+    display: none;
   }
 
   .sidebar__nav {
     flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    height: auto;
+    width: 100%;
+  }
+
+  .sidebar__nav-group {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .sidebar__nav-group--bottom {
+    margin-top: 0;
+  }
+
+  .sidebar__btn,
+  .sidebar--collapsed .sidebar__btn {
+    width: auto;
+    padding: 0.6rem 0.65rem;
+    border-radius: 10px;
+  }
+
+  .sidebar__btn-label {
+    display: none;
   }
 
   .sidebar__settings {
     margin-top: 0;
   }
 
-  .sidebar__toggle {
-    display: none;
+  /* Panels and cards: tighter chrome on small screens */
+  .hero-panel,
+  .pipeline-panel {
+    padding: 1.25rem;
+    border-radius: 20px;
+  }
+
+  .metric-card {
+    padding: 1.25rem;
+  }
+
+  .metric-card__value {
+    font-size: 2rem;
+  }
+
+  .pipeline-panel__client {
+    font-size: 1.5rem;
+  }
+
+  .niche-grid {
+    margin-top: 1.5rem;
+  }
+
+  /* Modals: fit the viewport and stay scrollable */
+  .modal-overlay {
+    padding: 1rem 0.75rem;
+  }
+
+  .modal {
+    padding: 1.5rem;
+    border-radius: 20px;
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+  }
+
+  .modal__title {
+    font-size: 1.5rem;
+  }
+
+  .toast-notification {
+    left: 1rem;
+    right: 1rem;
+    bottom: 1rem;
+    max-width: none;
+  }
+
+  .lead-filter-row {
+    grid-template-columns: 1fr;
+  }
+
+  .kv-grid {
+    grid-template-columns: 1fr;
+    gap: 0.1rem 0;
+  }
+}
+
+/* Phones: prevent iOS input zoom (needs >=16px font) and shrink type */
+@media (max-width: 640px) {
+  .input,
+  .select,
+  .settings-field input,
+  .settings-field select,
+  .modal textarea,
+  .pipeline-panel textarea {
+    font-size: 16px;
+  }
+
+  .hero-panel__title {
+    font-size: 1.6rem;
+  }
+
+  .client-page-header__title {
+    font-size: 1.5rem;
+  }
+
+  .account-metric-chip {
+    min-width: 0;
+    width: 100%;
   }
 }
 

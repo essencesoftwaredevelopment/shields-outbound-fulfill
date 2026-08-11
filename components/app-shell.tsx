@@ -2,6 +2,18 @@
 
 import { ReactNode, useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
+import {
+    House,
+    KeyRound,
+    LogOut,
+    Monitor,
+    Moon,
+    PanelLeftClose,
+    PanelLeftOpen,
+    Shield,
+    Sun,
+    User,
+} from "lucide-react";
 import { supabase } from "@/lib/supabase/client";
 import { usePlatformAdmin } from "@/lib/hooks/usePlatformAdmin";
 
@@ -32,13 +44,11 @@ export default function AppShell({ children }: { children: ReactNode }) {
     const router = useRouter();
     const pathname = usePathname();
     const { isAdmin } = usePlatformAdmin();
-    const [today, setToday] = useState<string>("");
     const [themeMode, setThemeMode] = useState<ThemeMode>("auto");
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
     const isActive = (path: string) => pathname === path || pathname.startsWith(`${path}/`);
 
     useEffect(() => {
-        setToday(new Date().toLocaleDateString());
         setThemeMode(getEffectiveTheme());
         const stored = localStorage.getItem("sidebar-collapsed");
         if (stored === "true") {
@@ -60,7 +70,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
         });
     }
 
-    const themeIcon = themeMode === "dark" ? "🌙" : themeMode === "light" ? "☀️" : "🖥️";
+    const ThemeIcon = themeMode === "dark" ? Moon : themeMode === "light" ? Sun : Monitor;
     const themeLabel = themeMode === "dark" ? "Dark" : themeMode === "light" ? "Light" : "Auto";
     const sidebarWidth = sidebarCollapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED;
 
@@ -69,54 +79,35 @@ export default function AppShell({ children }: { children: ReactNode }) {
             className="dashboard"
             style={{ "--app-sidebar-width": sidebarWidth } as React.CSSProperties}
         >
-            <aside
-                className={`sidebar${sidebarCollapsed ? " sidebar--collapsed" : ""}`}
-                style={{
-                    position: "fixed",
-                    top: 0,
-                    left: 0,
-                    height: "100vh",
-                    overflow: "hidden",
-                }}
-            >
-                <button
-                    type="button"
-                    className="sidebar__toggle"
-                    onClick={toggleSidebar}
-                    aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                    title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                >
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <aside className={`sidebar${sidebarCollapsed ? " sidebar--collapsed" : ""}`}>
+                <div className="sidebar__header">
+                    <div className="sidebar__brand">
+                        <span className="sidebar__wordmark">Essence Outbound</span>
+                    </div>
+                    <button
+                        type="button"
+                        className="sidebar__toggle"
+                        onClick={toggleSidebar}
+                        aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                        title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    >
                         {sidebarCollapsed ? (
-                            <path d="M6 4L10 8L6 12" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+                            <PanelLeftOpen size={16} aria-hidden="true" />
                         ) : (
-                            <path d="M10 4L6 8L10 12" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+                            <PanelLeftClose size={16} aria-hidden="true" />
                         )}
-                    </svg>
-                </button>
-
-                <div className="sidebar__brand">
-                    <span className="sidebar__tag">{today}</span>
+                    </button>
                 </div>
 
-                <div
-                    className="sidebar__nav"
-                    style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        height: "calc(100vh - 96px)",
-                        gap: "0.5rem",
-                        justifyContent: "space-between",
-                    }}
-                >
-                    <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                <div className="sidebar__nav">
+                    <div className="sidebar__nav-group sidebar__nav-group--top">
                         <button
                             type="button"
                             className={`sidebar__btn${isActive("/") ? " sidebar__btn--active" : ""}`}
                             onClick={() => router.push("/")}
                             title="Home"
                         >
-                            <span className="sidebar__btn-icon" aria-hidden="true">🏠</span>
+                            <span className="sidebar__btn-icon" aria-hidden="true"><House size={18} /></span>
                             <span className="sidebar__btn-label">Home</span>
                         </button>
                         <button
@@ -125,7 +116,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                             onClick={() => router.push("/account")}
                             title="Account"
                         >
-                            <span className="sidebar__btn-icon" aria-hidden="true">👤</span>
+                            <span className="sidebar__btn-icon" aria-hidden="true"><User size={18} /></span>
                             <span className="sidebar__btn-label">Account</span>
                         </button>
                         {isAdmin && (
@@ -135,20 +126,20 @@ export default function AppShell({ children }: { children: ReactNode }) {
                                 onClick={() => router.push("/admin")}
                                 title="Admin"
                             >
-                                <span className="sidebar__btn-icon" aria-hidden="true">🛡️</span>
+                                <span className="sidebar__btn-icon" aria-hidden="true"><Shield size={18} /></span>
                                 <span className="sidebar__btn-label">Admin</span>
                             </button>
                         )}
                     </div>
 
-                    <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                    <div className="sidebar__nav-group sidebar__nav-group--bottom">
                         <button
                             type="button"
                             className="sidebar__btn"
                             onClick={cycleTheme}
                             title={`Theme: ${themeLabel} — click to cycle`}
                         >
-                            <span className="sidebar__btn-icon" aria-hidden="true">{themeIcon}</span>
+                            <span className="sidebar__btn-icon" aria-hidden="true"><ThemeIcon size={18} /></span>
                             <span className="sidebar__btn-label">{themeLabel}</span>
                         </button>
                         <button
@@ -157,7 +148,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                             onClick={() => router.push("/?showKeys=1")}
                             title="Keys"
                         >
-                            <span className="sidebar__btn-icon" aria-hidden="true">🔑</span>
+                            <span className="sidebar__btn-icon" aria-hidden="true"><KeyRound size={18} /></span>
                             <span className="sidebar__btn-label">Keys</span>
                         </button>
                         <button
@@ -173,7 +164,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                                 }
                             }}
                         >
-                            <span className="sidebar__btn-icon" aria-hidden="true">🚪</span>
+                            <span className="sidebar__btn-icon" aria-hidden="true"><LogOut size={18} /></span>
                             <span className="sidebar__btn-label">Logout</span>
                         </button>
                     </div>

@@ -324,11 +324,11 @@ export default function ClientsPage() {
                             className="modal"
                             onClick={(e) => e.stopPropagation()}
                             style={{
-                                maxWidth: "520px",
+                                width: "min(520px, calc(100vw - 24px))",
                                 position: "fixed",
-                                right: 24,
-                                top: 24,
-                                bottom: 24,
+                                right: 12,
+                                top: 12,
+                                bottom: 12,
                                 overflow: "auto",
                                 zIndex: 50
                             }}
