@@ -6,7 +6,9 @@ import {
     resolveInstantlyReplySubject,
     humanizeDomainAsCompanyName,
     buildActiveFungiStoryUrl,
-    applyActiveFungiStoryUrlToTemplateVars
+    applyActiveFungiStoryUrlToTemplateVars,
+    normalizeRegenerateInstructions,
+    prependPriorityInstructions
 } from '../interestedAutoResponder.js';
 
 test('isEligiblePostAutoresponderReplyCategory accepts positive and neutral while interested', () => {
@@ -81,4 +83,22 @@ test('applyActiveFungiStoryUrlToTemplateVars adds story_url from template fields
     assert.match(vars.story_url, /^https:\/\/active-fungi\.vercel\.app\/\?/);
     assert.match(vars.story_url, /name=Jason/);
     assert.match(vars.story_url, /company=Merged/);
+});
+
+test('normalizeRegenerateInstructions trims, drops blanks, and caps length', () => {
+    assert.equal(normalizeRegenerateInstructions('  keep it shorter  '), 'keep it shorter');
+    assert.equal(normalizeRegenerateInstructions('   '), null);
+    assert.equal(normalizeRegenerateInstructions(null), null);
+    const long = 'x'.repeat(5000);
+    assert.equal(normalizeRegenerateInstructions(long)?.length, 4000);
+});
+
+test('prependPriorityInstructions puts reviewer notes above the campaign system prompt', () => {
+    const result = prependPriorityInstructions('Be a helpful sales assistant.', 'Keep it under 80 words.');
+    assert.match(result, /^HIGHEST PRIORITY/);
+    assert.ok(result.indexOf('Keep it under 80 words.') < result.indexOf('Be a helpful sales assistant.'));
+    assert.equal(
+        prependPriorityInstructions('Be a helpful sales assistant.', '   '),
+        'Be a helpful sales assistant.'
+    );
 });

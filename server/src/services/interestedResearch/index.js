@@ -453,7 +453,8 @@ export async function runPopupGeneration({ draftId, agencyId }) {
  *   agencyId: string,
  *   auditPreviewUrl?: string | null,
  *   isFollowUp?: boolean,
- *   skipNtfy?: boolean
+ *   skipNtfy?: boolean,
+ *   additionalInstructions?: string | null
  * }} args
  */
 export async function finalizeResearchDraft({
@@ -461,7 +462,8 @@ export async function finalizeResearchDraft({
     agencyId,
     auditPreviewUrl = null,
     isFollowUp = false,
-    skipNtfy = false
+    skipNtfy = false,
+    additionalInstructions = null
 }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
     const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
@@ -493,7 +495,8 @@ export async function finalizeResearchDraft({
         previousLeadMessage: draft.previous_lead_message,
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: draft.research_brief || null,
-        systemPromptOwnsCta: useActiveFungiStoryUrl
+        systemPromptOwnsCta: useActiveFungiStoryUrl,
+        additionalInstructions
     });
 
     const existingToken = String(draft.review_token || '').trim();

@@ -16,7 +16,8 @@ export async function triggerInterestedResearchWorkflow({
     draftId,
     agencyId,
     isFollowUp = false,
-    skipNtfy = false
+    skipNtfy = false,
+    additionalInstructions = null
 }) {
     const baseUrl = (
         process.env.APP_URL
@@ -43,7 +44,13 @@ export async function triggerInterestedResearchWorkflow({
     const res = await fetch(`${baseUrl}/internal/interested-research/start`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ draftId, agencyId, isFollowUp, skipNtfy: Boolean(skipNtfy) })
+        body: JSON.stringify({
+            draftId,
+            agencyId,
+            isFollowUp,
+            skipNtfy: Boolean(skipNtfy),
+            additionalInstructions: additionalInstructions || null
+        })
     });
 
     if (!res.ok) {

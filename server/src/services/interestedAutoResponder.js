@@ -61,6 +61,7 @@ const VULCAN_AUDIT_POLL_INTERVAL_MS = Math.max(
 );
 
 const OPEN_DRAFT_STATUSES = ['pending_review', 'blocked_missing_thread', 'researching'];
+const MAX_REGENERATE_INSTRUCTIONS_LENGTH = 4000;
 const INSTANTLY_API_BASE_URL = 'https://api.instantly.ai';
 const INSTANTLY_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -740,6 +741,32 @@ async function resolveClientInstantlyKey(agencyId, clientId, cachedKey = null) {
     return asTrimmedText(clientRow?.instantly_key);
 }
 
+export function normalizeRegenerateInstructions(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return null;
+    return text.slice(0, MAX_REGENERATE_INSTRUCTIONS_LENGTH);
+}
+
+/**
+ * Puts reviewer regenerate instructions above the campaign system prompt so they
+ * win conflicts with campaign copy, CTA guidance, and the research brief.
+ */
+export function prependPriorityInstructions(systemPrompt, additionalInstructions) {
+    const extra = normalizeRegenerateInstructions(additionalInstructions);
+    const base = String(systemPrompt || '');
+    if (!extra) return base;
+    return [
+        'HIGHEST PRIORITY — additional instructions from the reviewer for this regeneration.',
+        'Follow these even if they conflict with the campaign system prompt, CTA guidance, or research brief below.',
+        '',
+        extra,
+        '',
+        '---',
+        '',
+        base
+    ].join('\n');
+}
+
 export async function generateDraftReply({
     openaiKey,
     systemPrompt,
@@ -755,7 +782,8 @@ export async function generateDraftReply({
     researchBrief = null,
     // When true, the system prompt already owns the CTA (Active Fungi story URL).
     // Skip shopping-audit / Essence Calendly CTA instructions so they don't fight it.
-    systemPromptOwnsCta = false
+    systemPromptOwnsCta = false,
+    additionalInstructions = null
 }) {
     const previewUrl = auditPreviewUrl || essenceAiPreviewUrl || null;
     const client = new OpenAI({ apiKey: openaiKey });
@@ -766,11 +794,12 @@ export async function generateDraftReply({
             : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`;
     }
     const briefBlock = formatResearchBriefForPrompt(researchBrief);
+    const effectiveSystemPrompt = prependPriorityInstructions(systemPrompt, additionalInstructions);
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,
         // temperature: 0.6,
         messages: [
-            { role: 'system', content: systemPrompt },
+            { role: 'system', content: effectiveSystemPrompt },
             {
                 role: 'user',
                 content: [
@@ -1732,7 +1761,7 @@ export async function cancelInterestedAutoResponderDraftByToken({ token }) {
  * the same review token/URL. Prefer the durable research workflow when enabled;
  * otherwise regenerate inline (popup generate + draft reply).
  */
-export async function regenerateInterestedAutoResponderDraftByToken({ token }) {
+export async function regenerateInterestedAutoResponderDraftByToken({ token, additionalInstructions = null }) {
     const draft = await loadPendingReviewDraft(token);
     const settings = await fetchAgencyAndClientSettings(draft.agency_id, draft.client_id);
     if (!settings.openaiKey) {
@@ -1748,6 +1777,7 @@ export async function regenerateInterestedAutoResponderDraftByToken({ token }) {
         throw error;
     }
 
+    const extraInstructions = normalizeRegenerateInstructions(additionalInstructions);
     const useResearchPath = Boolean(settings.replyResearchAgent)
         && isInterestedResearchWorkflowConfigured();
 
@@ -1773,7 +1803,8 @@ export async function regenerateInterestedAutoResponderDraftByToken({ token }) {
             await triggerInterestedResearchWorkflow({
                 draftId: draft.id,
                 agencyId: draft.agency_id,
-                skipNtfy: true
+                skipNtfy: true,
+                additionalInstructions: extraInstructions
             });
             return {
                 regenerating: true,
@@ -1793,7 +1824,8 @@ export async function regenerateInterestedAutoResponderDraftByToken({ token }) {
     const regenerated = await regenerateDraftInline({
         draft,
         settings,
-        promptConfig
+        promptConfig,
+        additionalInstructions: extraInstructions
     });
     return {
         regenerating: false,
@@ -1805,7 +1837,7 @@ export async function regenerateInterestedAutoResponderDraftByToken({ token }) {
 }
 
 /** Popup (or Vulcan/story) + reply generation in-process; restores pending_review. */
-async function regenerateDraftInline({ draft, settings, promptConfig }) {
+async function regenerateDraftInline({ draft, settings, promptConfig, additionalInstructions = null }) {
     const signalRow = await resolveContactSignalContext(pool, draft.contact_id);
     const auditDomain = normalizeAuditDomain(signalRow.company_domain)
         || domainFromLeadEmail(draft.lead_email);
@@ -1845,7 +1877,8 @@ async function regenerateDraftInline({ draft, settings, promptConfig }) {
         previousLeadMessage: draft.previous_lead_message,
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: null,
-        systemPromptOwnsCta: useActiveFungiStoryUrl
+        systemPromptOwnsCta: useActiveFungiStoryUrl,
+        additionalInstructions
     });
 
     const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();

@@ -42,6 +42,8 @@ export interface InterestedResearchInput {
   isFollowUp?: boolean;
   /** When true, finalize skips the ntfy push (review-page regenerate). */
   skipNtfy?: boolean;
+  /** Reviewer regenerate notes — prepended above the campaign system prompt. */
+  additionalInstructions?: string | null;
 }
 
 export async function interestedResearchWorkflow(input: InterestedResearchInput) {

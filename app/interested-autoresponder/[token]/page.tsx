@@ -49,11 +49,14 @@ export default function InterestedAutoResponderReviewPage() {
     const [archiving, setArchiving] = useState(false);
     const [archived, setArchived] = useState(false);
     const [archiveModalOpen, setArchiveModalOpen] = useState(false);
+    const [regenerateModalOpen, setRegenerateModalOpen] = useState(false);
+    const [regenerateInstructions, setRegenerateInstructions] = useState("");
     const [error, setError] = useState<string | null>(null);
     const [sendSuccess, setSendSuccess] = useState(false);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
     const editorRef = useRef<HTMLDivElement>(null);
+    const regenerateInstructionsRef = useRef<HTMLTextAreaElement>(null);
     const lastSavedTextRef = useRef<string>("");
     const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -207,15 +210,24 @@ export default function InterestedAutoResponderReviewPage() {
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
     }, [renderedText, token, archived, regenerating, draft]);
 
-    // Close archive modal on Escape
+    // Close archive / regenerate modals on Escape
     useEffect(() => {
-        if (!archiveModalOpen) return;
+        if (!archiveModalOpen && !regenerateModalOpen) return;
         const handler = (e: KeyboardEvent) => {
-            if (e.key === "Escape" && !archiving) setArchiveModalOpen(false);
+            if (e.key !== "Escape") return;
+            if (archiving || regenerating) return;
+            if (regenerateModalOpen) setRegenerateModalOpen(false);
+            else setArchiveModalOpen(false);
         };
         document.addEventListener("keydown", handler);
         return () => document.removeEventListener("keydown", handler);
-    }, [archiveModalOpen, archiving]);
+    }, [archiveModalOpen, regenerateModalOpen, archiving, regenerating]);
+
+    useEffect(() => {
+        if (!regenerateModalOpen) return;
+        const id = window.setTimeout(() => regenerateInstructionsRef.current?.focus(), 0);
+        return () => window.clearTimeout(id);
+    }, [regenerateModalOpen]);
 
     const syncEditorContent = useCallback((syncDom = false) => {
         if (!editorRef.current) return;
@@ -379,11 +391,19 @@ export default function InterestedAutoResponderReviewPage() {
             clearTimeout(saveTimerRef.current);
             saveTimerRef.current = null;
         }
+        setRegenerateModalOpen(false);
         setRegenerating(true);
         try {
+            const extra = regenerateInstructions.trim();
             const response = await fetch(
                 `${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}/regenerate`,
-                { method: "POST" }
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        additionalInstructions: extra || undefined,
+                    }),
+                }
             );
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -514,6 +534,29 @@ export default function InterestedAutoResponderReviewPage() {
                     border: 1px solid rgba(255,255,255,0.12);
                     box-shadow: 0 24px 64px rgba(0,0,0,0.45);
                 }
+                .ar-modal--wide { max-width: 520px; }
+                .ar-modal textarea {
+                    display: block;
+                    width: 100%;
+                    min-height: 128px;
+                    margin: 0 0 1.25rem;
+                    padding: 0.75rem 0.85rem;
+                    border-radius: 10px;
+                    border: 1px solid rgba(255,255,255,0.12);
+                    background: rgba(0,0,0,0.28);
+                    color: #fff;
+                    font-size: 0.9rem;
+                    line-height: 1.5;
+                    resize: vertical;
+                    outline: none;
+                    font-family: inherit;
+                    box-sizing: border-box;
+                }
+                .ar-modal textarea:focus {
+                    border-color: rgba(96,165,250,0.6);
+                    box-shadow: 0 0 0 2px rgba(96,165,250,0.2);
+                }
+                .ar-modal textarea::placeholder { color: rgba(255,255,255,0.35); }
                 .ar-modal__title {
                     margin: 0 0 0.5rem;
                     font-size: 1.1rem;
@@ -552,8 +595,70 @@ export default function InterestedAutoResponderReviewPage() {
                     cursor: pointer;
                 }
                 .ar-btn-destructive:hover:not(:disabled) { background: rgba(239,68,68,0.28); }
-                .ar-btn-secondary:disabled, .ar-btn-destructive:disabled { opacity: 0.55; cursor: default; }
+                .ar-btn-primary {
+                    padding: 0.65rem 1rem;
+                    border-radius: 8px;
+                    border: none;
+                    background: #2563eb;
+                    color: #fff;
+                    font-weight: 600;
+                    font-size: 0.9rem;
+                    cursor: pointer;
+                }
+                .ar-btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+                .ar-btn-primary:active:not(:disabled) { transform: scale(0.98); }
+                .ar-btn-secondary:disabled,
+                .ar-btn-destructive:disabled,
+                .ar-btn-primary:disabled { opacity: 0.55; cursor: default; }
             `}</style>
+            {regenerateModalOpen && (
+                <div
+                    className="ar-modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="regenerate-draft-title"
+                    onClick={() => { if (!regenerating) setRegenerateModalOpen(false); }}
+                >
+                    <div className="ar-modal ar-modal--wide" onClick={(e) => e.stopPropagation()}>
+                        <h2 id="regenerate-draft-title" className="ar-modal__title">Regenerate reply</h2>
+                        <p className="ar-modal__body" style={{ marginBottom: "0.65rem" }}>
+                            Optional extra instructions for this regeneration. They take priority over the campaign system prompt if anything conflicts.
+                        </p>
+                        <textarea
+                            ref={regenerateInstructionsRef}
+                            value={regenerateInstructions}
+                            onChange={(e) => setRegenerateInstructions(e.target.value)}
+                            onKeyDown={(e) => {
+                                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                                    e.preventDefault();
+                                    if (!regenerating) handleRegenerate();
+                                }
+                            }}
+                            placeholder="e.g. Keep it under 80 words. Mention their new product line. Skip the audit link."
+                            maxLength={4000}
+                            disabled={regenerating}
+                        />
+                        <div className="ar-modal__actions">
+                            <button
+                                type="button"
+                                className="ar-btn-secondary"
+                                onClick={() => setRegenerateModalOpen(false)}
+                                disabled={regenerating}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="ar-btn-primary"
+                                onClick={handleRegenerate}
+                                disabled={regenerating}
+                            >
+                                {regenerating ? "Regenerating…" : "Regenerate"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
             {archiveModalOpen && (
                 <div
                     className="ar-modal-overlay"
@@ -680,7 +785,7 @@ export default function InterestedAutoResponderReviewPage() {
                                 {!sendSuccess && (
                                     <button
                                         type="button"
-                                        onClick={handleRegenerate}
+                                        onClick={() => setRegenerateModalOpen(true)}
                                         disabled={sending || regenerating || archiving}
                                         style={{
                                             width: "100%",

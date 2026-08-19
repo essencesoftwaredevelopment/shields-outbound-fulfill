@@ -467,7 +467,8 @@ router.post('/interested-autoresponder/review/:token/regenerate', async (req, re
     try {
         setNoStoreHeaders(res);
         const result = await regenerateInterestedAutoResponderDraftByToken({
-            token: String(req.params.token || '')
+            token: String(req.params.token || ''),
+            additionalInstructions: req.body?.additionalInstructions
         });
         res.json(result);
     } catch (error) {

@@ -23,7 +23,13 @@ export async function POST(request: Request) {
     }
   }
 
-  let body: { draftId?: number; agencyId?: string; isFollowUp?: boolean; skipNtfy?: boolean };
+  let body: {
+    draftId?: number;
+    agencyId?: string;
+    isFollowUp?: boolean;
+    skipNtfy?: boolean;
+    additionalInstructions?: string | null;
+  };
   try {
     body = await request.json();
   } catch {
@@ -45,6 +51,9 @@ export async function POST(request: Request) {
       agencyId,
       isFollowUp: Boolean(body.isFollowUp),
       skipNtfy: Boolean(body.skipNtfy),
+      additionalInstructions: typeof body.additionalInstructions === 'string'
+        ? body.additionalInstructions
+        : null,
     },
   ]);
 

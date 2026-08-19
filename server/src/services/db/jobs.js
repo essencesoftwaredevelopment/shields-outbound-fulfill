@@ -15,6 +15,28 @@ const COHORT_ELIGIBLE_SQL = `
     AND COALESCE(jd.raw_row->'_enrichment'->>'inEmailCohort', 'true') = 'true'`;
 
 /**
+ * FROM/JOIN for enrichment contact queues (email / verify / personalize).
+ *
+ * When `domainsParamIndex` is set, drive from `unnest($n::text[])` so Postgres
+ * starts at the batch domains (`idx_companies_agency_domain` → `job_domains_pkey`)
+ * instead of scanning every `job_domains` row for the job and joining companies
+ * via the trigram GIN index (job 1787155726011-2lozbz: ~80–90s per batch).
+ *
+ * Exported for unit tests that lock the join order.
+ */
+export function enrichmentQueueFromJoinSql(domainsParamIndex = null) {
+    if (domainsParamIndex != null) {
+        return `FROM unnest($${domainsParamIndex}::text[]) AS batch(domain_normalized)
+         JOIN companies co ON co.agency_id = $1 AND co.domain_normalized = batch.domain_normalized
+         JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         JOIN contacts c ON c.company_id = co.id AND c.agency_id = $1`;
+    }
+    return `FROM contacts c
+         JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
+         JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized`;
+}
+
+/**
  * job_domains marked `skipped` must never re-enter enrichment queues — whether
  * skipped by dedupe (skip mode) or by the shopping-audit matched-only gate.
  * Reprocess mode used to bypass this, but reprocess dedupe marks nothing as
@@ -636,11 +658,12 @@ export async function getEmailFindQueue(
     // Batch scoping happens here in SQL (not by filtering a global queue in JS):
     // under parallel child runs a global LIMIT window can starve batches whose
     // rows sort past it while work remains for other domains (incident §5.2).
-    let domainConstraint = '';
+    // Drive FROM unnest(domains) so the planner cannot scan the whole job first.
+    let domainsParamIndex = null;
     if (Array.isArray(domains)) {
         if (!domains.length) return [];
         params.push(domains);
-        domainConstraint = `AND co.domain_normalized = ANY($${params.length}::text[])`;
+        domainsParamIndex = params.length;
     }
 
     const result = await pool.query(
@@ -650,13 +673,10 @@ export async function getEmailFindQueue(
                 c.id AS contact_id,
                 co.domain_normalized AS domain,
                 c.full_name AS founder_name`}
-         FROM contacts c
-         JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
-         JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         ${enrichmentQueueFromJoinSql(domainsParamIndex)}
          WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            ${emailConstraint}
-           ${domainConstraint}
            AND (c.full_name IS NOT NULL AND BTRIM(c.full_name) <> '' AND LOWER(BTRIM(c.full_name)) <> 'not found')
            AND COALESCE(jd.raw_row->'_enrichment'->>'inFounderCohort', 'true') = 'true'
            ${COHORT_ELIGIBLE_SQL}
@@ -689,11 +709,11 @@ export async function getVerifyQueue(
     }
 
     // SQL batch scoping — see getEmailFindQueue for why (incident §5.2 starvation).
-    let domainConstraint = '';
+    let domainsParamIndex = null;
     if (Array.isArray(domains)) {
         if (!domains.length) return [];
         params.push(domains);
-        domainConstraint = `AND co.domain_normalized = ANY($${params.length}::text[])`;
+        domainsParamIndex = params.length;
     }
 
     const result = await pool.query(
@@ -705,15 +725,12 @@ export async function getVerifyQueue(
                 c.full_name AS founder_name,
                 c.email,
                 c.email_status`}
-         FROM contacts c
-         JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
-         JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         ${enrichmentQueueFromJoinSql(domainsParamIndex)}
          WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
            ${freshnessConstraint}
-           ${domainConstraint}
            ${COHORT_ELIGIBLE_SQL}
            ${skippedJobDomainSql()}
          ORDER BY ${distinctDomains ? 'co.domain_normalized ASC' : 'c.id ASC'}
@@ -754,11 +771,11 @@ export async function getPersonalizeQueue(
         : '';
 
     // SQL batch scoping — see getEmailFindQueue for why (incident §5.2 starvation).
-    let domainConstraint = '';
+    let domainsParamIndex = null;
     if (Array.isArray(domains)) {
         if (!domains.length) return [];
         params.push(domains);
-        domainConstraint = `AND co.domain_normalized = ANY($${params.length}::text[])`;
+        domainsParamIndex = params.length;
     }
 
     const result = await pool.query(
@@ -771,16 +788,13 @@ export async function getPersonalizeQueue(
                 c.email,
                 c.email_status,
                 c.personalization_first_line`}
-         FROM contacts c
-         JOIN companies co ON co.id = c.company_id AND co.agency_id = $1
-         JOIN job_domains jd ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         ${enrichmentQueueFromJoinSql(domainsParamIndex)}
          WHERE c.agency_id = $1 AND c.client_id = $2
            AND c.role_type = 'founder'
            AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
            AND LOWER(BTRIM(COALESCE(c.full_name, ''))) <> 'not found'
            ${personalizationFilter}
            ${emailStatusFilter}
-           ${domainConstraint}
            ${COHORT_ELIGIBLE_SQL}
            ${skippedJobDomainSql()}
          ORDER BY ${distinctDomains ? 'co.domain_normalized ASC' : 'c.id ASC'}
