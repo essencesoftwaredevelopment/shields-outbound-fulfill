@@ -28,6 +28,11 @@ import {
     PipelineStageState,
     PipelineStageStatus,
 } from "@/lib/pipeline/types";
+import {
+    isCreditExhaustionText,
+    shouldShowCreditExhaustionNotice,
+} from "@/lib/pipeline/creditExhaustion";
+import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
 
 /** HTTP fallback for upload / discovery — not for live pipeline progress (useJobRealtime). */
 const ACTIVE_JOB_POLL_MS = 10_000;
@@ -1810,7 +1815,11 @@ export default function ClientPage() {
                 incoming.activityMessage !== undefined
                     ? incoming.activityMessage
                     : prev?.activityMessage ?? null;
-            if (runningWithProgress) {
+            const paused = incoming.paused !== undefined ? incoming.paused === true : prev?.paused === true;
+            const creditExhausted =
+                isCreditExhaustionText(incoming.error)
+                || isCreditExhaustionText(activityMessage);
+            if (runningWithProgress && !paused && !creditExhausted) {
                 activityMessage = null;
             }
 
@@ -2417,6 +2426,15 @@ export default function ClientPage() {
         }
         return null;
     }, [jobState]);
+
+    const creditExhaustedJob = useMemo(() => {
+        const candidates: PipelineJob[] = [];
+        if (jobState) candidates.push(jobState);
+        for (const job of jobHistory) {
+            if (!candidates.some((row) => row.id === job.id)) candidates.push(job);
+        }
+        return candidates.find((job) => shouldShowCreditExhaustionNotice(job)) ?? null;
+    }, [jobState, jobHistory]);
 
     const recentJobLogLines = useMemo(() => {
         if (!jobState?.activityMessage) return [];
@@ -5360,7 +5378,14 @@ export default function ClientPage() {
             }
 
             if (isPaused) {
-                setJobState((prev) => (prev ? { ...prev, paused: false } : prev));
+                setJobState((prev) => (prev ? { ...prev, paused: false, error: null, activityMessage: null } : prev));
+                setJobHistory((prev) =>
+                    prev.map((job) =>
+                        job.id === jobState.id
+                            ? { ...job, paused: false, error: null, activityMessage: null }
+                            : job
+                    )
+                );
                 setJobStatusMessage('Job resumed.');
             } else {
                 setJobState((prev) =>
@@ -8041,6 +8066,24 @@ export default function ClientPage() {
                         <p className="client-page-header__description">Manage campaigns and view leads for this client.</p>
                     </header>
 
+                    {creditExhaustedJob && (
+                        <CreditExhaustionNotice
+                            fileName={creditExhaustedJob.fileName}
+                            selected={jobState?.id === creditExhaustedJob.id}
+                            resuming={pausingJob && jobState?.paused === true}
+                            onResume={() => {
+                                if (jobState?.id === creditExhaustedJob.id && jobState.paused) {
+                                    void handlePauseResumeJob();
+                                }
+                            }}
+                            onOpenJob={() => {
+                                setActiveTab("campaigns");
+                                setPipelineVisible(true);
+                                handleSelectJob(creditExhaustedJob);
+                            }}
+                        />
+                    )}
+
                     <div className="tab-nav">
                         <button
                             className={`tab-nav__button ${activeTab === "analytics" ? "tab-nav__button--active" : ""}`}
@@ -9433,20 +9476,8 @@ export default function ClientPage() {
                                                         <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
                                                     </div>
                                                     
-                                                    {stage?.error === 'Add Credits to TryKitt' ? (
-                                                        <div style={{
-                                                            marginTop: '0.75rem',
-                                                            padding: '1rem',
-                                                            background: 'rgba(239, 68, 68, 0.15)',
-                                                            border: '1px solid rgba(239, 68, 68, 0.5)',
-                                                            borderRadius: '8px',
-                                                            color: '#ef4444',
-                                                            fontWeight: 600,
-                                                            fontSize: '0.95rem',
-                                                            textAlign: 'center'
-                                                        }}>
-                                                            ⚠️ Add Credits to TryKitt
-                                                        </div>
+                                                    {isCreditExhaustionText(stage?.error) ? (
+                                                        <p className="stage-card__error">Add credits to TryKitt, then resume.</p>
                                                     ) : stage?.error ? (
                                                         <p className="stage-card__error">{stage.error}</p>
                                                     ) : heroNumber !== null ? (
@@ -9740,6 +9771,27 @@ export default function ClientPage() {
                                                                 {deletingJobId === job.id ? 'Deleting...' : 'Delete'}
                                                             </button>
                                                         </div>
+
+                                                        {shouldShowCreditExhaustionNotice(job) && (
+                                                            <div onClick={(event) => event.stopPropagation()}>
+                                                                <CreditExhaustionNotice
+                                                                    compact
+                                                                    fileName={job.fileName}
+                                                                    selected={jobState?.id === job.id}
+                                                                    resuming={pausingJob && jobState?.id === job.id && jobState?.paused === true}
+                                                                    onResume={() => {
+                                                                        if (jobState?.id === job.id && jobState.paused) {
+                                                                            void handlePauseResumeJob();
+                                                                        }
+                                                                    }}
+                                                                    onOpenJob={() => {
+                                                                        setActiveTab("campaigns");
+                                                                        setPipelineVisible(true);
+                                                                        handleSelectJob(job);
+                                                                    }}
+                                                                />
+                                                            </div>
+                                                        )}
 
                                                         {/* Expandable error panel for failed jobs */}
                                                         {job.status === 'failed' && (
