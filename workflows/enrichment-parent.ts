@@ -16,12 +16,15 @@
  * server/docs/wave-boundary-connection-storms-2026-07-26.md). Spawning one
  * child per step also serializes cold-starts naturally.
  *
- * `Promise.race` over completion hooks is replay-safe on workflow@4.5: the
- * runtime hands hook resolutions to workflow code in strict event-log order
- * (see awaitEarlierDeliveries in @workflow/core), so the race winner is
- * deterministic and independent of race-argument order.
+ * Completion uses ONE shared hook per parent run, consumed with `for await`
+ * (workflow's multi-payload pattern). Every child calls `resumeHook` on the
+ * same token, so every completion wakes the parent and the sliding window
+ * stays full. Per-child `createHook` + `Promise.race` did not: after a refill
+ * spawn, later `hook_received` events for older in-flight children were
+ * recorded on the parent run but never resumed it (job 1787155726011-2lozbz,
+ * effective concurrency 1).
  */
-import { createHook, type Hook } from 'workflow';
+import { createHook } from 'workflow';
 import { start } from 'workflow/api';
 import type { ParentWorkflowInput } from '@/lib/enrichment/types';
 import {
@@ -60,73 +63,87 @@ export async function enrichmentParentWorkflow(input: ParentWorkflowInput) {
     const state = createWindowState(plan.batches.length, plan.waveConcurrency);
 
     if (plan.batches.length) {
-      // One completion hook per child, created just before its spawn.
-      // Auto-generated (random) tokens: they are handed to each child via its
-      // input, and unlike deterministic tokens they can never collide with a
-      // lingering hook of a previous run for this job. The SDK commits hook
-      // registrations at suspension BEFORE queueing steps, so each hook is
-      // durably registered before its spawn step runs — a child can never
-      // report to an unregistered hook. Hooks are not explicitly disposed:
-      // run-end cleanup releases them without spending an extra hook_disposed
-      // event per child on this log.
-      const inFlightHooks = new Map<number, Hook<ChildCompletionPayload>>();
+      // One shared completion hook for every child of this parent run.
+      // Random token: cannot collide with a lingering hook from a previous
+      // parent run for this job. Registration commits at the first
+      // spawnChildStep suspension, before that step is queued, so a child
+      // can never report to an unregistered hook. `using` disposes the hook
+      // when this block exits (after in-flight children have drained).
+      using completionHook = createHook<ChildCompletionPayload>();
       // On a spawn-step failure (job paused, start() error) we stop scheduling
       // but DRAIN in-flight children before rethrowing, so no child ends up
       // reporting to a released hook of an already-ended parent run.
       let spawnFailure: unknown = null;
       let completionsSinceReconcile = 0;
 
+      const childInput = (batchIndex: number): ChildRunInput => {
+        const batch = plan.batches[batchIndex];
+        return {
+          jobId: input.jobId,
+          agencyId: input.agencyId,
+          batchDomains: batch.domains,
+          batchIndex,
+          pipelineMode: plan.pipelineMode,
+          resumeStagesOnly: batch.resumeStagesOnly,
+          completionToken: completionHook.token,
+        };
+      };
+
+      // Fill the window before waiting — `for await` on an empty hook hangs.
+      // spawnChildStep is awaited here (not in a nested async helper) so the
+      // workflow compiler still sees it as a step.
       for (;;) {
         const action = nextAction(state);
-        if (action.kind === 'done') break;
-
-        if (action.kind === 'spawn') {
-          const batch = plan.batches[action.batchIndex];
-          const hook = createHook<ChildCompletionPayload>();
-          try {
-            await spawnChildStep(input, {
-              jobId: input.jobId,
-              agencyId: input.agencyId,
-              batchDomains: batch.domains,
-              batchIndex: action.batchIndex,
-              pipelineMode: plan.pipelineMode,
-              resumeStagesOnly: batch.resumeStagesOnly,
-              completionToken: hook.token,
-            });
-          } catch (err) {
-            spawnFailure = err;
-            haltScheduling(state);
-            continue;
-          }
-          applySpawn(state, action.batchIndex);
-          inFlightHooks.set(action.batchIndex, hook);
-          continue;
+        if (action.kind !== 'spawn') break;
+        try {
+          await spawnChildStep(input, childInput(action.batchIndex));
+        } catch (err) {
+          spawnFailure = err;
+          haltScheduling(state);
+          break;
         }
+        applySpawn(state, action.batchIndex);
+      }
 
-        // awaitCompletion — children never reject their hook (failures arrive
-        // as payload statuses, per B2), so the race settles only with payloads
-        // and one bad batch cannot cancel its in-flight siblings.
-        const result = await Promise.race([...inFlightHooks.values()]);
-        if (!inFlightHooks.delete(result.batchIndex)) {
-          // A payload for a batch we don't have in flight can only be a child
-          // echoing the wrong index — abort loudly instead of racing the same
-          // resolved hook forever.
-          throw new Error(
-            `Child completion reported unknown batch index ${result.batchIndex}`
-          );
-        }
-        applyCompletion(state, result);
-
-        // Progress reconcile is best-effort: a stale UI must never fail the
-        // job. Same average cadence as the old once-per-wave reconcile.
-        completionsSinceReconcile += 1;
-        if (completionsSinceReconcile >= state.windowSize) {
-          completionsSinceReconcile = 0;
-          try {
-            await reconcileStagesStep(input);
-          } catch {
-            /* ignore — finalize runs an authoritative reconcile anyway */
+      // Children never reject the hook (failures arrive as payload statuses,
+      // per B2), so one bad batch cannot cancel its in-flight siblings.
+      if (state.inFlight.length > 0) {
+        for await (const payload of completionHook) {
+          if (!applyCompletion(state, payload)) {
+            // A payload for a batch we don't have in flight can only be a
+            // child echoing the wrong index — abort instead of looping on
+            // completions that never shrink inFlight.
+            throw new Error(
+              `Child completion reported unknown batch index ${payload.batchIndex}`
+            );
           }
+
+          // Progress reconcile is best-effort: a stale UI must never fail the
+          // job. Same average cadence as the old once-per-wave reconcile.
+          completionsSinceReconcile += 1;
+          if (completionsSinceReconcile >= state.windowSize) {
+            completionsSinceReconcile = 0;
+            try {
+              await reconcileStagesStep(input);
+            } catch {
+              /* ignore — finalize runs an authoritative reconcile anyway */
+            }
+          }
+
+          for (;;) {
+            const action = nextAction(state);
+            if (action.kind !== 'spawn') break;
+            try {
+              await spawnChildStep(input, childInput(action.batchIndex));
+            } catch (err) {
+              spawnFailure = err;
+              haltScheduling(state);
+              break;
+            }
+            applySpawn(state, action.batchIndex);
+          }
+
+          if (nextAction(state).kind === 'done') break;
         }
       }
 

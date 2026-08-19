@@ -12,9 +12,9 @@ import type {
  * TryKitt verification tail) no longer idles the other N−1 slots, and child
  * cold-starts stop happening in synchronized herds.
  *
- * The workflow drives this machine and owns every side effect (createHook /
- * spawn step / Promise.race over hooks); everything here is deterministic
- * bookkeeping, so it replays identically and is unit-testable.
+ * The workflow drives this machine and owns every side effect (one shared
+ * createHook, spawn steps, `for await` over completions); everything here is
+ * deterministic bookkeeping, so it replays identically and is unit-testable.
  *
  * Failure semantics preserved from the wave design:
  * - `windowSize` CONSECUTIVE failures (zero successes between) = systemic

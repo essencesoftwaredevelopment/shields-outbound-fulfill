@@ -20,7 +20,7 @@ async function loadEnrichment(): Promise<EnrichmentModule> {
 }
 
 export type ChildRunInput = ChildBatchInput & {
-  /** Token of the parent's completion hook for this batch. */
+  /** Shared parent completion-hook token — many children, one hook. */
   completionToken: string;
 };
 

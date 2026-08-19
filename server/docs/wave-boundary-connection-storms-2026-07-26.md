@@ -52,9 +52,9 @@ is an acceptable steady state.
    doc's update). `workflows/enrichment-parent.ts` no longer runs waves at all:
    `waveConcurrency` children stay in flight continuously, each spawned by its
    own step the moment a slot frees (`lib/enrichment/slidingWindow.ts` holds
-   the pure scheduler; `Promise.race` over completion hooks is replay-safe on
-   workflow@4.5 — the runtime delivers hook resolutions in strict event-log
-   order, see `awaitEarlierDeliveries` in `@workflow/core`). This removes the
+   the pure scheduler; the parent consumes a single shared completion hook
+   with `for await` — per-child `Promise.race` collapsed concurrency, see
+   job 1787155726011-2lozbz). This removes the
    synchronized wave-boundary cold-start herd (spawns serialize through parent
    steps and thereafter follow completion events) AND stops the whole job
    waiting on each wave's slowest child (e.g. TryKitt verification tails).
