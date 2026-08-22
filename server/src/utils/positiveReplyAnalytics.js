@@ -144,10 +144,10 @@ export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql) {
                 cie.contact_id,
                 cie.event_timestamp AS interested_at
             FROM contact_instantly_events cie
-            WHERE cie.client_id = $2
-              AND LOWER(TRIM(COALESCE(cie.event_type, ''))) = '${INTERESTED_EVENT_TYPE}'
+            WHERE cie.agency_id = $1
+              AND cie.client_id = $2
+              AND cie.event_type = '${INTERESTED_EVENT_TYPE}'
               AND cie.event_timestamp >= ${periodFloorSql}
-              AND cie.agency_id = $1
               AND cie.contact_id IS NOT NULL
             ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
         ),
@@ -216,5 +216,24 @@ export function buildPositiveRepliesByBucketSql(periodFloorSql, bucketUnit) {
             COUNT(*)::int AS count
         FROM qualified_contacts qc
         GROUP BY 1
+    `;
+}
+
+export function buildPositiveRepliesCoreSql(periodFloorSql, bucketUnit) {
+    const unit = bucketUnit === 'hour' ? 'hour' : 'day';
+    return `
+        WITH ${buildPositiveRepliesLifecycleCtesSql(periodFloorSql)}
+        SELECT
+            (SELECT COUNT(*)::int FROM qualified_contacts) AS positive_replies,
+            COALESCE((
+                SELECT json_agg(row_to_json(b) ORDER BY b.bucket)
+                FROM (
+                    SELECT
+                        TO_CHAR(DATE_TRUNC('${unit}', qc.interested_at), 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
+                        COUNT(*)::int AS count
+                    FROM qualified_contacts qc
+                    GROUP BY 1
+                ) b
+            ), '[]'::json) AS buckets
     `;
 }

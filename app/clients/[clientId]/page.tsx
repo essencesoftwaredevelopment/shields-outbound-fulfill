@@ -33,6 +33,8 @@ import {
     shouldShowCreditExhaustionNotice,
 } from "@/lib/pipeline/creditExhaustion";
 import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
+import instantlyLogo from "@/app/assets/instantly.png";
+import calendlyLogo from "@/app/assets/Calendly.png";
 
 /** HTTP fallback for upload / discovery — not for live pipeline progress (useJobRealtime). */
 const ACTIVE_JOB_POLL_MS = 10_000;
@@ -325,6 +327,7 @@ type InstantlyEventRealtimeConfig = {
 };
 
 type InstantlyEventAnalyticsPayload = {
+    scope?: "core" | "details" | "full";
     clientSqlId: number | null;
     realtimeConfig: InstantlyEventRealtimeConfig | null;
     window: InstantlyEventAnalyticsWindow;
@@ -334,6 +337,52 @@ type InstantlyEventAnalyticsPayload = {
     byHour: InstantlyEventAnalyticsByHourRow[];
     recentEvents: InstantlyEventAnalyticsRecentEvent[];
 };
+
+function analyticsFiltersMatch(
+    payload: InstantlyEventAnalyticsPayload | null,
+    period: InstantlyEventAnalyticsPeriod,
+    eventType: string
+) {
+    return payload?.window?.period === period && payload?.eventType?.value === eventType;
+}
+
+function mergeAnalyticsPayloads(
+    core: InstantlyEventAnalyticsPayload | null,
+    details: InstantlyEventAnalyticsPayload | null
+): InstantlyEventAnalyticsPayload | null {
+    if (!core && !details) return null;
+    if (!details) {
+        return core ? { ...core, scope: "core" } : null;
+    }
+    if (!core) {
+        return { ...details, scope: details.scope || "details" };
+    }
+
+    const detailsByBucket = new Map((details.byHour || []).map((row) => [row.bucket, row]));
+    const baseRows = (core.byHour && core.byHour.length > 0) ? core.byHour : details.byHour;
+
+    return {
+        ...details,
+        scope: "full",
+        clientSqlId: core.clientSqlId ?? details.clientSqlId,
+        realtimeConfig: core.realtimeConfig || details.realtimeConfig,
+        summary: {
+            ...details.summary,
+            emails_sent: core.summary.emails_sent,
+            contacts_emailed: core.summary.contacts_emailed,
+            positive_replies: core.summary.positive_replies,
+            meetings_booked: core.summary.meetings_booked
+        },
+        byHour: (baseRows || []).map((row) => ({
+            ...row,
+            count: detailsByBucket.get(row.bucket)?.count ?? row.count ?? 0
+        })),
+        recentEvents: details.recentEvents || [],
+        availableEventTypes: details.availableEventTypes?.length
+            ? details.availableEventTypes
+            : core.availableEventTypes
+    };
+}
 
 type CollatableActivityEvent = {
     id: string;
@@ -346,6 +395,7 @@ type CollatableActivityEvent = {
     reply_text_snippet?: string | null;
     reply_category?: string | null;
     displayLabel?: string | null;
+    source?: string | null;
     synthetic?: boolean;
 };
 
@@ -496,7 +546,10 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
 }
 
 function getActivityDisplayTone(label?: string | null) {
-    const normalized = String(label || "").toLowerCase().replace(/[_ ]+/g, " ").trim();
+    let normalized = String(label || "").toLowerCase().replace(/[_ ]+/g, " ").trim();
+    if (normalized.startsWith("marked as ")) {
+        normalized = normalized.slice("marked as ".length).trim();
+    }
     if (POSITIVE_ACTIVITY_LABELS.has(normalized)) return "positive";
     if (NEGATIVE_ACTIVITY_LABELS.has(normalized)) return "negative";
     if (NEUTRAL_ACTIVITY_LABELS.has(normalized)) return "neutral";
@@ -505,37 +558,175 @@ function getActivityDisplayTone(label?: string | null) {
 }
 
 function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | null) {
-    const normalized = String(eventType || "").toLowerCase();
+    const normalized = String(eventType || "").toLowerCase().replace(/[_ ]+/g, " ").trim();
     const displayLabel = formatInstantlyActivityLabel(eventType, fallbackLabel);
-    const displayTone = getActivityDisplayTone(displayLabel);
-    if (normalized === "interested_reply_sent") return "var(--app-event-auto-reply)";
-    if (normalized === "email_sent") return "var(--app-event-email-sent)";
-    if (normalized === "email_opened") return "var(--app-event-email-opened)";
-    if (normalized === "email_link_clicked") return "var(--app-event-link-clicked)";
-    if (normalized === "warm follow up" || normalized === "warm_follow_up" || displayTone === "manual") return "var(--app-event-warm-followup)";
-    if (normalized === "reply_received" || normalized === "lead_interested" || normalized === "lead_meeting_booked" || normalized === "lead_meeting_completed" || normalized === "lead_closed" || normalized === "meeting_booked") {
+    const formattedTone = getActivityDisplayTone(displayLabel);
+    const displayTone = formattedTone !== "default" ? formattedTone : getActivityDisplayTone(fallbackLabel);
+    if (normalized === "interested reply sent") return "var(--app-event-auto-reply)";
+    if (normalized === "email sent") return "var(--app-event-email-sent)";
+    if (normalized === "email opened") return "var(--app-event-email-opened)";
+    if (normalized === "email link clicked") return "var(--app-event-link-clicked)";
+    if (normalized === "warm follow up" || displayTone === "manual") return "var(--app-event-warm-followup)";
+    if (
+        normalized === "reply received"
+        || normalized === "reply"
+        || normalized === "replied"
+        || normalized === "lead interested"
+        || normalized === "lead meeting booked"
+        || normalized === "lead meeting completed"
+        || normalized === "lead closed"
+        || normalized === "meeting booked"
+    ) {
         return "var(--app-event-positive)";
     }
-    if (normalized === "email_bounced" || normalized === "lead_not_interested" || normalized === "lead_wrong_person" || normalized === "lead_no_show") {
+    if (
+        normalized === "email bounced"
+        || normalized === "lead not interested"
+        || normalized === "not interested"
+        || normalized === "lead wrong person"
+        || normalized === "lead no show"
+        || normalized === "bad fit"
+        || normalized === "lost"
+        || displayTone === "negative"
+    ) {
         return "var(--app-event-negative)";
     }
-    if (normalized === "lead_unsubscribed" || normalized === "lead_out_of_office") {
+    if (normalized === "lead unsubscribed" || normalized === "lead out of office") {
         return "var(--app-event-warning)";
     }
-    if (normalized === "lead_neutral") {
+    if (normalized === "lead neutral") {
         return "var(--app-event-neutral)";
     }
-    if (normalized === "interest_change") {
-        if (displayTone === "positive") return "var(--app-event-positive)";
-        if (displayTone === "negative") return "var(--app-event-negative)";
-        if (displayTone === "neutral") return "var(--app-event-neutral)";
-    }
+    if (displayTone === "positive") return "var(--app-event-positive)";
+    if (displayTone === "neutral") return "var(--app-event-neutral)";
     return "var(--app-event-default)";
 }
 
 function isReplyActivityEvent(eventType: string) {
     const normalized = String(eventType || "").toLowerCase();
     return normalized === "reply_received" || normalized === "reply" || normalized === "replied";
+}
+
+function looksLikeHtml(value?: string | null) {
+    if (!value) return false;
+    return /<\s*(?:br|p|div|span|html|body|table|tr|td|thead|tbody|a|img|font|strong|em|b|i|u|h[1-6]|ul|ol|li|blockquote|hr|style|head|meta|center)(?:\s|\/|>)/i.test(value);
+}
+
+function formatLeadActivityTimestamp(timestamp: string, now = new Date()) {
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) return '';
+    const diffMs = now.getTime() - date.getTime();
+    if (diffMs >= 0 && diffMs < 24 * 60 * 60 * 1000) {
+        const minutes = Math.floor(diffMs / 60000);
+        if (minutes < 1) return 'just now';
+        if (minutes < 60) return `${minutes}m ago`;
+        const hours = Math.floor(minutes / 60);
+        return `${hours}h ago`;
+    }
+    const isCurrentYear = date.getFullYear() === now.getFullYear();
+    const dateStr = isCurrentYear
+        ? date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
+        : date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    if (diffMs >= 0 && diffMs <= sevenDaysMs) {
+        const timeStr = date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+        return `${dateStr}, ${timeStr}`;
+    }
+    return dateStr;
+}
+
+function importedAssetSrc(asset: string | { src: string }) {
+    return typeof asset === 'string' ? asset : asset.src;
+}
+
+type ActivitySourceLogo = {
+    src: string;
+    alt: string;
+    className?: string;
+};
+
+const SHIELDS_ACTIVITY_LOGO: ActivitySourceLogo = {
+    src: '/vercel.svg',
+    alt: 'Shields Outbound',
+    className: 'activity-source-logo activity-source-logo--shields',
+};
+
+const INSTANTLY_ACTIVITY_LOGO: ActivitySourceLogo = {
+    src: importedAssetSrc(instantlyLogo),
+    alt: 'Instantly',
+};
+
+const CALENDLY_ACTIVITY_LOGO: ActivitySourceLogo = {
+    src: importedAssetSrc(calendlyLogo),
+    alt: 'Calendly',
+};
+
+const INSTANTLY_ACTIVITY_EVENT_TYPES = new Set([
+    'email_sent',
+    'email_opened',
+    'email_link_clicked',
+    'email_bounced',
+    'reply_received',
+    'reply',
+    'replied',
+    'lead_interested',
+    'lead_meeting_booked',
+    'lead_meeting_completed',
+    'lead_closed',
+    'lead_not_interested',
+    'lead_wrong_person',
+    'lead_neutral',
+    'lead_no_show',
+    'lead_out_of_office',
+    'lead_unsubscribed',
+    'added_to_campaign',
+    'interest_change',
+    'state_sync',
+]);
+
+function getActivitySourceLogo(event: {
+    event_type?: string | null;
+    source?: string | null;
+    synthetic?: boolean;
+}): ActivitySourceLogo | null {
+    const source = String(event.source || '').toLowerCase();
+    const type = String(event.event_type || '').toLowerCase();
+
+    if (source === 'calendly' || type === 'meeting_canceled' || type === 'meeting_cancelled') {
+        return CALENDLY_ACTIVITY_LOGO;
+    }
+
+    if (
+        source === 'shields'
+        || source === 'manual'
+        || source === 'server_follow_up'
+        || source === 'interested_autoresponder'
+        || source === 'prospect_activity'
+        || type === 'email_found'
+        || type === 'email_verified'
+        || type === 'email_not_found'
+        || type === 'interest_status_set'
+        || type === 'interested_reply_sent'
+        || type === 'warm_follow_up'
+        || type === 'warm follow up'
+        || type === 'warm_follow_up_label_skipped'
+        || type === 'warm_follow_up_label_failed'
+    ) {
+        return SHIELDS_ACTIVITY_LOGO;
+    }
+
+    if (
+        source === 'webhook'
+        || source === 'instantly'
+        || source === 'instantly_webhook'
+        || source === 'instantly_sync'
+        || source === 'campaign_link'
+        || INSTANTLY_ACTIVITY_EVENT_TYPES.has(type)
+    ) {
+        return INSTANTLY_ACTIVITY_LOGO;
+    }
+
+    return null;
 }
 
 function isInterestActivityEvent(event: CollatableActivityEvent) {
@@ -1560,10 +1751,13 @@ export default function ClientPage() {
     const [animatedRecentEventIds, setAnimatedRecentEventIds] = useState<Set<string>>(new Set());
     const [expandedRecentEventId, setExpandedRecentEventId] = useState<string | null>(null);
     const [instantlyEventAnalyticsLoading, setInstantlyEventAnalyticsLoading] = useState(false);
+    const [instantlyEventAnalyticsCoreLoading, setInstantlyEventAnalyticsCoreLoading] = useState(false);
+    const [instantlyEventAnalyticsDetailsLoading, setInstantlyEventAnalyticsDetailsLoading] = useState(false);
     const [instantlyEventAnalyticsError, setInstantlyEventAnalyticsError] = useState<string | null>(null);
     const [instantlyEventRealtimeError, setInstantlyEventRealtimeError] = useState<string | null>(null);
     const previousRecentEventIdsRef = useRef<Set<string> | null>(null);
     const recentEventAnimationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const analyticsRequestIdRef = useRef(0);
 
     type PendingReviewDraft = {
         id: number;
@@ -2141,7 +2335,7 @@ export default function ClientPage() {
     const [leadStatusCampaignId, setLeadStatusCampaignId] = useState<string>('');
     const [leadStatusInterestValue, setLeadStatusInterestValue] = useState<string>('');
     const [savingLeadInstantlyStatus, setSavingLeadInstantlyStatus] = useState(false);
-    const [activityReplyPopup, setActivityReplyPopup] = useState<{ html: string; isHtml: boolean; x: number; y: number } | null>(null);
+    const [expandedLeadActivityIds, setExpandedLeadActivityIds] = useState<string[]>([]);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
@@ -2168,6 +2362,7 @@ export default function ClientPage() {
     useEffect(() => {
         setLeadModalTab('detail');
         setShowLeadAdvanced(false);
+        setExpandedLeadActivityIds([]);
         setEmailCopied(false);
         const campaigns = selectedLead?.campaignsData || [];
         setLeadStatusCampaignId(campaigns[0]?.campaignId || '');
@@ -4445,45 +4640,58 @@ export default function ClientPage() {
     const fetchInstantlyEventAnalytics = useCallback(async (showLoading = true) => {
         if (!user || !clientId) return;
 
+        const requestId = ++analyticsRequestIdRef.current;
+        const period = instantlyEventAnalyticsPeriod;
+        const eventType = instantlyEventAnalyticsEventType;
+        const loadCore = eventType === "all";
+
         try {
             if (showLoading) {
+                setInstantlyEventAnalyticsCoreLoading(loadCore);
+                setInstantlyEventAnalyticsDetailsLoading(true);
                 setInstantlyEventAnalyticsLoading(true);
             }
             setInstantlyEventAnalyticsError(null);
 
             const token = await getAccessToken();
             if (!token) return;
-            const params = new URLSearchParams({
-                period: instantlyEventAnalyticsPeriod,
-                eventType: instantlyEventAnalyticsEventType
-            });
-            const response = await fetchWithRetry(
-                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/analytics/instantly-events?${params.toString()}`,
-                {
-                    headers: {
-                        Authorization: `Bearer ${token}`
+
+            const fetchScope = async (scope: "core" | "details") => {
+                const params = new URLSearchParams({
+                    period,
+                    eventType,
+                    scope
+                });
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/analytics/instantly-events?${params.toString()}`,
+                    {
+                        headers: {
+                            Authorization: `Bearer ${token}`
+                        }
                     }
+                );
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data?.error || `Failed to fetch analytics (${response.status})`);
                 }
-            );
+                return data as InstantlyEventAnalyticsPayload;
+            };
 
-            const data = await response.json();
-            if (!response.ok) {
-                throw new Error(data?.error || `Failed to fetch analytics (${response.status})`);
-            }
+            const applyRecentEventAnimation = (analyticsPayload: InstantlyEventAnalyticsPayload) => {
+                const recentEventIds = (analyticsPayload.recentEvents || []).map((event) => event.id);
+                const previousRecentEventIds = previousRecentEventIdsRef.current;
 
-            const analyticsPayload = data as InstantlyEventAnalyticsPayload;
-            const recentEventIds = (analyticsPayload.recentEvents || []).map((event) => event.id);
-            const previousRecentEventIds = previousRecentEventIdsRef.current;
+                if (recentEventAnimationTimeoutRef.current) {
+                    clearTimeout(recentEventAnimationTimeoutRef.current);
+                    recentEventAnimationTimeoutRef.current = null;
+                }
 
-            if (recentEventAnimationTimeoutRef.current) {
-                clearTimeout(recentEventAnimationTimeoutRef.current);
-                recentEventAnimationTimeoutRef.current = null;
-            }
+                if (!previousRecentEventIds) {
+                    previousRecentEventIdsRef.current = new Set(recentEventIds);
+                    setAnimatedRecentEventIds(new Set());
+                    return;
+                }
 
-            if (!previousRecentEventIds) {
-                previousRecentEventIdsRef.current = new Set(recentEventIds);
-                setAnimatedRecentEventIds(new Set());
-            } else {
                 const newRecentEventIds = recentEventIds.filter((id) => !previousRecentEventIds.has(id));
                 previousRecentEventIdsRef.current = new Set(recentEventIds);
 
@@ -4496,14 +4704,41 @@ export default function ClientPage() {
                 } else {
                     setAnimatedRecentEventIds(new Set());
                 }
+            };
+
+            if (loadCore) {
+                const corePayload = await fetchScope("core");
+                if (requestId !== analyticsRequestIdRef.current) return;
+                setInstantlyEventAnalytics((prev) => {
+                    if (analyticsFiltersMatch(prev, period, eventType) && (prev?.scope === "details" || prev?.scope === "full")) {
+                        return mergeAnalyticsPayloads(corePayload, prev);
+                    }
+                    return mergeAnalyticsPayloads(corePayload, null);
+                });
+                if (showLoading) {
+                    setInstantlyEventAnalyticsCoreLoading(false);
+                    setInstantlyEventAnalyticsLoading(false);
+                }
             }
 
-            setInstantlyEventAnalytics(analyticsPayload);
+            const detailsPayload = await fetchScope("details");
+            if (requestId !== analyticsRequestIdRef.current) return;
+            applyRecentEventAnimation(detailsPayload);
+            setInstantlyEventAnalytics((prev) => {
+                if (analyticsFiltersMatch(prev, period, eventType) && (prev?.scope === "core" || prev?.scope === "full")) {
+                    return mergeAnalyticsPayloads(prev, detailsPayload);
+                }
+                return mergeAnalyticsPayloads(null, detailsPayload);
+            });
         } catch (error) {
-            console.error('Error fetching Instantly event analytics:', error);
-            setInstantlyEventAnalyticsError(error instanceof Error ? error.message : 'Failed to fetch Instantly event analytics.');
+            if (requestId !== analyticsRequestIdRef.current) return;
+            console.error("Error fetching Instantly event analytics:", error);
+            setInstantlyEventAnalyticsError(error instanceof Error ? error.message : "Failed to fetch Instantly event analytics.");
         } finally {
+            if (requestId !== analyticsRequestIdRef.current) return;
             if (showLoading) {
+                setInstantlyEventAnalyticsCoreLoading(false);
+                setInstantlyEventAnalyticsDetailsLoading(false);
                 setInstantlyEventAnalyticsLoading(false);
             }
         }
@@ -4659,17 +4894,15 @@ export default function ClientPage() {
             return;
         }
 
-        if (instantlyEventAnalyticsLoading || !instantlyEventAnalytics) {
+        if (!instantlyEventAnalytics?.clientSqlId || !instantlyEventAnalytics?.realtimeConfig?.websocketUrl) {
+            if (instantlyEventAnalytics && !instantlyEventAnalytics.realtimeConfig?.websocketUrl) {
+                setInstantlyEventRealtimeError('Supabase Realtime connection details are unavailable.');
+            }
             return;
         }
 
-        const websocketUrl = instantlyEventAnalytics?.realtimeConfig?.websocketUrl;
-        if (!websocketUrl) {
-            setInstantlyEventRealtimeError('Supabase Realtime connection details are unavailable.');
-            return;
-        }
-
-        const sqlClientId = instantlyEventAnalytics?.clientSqlId;
+        const sqlClientId = instantlyEventAnalytics.clientSqlId;
+        const websocketUrl = instantlyEventAnalytics.realtimeConfig.websocketUrl;
         if (!sqlClientId) {
             return;
         }
@@ -4859,7 +5092,7 @@ export default function ClientPage() {
             }
             socket?.close();
         };
-    }, [activeTab, instantlyEventAnalytics, instantlyEventAnalyticsLoading, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
+    }, [activeTab, instantlyEventAnalytics?.clientSqlId, instantlyEventAnalytics?.realtimeConfig?.websocketUrl, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
 
     // Instantly upload status: when job list membership changes, not on every pipeline UPDATE.
     useEffect(() => {
@@ -8143,7 +8376,7 @@ export default function ClientPage() {
                                             <select
                                                 value={instantlyEventAnalyticsEventType}
                                                 onChange={(e) => setInstantlyEventAnalyticsEventType(e.target.value)}
-                                                disabled={instantlyEventAnalyticsLoading}
+                                                disabled={instantlyEventAnalyticsCoreLoading && instantlyEventAnalyticsDetailsLoading}
                                             >
                                                 {(instantlyEventAnalytics?.availableEventTypes || [{ value: "all", label: "All event types" }]).map((option) => (
                                                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -8155,7 +8388,7 @@ export default function ClientPage() {
                                             <select
                                                 value={instantlyEventAnalyticsPeriod}
                                                 onChange={(e) => setInstantlyEventAnalyticsPeriod(e.target.value as InstantlyEventAnalyticsPeriod)}
-                                                disabled={instantlyEventAnalyticsLoading}
+                                                disabled={instantlyEventAnalyticsCoreLoading && instantlyEventAnalyticsDetailsLoading}
                                             >
                                                 {INSTANTLY_ANALYTICS_PERIOD_OPTIONS.map((option) => (
                                                     <option key={option.value} value={option.value}>{option.label}</option>
@@ -8190,20 +8423,6 @@ export default function ClientPage() {
                                 </div>
                             )}
 
-                            {instantlyEventAnalyticsLoading && !instantlyEventAnalytics && (
-                                <div className="pipeline-panel__empty" style={{ minHeight: "260px" }}>
-                                    <svg className="spinner" style={{ width: "32px", height: "32px", color: "#3b82f6" }} viewBox="0 0 24 24" fill="none">
-                                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
-                                        <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
-                                    </svg>
-                                    <p style={{ margin: "0.9rem 0 0", fontSize: "0.95rem", color: "var(--app-text-muted)" }}>
-                                        Loading Instantly analytics…
-                                    </p>
-                                </div>
-                            )}
-
-                            {(!instantlyEventAnalyticsLoading || instantlyEventAnalytics) && (
-                                <>
                             {(() => {
                                 type AnalyticsStatCard = {
                                     key: string;
@@ -8217,16 +8436,22 @@ export default function ClientPage() {
                                     };
                                 };
 
-                                const analyticsMatchesFilters = instantlyEventAnalytics
-                                    && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType
-                                    && instantlyEventAnalytics.window?.period === instantlyEventAnalyticsPeriod;
+                                const analyticsMatchesFilters = analyticsFiltersMatch(
+                                    instantlyEventAnalytics,
+                                    instantlyEventAnalyticsPeriod,
+                                    instantlyEventAnalyticsEventType
+                                );
                                 const displayAnalytics = analyticsMatchesFilters ? instantlyEventAnalytics : null;
                                 const summary = displayAnalytics?.summary;
                                 const isFiltered = instantlyEventAnalyticsEventType !== "all";
                                 const selectedEventLabel = (instantlyEventAnalytics?.availableEventTypes || []).find((option) => option.value === instantlyEventAnalyticsEventType)?.label
                                     || displayAnalytics?.eventType?.label
                                     || "Events";
-                                const showAnalyticsLoading = instantlyEventAnalyticsLoading || !analyticsMatchesFilters;
+                                const detailsReady = analyticsMatchesFilters && instantlyEventAnalytics?.scope !== "core";
+                                const showCoreLoading = isFiltered
+                                    ? (instantlyEventAnalyticsDetailsLoading || !detailsReady)
+                                    : (instantlyEventAnalyticsCoreLoading || !analyticsMatchesFilters);
+                                const showDetailsLoading = instantlyEventAnalyticsDetailsLoading || !detailsReady;
                                 const positiveReplyRatePercent = displayAnalytics && (displayAnalytics.summary.contacts_emailed ?? 0) > 0
                                     ? (displayAnalytics.summary.positive_replies / displayAnalytics.summary.contacts_emailed) * 100
                                     : 0;
@@ -8322,6 +8547,11 @@ export default function ClientPage() {
                                     icon: <MessageCircleReply width={18} height={18} strokeWidth={1.8} />
                                 };
 
+                                const cardIsLoading = (key: string) => {
+                                    if (key === "follow_up_sent") return showDetailsLoading;
+                                    if (isFiltered) return showDetailsLoading;
+                                    return showCoreLoading;
+                                };
                                 const statCardPadding = "1.35rem 1.2rem";
                                 const statCardSecondarySlotStyle = {
                                     margin: "0.45rem 0 0",
@@ -8349,7 +8579,7 @@ export default function ClientPage() {
                                         }}
                                     >
                                         <div>
-                                            {showAnalyticsLoading ? (
+                                            {cardIsLoading(card.key) ? (
                                                 <>
                                                     <div className="analytics-skeleton" style={{ width: "72px", height: "48px" }} />
                                                     <div className="analytics-skeleton" style={{ width: "88px", height: "22px", marginTop: "0.45rem" }} />
@@ -8406,10 +8636,12 @@ export default function ClientPage() {
 
                             <InstantlyEventAnalyticsChart
                                 rows={
-                                    instantlyEventAnalytics
-                                    && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType
-                                    && instantlyEventAnalytics.window?.period === instantlyEventAnalyticsPeriod
-                                        ? instantlyEventAnalytics.byHour
+                                    analyticsFiltersMatch(
+                                        instantlyEventAnalytics,
+                                        instantlyEventAnalyticsPeriod,
+                                        instantlyEventAnalyticsEventType
+                                    ) && (instantlyEventAnalyticsEventType !== "all" || instantlyEventAnalytics?.scope !== "details")
+                                        ? instantlyEventAnalytics?.byHour || []
                                         : []
                                 }
                                 bucketUnit={instantlyEventAnalytics?.window.bucketUnit || "hour"}
@@ -8425,11 +8657,19 @@ export default function ClientPage() {
                                 }
                                 showPositiveReplies={instantlyEventAnalyticsEventType === "all"}
                                 showMeetingsBooked={instantlyEventAnalyticsEventType === "all"}
-                                loading={instantlyEventAnalyticsLoading || !(
-                                    instantlyEventAnalytics
-                                    && instantlyEventAnalytics.eventType?.value === instantlyEventAnalyticsEventType
-                                    && instantlyEventAnalytics.window?.period === instantlyEventAnalyticsPeriod
-                                )}
+                                loading={
+                                    instantlyEventAnalyticsEventType === "all"
+                                        ? (instantlyEventAnalyticsCoreLoading || !analyticsFiltersMatch(
+                                            instantlyEventAnalytics,
+                                            instantlyEventAnalyticsPeriod,
+                                            instantlyEventAnalyticsEventType
+                                        ))
+                                        : (instantlyEventAnalyticsDetailsLoading || !analyticsFiltersMatch(
+                                            instantlyEventAnalytics,
+                                            instantlyEventAnalyticsPeriod,
+                                            instantlyEventAnalyticsEventType
+                                        ))
+                                }
                             />
 
                             <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start" }}>
@@ -8446,6 +8686,22 @@ export default function ClientPage() {
 
                                 {(() => {
                                     const recentEvents = buildCollatedActivityEvents(instantlyEventAnalytics?.recentEvents || []).slice(0, 25);
+                                    const recentEventsLoading = instantlyEventAnalyticsDetailsLoading
+                                        || instantlyEventAnalytics?.scope === "core"
+                                        || !analyticsFiltersMatch(
+                                            instantlyEventAnalytics,
+                                            instantlyEventAnalyticsPeriod,
+                                            instantlyEventAnalyticsEventType
+                                        );
+                                    if (recentEventsLoading) {
+                                        return (
+                                            <div style={{ display: "flex", flexDirection: "column", gap: "0.65rem" }}>
+                                                {Array.from({ length: 6 }).map((_, index) => (
+                                                    <div key={index} className="analytics-skeleton" style={{ height: "42px", borderRadius: "10px" }} />
+                                                ))}
+                                            </div>
+                                        );
+                                    }
                                     if (recentEvents.length === 0) {
                                         return (
                                             <div className="pipeline-panel__empty">
@@ -8591,7 +8847,6 @@ export default function ClientPage() {
                                                             onClick={() => {
                                                                 if (hasExpandable) {
                                                                     setExpandedRecentEventId(isExpanded ? null : primaryEvt.id);
-                                                                    setActivityReplyPopup(null);
                                                                 }
                                                             }}
                                                         >
@@ -8884,8 +9139,6 @@ export default function ClientPage() {
                             </div>
 
                             </div>{/* end flex row */}
-                                </>
-                            )}
                         </div>
                     )}
 
@@ -13834,10 +14087,14 @@ export default function ClientPage() {
                                             message_text: string | null;
                                             reply_text_snippet: string | null;
                                             reply_category: string | null;
+                                            subtitle?: string | null;
+                                            source?: string | null;
                                             synthetic?: boolean;
                                         };
 
                                         const syntheticEvents: TimelineItem[] = [];
+                                        const enrichmentJobId = (selectedLead.jobId || '').trim();
+                                        const enrichmentJobSubtitle = enrichmentJobId ? `Job ${enrichmentJobId}` : null;
 
                                         // Email find event
                                         if (selectedLead.emailFindCompletedAt) {
@@ -13851,6 +14108,8 @@ export default function ClientPage() {
                                                 message_text: null,
                                                 reply_text_snippet: null,
                                                 reply_category: null,
+                                                subtitle: selectedLead.email ? enrichmentJobSubtitle : null,
+                                                source: 'shields',
                                                 synthetic: true,
                                             });
                                         }
@@ -13873,6 +14132,8 @@ export default function ClientPage() {
                                                 message_text: null,
                                                 reply_text_snippet: null,
                                                 reply_category: null,
+                                                subtitle: enrichmentJobSubtitle,
+                                                source: 'shields',
                                                 synthetic: true,
                                             });
                                         }
@@ -13892,6 +14153,7 @@ export default function ClientPage() {
                                                     message_text: null,
                                                     reply_text_snippet: null,
                                                     reply_category: null,
+                                                    source: 'instantly',
                                                     synthetic: true,
                                                 });
                                             } else if (interestNorm && campaign.timestampLastInterestChange) {
@@ -13905,6 +14167,7 @@ export default function ClientPage() {
                                                     message_text: null,
                                                     reply_text_snippet: null,
                                                     reply_category: null,
+                                                    source: 'instantly',
                                                     synthetic: true,
                                                 });
                                             }
@@ -13926,6 +14189,7 @@ export default function ClientPage() {
                                             message_text: evt.message_text || null,
                                             reply_text_snippet: evt.reply_text_snippet || null,
                                             reply_category: evt.reply_category || null,
+                                            source: evt.source || null,
                                         }));
 
                                         const allEvents = buildCollatedActivityEvents([...realEvents, ...syntheticEvents]);
@@ -13963,104 +14227,190 @@ export default function ClientPage() {
                                                                         ? '#22c55e'
                                                                         : getInstantlyActivityColor(evt.event_type, evt.displayLabel);
 
-                                                    const evtDate = new Date(evt.event_timestamp);
-                                                    const now = new Date();
-                                                    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-                                                    const isWithinLastSevenDays = (now.getTime() - evtDate.getTime()) <= sevenDaysMs;
-                                                    const isCurrentYear = evtDate.getFullYear() === now.getFullYear();
-                                                    const dateStr = isCurrentYear
-                                                        ? evtDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
-                                                        : evtDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-                                                    const timeStr = evtDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-                                                    const dateTimeStr = isWithinLastSevenDays ? `${dateStr}, ${timeStr}` : dateStr;
+                                                    const dateTimeStr = formatLeadActivityTimestamp(evt.event_timestamp);
+                                                    const sourceLogo = getActivitySourceLogo(evt);
+                                                    const rawSnippet = evt.reply_text_snippet
+                                                        || (evt.event_type === 'added_to_campaign' ? evt.message_text : null)
+                                                        || (evt.message_text ? evt.message_text.split('\n').find(l => l.trim()) || null : null);
+                                                    const snippet = rawSnippet
+                                                        ? rawSnippet.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+                                                        : '';
+                                                    const fullContent = (evt.message_text || rawSnippet || '')
+                                                        .replace(/\r\n|\r/g, '\n');
+                                                    const isHtmlContent = looksLikeHtml(fullContent);
+                                                    const htmlToRender = isHtmlContent && /<\s*(?:br|p|div|li|tr|h[1-6]|blockquote)\b/i.test(fullContent)
+                                                        ? fullContent
+                                                        : fullContent.replace(/\n/g, '<br>');
+                                                    const preview = snippet || evt.campaign_name || evt.subtitle || (evt.secondaryLabel ? `Includes ${evt.secondaryLabel.toLowerCase()}` : '');
+                                                    const hasDetails = Boolean(fullContent || evt.campaign_name || evt.reply_category || evt.secondaryLabel);
+                                                    const isExpanded = expandedLeadActivityIds.includes(evt.id);
+                                                    const toggleExpanded = () => {
+                                                        if (!hasDetails) return;
+                                                        setExpandedLeadActivityIds((prev) => (
+                                                            prev.includes(evt.id)
+                                                                ? prev.filter((id) => id !== evt.id)
+                                                                : [...prev, evt.id]
+                                                        ));
+                                                    };
 
                                                     return (
-                                                        <div key={evt.id} style={{
-                                                            position: 'relative',
-                                                            padding: '0.5rem 0.6rem',
-                                                            marginBottom: '0.5rem',
-                                                            background: 'var(--app-surface-3)',
-                                                            border: '1px solid var(--app-border)',
-                                                            borderRadius: '10px',
-                                                        }}>
-                                                            {/* Dot */}
-                                                            <div style={{
-                                                                position: 'absolute',
-                                                                left: '-1rem',
-                                                                top: '5px',
-                                                                width: '7px',
-                                                                height: '7px',
-                                                                borderRadius: '50%',
-                                                                background: dotColor
-                                                            }} />
-                                                            <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem', flexWrap: 'wrap' }}>
-                                                                <span style={{
-                                                                    fontSize: '0.82rem',
-                                                                    fontWeight: 500,
-                                                                    color: 'var(--app-text-high)',
-                                                                    textTransform: 'capitalize'
-                                                                }}>{evt.displayLabel}</span>
-                                                                <span style={{ fontSize: '0.75rem', color: 'var(--app-text-ghost)' }}>
-                                                                    {dateTimeStr}
-                                                                </span>
-                                                            </div>
-                                                            {evt.secondaryLabel && (
-                                                                <p style={{ margin: '0.18rem 0 0', fontSize: '0.72rem', color: 'rgba(191, 219, 254, 0.72)' }}>
-                                                                    Includes {evt.secondaryLabel.toLowerCase()}
-                                                                </p>
-                                                            )}
-                                                            {evt.campaign_name && (
-                                                                <span style={{
-                                                                    display: 'inline-flex',
-                                                                    alignItems: 'center',
-                                                                    gap: '0.3rem',
-                                                                    marginTop: '0.25rem',
-                                                                    padding: '0.15rem 0.5rem',
-                                                                    borderRadius: '999px',
-                                                                    background: 'var(--app-surface-3)',
-                                                                    border: '1px solid var(--app-border)',
-                                                                    fontSize: '0.72rem',
-                                                                    color: 'var(--app-text-faint)',
-                                                                    lineHeight: 1.4
-                                                                }}>
-                                                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.7 }}>
-                                                                        <line x1="22" y1="2" x2="11" y2="13" />
-                                                                        <polygon points="22 2 15 22 11 13 2 9 22 2" />
-                                                                    </svg>
-                                                                    {evt.campaign_name}
-                                                                </span>
-                                                            )}
-                                                            {(() => {
-                                                                const snippet = evt.reply_text_snippet
-                                                                    || (evt.event_type === 'added_to_campaign' ? evt.message_text : null)
-                                                                    || (evt.message_text ? evt.message_text.split('\n').find(l => l.trim()) || null : null);
-                                                                const fullContent = evt.message_text || snippet;
-                                                                return snippet ? (
-                                                                    <p
-                                                                        style={{ margin: '0.15rem 0 0', fontSize: '0.78rem', color: 'var(--app-text-faint)', cursor: 'default' }}
-                                                                        onMouseEnter={(e) => {
-                                                                            if (fullContent) setActivityReplyPopup({ html: fullContent, isHtml: Boolean(evt.message_text && evt.message_text.includes('<')), x: e.clientX, y: e.clientY });
-                                                                        }}
-                                                                        onMouseMove={(e) => {
-                                                                            setActivityReplyPopup(prev => prev ? { ...prev, x: e.clientX, y: e.clientY } : null);
-                                                                        }}
-                                                                        onMouseLeave={() => setActivityReplyPopup(null)}
-                                                                    >
-                                                                        {snippet.length > 160 ? snippet.slice(0, 160) + '…' : snippet}
+                                                        <div
+                                                            key={evt.id}
+                                                            role={hasDetails ? 'button' : undefined}
+                                                            tabIndex={hasDetails ? 0 : undefined}
+                                                            aria-expanded={hasDetails ? isExpanded : undefined}
+                                                            onClick={(e) => {
+                                                                if ((e.target as HTMLElement).closest('a')) return;
+                                                                toggleExpanded();
+                                                            }}
+                                                            onKeyDown={(e) => {
+                                                                if (e.key === 'Enter' || e.key === ' ') {
+                                                                    e.preventDefault();
+                                                                    toggleExpanded();
+                                                                }
+                                                            }}
+                                                            style={{
+                                                                position: 'relative',
+                                                                display: 'flex',
+                                                                flexDirection: 'column',
+                                                                justifyContent: isExpanded ? 'flex-start' : 'center',
+                                                                minHeight: isExpanded ? undefined : '4.25rem',
+                                                                padding: '0.5rem 0.6rem',
+                                                                marginBottom: '0.5rem',
+                                                                background: 'var(--app-surface-3)',
+                                                                border: '1px solid var(--app-border)',
+                                                                borderRadius: '10px',
+                                                                cursor: hasDetails ? 'pointer' : 'default',
+                                                                outline: 'none',
+                                                            }}
+                                                        >
+                                                            <div>
+                                                                <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '0.4rem', minHeight: '1.2rem', minWidth: 0 }}>
+                                                                    {/* Dot */}
+                                                                    <div style={{
+                                                                        position: 'absolute',
+                                                                        left: 'calc(-1.6rem - 1px)',
+                                                                        top: '40%',
+                                                                        width: '7px',
+                                                                        height: '7px',
+                                                                        borderRadius: '50%',
+                                                                        background: dotColor,
+                                                                        transform: 'translateY(-50%)'
+                                                                    }} />
+                                                                    {sourceLogo && (
+                                                                        <img
+                                                                            src={sourceLogo.src}
+                                                                            alt={sourceLogo.alt}
+                                                                            title={sourceLogo.alt}
+                                                                            className={sourceLogo.className}
+                                                                            style={{
+                                                                                width: 12.8,
+                                                                                height: 12.8,
+                                                                                flexShrink: 0,
+                                                                                borderRadius: 3,
+                                                                                objectFit: 'contain',
+                                                                                display: 'block'
+                                                                            }}
+                                                                        />
+                                                                    )}
+                                                                    <span style={{
+                                                                        fontSize: '0.82rem',
+                                                                        fontWeight: 500,
+                                                                        color: 'var(--app-text-high)',
+                                                                        textTransform: 'capitalize',
+                                                                        overflow: 'hidden',
+                                                                        textOverflow: 'ellipsis',
+                                                                        whiteSpace: 'nowrap',
+                                                                        minWidth: 0
+                                                                    }}>{evt.displayLabel}</span>
+                                                                    <span style={{
+                                                                        fontSize: '0.75rem',
+                                                                        color: 'var(--app-text-ghost)',
+                                                                        flexShrink: 0,
+                                                                        fontVariantNumeric: 'tabular-nums'
+                                                                    }}>
+                                                                        {dateTimeStr}
+                                                                    </span>
+                                                                </div>
+                                                                {!isExpanded && (
+                                                                    <p style={{
+                                                                        margin: '0.2rem 0 0',
+                                                                        minHeight: '1.1rem',
+                                                                        fontSize: '0.76rem',
+                                                                        color: 'var(--app-text-faint)',
+                                                                        lineHeight: 1.45,
+                                                                        overflow: 'hidden',
+                                                                        textOverflow: 'ellipsis',
+                                                                        whiteSpace: 'nowrap'
+                                                                    }}>
+                                                                        {preview || '\u00a0'}
                                                                     </p>
-                                                                ) : null;
-                                                            })()}
-                                                            {evt.reply_category && (
-                                                                <span style={{
-                                                                    display: 'inline-block',
-                                                                    marginTop: '0.2rem',
-                                                                    padding: '0.1rem 0.4rem',
-                                                                    borderRadius: '4px',
-                                                                    fontSize: '0.72rem',
-                                                                    fontWeight: 500,
-                                                                    background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'var(--app-surface-3)',
-                                                                    color: evt.reply_category === 'Interested' ? '#4ade80' : 'var(--app-text-ghost)'
-                                                                }}>{evt.reply_category}</span>
+                                                                )}
+                                                            </div>
+                                                            {isExpanded && (
+                                                                <div style={{
+                                                                    display: 'flex',
+                                                                    flexDirection: 'column',
+                                                                    gap: '0.35rem',
+                                                                    marginTop: '0.35rem',
+                                                                    paddingTop: '0.4rem',
+                                                                    borderTop: '1px solid var(--app-border)'
+                                                                }}>
+                                                                    {evt.secondaryLabel && (
+                                                                        <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--app-text-muted)' }}>
+                                                                            Includes {evt.secondaryLabel.toLowerCase()}
+                                                                        </p>
+                                                                    )}
+                                                                    {evt.campaign_name && (
+                                                                        <span style={{
+                                                                            display: 'inline-flex',
+                                                                            alignItems: 'center',
+                                                                            alignSelf: 'flex-start',
+                                                                            gap: '0.3rem',
+                                                                            padding: '0.15rem 0.5rem',
+                                                                            borderRadius: '999px',
+                                                                            background: 'var(--app-surface-3)',
+                                                                            border: '1px solid var(--app-border)',
+                                                                            fontSize: '0.72rem',
+                                                                            color: 'var(--app-text-faint)',
+                                                                            lineHeight: 1.4
+                                                                        }}>
+                                                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.7 }}>
+                                                                                <line x1="22" y1="2" x2="11" y2="13" />
+                                                                                <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                                                                            </svg>
+                                                                            {evt.campaign_name}
+                                                                        </span>
+                                                                    )}
+                                                                    {fullContent && (
+                                                                        <div style={{
+                                                                            maxHeight: '280px',
+                                                                            overflow: 'auto',
+                                                                            fontSize: '0.78rem',
+                                                                            color: 'var(--app-text-muted)',
+                                                                            lineHeight: 1.55,
+                                                                            wordBreak: 'break-word',
+                                                                            whiteSpace: isHtmlContent ? 'normal' : 'pre-wrap'
+                                                                        }}>
+                                                                            {isHtmlContent
+                                                                                ? <div dangerouslySetInnerHTML={{ __html: htmlToRender }} />
+                                                                                : fullContent
+                                                                            }
+                                                                        </div>
+                                                                    )}
+                                                                    {evt.reply_category && (
+                                                                        <span style={{
+                                                                            display: 'inline-block',
+                                                                            alignSelf: 'flex-start',
+                                                                            padding: '0.1rem 0.4rem',
+                                                                            borderRadius: '4px',
+                                                                            fontSize: '0.72rem',
+                                                                            fontWeight: 500,
+                                                                            background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'var(--app-surface-3)',
+                                                                            color: evt.reply_category === 'Interested' ? '#4ade80' : 'var(--app-text-ghost)'
+                                                                        }}>{evt.reply_category}</span>
+                                                                    )}
+                                                                </div>
                                                             )}
                                                         </div>
                                                     );
@@ -14263,36 +14613,6 @@ export default function ClientPage() {
                         </div>
                     </div>
                 </>
-            )}
-
-            {/* Activity Reply Hover Popup */}
-            {activityReplyPopup && (
-                <div
-                    style={{
-                        position: 'fixed',
-                        zIndex: 99999,
-                        left: activityReplyPopup.x + 16,
-                        top: activityReplyPopup.y + 16,
-                        width: '360px',
-                        maxHeight: '420px',
-                        overflowY: 'auto',
-                        background: 'rgb(14, 14, 24)',
-                        border: '1px solid var(--app-border-mid)',
-                        borderRadius: '10px',
-                        padding: '0.75rem',
-                        boxShadow: '0 8px 32px rgba(0, 0, 0, 0.8)',
-                        fontSize: '0.8rem',
-                        color: 'var(--app-text-high)',
-                        lineHeight: '1.55',
-                        wordBreak: 'break-word',
-                        pointerEvents: 'none',
-                    }}
-                >
-                    {activityReplyPopup.isHtml
-                        ? <div dangerouslySetInnerHTML={{ __html: activityReplyPopup.html }} />
-                        : <span style={{ whiteSpace: 'pre-wrap' }}>{activityReplyPopup.html}</span>
-                    }
-                </div>
             )}
 
             {/* Toast Notification */}

@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     countQualifiedInterestedContacts,
-    getLifecycleStateDelta
+    getLifecycleStateDelta,
+    buildPositiveRepliesCoreSql
 } from '../positiveReplyAnalytics.js';
 
 const PERIOD_START = '2026-06-01T00:00:00.000Z';
@@ -130,4 +131,14 @@ test('counts unique contacts only once', () => {
     ], { periodStart: PERIOD_START, periodEnd: PERIOD_END });
 
     assert.equal(count, 2);
+});
+
+test('positive replies core SQL uses exact lead_interested for the type index', () => {
+    const sql = buildPositiveRepliesCoreSql(`NOW() - INTERVAL '90 days'`, 'day');
+
+    assert.match(sql, /cie\.agency_id = \$1/);
+    assert.match(sql, /cie\.event_type = 'lead_interested'/);
+    assert.match(sql, /AS positive_replies/);
+    assert.match(sql, /AS buckets/);
+    assert.match(sql, /Bad Fit|bad fit/);
 });

@@ -4,13 +4,16 @@ import {
     buildFollowUpStatsQuery,
     buildInstantlyEventBucketCountsQuery,
     buildInstantlyEventPeriodFilterSql,
+    buildTypedInstantlyEventPeriodFilterSql,
     buildInstantlyEventSummaryQuery,
     buildInstantlyEventTypesQuery,
     buildInstantlyRecentEventsQuery,
     buildEmailsSentByBucketQuery,
+    buildEmailsSentCoreSql,
     buildMeetingsBookedByBucketQuery,
     generateBucketSeries,
-    mergeAnalyticsBuckets
+    mergeAnalyticsBuckets,
+    mergeCoreAndDetailsAnalytics
 } from '../instantlyEventAnalytics.js';
 
 const PERIOD_CONFIG_7D = {
@@ -60,13 +63,24 @@ test('bucket and event-type queries use direct grouped scans', () => {
     assert.match(eventTypeSql, /GROUP BY 1/);
 });
 
+test('typed period filter leads with agency_id, client_id, then event_type', () => {
+    const sql = buildTypedInstantlyEventPeriodFilterSql(PERIOD_CONFIG_7D.eventFloorSql, 'email_sent');
+
+    assert.match(sql, /^cie\.agency_id = \$1/);
+    assert.match(sql, /cie\.client_id = \$2/);
+    assert.match(sql, /cie\.event_type = 'email_sent'/);
+    assert.match(sql, /cie\.event_timestamp >= NOW\(\) - INTERVAL '7 days'/);
+    assert.doesNotMatch(sql, /LOWER\(/);
+});
+
 test('meetings booked bucket query counts unique contacts by earliest booking', () => {
     const sql = buildMeetingsBookedByBucketQuery(PERIOD_CONFIG_7D);
 
     assert.match(sql, /WITH first_meeting_per_contact AS/);
     assert.match(sql, /SELECT DISTINCT ON \(cie\.contact_id\)/);
-    assert.match(sql, /cie\.client_id = \$2/);
-    assert.match(sql, /lead_meeting_booked/);
+    assert.match(sql, /cie\.agency_id = \$1/);
+    assert.match(sql, /event_type = 'lead_meeting_booked'/);
+    assert.doesNotMatch(sql, /LOWER\(COALESCE\(cie\.event_type/);
     assert.match(sql, /cie\.contact_id IS NOT NULL/);
     assert.match(sql, /ORDER BY cie\.contact_id, cie\.event_timestamp ASC, cie\.id ASC/);
     assert.match(sql, /DATE_TRUNC\('day', fmc\.booked_at\)/);
@@ -83,8 +97,9 @@ test('emails sent bucket query filters by period and event type', () => {
     const sql = buildEmailsSentByBucketQuery(PERIOD_CONFIG_7D);
 
     assert.match(sql, /FROM contact_instantly_events cie/);
-    assert.match(sql, /cie\.client_id = \$2/);
-    assert.match(sql, /email_sent/);
+    assert.match(sql, /cie\.agency_id = \$1/);
+    assert.match(sql, /event_type = 'email_sent'/);
+    assert.doesNotMatch(sql, /LOWER\(COALESCE\(cie\.event_type/);
     assert.match(sql, /GROUP BY 1/);
 });
 
@@ -116,7 +131,7 @@ test('generateBucketSeries returns expected bucket counts', () => {
 
 test('mergeAnalyticsBuckets fills missing buckets with zero counts', () => {
     const periodConfig = PERIOD_CONFIG_7D;
-    const series = generateBucketSeries(periodConfig, new Date('2026-06-07T12:00:00.000Z'));
+    const series = generateBucketSeries(periodConfig);
     const [firstBucket, secondBucket] = series;
 
     const merged = mergeAnalyticsBuckets({
@@ -137,4 +152,55 @@ test('mergeAnalyticsBuckets fills missing buckets with zero counts', () => {
     assert.equal(merged[1].meetings_booked, 2);
     assert.equal(merged[1].count, 0);
     assert.equal(merged[1].emails_sent, 0);
+});
+
+test('emails sent core query returns counts and buckets from one scan', () => {
+    const sql = buildEmailsSentCoreSql(PERIOD_CONFIG_7D);
+
+    assert.match(sql, /WITH sent AS MATERIALIZED/);
+    assert.match(sql, /event_type = 'email_sent'/);
+    assert.match(sql, /AS emails_sent/);
+    assert.match(sql, /AS contacts_emailed/);
+    assert.match(sql, /AS buckets/);
+});
+
+test('mergeCoreAndDetailsAnalytics keeps core outreach metrics and overlays event counts', () => {
+    const merged = mergeCoreAndDetailsAnalytics(
+        {
+            summary: {
+                emails_sent: 12,
+                contacts_emailed: 8,
+                positive_replies: 3,
+                meetings_booked: 1
+            },
+            byHour: [
+                { bucket: 'a', label: 'A', count: 0, emails_sent: 4, positive_replies: 1, meetings_booked: 0 },
+                { bucket: 'b', label: 'B', count: 0, emails_sent: 8, positive_replies: 2, meetings_booked: 1 }
+            ]
+        },
+        {
+            summary: {
+                total_events: 40,
+                emails_sent: 99,
+                positive_replies: 0,
+                meetings_booked: 0
+            },
+            byHour: [
+                { bucket: 'a', label: 'A', count: 10, emails_sent: 0, positive_replies: 0, meetings_booked: 0 },
+                { bucket: 'b', label: 'B', count: 30, emails_sent: 0, positive_replies: 0, meetings_booked: 0 }
+            ],
+            eventTypeRows: [{ event_type: 'email_sent' }],
+            recentEvents: [{ id: '1' }],
+            followUpStats: { follow_up_sent: 2 }
+        }
+    );
+
+    assert.equal(merged.summary.emails_sent, 12);
+    assert.equal(merged.summary.positive_replies, 3);
+    assert.equal(merged.summary.meetings_booked, 1);
+    assert.equal(merged.summary.total_events, 40);
+    assert.equal(merged.byHour[0].count, 10);
+    assert.equal(merged.byHour[0].emails_sent, 4);
+    assert.equal(merged.followUpStats.follow_up_sent, 2);
+    assert.equal(merged.recentEvents.length, 1);
 });

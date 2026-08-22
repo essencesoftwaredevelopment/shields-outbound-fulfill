@@ -25,6 +25,23 @@ export const WARM_FOLLOW_UP_LABEL_SKIPPED_EVENT = 'warm_follow_up_label_skipped'
 export const WARM_FOLLOW_UP_LABEL_FAILED_EVENT = 'warm_follow_up_label_failed';
 
 /**
+ * Instantly built-in interest statuses. GET /api/v2/lead-labels only returns
+ * workspace custom labels (Day 1, Warm Follow Up, …), so these need to be
+ * merged in for the status picker.
+ */
+export const DEFAULT_INSTANTLY_LEAD_LABELS = [
+    { value: 1, label: 'Interested', sentiment: 'positive', description: null },
+    { value: 2, label: 'Meeting Booked', sentiment: 'positive', description: null },
+    { value: 3, label: 'Meeting Completed', sentiment: 'positive', description: null },
+    { value: 4, label: 'Won', sentiment: 'positive', description: null },
+    { value: 0, label: 'Out of Office', sentiment: 'neutral', description: null },
+    { value: -1, label: 'Not Interested', sentiment: 'negative', description: null },
+    { value: -2, label: 'Wrong Person', sentiment: 'negative', description: null },
+    { value: -3, label: 'Lost', sentiment: 'negative', description: null },
+    { value: -4, label: 'No Show', sentiment: 'negative', description: null }
+];
+
+/**
  * Normalize raw Instantly lead-label objects into picker options.
  * Tolerates missing/invalid rows and both v2 field spellings.
  */
@@ -46,6 +63,20 @@ export function normalizeLeadLabels(rawLabels) {
         });
     }
     return normalized;
+}
+
+/**
+ * Built-in Instantly statuses first, then workspace custom labels.
+ * Custom labels keep their Instantly-assigned values; if a custom label
+ * reuses a built-in value, the custom label wins.
+ */
+export function mergeLeadLabelsWithDefaults(customLabels) {
+    const custom = Array.isArray(customLabels) ? customLabels : [];
+    const customValues = new Set(custom.map((item) => item.value));
+    return [
+        ...DEFAULT_INSTANTLY_LEAD_LABELS.filter((item) => !customValues.has(item.value)),
+        ...custom
+    ];
 }
 
 /**

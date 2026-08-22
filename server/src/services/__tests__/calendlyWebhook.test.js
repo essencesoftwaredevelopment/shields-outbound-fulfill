@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import test from 'node:test';
 import {
     verifyCalendlySignature,
+    parseScheduledEventStartTime,
     parseWebhookPayload,
     resolveTimelineEventTimestamp
 } from '../calendlyWebhook.js';
@@ -26,6 +27,13 @@ test('verifyCalendlySignature: invalid signature fails', () => {
     const rawBody = Buffer.from('{}');
     const result = verifyCalendlySignature(rawBody, 't=1,v1=deadbeef', 'secret');
     assert.equal(result.valid, false);
+});
+
+test('parseScheduledEventStartTime: returns ISO timestamp or null', () => {
+    assert.equal(parseScheduledEventStartTime('2026-06-18T10:30:00.000000Z'), '2026-06-18T10:30:00.000Z');
+    assert.equal(parseScheduledEventStartTime(''), null);
+    assert.equal(parseScheduledEventStartTime(null), null);
+    assert.equal(parseScheduledEventStartTime('not-a-date'), null);
 });
 
 test('verifyCalendlySignature: skips when secret not configured', () => {
@@ -52,6 +60,22 @@ test('parseWebhookPayload: extracts invitee email and scheduled event uri', () =
     assert.equal(parsed.inviteeName, 'Jane Doe');
     assert.equal(parsed.scheduledEventUri, 'https://api.calendly.com/scheduled_events/EVT123');
     assert.equal(parsed.inviteeUri, 'https://api.calendly.com/scheduled_events/EVT123/invitees/INV456');
+    assert.equal(parsed.scheduledEventStartTime, null);
+});
+
+test('parseWebhookPayload: extracts payload.scheduled_event.start_time', () => {
+    const body = {
+        event: 'invitee.created',
+        payload: {
+            email: 'jane@example.com',
+            scheduled_event: {
+                start_time: '2026-06-18T10:30:00.000000Z'
+            }
+        }
+    };
+
+    const parsed = parseWebhookPayload(body);
+    assert.equal(parsed.scheduledEventStartTime, '2026-06-18T10:30:00.000Z');
 });
 
 test('resolveTimelineEventTimestamp: invitee.created uses booking time, not meeting start', () => {

@@ -1,7 +1,12 @@
 import {
-    buildPositiveRepliesByBucketSql,
-    buildPositiveRepliesCountSql
+    buildPositiveRepliesCoreSql
 } from './positiveReplyAnalytics.js';
+
+const TYPED_EVENT_TYPES = new Set([
+    'email_sent',
+    'lead_interested',
+    'lead_meeting_booked'
+]);
 
 const ANALYTICS_CACHE_TTL_MS = 60_000;
 const analyticsCache = new Map();
@@ -23,14 +28,25 @@ function pruneAnalyticsCache() {
     }
 }
 
-function buildAnalyticsCacheKey(agencyId, sqlClientId, period, eventType) {
-    return `${agencyId}:${sqlClientId}:${period}:${eventType}`;
+function buildAnalyticsCacheKey(agencyId, sqlClientId, period, eventType, scope = 'full') {
+    return `${agencyId}:${sqlClientId}:${period}:${eventType}:${scope}`;
 }
 
 export function buildInstantlyEventPeriodFilterSql(eventFloorSql, tableAlias = 'cie') {
     return `${tableAlias}.client_id = $2
           AND ${tableAlias}.event_timestamp >= ${eventFloorSql}
           AND ${tableAlias}.agency_id = $1`;
+}
+
+export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType, tableAlias = 'cie') {
+    if (!TYPED_EVENT_TYPES.has(eventType)) {
+        throw new Error(`Unsupported typed analytics event_type: ${eventType}`);
+    }
+
+    return `${tableAlias}.agency_id = $1
+          AND ${tableAlias}.client_id = $2
+          AND ${tableAlias}.event_type = '${eventType}'
+          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}`;
 }
 
 export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilterClause) {
@@ -68,8 +84,12 @@ export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilter
  * same lead collapse to one booking, attributed to the earliest event timestamp.
  */
 export function buildMeetingsBookedByBucketQuery(periodConfig) {
-    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
     const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
+
+    const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
+        periodConfig.eventFloorSql,
+        'lead_meeting_booked'
+    );
 
     return `
         WITH first_meeting_per_contact AS (
@@ -77,8 +97,7 @@ export function buildMeetingsBookedByBucketQuery(periodConfig) {
                 cie.contact_id,
                 cie.event_timestamp AS booked_at
             FROM contact_instantly_events cie
-            WHERE ${periodFilterSql}
-              AND LOWER(COALESCE(cie.event_type, '')) = 'lead_meeting_booked'
+            WHERE ${typedFilterSql}
               AND cie.contact_id IS NOT NULL
             ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
         )
@@ -91,8 +110,43 @@ export function buildMeetingsBookedByBucketQuery(periodConfig) {
     `;
 }
 
+export function buildMeetingsBookedCoreSql(periodConfig) {
+    const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
+    const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
+        periodConfig.eventFloorSql,
+        'lead_meeting_booked'
+    );
+
+    return `
+        WITH first_meeting_per_contact AS (
+            SELECT DISTINCT ON (cie.contact_id)
+                cie.contact_id,
+                cie.event_timestamp AS booked_at
+            FROM contact_instantly_events cie
+            WHERE ${typedFilterSql}
+              AND cie.contact_id IS NOT NULL
+            ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
+        )
+        SELECT
+            (SELECT COUNT(*)::int FROM first_meeting_per_contact) AS meetings_booked,
+            COALESCE((
+                SELECT json_agg(row_to_json(b) ORDER BY b.bucket)
+                FROM (
+                    SELECT
+                        TO_CHAR(DATE_TRUNC('${bucketUnit}', fmc.booked_at), 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
+                        COUNT(*)::int AS count
+                    FROM first_meeting_per_contact fmc
+                    GROUP BY 1
+                ) b
+            ), '[]'::json) AS buckets
+    `;
+}
+
 export function buildEmailsSentByBucketQuery(periodConfig) {
-    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
+    const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
+        periodConfig.eventFloorSql,
+        'email_sent'
+    );
     const bucketTruncSql = periodConfig.bucketTruncSql;
 
     return `
@@ -100,10 +154,40 @@ export function buildEmailsSentByBucketQuery(periodConfig) {
             TO_CHAR(${bucketTruncSql}, 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
             COUNT(*)::int AS count
         FROM contact_instantly_events cie
-        WHERE ${periodFilterSql}
-          AND LOWER(COALESCE(cie.event_type, '')) = 'email_sent'
+        WHERE ${typedFilterSql}
         GROUP BY 1
         ORDER BY 1 ASC
+    `;
+}
+
+export function buildEmailsSentCoreSql(periodConfig) {
+    const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
+        periodConfig.eventFloorSql,
+        'email_sent'
+    );
+    const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
+
+    return `
+        WITH sent AS MATERIALIZED (
+            SELECT cie.contact_id, cie.event_timestamp
+            FROM contact_instantly_events cie
+            WHERE ${typedFilterSql}
+        )
+        SELECT
+            (SELECT COUNT(*)::int FROM sent) AS emails_sent,
+            (SELECT COUNT(*)::int FROM (
+                SELECT 1 FROM sent WHERE contact_id IS NOT NULL GROUP BY contact_id
+            ) s) AS contacts_emailed,
+            COALESCE((
+                SELECT json_agg(row_to_json(b) ORDER BY b.bucket)
+                FROM (
+                    SELECT
+                        TO_CHAR(DATE_TRUNC('${bucketUnit}', sent.event_timestamp), 'YYYY-MM-DD"T"HH24:00:00"Z"') AS bucket,
+                        COUNT(*)::int AS count
+                    FROM sent
+                    GROUP BY 1
+                ) b
+            ), '[]'::json) AS buckets
     `;
 }
 
@@ -259,21 +343,21 @@ export function mergeAnalyticsBuckets({
     }));
 }
 
-export async function loadInstantlyEventAnalytics({
-    pool,
-    agencyId,
-    sqlClientId,
-    periodConfig,
-    eventTypeFilter,
-    skipCache = false
-}) {
-    const cacheKey = buildAnalyticsCacheKey(
-        agencyId,
-        sqlClientId,
-        periodConfig.period,
-        eventTypeFilter.normalized
-    );
+function parseJsonAgg(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
+}
 
+async function withAnalyticsCache(cacheKey, skipCache, loader) {
     if (!skipCache) {
         const cached = analyticsCache.get(cacheKey);
         if (cached && cached.expiresAt > Date.now()) {
@@ -286,19 +370,101 @@ export async function loadInstantlyEventAnalytics({
         }
     }
 
-    const analyticsParams = [agencyId, sqlClientId, ...eventTypeFilter.params];
-    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
+    const loadPromise = (async () => {
+        const value = await loader();
+        if (!skipCache) {
+            analyticsCache.set(cacheKey, {
+                value,
+                expiresAt: Date.now() + ANALYTICS_CACHE_TTL_MS
+            });
+            pruneAnalyticsCache();
+        }
+        return value;
+    })();
+
+    if (!skipCache) {
+        analyticsInFlight.set(cacheKey, loadPromise);
+        try {
+            return await loadPromise;
+        } finally {
+            analyticsInFlight.delete(cacheKey);
+        }
+    }
+
+    return loadPromise;
+}
+
+export async function loadInstantlyEventAnalyticsCore({
+    pool,
+    agencyId,
+    sqlClientId,
+    periodConfig,
+    skipCache = false
+}) {
+    const cacheKey = buildAnalyticsCacheKey(
+        agencyId,
+        sqlClientId,
+        periodConfig.period,
+        'all',
+        'core'
+    );
     const lifecycleParams = [agencyId, sqlClientId];
 
-    const loadPromise = (async () => {
+    return withAnalyticsCache(cacheKey, skipCache, async () => {
+        const [emailsResult, positiveResult, meetingsResult] = await Promise.all([
+            pool.query(buildEmailsSentCoreSql(periodConfig), lifecycleParams),
+            pool.query(
+                buildPositiveRepliesCoreSql(periodConfig.eventFloorSql, periodConfig.bucketUnit),
+                lifecycleParams
+            ),
+            pool.query(buildMeetingsBookedCoreSql(periodConfig), lifecycleParams)
+        ]);
+
+        const emailsRow = emailsResult.rows[0] || {};
+        const positiveRow = positiveResult.rows[0] || {};
+        const meetingsRow = meetingsResult.rows[0] || {};
+
+        return {
+            summary: {
+                emails_sent: emailsRow.emails_sent ?? 0,
+                contacts_emailed: emailsRow.contacts_emailed ?? 0,
+                positive_replies: positiveRow.positive_replies ?? 0,
+                meetings_booked: meetingsRow.meetings_booked ?? 0
+            },
+            byHour: mergeAnalyticsBuckets({
+                periodConfig,
+                eventBucketRows: [],
+                emailsSentBucketRows: parseJsonAgg(emailsRow.buckets),
+                positiveReplyBucketRows: parseJsonAgg(positiveRow.buckets),
+                meetingsBookedBucketRows: parseJsonAgg(meetingsRow.buckets)
+            })
+        };
+    });
+}
+
+export async function loadInstantlyEventAnalyticsDetails({
+    pool,
+    agencyId,
+    sqlClientId,
+    periodConfig,
+    eventTypeFilter,
+    skipCache = false
+}) {
+    const cacheKey = buildAnalyticsCacheKey(
+        agencyId,
+        sqlClientId,
+        periodConfig.period,
+        eventTypeFilter.normalized,
+        'details'
+    );
+    const analyticsParams = [agencyId, sqlClientId, ...eventTypeFilter.params];
+    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
+
+    return withAnalyticsCache(cacheKey, skipCache, async () => {
         const [
             summaryResult,
             bucketCountsResult,
             eventTypesResult,
-            positiveRepliesResult,
-            positiveRepliesByBucketResult,
-            meetingsBookedByBucketResult,
-            emailsSentByBucketResult,
             recentEventsResult,
             followUpStatsResult
         ] = await Promise.all([
@@ -319,22 +485,6 @@ export async function loadInstantlyEventAnalytics({
                 analyticsParams
             ),
             pool.query(
-                buildPositiveRepliesCountSql(periodConfig.eventFloorSql),
-                lifecycleParams
-            ),
-            pool.query(
-                buildPositiveRepliesByBucketSql(periodConfig.eventFloorSql, periodConfig.bucketUnit),
-                lifecycleParams
-            ),
-            pool.query(
-                buildMeetingsBookedByBucketQuery(periodConfig),
-                lifecycleParams
-            ),
-            pool.query(
-                buildEmailsSentByBucketQuery(periodConfig),
-                lifecycleParams
-            ),
-            pool.query(
                 buildInstantlyRecentEventsQuery(periodConfig.eventFloorSql, eventTypeFilter.clause),
                 analyticsParams
             ),
@@ -345,47 +495,72 @@ export async function loadInstantlyEventAnalytics({
         ]);
 
         const summaryRow = summaryResult.rows[0] || {};
-        const positiveReplies = positiveRepliesResult.rows[0]?.positive_replies ?? 0;
         const followUpStats = followUpStatsResult.rows[0] || {
             follow_up_sent: 0
         };
 
-        const value = {
-            summary: {
-                ...summaryRow,
-                positive_replies: positiveReplies
-            },
+        return {
+            summary: summaryRow,
             byHour: mergeAnalyticsBuckets({
                 periodConfig,
                 eventBucketRows: bucketCountsResult.rows,
-                emailsSentBucketRows: emailsSentByBucketResult.rows,
-                positiveReplyBucketRows: positiveRepliesByBucketResult.rows,
-                meetingsBookedBucketRows: meetingsBookedByBucketResult.rows
+                emailsSentBucketRows: [],
+                positiveReplyBucketRows: [],
+                meetingsBookedBucketRows: []
             }),
             eventTypeRows: eventTypesResult.rows,
             recentEvents: recentEventsResult.rows,
             followUpStats
         };
+    });
+}
 
-        if (!skipCache) {
-            analyticsCache.set(cacheKey, {
-                value,
-                expiresAt: Date.now() + ANALYTICS_CACHE_TTL_MS
-            });
-            pruneAnalyticsCache();
-        }
+export async function loadInstantlyEventAnalytics({
+    pool,
+    agencyId,
+    sqlClientId,
+    periodConfig,
+    eventTypeFilter,
+    skipCache = false
+}) {
+    const core = await loadInstantlyEventAnalyticsCore({
+        pool,
+        agencyId,
+        sqlClientId,
+        periodConfig,
+        skipCache
+    });
+    const details = await loadInstantlyEventAnalyticsDetails({
+        pool,
+        agencyId,
+        sqlClientId,
+        periodConfig,
+        eventTypeFilter,
+        skipCache
+    });
 
-        return value;
-    })();
+    return mergeCoreAndDetailsAnalytics(core, details);
+}
 
-    if (!skipCache) {
-        analyticsInFlight.set(cacheKey, loadPromise);
-        try {
-            return await loadPromise;
-        } finally {
-            analyticsInFlight.delete(cacheKey);
-        }
-    }
+export function mergeCoreAndDetailsAnalytics(core, details) {
+    const detailsByBucket = new Map(
+        (details?.byHour || []).map((row) => [row.bucket, row])
+    );
 
-    return loadPromise;
+    return {
+        summary: {
+            ...(details?.summary || {}),
+            emails_sent: core?.summary?.emails_sent ?? details?.summary?.emails_sent ?? 0,
+            contacts_emailed: core?.summary?.contacts_emailed ?? details?.summary?.contacts_emailed ?? 0,
+            positive_replies: core?.summary?.positive_replies ?? details?.summary?.positive_replies ?? 0,
+            meetings_booked: core?.summary?.meetings_booked ?? details?.summary?.meetings_booked ?? 0
+        },
+        byHour: (core?.byHour || details?.byHour || []).map((row) => ({
+            ...row,
+            count: detailsByBucket.get(row.bucket)?.count ?? row.count ?? 0
+        })),
+        eventTypeRows: details?.eventTypeRows || [],
+        recentEvents: details?.recentEvents || [],
+        followUpStats: details?.followUpStats || { follow_up_sent: 0 }
+    };
 }

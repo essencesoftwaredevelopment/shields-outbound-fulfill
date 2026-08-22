@@ -32,7 +32,7 @@ import {
     ,
     syncClientEmailAccounts
 } from '../services/instantlyState.js';
-import { normalizeLeadLabels } from '../services/warmFollowUpStatus.js';
+import { mergeLeadLabelsWithDefaults, normalizeLeadLabels } from '../services/warmFollowUpStatus.js';
 import {
     choosePreferredCampaign,
     extractCampaignApiItems,
@@ -52,7 +52,11 @@ import {
     sanitizeHtml
 } from '../services/followUpSender.js';
 import { runFollowUpsForClient } from '../services/followUpSender.js';
-import { loadInstantlyEventAnalytics } from '../utils/instantlyEventAnalytics.js';
+import {
+    loadInstantlyEventAnalytics,
+    loadInstantlyEventAnalyticsCore,
+    loadInstantlyEventAnalyticsDetails
+} from '../utils/instantlyEventAnalytics.js';
 
 const router = express.Router();
 const upload = multer({
@@ -598,7 +602,7 @@ router.get('/clients/:clientId/instantly/lead-labels', requireAuth, async (req, 
         setNoStoreHeaders(res);
         const { instantlyKey } = await requireClientWithInstantly(req.agencyId, req.params.clientId);
         const rawLabels = await listInstantlyLeadLabels(instantlyKey);
-        res.json({ labels: normalizeLeadLabels(rawLabels) });
+        res.json({ labels: mergeLeadLabelsWithDefaults(normalizeLeadLabels(rawLabels)) });
     } catch (error) {
         const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 502;
         console.error('GET instantly lead-labels error:', error?.message || error);
@@ -730,6 +734,87 @@ router.post('/clients/:id/instantly/sync-runs/:runId/stop', async (req, res) => 
     }
 });
 
+const INSTANTLY_ANALYTICS_SUMMARY_DEFAULTS = {
+    total_events: 0,
+    unique_contacts: 0,
+    unique_campaigns: 0,
+    emails_sent: 0,
+    contacts_emailed: 0,
+    meetings_booked: 0,
+    reply_events: 0,
+    bounce_events: 0,
+    first_event_at: null,
+    last_event_at: null,
+    positive_replies: 0,
+    follow_up_sent: 0
+};
+
+function buildInstantlyAnalyticsRealtimeConfig() {
+    try {
+        const wsUrl = new URL(DEFAULT_SUPABASE_URL);
+        wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsUrl.pathname = '/realtime/v1/websocket';
+        wsUrl.search = '';
+        wsUrl.searchParams.set('apikey', DEFAULT_SUPABASE_PUBLISHABLE_KEY);
+        wsUrl.searchParams.set('vsn', '1.0.0');
+        return {
+            websocketUrl: wsUrl.toString(),
+            supabaseUrl: DEFAULT_SUPABASE_URL,
+            publishableKey: DEFAULT_SUPABASE_PUBLISHABLE_KEY
+        };
+    } catch {
+        return null;
+    }
+}
+
+function buildInstantlyAnalyticsEventTypes(eventTypeRows = []) {
+    return [
+        { value: 'all', label: formatInstantlyEventTypeLabel('all') },
+        ...Array.from(
+            new Map(
+                eventTypeRows
+                    .map((row) => normalizeInstantlyEventType(row.event_type))
+                    .filter(Boolean)
+                    .map((value) => [value, { value, label: formatInstantlyEventTypeLabel(value) }])
+            ).values()
+        )
+    ];
+}
+
+function buildInstantlyAnalyticsPayload({
+    sqlClientId,
+    periodConfig,
+    eventTypeFilter,
+    analytics,
+    scope,
+    availableEventTypes = [{ value: 'all', label: formatInstantlyEventTypeLabel('all') }]
+}) {
+    return {
+        scope,
+        clientSqlId: sqlClientId,
+        realtimeConfig: buildInstantlyAnalyticsRealtimeConfig(),
+        window: {
+            period: periodConfig.period,
+            label: periodConfig.label,
+            bucketUnit: periodConfig.bucketUnit,
+            startAt: new Date(analytics.byHour[0]?.bucket || Date.now()).toISOString(),
+            endAt: new Date(analytics.byHour[analytics.byHour.length - 1]?.bucket || Date.now()).toISOString()
+        },
+        eventType: {
+            value: eventTypeFilter.normalized,
+            label: formatInstantlyEventTypeLabel(eventTypeFilter.normalized)
+        },
+        availableEventTypes,
+        summary: {
+            ...INSTANTLY_ANALYTICS_SUMMARY_DEFAULTS,
+            ...(analytics.summary || {}),
+            ...(analytics.followUpStats || {})
+        },
+        byHour: analytics.byHour || [],
+        recentEvents: analytics.recentEvents || []
+    };
+}
+
 router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => {
     try {
         setNoStoreHeaders(res);
@@ -741,81 +826,49 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
         const periodConfig = INSTANTLY_ANALYTICS_PERIODS[requestedPeriod] || INSTANTLY_ANALYTICS_PERIODS['24h'];
         const requestedEventType = String(req.query?.eventType || 'all').trim().toLowerCase();
         const eventTypeFilter = buildInstantlyEventTypeFilterClause(requestedEventType, 'cie', '$3');
+        const requestedScope = String(req.query?.scope || 'full').trim().toLowerCase();
+        const scope = requestedScope === 'core' || requestedScope === 'details' ? requestedScope : 'full';
 
-        let realtimeWebsocketUrl = null;
-        try {
-            const wsUrl = new URL(DEFAULT_SUPABASE_URL);
-            wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-            wsUrl.pathname = '/realtime/v1/websocket';
-            wsUrl.search = '';
-            wsUrl.searchParams.set('apikey', DEFAULT_SUPABASE_PUBLISHABLE_KEY);
-            wsUrl.searchParams.set('vsn', '1.0.0');
-            realtimeWebsocketUrl = wsUrl.toString();
-        } catch {
-            realtimeWebsocketUrl = null;
-        }
-
-        const analytics = await loadInstantlyEventAnalytics({
+        const loadArgs = {
             pool,
             agencyId,
             sqlClientId,
             periodConfig,
             eventTypeFilter
-        });
-
-        const availableEventTypes = [
-            { value: 'all', label: formatInstantlyEventTypeLabel('all') },
-            ...Array.from(
-                new Map(
-                    analytics.eventTypeRows
-                        .map((row) => normalizeInstantlyEventType(row.event_type))
-                        .filter(Boolean)
-                        .map((value) => [value, { value, label: formatInstantlyEventTypeLabel(value) }])
-                ).values()
-            )
-        ];
-
-        const summaryDefaults = {
-            total_events: 0,
-            unique_contacts: 0,
-            unique_campaigns: 0,
-            emails_sent: 0,
-            meetings_booked: 0,
-            reply_events: 0,
-            bounce_events: 0,
-            first_event_at: null,
-            last_event_at: null,
-            positive_replies: 0
         };
 
-        res.json({
-            clientSqlId: sqlClientId,
-            realtimeConfig: realtimeWebsocketUrl
-                ? {
-                    websocketUrl: realtimeWebsocketUrl,
-                    supabaseUrl: DEFAULT_SUPABASE_URL,
-                    publishableKey: DEFAULT_SUPABASE_PUBLISHABLE_KEY
-                }
-                : null,
-            window: {
-                period: periodConfig.period,
-                label: periodConfig.label,
-                bucketUnit: periodConfig.bucketUnit,
-                startAt: new Date(analytics.byHour[0]?.bucket || Date.now()).toISOString(),
-                endAt: new Date(analytics.byHour[analytics.byHour.length - 1]?.bucket || Date.now()).toISOString()
-            },
-            eventType: {
-                value: eventTypeFilter.normalized,
-                label: formatInstantlyEventTypeLabel(eventTypeFilter.normalized)
-            },
-            availableEventTypes,
-            summary: {
-                ...(analytics.summary || summaryDefaults),
-                ...analytics.followUpStats
-            },
-            byHour: analytics.byHour,
-            recentEvents: analytics.recentEvents
-        });
+        if (scope === 'core') {
+            const analytics = await loadInstantlyEventAnalyticsCore(loadArgs);
+            return res.json(buildInstantlyAnalyticsPayload({
+                sqlClientId,
+                periodConfig,
+                eventTypeFilter,
+                analytics,
+                scope: 'core'
+            }));
+        }
+
+        if (scope === 'details') {
+            const analytics = await loadInstantlyEventAnalyticsDetails(loadArgs);
+            return res.json(buildInstantlyAnalyticsPayload({
+                sqlClientId,
+                periodConfig,
+                eventTypeFilter,
+                analytics,
+                scope: 'details',
+                availableEventTypes: buildInstantlyAnalyticsEventTypes(analytics.eventTypeRows)
+            }));
+        }
+
+        const analytics = await loadInstantlyEventAnalytics(loadArgs);
+        res.json(buildInstantlyAnalyticsPayload({
+            sqlClientId,
+            periodConfig,
+            eventTypeFilter,
+            analytics,
+            scope: 'full',
+            availableEventTypes: buildInstantlyAnalyticsEventTypes(analytics.eventTypeRows)
+        }));
     } catch (error) {
         const statusCode = Number(error?.statusCode || 500);
         console.error('Error fetching Instantly event analytics:', error);

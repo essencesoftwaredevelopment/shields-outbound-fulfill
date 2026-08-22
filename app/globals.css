@@ -1087,6 +1087,14 @@ body {
   animation: analyticsEventEnter 1.8s ease-out both;
 }
 
+.activity-source-logo--shields {
+  filter: invert(1);
+}
+
+.dark .activity-source-logo--shields {
+  filter: none;
+}
+
 @keyframes areDotPulse {
   0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
   50%       { box-shadow: 0 0 0 5px rgba(255,255,255,0); opacity: 0.7; }

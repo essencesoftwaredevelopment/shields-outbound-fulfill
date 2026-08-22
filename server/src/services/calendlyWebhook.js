@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import axios from 'axios';
 import { pool } from '../lib/db.js';
 import { getOrCreateClient } from '../services/db/queries.js';
+import { notifyEssenceAiDemoBooked } from './discoveryCallResend.js';
 
 const CALENDLY_API_BASE = 'https://api.calendly.com';
 
@@ -15,6 +16,14 @@ function extractUuidFromUri(uri) {
     if (!uri || typeof uri !== 'string') return null;
     const parts = uri.replace(/\/+$/, '').split('/');
     return parts[parts.length - 1] || null;
+}
+
+function parseScheduledEventStartTime(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
 function parseSignatureHeader(header) {
@@ -90,6 +99,10 @@ function parseWebhookPayload(body) {
         || payload.name
         || null;
 
+    const scheduledEventStartTime = parseScheduledEventStartTime(
+        payload.scheduled_event?.start_time
+    );
+
     return {
         eventType,
         payload,
@@ -98,6 +111,7 @@ function parseWebhookPayload(body) {
         inviteeUri,
         email,
         inviteeName,
+        scheduledEventStartTime,
         calendlyEventUuid: extractUuidFromUri(inviteeUri || scheduledEventUri)
     };
 }
@@ -153,8 +167,12 @@ async function findContactByEmail(email, { agencyId = null, clientId = null } = 
     }
 
     const result = await pool.query(
-        `SELECT c.id, c.agency_id, c.client_id, c.full_name, c.email
+        `SELECT c.id, c.agency_id, c.client_id, c.full_name, c.email,
+                co.domain_normalized AS domain,
+                ci.uses_klaviyo
          FROM contacts c
+         LEFT JOIN companies co ON co.id = c.company_id
+         LEFT JOIN contact_insights ci ON ci.contact_id = c.id
          WHERE ${whereClause}
          ORDER BY c.last_contacted_at DESC NULLS LAST, c.updated_at DESC
          LIMIT 1`,
@@ -222,14 +240,16 @@ async function persistCalendlyEvent({
     inviteeUri,
     email,
     inviteeName,
+    startTime,
     payload
 }) {
     const result = await pool.query(
         `INSERT INTO calendly_events (
             event_type, calendly_event_uuid, webhook_delivery_id,
-            calendly_event_uri, invitee_uri, invitee_email, invitee_name, payload
+            calendly_event_uri, invitee_uri, invitee_email, invitee_name,
+            start_time, payload
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::jsonb)
         ON CONFLICT DO NOTHING
         RETURNING id`,
         [
@@ -240,6 +260,7 @@ async function persistCalendlyEvent({
             inviteeUri,
             email,
             inviteeName,
+            startTime,
             JSON.stringify(payload)
         ]
     );
@@ -382,6 +403,7 @@ export async function processCalendlyWebhook({
         inviteeUri,
         email,
         inviteeName,
+        scheduledEventStartTime,
         calendlyEventUuid
     } = parsed;
 
@@ -407,6 +429,7 @@ export async function processCalendlyWebhook({
         inviteeUri,
         email,
         inviteeName,
+        startTime: scheduledEventStartTime,
         payload: body
     });
 
@@ -437,6 +460,16 @@ export async function processCalendlyWebhook({
         } catch (error) {
             console.warn('[calendly-webhook] failed to fetch event details:', error?.message || error);
         }
+    }
+
+    const enrichedStartTime = parseScheduledEventStartTime(scheduledEvent?.start_time);
+    if (eventRecord.id && !scheduledEventStartTime && enrichedStartTime) {
+        await pool.query(
+            `UPDATE calendly_events
+             SET start_time = $1::timestamptz
+             WHERE id = $2 AND start_time IS NULL`,
+            [enrichedStartTime, eventRecord.id]
+        );
     }
 
     const eventName = scheduledEvent?.name || payload.event_type?.name || null;
@@ -515,12 +548,36 @@ export async function processCalendlyWebhook({
         });
     }
 
+    let resendNotify = null;
+    if (eventType === 'invitee.created') {
+        try {
+            resendNotify = await notifyEssenceAiDemoBooked({
+                eventType,
+                eventName,
+                email,
+                inviteeName,
+                invitee,
+                enrichedInvitee,
+                payload,
+                scheduledEvent,
+                questionsAndAnswers,
+                location,
+                startTime,
+                contact
+            });
+        } catch (error) {
+            console.warn('[calendly-webhook] resend discovery notify failed:', error?.message || error);
+            resendNotify = { skipped: false, success: false, error: error?.message || String(error) };
+        }
+    }
+
     const result = {
         ...logBase,
         success: true,
         contact_id: contact?.id || null,
         timeline_added: timelineAdded,
         booking_status: bookingStatus,
+        resend: resendNotify,
         duration_ms: Date.now() - startMs
     };
 
@@ -546,6 +603,7 @@ export async function processCalendlyWebhookForClient({ body, agencyId, clientId
 
 export {
     normalizeEmail,
+    parseScheduledEventStartTime,
     parseWebhookPayload,
     resolveTimelineEventTimestamp,
     verifyCalendlySignature as verifySignature

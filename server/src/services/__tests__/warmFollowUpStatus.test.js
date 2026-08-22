@@ -14,6 +14,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    DEFAULT_INSTANTLY_LEAD_LABELS,
+    mergeLeadLabelsWithDefaults,
     normalizeLeadLabels,
     resolveWarmFollowUpStatusConfig,
     applyWarmFollowUpStatusAfterAutoresponderSend,
@@ -64,6 +66,25 @@ test('normalizeLeadLabels returns empty array for non-array input', () => {
     assert.deepEqual(normalizeLeadLabels(null), []);
     assert.deepEqual(normalizeLeadLabels(undefined), []);
     assert.deepEqual(normalizeLeadLabels({}), []);
+});
+
+test('mergeLeadLabelsWithDefaults prepends built-in Instantly statuses', () => {
+    const custom = [{ value: 51, label: 'Warm Follow Up', sentiment: 'positive', description: null }];
+    const result = mergeLeadLabelsWithDefaults(custom);
+    assert.equal(result[0].label, 'Interested');
+    assert.equal(result[0].value, 1);
+    assert.equal(result.find((item) => item.value === 2)?.label, 'Meeting Booked');
+    assert.equal(result.find((item) => item.value === -1)?.label, 'Not Interested');
+    assert.equal(result.at(-1).label, 'Warm Follow Up');
+    assert.equal(result.length, DEFAULT_INSTANTLY_LEAD_LABELS.length + 1);
+});
+
+test('mergeLeadLabelsWithDefaults lets a custom label win on value collision', () => {
+    const custom = [{ value: 1, label: 'Hot Lead', sentiment: 'positive', description: null }];
+    const result = mergeLeadLabelsWithDefaults(custom);
+    const ones = result.filter((item) => item.value === 1);
+    assert.equal(ones.length, 1);
+    assert.equal(ones[0].label, 'Hot Lead');
 });
 
 // ─── resolveWarmFollowUpStatusConfig ─────────────────────────────────────────
