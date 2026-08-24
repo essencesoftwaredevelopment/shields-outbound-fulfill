@@ -41,7 +41,7 @@ import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
 import path from 'path';
 import { deleteQueueJob, enqueuePipelineJob, getQueueJob, getRunnerRecord, setQueueStatus, updateQueueControl } from '../services/jobQueue.js';
 import { dispatchEnrichmentJob } from '../enrichment/dispatch.js';
-import { clearWorkflowRunId } from '../enrichment/persist.js';
+import { clearWorkflowRunId, forceCompleteJob } from '../enrichment/persist.js';
 import { resolveExecutionRunner } from '../enrichment/executionRunner.js';
 import { queryFilteredLeadSeedRows } from './leads.js';
 
@@ -793,6 +793,47 @@ router.post('/jobs/:id/pause', async (req, res) => {
     } catch (error) {
         console.error('Pause job error:', error);
         return res.status(500).json({ error: 'Failed to pause job.' });
+    }
+});
+
+router.post('/jobs/:id/complete', async (req, res) => {
+    try {
+        const jobId = req.params.id;
+        const agencyId = await agencyFromRequest(req);
+        const row = await getJobById(jobId, agencyId);
+        if (!row) return res.status(404).json({ error: 'Job not found.' });
+        if (row.status === 'completed') {
+            return res.json({ status: 'completed', message: 'Job already completed.' });
+        }
+        if (row.cancelled || row.status === 'cancelled') {
+            return res.status(409).json({ error: 'Cancelled jobs cannot be marked completed.' });
+        }
+        const liveOrPaused = row.status === 'running' || row.status === 'queued' || row.paused === true;
+        if (!liveOrPaused) {
+            return res.status(409).json({ error: 'Only a running or paused pipeline can be marked completed.' });
+        }
+
+        writeJobControl(jobId, { paused: false, cancelled: false });
+        await updateJobControl(jobId, { paused: false, cancelled: false });
+        void forceTerminateRunner(jobId).catch((err) => {
+            console.error(`[${jobId}] Force terminate after complete:`, err?.message || err);
+        });
+
+        const localJob = jobs.get(jobId);
+        if (localJob) {
+            localJob.status = 'completed';
+            localJob.paused = false;
+            localJob.cancelled = false;
+            localJob.error = null;
+        }
+
+        const result = await forceCompleteJob(jobId, agencyId);
+        await clearActiveJobForClient(agencyId, row.client_id, { jobId, uploadStatus: 'completed' });
+        return res.json({ status: 'completed', ...result });
+    } catch (error) {
+        console.error('Complete job error:', error);
+        const status = error.statusCode || 500;
+        return res.status(status).json({ error: error.message || 'Failed to mark job completed.' });
     }
 });
 

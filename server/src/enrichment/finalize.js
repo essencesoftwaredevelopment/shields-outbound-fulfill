@@ -87,12 +87,12 @@ export async function runFinalizeError(ctx, error) {
  * @param {string} jobId
  * @param {string} agencyId
  * @param {{ message?: string | null, code?: string | null }} [errorInfo]
- * @returns {Promise<{ disposition: 'cancelled' | 'paused' | 'error' }>}
+ * @returns {Promise<{ disposition: 'cancelled' | 'paused' | 'error' | 'completed' }>}
  */
 export async function handleWorkflowFailure(jobId, agencyId, errorInfo = {}) {
     const { message = null, code = null } = errorInfo || {};
 
-    let flags = { cancelled: false, paused: false };
+    let flags = { cancelled: false, paused: false, status: null };
     try {
         flags = await getJobControlFlags(jobId, agencyId);
     } catch {
@@ -102,6 +102,9 @@ export async function handleWorkflowFailure(jobId, agencyId, errorInfo = {}) {
 
     const disposition = resolveWorkflowFailureDisposition(flags, code);
 
+    if (disposition === 'completed') {
+        return { disposition };
+    }
     if (disposition === 'cancelled') {
         await finalizeWorkflowCancelled(jobId, agencyId);
     } else if (disposition === 'paused') {
@@ -122,9 +125,10 @@ export async function handleWorkflowFailure(jobId, agencyId, errorInfo = {}) {
  *
  * @param {{ cancelled?: boolean, paused?: boolean }} flags
  * @param {string | null} [code]
- * @returns {'cancelled' | 'paused' | 'error'}
+ * @returns {'cancelled' | 'paused' | 'error' | 'completed'}
  */
 export function resolveWorkflowFailureDisposition(flags = {}, code = null) {
+    if (flags.status === 'completed' || code === 'JOB_COMPLETED') return 'completed';
     if (flags.cancelled || code === 'JOB_CANCELLED') return 'cancelled';
     if (flags.paused || code === 'JOB_PAUSED') return 'paused';
     return 'error';

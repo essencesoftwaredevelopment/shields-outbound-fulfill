@@ -3,12 +3,17 @@ import { getJobById } from '../services/db/jobs.js';
 
 export async function getJobControlFlags(jobId, agencyId) {
     const row = await getJobById(jobId, agencyId);
-    if (!row) return { cancelled: true, paused: false };
-    return { cancelled: !!row.cancelled, paused: !!row.paused };
+    if (!row) return { cancelled: true, paused: false, status: null };
+    return { cancelled: !!row.cancelled, paused: !!row.paused, status: row.status || null };
 }
 
 export async function assertJobActive(jobId, agencyId) {
     const flags = await getJobControlFlags(jobId, agencyId);
+    if (flags.status === 'completed') {
+        const err = new Error('Job already completed');
+        err.code = 'JOB_COMPLETED';
+        throw err;
+    }
     if (flags.cancelled) {
         const err = new Error('Job cancelled');
         err.code = 'JOB_CANCELLED';
@@ -30,7 +35,8 @@ export async function markJobRunning(jobId, agencyId, workflowRunId = null) {
     await pool.query(
         `UPDATE jobs SET status = 'running', updated_at = NOW(),
          options = COALESCE(options, '{}'::jsonb) || $3::jsonb
-         WHERE id = $1 AND agency_id = $2`,
+         WHERE id = $1 AND agency_id = $2
+           AND status IS DISTINCT FROM 'completed'`,
         [
             jobId,
             agencyId,
@@ -110,6 +116,8 @@ export async function finalizeJobSuccess(jobId, agencyId, { cost = 0, finishedCo
             completed_at = NOW(),
             cost = $3,
             is_active = false,
+            paused = false,
+            cancelled = false,
             error = NULL,
             options = (COALESCE(options, '{}'::jsonb) - 'autoResumeAttempts') || $4::jsonb,
             updated_at = NOW()
@@ -163,7 +171,8 @@ export async function finalizeWorkflowError(jobId, agencyId, errorMessage) {
             error = $3,
             options = COALESCE(options, '{}'::jsonb) || $4::jsonb,
             updated_at = NOW()
-         WHERE id = $1 AND agency_id = $2`,
+         WHERE id = $1 AND agency_id = $2
+           AND status IS DISTINCT FROM 'completed'`,
         [
             jobId,
             agencyId,
@@ -175,7 +184,8 @@ export async function finalizeWorkflowError(jobId, agencyId, errorMessage) {
         ]
     );
     await pool.query(
-        `UPDATE job_queue SET status = 'paused', error = $2, updated_at = NOW() WHERE job_id = $1`,
+        `UPDATE job_queue SET status = 'paused', error = $2, updated_at = NOW()
+         WHERE job_id = $1 AND status IS DISTINCT FROM 'completed'`,
         [jobId, message]
     );
 }
@@ -190,11 +200,13 @@ export async function finalizeWorkflowCancelled(jobId, agencyId, reason = 'Cance
             error = $3,
             completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
-         WHERE id = $1 AND agency_id = $2`,
+         WHERE id = $1 AND agency_id = $2
+           AND status IS DISTINCT FROM 'completed'`,
         [jobId, agencyId, reason]
     );
     await pool.query(
-        `UPDATE job_queue SET status = 'cancelled', updated_at = NOW() WHERE job_id = $1`,
+        `UPDATE job_queue SET status = 'cancelled', updated_at = NOW()
+         WHERE job_id = $1 AND status IS DISTINCT FROM 'completed'`,
         [jobId]
     );
 }
@@ -203,13 +215,82 @@ export async function finalizeWorkflowCancelled(jobId, agencyId, reason = 'Cance
 export async function finalizeWorkflowPaused(jobId, agencyId) {
     await pool.query(
         `UPDATE jobs SET paused = true, paused_at = NOW(), cancelled = false, updated_at = NOW()
-         WHERE id = $1 AND agency_id = $2`,
+         WHERE id = $1 AND agency_id = $2
+           AND status IS DISTINCT FROM 'completed'`,
         [jobId, agencyId]
     );
     await pool.query(
-        `UPDATE job_queue SET status = 'paused', updated_at = NOW() WHERE job_id = $1`,
+        `UPDATE job_queue SET status = 'paused', updated_at = NOW()
+         WHERE job_id = $1 AND status IS DISTINCT FROM 'completed'`,
         [jobId]
     );
+}
+
+/**
+ * Force-complete UI: mark every recorded stage completed without changing counts.
+ * Remaining pipeline rows are closed separately so resume/reaper cannot revive the job.
+ */
+export function markStagesCompletedForForceComplete(stages) {
+    const now = new Date().toISOString();
+    const next = { ...(stages || {}) };
+    for (const [key, stage] of Object.entries(next)) {
+        if (!stage || typeof stage !== 'object') continue;
+        next[key] = {
+            ...stage,
+            status: 'completed',
+            error: null,
+            completedAt: stage.completedAt || now
+        };
+    }
+    return next;
+}
+
+/**
+ * Operator "mark completed" for a live or paused job: close leftover queue work,
+ * stamp stages complete, then finalize. Does not resume or continue enrichment.
+ */
+export async function forceCompleteJob(jobId, agencyId) {
+    const row = await getJobById(jobId, agencyId);
+    if (!row) {
+        const err = new Error('Job not found');
+        err.statusCode = 404;
+        throw err;
+    }
+    if (row.status === 'completed') {
+        return { alreadyCompleted: true };
+    }
+    if (row.cancelled || row.status === 'cancelled') {
+        const err = new Error('Cancelled jobs cannot be marked completed.');
+        err.statusCode = 409;
+        throw err;
+    }
+
+    const { closeRemainingPipelineWork, countFinishedLeadsForJob } = await import('../services/db/jobs.js');
+    await closeRemainingPipelineWork({
+        agencyId,
+        clientId: row.client_id,
+        jobId
+    });
+
+    const stages = markStagesCompletedForForceComplete(row.stages);
+    await pool.query(
+        `UPDATE jobs SET stages = $3::jsonb, updated_at = NOW() WHERE id = $1 AND agency_id = $2`,
+        [jobId, agencyId, JSON.stringify(stages)]
+    );
+
+    const finishedCount = await countFinishedLeadsForJob(jobId);
+    await finalizeJobSuccess(jobId, agencyId, {
+        cost: Number(row.cost) || 0,
+        finishedCount
+    });
+    await pool.query(
+        `UPDATE jobs SET
+            options = (COALESCE(options, '{}'::jsonb) - 'workflowRunId' - 'workflow_run_id'),
+            updated_at = NOW()
+         WHERE id = $1 AND agency_id = $2`,
+        [jobId, agencyId]
+    );
+    return { alreadyCompleted: false, finishedCount };
 }
 
 export async function isStageComplete(jobId, agencyId, stageKey) {

@@ -1679,6 +1679,7 @@ export default function ClientPage() {
     const [pausingJob, setPausingJob] = useState(false);
     const pendingPauseControlRef = useRef<'pause' | 'resume' | null>(null);
     const [stoppingJob, setStoppingJob] = useState(false);
+    const [completingJob, setCompletingJob] = useState(false);
     const [pipelineVisible, setPipelineVisible] = useState(true);
     const [expandedErrorJobId, setExpandedErrorJobId] = useState<string | null>(null);
     const [downloadScope, setDownloadScope] = useState<'all' | 'valid'>('valid');
@@ -5548,6 +5549,45 @@ export default function ClientPage() {
         }
     };
 
+    const handleCompleteJob = async () => {
+        if (!jobState || !user) return;
+        const confirmed = window.confirm(
+            'Mark this pipeline as completed? Unfinished work will be closed and the job cannot be resumed.'
+        );
+        if (!confirmed) return;
+        setCompletingJob(true);
+        setJobStatusMessage('Marking job completed...');
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const resp = await fetchWithRetry(`${getPipelineBaseUrl()}/api/jobs/${jobState.id}/complete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ idToken, clientId })
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Failed to mark job completed (${resp.status})`);
+            }
+            stopJobWatch();
+            const completedAt = new Date().toISOString();
+            setJobState((prev) => prev
+                ? { ...prev, status: 'completed', paused: false, cancelled: false, error: null, completedAt }
+                : prev);
+            setJobHistory((prev) => prev.map((job) =>
+                job.id === jobState.id
+                    ? { ...job, status: 'completed', paused: false, cancelled: false, error: null, completedAt }
+                    : job
+            ));
+            setJobStatusMessage('Job marked completed.');
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to mark job completed');
+            setToastVisible(true);
+        } finally {
+            setCompletingJob(false);
+        }
+    };
+
     const waitForGracefulPause = useCallback(
         async (jobId: string) => {
             const deadline = Date.now() + 15_000;
@@ -9297,13 +9337,13 @@ export default function ClientPage() {
                                                     Viewing job: {jobState.fileName || jobState.id} · {jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status]}
                                                 </p>
                                                 {(jobState.status === 'running' || jobState.status === 'queued' || jobState.paused) && (
-                                                    <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
+                                                    <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                                                         {(jobState.status === 'running' || jobState.paused) && (
                                                             <button
                                                                 type="button"
                                                                 className="primary-button"
                                                                 onClick={handlePauseResumeJob}
-                                                                disabled={pausingJob}
+                                                                disabled={pausingJob || stoppingJob || completingJob}
                                                                 style={{ 
                                                                     minWidth: '120px',
                                                                     display: 'flex',
@@ -9342,12 +9382,21 @@ export default function ClientPage() {
                                                             type="button"
                                                             className="destructive-button"
                                                             onClick={handleStopJob}
-                                                            disabled={stoppingJob}
+                                                            disabled={stoppingJob || pausingJob || completingJob}
                                                             style={{ minWidth: '100px' }}
                                                         >
                                                             {stoppingJob
                                                                 ? (jobState.paused ? 'Cancelling...' : 'Stopping...')
                                                                 : (jobState.paused ? 'Cancel run' : 'Stop run')}
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className="secondary-button secondary-button--active"
+                                                            onClick={handleCompleteJob}
+                                                            disabled={completingJob || pausingJob || stoppingJob}
+                                                            style={{ minWidth: '148px' }}
+                                                        >
+                                                            {completingJob ? 'Completing...' : 'Mark completed'}
                                                         </button>
                                                     </div>
                                                 )}

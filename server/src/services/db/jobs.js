@@ -372,7 +372,8 @@ export async function persistJobState(job, { includeTiming = true } = {}) {
             completed_at = CASE WHEN $10::timestamptz IS NOT NULL THEN $10::timestamptz ELSE completed_at END,
             paused_at = CASE WHEN $11::timestamptz IS NOT NULL THEN $11::timestamptz ELSE paused_at END,
             resumed_at = CASE WHEN $12::timestamptz IS NOT NULL THEN $12::timestamptz ELSE resumed_at END
-         WHERE id = $1`,
+         WHERE id = $1
+           AND (status IS DISTINCT FROM 'completed' OR $2::text = 'completed')`,
         [
             job.id,
             job.status,
@@ -547,6 +548,69 @@ export async function listJobDomainsForJob(jobId, { emailCohortOnly = false, exc
         [jobId]
     );
     return result.rows;
+}
+
+/**
+ * Close leftover pipeline work so a force-completed job cannot be revived by
+ * resume or the stall reaper. Stamps remaining founder-cohort rows as attempted
+ * and marks unfinished job_domains done.
+ */
+export async function closeRemainingPipelineWork({ agencyId, clientId, jobId }) {
+    await pool.query(
+        `UPDATE job_domains
+            SET status = 'done', updated_at = NOW()
+          WHERE job_id = $1
+            AND status IN ('pending', 'processing')`,
+        [jobId]
+    );
+    await pool.query(
+        `UPDATE contacts c
+            SET email_find_completed_at = COALESCE(c.email_find_completed_at, NOW()),
+                updated_at = NOW()
+          FROM companies co
+          JOIN job_domains jd
+            ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         WHERE c.company_id = co.id
+           AND c.agency_id = $1 AND co.agency_id = $1
+           AND c.client_id = $2
+           AND c.role_type = 'founder'
+           AND c.email_find_completed_at IS NULL
+           AND jd.status <> 'skipped'`,
+        [agencyId, clientId, jobId]
+    );
+    await pool.query(
+        `UPDATE contacts c
+            SET email_verify_completed_at = COALESCE(c.email_verify_completed_at, NOW()),
+                email_status = COALESCE(NULLIF(BTRIM(c.email_status), ''), 'unknown'),
+                updated_at = NOW()
+          FROM companies co
+          JOIN job_domains jd
+            ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         WHERE c.company_id = co.id
+           AND c.agency_id = $1 AND co.agency_id = $1
+           AND c.client_id = $2
+           AND c.role_type = 'founder'
+           AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+           AND c.email_verify_completed_at IS NULL
+           AND jd.status <> 'skipped'`,
+        [agencyId, clientId, jobId]
+    );
+    await pool.query(
+        `UPDATE contacts c
+            SET personalization_completed_at = COALESCE(c.personalization_completed_at, NOW()),
+                updated_at = NOW()
+          FROM companies co
+          JOIN job_domains jd
+            ON jd.job_id = $3 AND jd.domain_normalized = co.domain_normalized
+         WHERE c.company_id = co.id
+           AND c.agency_id = $1 AND co.agency_id = $1
+           AND c.client_id = $2
+           AND c.role_type = 'founder'
+           AND c.email IS NOT NULL AND BTRIM(c.email) <> ''
+           AND c.personalization_completed_at IS NULL
+           AND jd.status <> 'skipped'`,
+        [agencyId, clientId, jobId]
+    );
 }
 
 /**

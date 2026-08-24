@@ -10,6 +10,7 @@ export {
     setJobActivity,
     finalizeJobSuccess,
     finalizeJobError,
+    forceCompleteJob,
     guardWorkflowStart,
     isStageComplete,
     runStageIfComplete

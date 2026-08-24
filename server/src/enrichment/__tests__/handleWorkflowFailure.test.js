@@ -42,6 +42,18 @@ describe('resolveWorkflowFailureDisposition', () => {
         assert.equal(resolveWorkflowFailureDisposition({ paused: true }, 'JOB_CANCELLED'), 'cancelled');
     });
 
+    it('does not overwrite a force-completed job when the runner later dies', () => {
+        assert.equal(
+            resolveWorkflowFailureDisposition({ status: 'completed', paused: true }, 'JOB_PAUSED'),
+            'completed'
+        );
+        assert.equal(
+            resolveWorkflowFailureDisposition({ status: 'completed', cancelled: true }, null),
+            'completed'
+        );
+        assert.equal(resolveWorkflowFailureDisposition({}, 'JOB_COMPLETED'), 'completed');
+    });
+
     it('tolerates missing/garbage arguments', () => {
         assert.equal(resolveWorkflowFailureDisposition(), 'error');
         assert.equal(resolveWorkflowFailureDisposition(undefined, undefined), 'error');
