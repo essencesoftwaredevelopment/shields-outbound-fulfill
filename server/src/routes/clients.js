@@ -125,6 +125,8 @@ const INSTANTLY_EVENT_TYPE_LABELS = {
     email_link_clicked: 'Link Clicked',
     reply_received: 'Reply Received',
     email_bounced: 'Email Bounced',
+    email_complained: 'Marked as spam',
+    email_failed: 'Email Failed',
     lead_unsubscribed: 'Unsubscribed',
     lead_interested: 'Interested',
     lead_meeting_booked: 'Meeting Booked',

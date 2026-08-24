@@ -7,6 +7,7 @@
 import { Resend } from 'resend';
 import { env } from '../config/env.js';
 import { normalizeDomain } from '../utils/domain.js';
+import { resolveCaseStudyIndustry } from './discoveryCallCaseStudy.js';
 
 export const DISCOVERY_CALL_BOOKED_EVENT = 'Discovery Call Booked';
 export const ESSENCE_AI_DEMO_EVENT_TYPE_ID = '30336f6d-1955-4c5f-ad3c-49f319bd61e3';
@@ -177,6 +178,7 @@ export function buildDiscoveryCallBookedPayload({
     location,
     startTime,
     contact,
+    industry,
     now = new Date()
 } = {}) {
     const source = enrichedInvitee || invitee || payload || {};
@@ -217,7 +219,8 @@ export function buildDiscoveryCallBookedPayload({
         inviter_name: inviterName,
         brand_name: brandNameFromDomain(domain),
         domain,
-        esp: contact?.uses_klaviyo === false ? null : 'Klaviyo'
+        esp: contact?.uses_klaviyo === false ? null : 'Klaviyo',
+        industry: resolveCaseStudyIndustry(industry)
     };
 
     return {

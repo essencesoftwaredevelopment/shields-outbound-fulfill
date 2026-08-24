@@ -3,6 +3,7 @@ import axios from 'axios';
 import { pool } from '../lib/db.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import { notifyEssenceAiDemoBooked } from './discoveryCallResend.js';
+import { resolveCaseStudyIndustry } from './discoveryCallCaseStudy.js';
 
 const CALENDLY_API_BASE = 'https://api.calendly.com';
 
@@ -180,6 +181,20 @@ async function findContactByEmail(email, { agencyId = null, clientId = null } = 
     );
 
     return result.rows[0] || null;
+}
+
+async function findResearchIndustryForContact(contactId) {
+    if (!contactId) return null;
+    const result = await pool.query(
+        `SELECT research_brief->>'industry' AS industry
+         FROM interested_autoresponder_drafts
+         WHERE contact_id = $1
+           AND research_brief IS NOT NULL
+         ORDER BY COALESCE(research_completed_at, updated_at, created_at) DESC
+         LIMIT 1`,
+        [contactId]
+    );
+    return resolveCaseStudyIndustry(result.rows[0]?.industry);
 }
 
 function buildTimelineFingerprint({ inviteeUri, email, startTime, timelineEventType }) {
@@ -551,6 +566,7 @@ export async function processCalendlyWebhook({
     let resendNotify = null;
     if (eventType === 'invitee.created') {
         try {
+            const industry = await findResearchIndustryForContact(contact?.id);
             resendNotify = await notifyEssenceAiDemoBooked({
                 eventType,
                 eventName,
@@ -563,7 +579,8 @@ export async function processCalendlyWebhook({
                 questionsAndAnswers,
                 location,
                 startTime,
-                contact
+                contact,
+                industry
             });
         } catch (error) {
             console.warn('[calendly-webhook] resend discovery notify failed:', error?.message || error);

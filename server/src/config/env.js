@@ -63,5 +63,6 @@ export const env = {
     CALENDLY_PAT: process.env.CALENDLY_PAT || process.env.CALENDLY_API_KEY || '',
     CALENDLY_WEBHOOK_SECRET: process.env.CALENDLY_WEBHOOK_SECRET || '',
     RESEND_API_KEY: process.env.RESEND_API_KEY || '',
+    RESEND_WEBHOOK_SECRET: process.env.RESEND_WEBHOOK_SECRET || '',
     PERSONALIZATION_FILTER_B2B: process.env.PERSONALIZATION_FILTER_B2B
 };

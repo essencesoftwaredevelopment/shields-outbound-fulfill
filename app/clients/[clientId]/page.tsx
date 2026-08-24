@@ -517,6 +517,8 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
     if (normalized === "email opened") return "Email opened";
     if (normalized === "email link clicked") return "Link clicked";
     if (normalized === "email bounced") return "Email bounced";
+    if (normalized === "email complained") return "Marked as spam";
+    if (normalized === "email failed") return "Email failed";
     if (normalized === "lead unsubscribed") return "Unsubscribed";
     if (normalized === "lead interested") return "Interested";
     if (normalized === "lead meeting booked") return "Meeting booked";
@@ -581,6 +583,8 @@ function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | n
     }
     if (
         normalized === "email bounced"
+        || normalized === "email failed"
+        || normalized === "email complained"
         || normalized === "lead not interested"
         || normalized === "not interested"
         || normalized === "lead wrong person"
@@ -661,6 +665,12 @@ const CALENDLY_ACTIVITY_LOGO: ActivitySourceLogo = {
     alt: 'Calendly',
 };
 
+const RESEND_ACTIVITY_LOGO: ActivitySourceLogo = {
+    src: '/resend.svg',
+    alt: 'Resend',
+    className: 'activity-source-logo activity-source-logo--resend',
+};
+
 const INSTANTLY_ACTIVITY_EVENT_TYPES = new Set([
     'email_sent',
     'email_opened',
@@ -694,6 +704,10 @@ function getActivitySourceLogo(event: {
 
     if (source === 'calendly' || type === 'meeting_canceled' || type === 'meeting_cancelled') {
         return CALENDLY_ACTIVITY_LOGO;
+    }
+
+    if (source === 'resend') {
+        return RESEND_ACTIVITY_LOGO;
     }
 
     if (

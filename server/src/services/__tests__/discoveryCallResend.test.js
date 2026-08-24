@@ -96,6 +96,7 @@ test('buildDiscoveryCallBookedPayload: maps ESSENCE AI Demo booking fields', () 
         location: 'https://calendly.com/events/abc/google_meet',
         startTime: '2026-08-13T18:00:00.000000Z',
         contact: { domain: 'girlsjustwannabox.com', uses_klaviyo: null },
+        industry: 'beauty_skincare',
         now: new Date('2026-08-12T15:00:00.000Z')
     });
 
@@ -108,8 +109,36 @@ test('buildDiscoveryCallBookedPayload: maps ESSENCE AI Demo booking fields', () 
     assert.equal(built.eventPayload.brand_name, 'Girlsjustwannabox');
     assert.equal(built.eventPayload.domain, 'girlsjustwannabox.com');
     assert.equal(built.eventPayload.esp, 'Klaviyo');
+    assert.equal(built.eventPayload.industry, 'beauty_skincare');
     assert.equal(built.eventPayload.call_date_relative, 'tomorrow at 2:00 PM');
     assert.match(built.eventPayload.call_date, /Thursday/);
+});
+
+test('buildDiscoveryCallBookedPayload: maps unrouted industries to fashion fallback', () => {
+    const built = buildDiscoveryCallBookedPayload({
+        email: 'a@b.com',
+        invitee: { first_name: 'A', last_name: 'B', timezone: 'UTC' },
+        scheduledEvent: {
+            location: { join_url: 'https://calendly.com/events/x/google_meet' }
+        },
+        startTime: '2026-08-13T18:00:00.000Z',
+        industry: 'home_garden',
+        now: new Date('2026-08-12T15:00:00.000Z')
+    });
+    assert.equal(built.eventPayload.industry, 'fashion_apparel');
+});
+
+test('buildDiscoveryCallBookedPayload: missing industry still falls back to fashion', () => {
+    const built = buildDiscoveryCallBookedPayload({
+        email: 'a@b.com',
+        invitee: { first_name: 'A', last_name: 'B', timezone: 'UTC' },
+        scheduledEvent: {
+            location: { join_url: 'https://calendly.com/events/x/google_meet' }
+        },
+        startTime: '2026-08-13T18:00:00.000Z',
+        now: new Date('2026-08-12T15:00:00.000Z')
+    });
+    assert.equal(built.eventPayload.industry, 'fashion_apparel');
 });
 
 test('notifyEssenceAiDemoBooked: skips non-demo events', async () => {

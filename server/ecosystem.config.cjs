@@ -35,6 +35,8 @@ const baseEnv = {
   ...(envOrUnset('CALENDLY_PAT') ? { CALENDLY_PAT: process.env.CALENDLY_PAT } : {}),
   ...(envOrUnset('CALENDLY_API_KEY') ? { CALENDLY_API_KEY: process.env.CALENDLY_API_KEY } : {}),
   ...(envOrUnset('CALENDLY_WEBHOOK_SECRET') ? { CALENDLY_WEBHOOK_SECRET: process.env.CALENDLY_WEBHOOK_SECRET } : {}),
+  ...(envOrUnset('RESEND_API_KEY') ? { RESEND_API_KEY: process.env.RESEND_API_KEY } : {}),
+  ...(envOrUnset('RESEND_WEBHOOK_SECRET') ? { RESEND_WEBHOOK_SECRET: process.env.RESEND_WEBHOOK_SECRET } : {}),
   // Scheduled Instantly sync is off by default (manual sync via UI / POST .../instantly/sync still works).
   INSTANTLY_SYNC_AUTOMATIC_ENABLED: process.env.INSTANTLY_SYNC_AUTOMATIC_ENABLED || 'false',
   INSTANTLY_SYNC_INTERVAL_MS: process.env.INSTANTLY_SYNC_INTERVAL_MS || 86400000,
