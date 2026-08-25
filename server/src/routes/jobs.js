@@ -1626,7 +1626,6 @@ router.post('/jobs/check-domains', async (req, res) => {
                 uniqueDomains: uniqueDomains.length,
                 existingDomains: 0,
                 newDomains: uniqueDomains.length,
-                newDomainList: uniqueDomains,
                 run: 0,
                 notRun: 0,
                 withFounders: 0,
@@ -1646,10 +1645,8 @@ router.post('/jobs/check-domains', async (req, res) => {
         `;
         const existingResult = await pool.query(existingDomainsQuery, [sqlClientId, uniqueDomains]);
         const existingDomainsList = existingResult.rows.map(row => row.domain_normalized);
-        const existingSet = new Set(existingDomainsList);
-        const existingCount = existingSet.size;
-        const newDomainList = uniqueDomains.filter((domain) => !existingSet.has(domain));
-        const newCount = newDomainList.length;
+        const existingCount = existingDomainsList.length;
+        const newCount = uniqueDomains.length - existingCount;
 
         // If no existing domains, return zeros for all enrichment stats
         if (existingCount === 0) {
@@ -1658,7 +1655,6 @@ router.post('/jobs/check-domains', async (req, res) => {
                 uniqueDomains: uniqueDomains.length,
                 existingDomains: 0,
                 newDomains: newCount,
-                newDomainList,
                 run: 0,
                 notRun: 0,
                 withFounders: 0,
@@ -1720,7 +1716,6 @@ router.post('/jobs/check-domains', async (req, res) => {
             uniqueDomains: uniqueDomains.length,
             existingDomains: existingCount,
             newDomains: newCount,
-            newDomainList,
             run: runCount,
             notRun: notRunCount,
             withFounders: parseInt(enrichment.with_founders_count) || 0,
@@ -1731,6 +1726,54 @@ router.post('/jobs/check-domains', async (req, res) => {
     } catch (error) {
         console.error('Error checking domains:', error);
         res.status(500).json({ error: 'Failed to check domains.' });
+    }
+});
+
+// POST /api/jobs/check-domains/new.csv — unique new domains only (download on demand)
+router.post('/jobs/check-domains/new.csv', async (req, res) => {
+    try {
+        const { domains, clientId: clientSlug } = req.body;
+
+        if (!Array.isArray(domains) || domains.length === 0) {
+            return res.status(400).json({ error: 'domains must be a non-empty array.' });
+        }
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'Missing clientId.' });
+        }
+
+        const agencyId = await agencyFromRequest(req);
+        const uniqueDomains = Array.from(new Set(domains.map((d) => normalizeDomain(d)).filter(Boolean)));
+
+        let newDomainList = uniqueDomains;
+        const clientRow = await resolveClientRow(agencyId, String(clientSlug).trim());
+        if (clientRow?.id) {
+            const existingResult = await pool.query(
+                `SELECT DISTINCT domain_normalized
+                 FROM companies
+                 WHERE client_id = $1
+                 AND domain_normalized = ANY($2::text[])`,
+                [clientRow.id, uniqueDomains]
+            );
+            const existingSet = new Set(existingResult.rows.map((row) => row.domain_normalized));
+            newDomainList = uniqueDomains.filter((domain) => !existingSet.has(domain));
+        }
+
+        const escapeCsvCell = (value) => {
+            const text = String(value || '');
+            if (/[",\n\r]/.test(text)) {
+                return `"${text.replace(/"/g, '""')}"`;
+            }
+            return text;
+        };
+
+        const csv = ['domain', ...newDomainList.map(escapeCsvCell)].join('\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="new_domains.csv"');
+        return res.send(csv);
+    } catch (error) {
+        console.error('Error exporting new domains:', error);
+        res.status(500).json({ error: 'Failed to export new domains.' });
     }
 });
 

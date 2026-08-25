@@ -1641,7 +1641,6 @@ export default function ClientPage() {
         unique: number; 
         existing: number; 
         new: number;
-        newDomainList: string[];
         run: number;
         notRun: number;
         withFounders: number;
@@ -1649,6 +1648,8 @@ export default function ClientPage() {
         withPersonalization: number;
     } | null>(null);
     const [checkingDomains, setCheckingDomains] = useState(false);
+    const [downloadingNewDomains, setDownloadingNewDomains] = useState(false);
+    const uploadedCsvDomainsRef = useRef<string[]>([]);
 
     // Step 3: Personalization options
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
@@ -5178,6 +5179,7 @@ export default function ClientPage() {
         setSelectedFile(file);
         setUploadError("");
         setDomainCheckStats(null);
+        uploadedCsvDomainsRef.current = [];
 
         // Reset mappings when a new file is chosen
         setCsvColumns([]);
@@ -5219,6 +5221,7 @@ export default function ClientPage() {
                                 return values[domainColumnIndex];
                             })
                             .filter(Boolean);
+                        uploadedCsvDomainsRef.current = domains;
 
                         // Check domains against database
                         const token = await getAccessToken();
@@ -5245,7 +5248,6 @@ export default function ClientPage() {
                                 unique: data.uniqueDomains ?? data.totalDomains,
                                 existing: data.existingDomains,
                                 new: data.newDomains,
-                                newDomainList: Array.isArray(data.newDomainList) ? data.newDomainList : [],
                                 run: data.run || 0,
                                 notRun: data.notRun || 0,
                                 withFounders: data.withFounders || 0,
@@ -5272,36 +5274,75 @@ export default function ClientPage() {
         }
     };
 
-    const handleDownloadNewDomainsCsv = () => {
-        const domains = domainCheckStats?.newDomainList || [];
-        if (!domains.length) {
+    const handleDownloadNewDomainsCsv = async () => {
+        if (downloadingNewDomains) return;
+        if (!domainCheckStats?.new) {
             setToastMessage('No new domains to download.');
             setToastVisible(true);
             return;
         }
+        if (!user || !clientId) {
+            setToastMessage('You must be signed in to download new domains.');
+            setToastVisible(true);
+            return;
+        }
 
-        const escapeCsvCell = (value: string) => {
-            if (/[",\n\r]/.test(value)) {
-                return `"${value.replace(/"/g, '""')}"`;
+        const domains = uploadedCsvDomainsRef.current;
+        if (!domains.length) {
+            setToastMessage('Re-upload the CSV to download new domains.');
+            setToastVisible(true);
+            return;
+        }
+
+        setDownloadingNewDomains(true);
+        try {
+            const token = await getAccessToken();
+            if (!token) {
+                setToastMessage('Session expired. Sign in again and retry.');
+                setToastVisible(true);
+                return;
             }
-            return value;
-        };
 
-        const csvContent = ['domain', ...domains.map(escapeCsvCell)].join('\n');
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        const sourceName = selectedFile?.name?.replace(/\.csv$/i, '') || 'upload';
-        link.href = url;
-        link.download = `${sourceName}_new_domains.csv`;
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/jobs/check-domains/new.csv`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        domains,
+                        clientId,
+                    })
+                }
+            );
 
-        setToastMessage(`Downloaded ${domains.length.toLocaleString()} new domain${domains.length === 1 ? '' : 's'}`);
-        setToastVisible(true);
+            if (!response.ok) {
+                throw new Error('Failed to export new domains.');
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            const sourceName = selectedFile?.name?.replace(/\.csv$/i, '') || 'upload';
+            link.href = url;
+            link.download = `${sourceName}_new_domains.csv`;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            setToastMessage(`Downloaded ${domainCheckStats.new.toLocaleString()} new domain${domainCheckStats.new === 1 ? '' : 's'}`);
+            setToastVisible(true);
+        } catch (error) {
+            console.error('Error downloading new domains:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to download new domains');
+            setToastVisible(true);
+        } finally {
+            setDownloadingNewDomains(false);
+        }
     };
 
     const handleSelectJob = useCallback((job: PipelineJob) => {
@@ -11652,9 +11693,9 @@ export default function ClientPage() {
                                                                 <button
                                                                     type="button"
                                                                     onClick={handleDownloadNewDomainsCsv}
-                                                                    disabled={!domainCheckStats.newDomainList.length}
-                                                                    title="Download CSV of new domains"
-                                                                    aria-label="Download CSV of new domains"
+                                                                    disabled={downloadingNewDomains}
+                                                                    title={downloadingNewDomains ? 'Preparing CSV…' : 'Download CSV of new domains'}
+                                                                    aria-label={downloadingNewDomains ? 'Preparing CSV' : 'Download CSV of new domains'}
                                                                     style={{
                                                                         display: 'inline-flex',
                                                                         alignItems: 'center',
@@ -11666,11 +11707,24 @@ export default function ClientPage() {
                                                                         borderRadius: '5px',
                                                                         background: 'rgba(16, 185, 129, 0.12)',
                                                                         color: '#10b981',
-                                                                        cursor: domainCheckStats.newDomainList.length ? 'pointer' : 'not-allowed',
-                                                                        opacity: domainCheckStats.newDomainList.length ? 1 : 0.5,
+                                                                        cursor: downloadingNewDomains ? 'wait' : 'pointer',
+                                                                        opacity: downloadingNewDomains ? 0.7 : 1,
                                                                     }}
                                                                 >
-                                                                    <Download size={13} strokeWidth={2} />
+                                                                    {downloadingNewDomains ? (
+                                                                        <span
+                                                                            style={{
+                                                                                width: '11px',
+                                                                                height: '11px',
+                                                                                border: '2px solid rgba(16, 185, 129, 0.3)',
+                                                                                borderTopColor: '#10b981',
+                                                                                borderRadius: '50%',
+                                                                                animation: 'spin 0.8s linear infinite'
+                                                                            }}
+                                                                        />
+                                                                    ) : (
+                                                                        <Download size={13} strokeWidth={2} />
+                                                                    )}
                                                                 </button>
                                                             )}
                                                         </span>
