@@ -13,6 +13,7 @@ import {
     listUnifiedRowsFromDb,
     countUnifiedRowsByEmailStatus,
     filterUnifiedRowsByEmailStatus,
+    formatUnifiedCsvLine,
     getUnifiedRowHeaders,
     isShoppingAuditJobById,
     shoppingAuditFromJobRow,
@@ -1037,20 +1038,20 @@ router.get('/jobs/:id/result', async (req, res) => {
             return res.status(404).json({ error: 'No data to export.' });
         }
         const headers = getUnifiedRowHeaders(shoppingAudit);
-        const csvLines = [headers.join(',')];
-        rows.forEach((row) => {
-            const line = headers.map((key) => {
-                const safe = String(row[key] ?? '').replace(/"/g, '""');
-                return `"${safe}"`;
-            }).join(',');
-            csvLines.push(line);
-        });
         const filename = `results-${jobId}-${scopeParam}.csv`;
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename=\"${filename}\"`);
-        res.send(csvLines.join('\n'));
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.write(`${headers.join(',')}\n`);
+        for (const row of rows) {
+            res.write(`${formatUnifiedCsvLine(headers, row)}\n`);
+        }
+        res.end();
     } catch (error) {
         console.error('Result download error:', error);
+        if (res.headersSent) {
+            return res.end();
+        }
         res.status(500).json({ error: 'Failed to build export.' });
     }
 });

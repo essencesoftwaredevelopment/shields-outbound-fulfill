@@ -1204,7 +1204,19 @@ const UNIFIED_ROW_BASE_SELECT = `
         c.personalization_first_line AS personalization,
         c.personalization_first_line AS first_line`;
 
+// Existence check for shopify_store. Must LIMIT 1 through
+// idx_shopify_snapshots_job_domain (job_id, domain_normalized). A correlated
+// EXISTS against idx_shopify_snapshots_job (job_id only) nested-looped 475k
+// catalog rows per contact on Vulcan job 1787176188900-j7shhv; the export
+// crossed statement_timeout and nginx returned 504.
 const SHOPPING_AUDIT_ROW_JOINS = `
+    LEFT JOIN LATERAL (
+        SELECT true AS has_snapshot
+        FROM shopify_snapshots ss
+        WHERE ss.job_id = c.job_id
+          AND ss.domain_normalized = co.domain_normalized
+        LIMIT 1
+    ) snap_any ON true
     LEFT JOIN hero_selections hs
         ON hs.job_id = c.job_id AND hs.domain_normalized = co.domain_normalized
     LEFT JOIN shopify_snapshots hero_snap
@@ -1265,12 +1277,7 @@ function buildUnifiedQueryParts(shoppingAudit) {
         select: `SELECT
         ${UNIFIED_ROW_BASE_SELECT},
         CASE
-            WHEN hs.id IS NOT NULL THEN 'Yes'
-            WHEN EXISTS (
-                SELECT 1 FROM shopify_snapshots ss
-                WHERE ss.job_id = c.job_id AND ss.domain_normalized = co.domain_normalized
-                LIMIT 1
-            ) THEN 'Yes'
+            WHEN hs.id IS NOT NULL OR snap_any.has_snapshot THEN 'Yes'
             ELSE 'No'
         END AS shopify_store,
         CASE WHEN COALESCE(ad.matched, FALSE) THEN 'Yes' ELSE 'No' END AS ad_matched,
@@ -1303,6 +1310,13 @@ export async function isShoppingAuditJobById(jobId) {
 
 export function getUnifiedRowHeaders(shoppingAudit = false) {
     return shoppingAudit ? SHOPPING_AUDIT_UNIFIED_HEADERS : STANDARD_UNIFIED_HEADERS;
+}
+
+export function formatUnifiedCsvLine(headers, row) {
+    return headers.map((key) => {
+        const safe = String(row[key] ?? '').replace(/"/g, '""');
+        return `"${safe}"`;
+    }).join(',');
 }
 
 function mapUnifiedContactRow(row, shoppingAudit = false) {
