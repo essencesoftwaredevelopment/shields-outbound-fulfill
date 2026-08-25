@@ -18,7 +18,7 @@ import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipel
 import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
 import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
-import { CalendarCheck, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
+import { CalendarCheck, Download, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
     ALL_PIPELINE_STAGE_KEYS,
     isShoppingAuditPipelineJob,
@@ -1641,6 +1641,7 @@ export default function ClientPage() {
         unique: number; 
         existing: number; 
         new: number;
+        newDomainList: string[];
         run: number;
         notRun: number;
         withFounders: number;
@@ -5244,6 +5245,7 @@ export default function ClientPage() {
                                 unique: data.uniqueDomains ?? data.totalDomains,
                                 existing: data.existingDomains,
                                 new: data.newDomains,
+                                newDomainList: Array.isArray(data.newDomainList) ? data.newDomainList : [],
                                 run: data.run || 0,
                                 notRun: data.notRun || 0,
                                 withFounders: data.withFounders || 0,
@@ -5268,6 +5270,38 @@ export default function ClientPage() {
         } catch (error) {
             console.error("Failed to read CSV header", error);
         }
+    };
+
+    const handleDownloadNewDomainsCsv = () => {
+        const domains = domainCheckStats?.newDomainList || [];
+        if (!domains.length) {
+            setToastMessage('No new domains to download.');
+            setToastVisible(true);
+            return;
+        }
+
+        const escapeCsvCell = (value: string) => {
+            if (/[",\n\r]/.test(value)) {
+                return `"${value.replace(/"/g, '""')}"`;
+            }
+            return value;
+        };
+
+        const csvContent = ['domain', ...domains.map(escapeCsvCell)].join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const sourceName = selectedFile?.name?.replace(/\.csv$/i, '') || 'upload';
+        link.href = url;
+        link.download = `${sourceName}_new_domains.csv`;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        setToastMessage(`Downloaded ${domains.length.toLocaleString()} new domain${domains.length === 1 ? '' : 's'}`);
+        setToastVisible(true);
     };
 
     const handleSelectJob = useCallback((job: PipelineJob) => {
@@ -11610,8 +11644,35 @@ export default function ClientPage() {
                                                         <span>
                                                             <strong style={{ color: '#f59e0b' }}>{domainCheckStats.existing.toLocaleString()}</strong> existing
                                                         </span>
-                                                        <span>
-                                                            <strong style={{ color: '#10b981' }}>{domainCheckStats.new.toLocaleString()}</strong> new
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: '#10b981' }}>{domainCheckStats.new.toLocaleString()}</strong> new
+                                                            </span>
+                                                            {domainCheckStats.new > 0 && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={handleDownloadNewDomainsCsv}
+                                                                    disabled={!domainCheckStats.newDomainList.length}
+                                                                    title="Download CSV of new domains"
+                                                                    aria-label="Download CSV of new domains"
+                                                                    style={{
+                                                                        display: 'inline-flex',
+                                                                        alignItems: 'center',
+                                                                        justifyContent: 'center',
+                                                                        width: '22px',
+                                                                        height: '22px',
+                                                                        padding: 0,
+                                                                        border: '1px solid rgba(16, 185, 129, 0.4)',
+                                                                        borderRadius: '5px',
+                                                                        background: 'rgba(16, 185, 129, 0.12)',
+                                                                        color: '#10b981',
+                                                                        cursor: domainCheckStats.newDomainList.length ? 'pointer' : 'not-allowed',
+                                                                        opacity: domainCheckStats.newDomainList.length ? 1 : 0.5,
+                                                                    }}
+                                                                >
+                                                                    <Download size={13} strokeWidth={2} />
+                                                                </button>
+                                                            )}
                                                         </span>
                                                     </div>
 

@@ -1626,6 +1626,7 @@ router.post('/jobs/check-domains', async (req, res) => {
                 uniqueDomains: uniqueDomains.length,
                 existingDomains: 0,
                 newDomains: uniqueDomains.length,
+                newDomainList: uniqueDomains,
                 run: 0,
                 notRun: 0,
                 withFounders: 0,
@@ -1645,8 +1646,10 @@ router.post('/jobs/check-domains', async (req, res) => {
         `;
         const existingResult = await pool.query(existingDomainsQuery, [sqlClientId, uniqueDomains]);
         const existingDomainsList = existingResult.rows.map(row => row.domain_normalized);
-        const existingCount = existingDomainsList.length;
-        const newCount = uniqueDomains.length - existingCount;
+        const existingSet = new Set(existingDomainsList);
+        const existingCount = existingSet.size;
+        const newDomainList = uniqueDomains.filter((domain) => !existingSet.has(domain));
+        const newCount = newDomainList.length;
 
         // If no existing domains, return zeros for all enrichment stats
         if (existingCount === 0) {
@@ -1655,6 +1658,7 @@ router.post('/jobs/check-domains', async (req, res) => {
                 uniqueDomains: uniqueDomains.length,
                 existingDomains: 0,
                 newDomains: newCount,
+                newDomainList,
                 run: 0,
                 notRun: 0,
                 withFounders: 0,
@@ -1716,6 +1720,7 @@ router.post('/jobs/check-domains', async (req, res) => {
             uniqueDomains: uniqueDomains.length,
             existingDomains: existingCount,
             newDomains: newCount,
+            newDomainList,
             run: runCount,
             notRun: notRunCount,
             withFounders: parseInt(enrichment.with_founders_count) || 0,
