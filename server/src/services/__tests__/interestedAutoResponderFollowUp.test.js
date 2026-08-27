@@ -8,7 +8,8 @@ import {
     buildActiveFungiStoryUrl,
     applyActiveFungiStoryUrlToTemplateVars,
     normalizeRegenerateInstructions,
-    prependPriorityInstructions
+    prependPriorityInstructions,
+    resolveLeadWebsite
 } from '../interestedAutoResponder.js';
 
 test('isEligiblePostAutoresponderReplyCategory accepts positive and neutral while interested', () => {
@@ -101,4 +102,20 @@ test('prependPriorityInstructions puts reviewer notes above the campaign system 
         prependPriorityInstructions('Be a helpful sales assistant.', '   '),
         'Be a helpful sales assistant.'
     );
+});
+
+test('resolveLeadWebsite prefers company domain then falls back to email domain', () => {
+    assert.deepEqual(
+        resolveLeadWebsite('wildorchard.com', 'erin@gmail.com'),
+        { domain: 'wildorchard.com', url: 'https://wildorchard.com' }
+    );
+    assert.deepEqual(
+        resolveLeadWebsite(null, 'jason@merged.ca'),
+        { domain: 'merged.ca', url: 'https://merged.ca' }
+    );
+    assert.deepEqual(
+        resolveLeadWebsite('https://www.naked-sundays.com/about', 'x@example.com'),
+        { domain: 'naked-sundays.com', url: 'https://naked-sundays.com' }
+    );
+    assert.deepEqual(resolveLeadWebsite(null, 'not-an-email'), { domain: null, url: null });
 });

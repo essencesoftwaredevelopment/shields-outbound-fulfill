@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
+import { ExternalLink, Globe } from "lucide-react";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import {
     normalizeReplyEditorHtml,
@@ -16,6 +17,8 @@ type ReviewDraft = {
     renderedText: string;
     expiresAt: string | null;
     status?: "pending_review" | "researching" | string;
+    websiteDomain?: string | null;
+    websiteUrl?: string | null;
 };
 
 /** Review-page preview: Vulcan public audit → admin edit; Essence links unchanged. */
@@ -35,6 +38,29 @@ function extractReviewPreviewUrl(renderedText: string): string | null {
     }
 
     return null;
+}
+
+function domainFromLeadEmail(leadEmail: string): string | null {
+    const atIndex = String(leadEmail || "").indexOf("@");
+    if (atIndex === -1) return null;
+    const host = String(leadEmail)
+        .slice(atIndex + 1)
+        .trim()
+        .toLowerCase()
+        .replace(/^www\./, "")
+        .split("/")[0]
+        .split("?")[0]
+        .split("#")[0]
+        .split(":")[0];
+    if (!/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(host)) return null;
+    return host;
+}
+
+function websiteFromDraft(draft: ReviewDraft): { href: string; domain: string } | null {
+    const domain = draft.websiteDomain || domainFromLeadEmail(draft.leadEmail);
+    const href = draft.websiteUrl || (domain ? `https://${domain}` : null);
+    if (!href || !domain) return null;
+    return { href, domain };
 }
 
 export default function InterestedAutoResponderReviewPage() {
@@ -451,6 +477,8 @@ export default function InterestedAutoResponderReviewPage() {
         }
     };
 
+    const website = draft ? websiteFromDraft(draft) : null;
+
     return (
         <main style={{ minHeight: "100vh", background: "#0b1020", color: "#fff", padding: "1rem 0.25rem" }}>
             <style>{`
@@ -610,6 +638,39 @@ export default function InterestedAutoResponderReviewPage() {
                 .ar-btn-secondary:disabled,
                 .ar-btn-destructive:disabled,
                 .ar-btn-primary:disabled { opacity: 0.55; cursor: default; }
+                .ar-link-btns {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 0.55rem;
+                    margin-top: 0.35rem;
+                }
+                .ar-link-btn {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 0.4rem;
+                    padding: 0.5rem 0.85rem;
+                    border-radius: 8px;
+                    border: 1px solid rgba(255,255,255,0.15);
+                    background: rgba(255,255,255,0.06);
+                    color: #fff;
+                    font-weight: 600;
+                    font-size: 0.85rem;
+                    text-decoration: none;
+                    cursor: pointer;
+                    transition: background 0.15s, border-color 0.15s, transform 0.12s;
+                }
+                .ar-link-btn:hover {
+                    background: rgba(255,255,255,0.11);
+                    border-color: rgba(255,255,255,0.28);
+                }
+                .ar-link-btn:active { transform: scale(0.98); }
+                .ar-link-btn svg { flex-shrink: 0; }
+                .ar-link-btn--preview {
+                    background: rgba(37,99,235,0.16);
+                    border-color: rgba(96,165,250,0.45);
+                    color: #93c5fd;
+                }
+                .ar-link-btn--preview:hover { background: rgba(37,99,235,0.28); }
             `}</style>
             {regenerateModalOpen && (
                 <div
@@ -737,7 +798,33 @@ export default function InterestedAutoResponderReviewPage() {
                         <div style={{ display: "grid", gap: "0.35rem", fontSize: "0.9rem" }}>
                             <div><strong>Lead:</strong> {draft.leadEmail}</div>
                             <div><strong>Campaign:</strong> {draft.campaignName}</div>
-                            <div><strong>Preview Link:</strong> <a style={{ color: "rgb(29, 132, 235)", textDecoration: "underline" }} href={previewUrl??""} target="_blank" rel="noopener noreferrer">{previewUrl}</a></div>
+                            {(website || previewUrl) && (
+                                <div className="ar-link-btns">
+                                    {website && (
+                                        <a
+                                            className="ar-link-btn"
+                                            href={website.href}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            title={website.domain}
+                                        >
+                                            <Globe size={15} strokeWidth={2} />
+                                            Website
+                                        </a>
+                                    )}
+                                    {previewUrl && (
+                                        <a
+                                            className="ar-link-btn ar-link-btn--preview"
+                                            href={previewUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                        >
+                                            <ExternalLink size={15} strokeWidth={2} />
+                                            Preview Link
+                                        </a>
+                                    )}
+                                </div>
+                            )}
                         </div>
 
                         {/* Reply editor — rendered HTML, contentEditable */}

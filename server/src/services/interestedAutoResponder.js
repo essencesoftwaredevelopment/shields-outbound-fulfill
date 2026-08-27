@@ -111,6 +111,13 @@ export function domainFromLeadEmail(leadEmail) {
     return normalizeAuditDomain(String(leadEmail).slice(atIndex + 1));
 }
 
+/** Lead website: company domain, else the domain in the lead email. */
+export function resolveLeadWebsite(companyDomain, leadEmail) {
+    const domain = normalizeAuditDomain(companyDomain) || domainFromLeadEmail(leadEmail);
+    if (!domain) return { domain: null, url: null };
+    return { domain, url: `https://${domain}` };
+}
+
 /** Turn `wildorchard.com` → `Wildorchard` when no company display name exists. */
 export function humanizeDomainAsCompanyName(domain) {
     const normalized = normalizeAuditDomain(domain);
@@ -1463,10 +1470,13 @@ async function loadDraftByReviewToken(token) {
                 c.slug AS client_slug,
                 c.instantly_key AS client_instantly_key,
                 c.warm_follow_up_interest_value AS client_warm_follow_up_interest_value,
-                c.warm_follow_up_interest_label AS client_warm_follow_up_interest_label
+                c.warm_follow_up_interest_label AS client_warm_follow_up_interest_label,
+                co.domain_normalized AS company_domain
          FROM interested_autoresponder_drafts d
          JOIN instantly_campaigns ic ON ic.id = d.campaign_id
          JOIN clients c ON c.id = d.client_id AND c.agency_id = d.agency_id
+         LEFT JOIN contacts ct ON ct.id = d.contact_id
+         LEFT JOIN companies co ON co.id = ct.company_id
          WHERE d.review_token = $1
          LIMIT 1`,
         [token]
@@ -1507,6 +1517,7 @@ async function loadPendingReviewDraft(token) {
 }
 
 function serializeReviewDraft(draft) {
+    const website = resolveLeadWebsite(draft.company_domain, draft.lead_email);
     return {
         id: draft.id,
         leadEmail: draft.lead_email,
@@ -1514,7 +1525,9 @@ function serializeReviewDraft(draft) {
         previousLeadMessage: draft.previous_lead_message,
         renderedText: draft.rendered_text,
         expiresAt: draft.review_token_expires_at,
-        status: draft.status
+        status: draft.status,
+        websiteDomain: website.domain,
+        websiteUrl: website.url
     };
 }
 
@@ -1912,6 +1925,7 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
     }
 
     return serializeReviewDraft({
+        ...draft,
         ...result.rows[0],
         campaign_name: draft.campaign_name
     });
