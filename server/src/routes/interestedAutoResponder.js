@@ -14,7 +14,8 @@ import {
     regenerateInterestedAutoResponderDraftByToken,
     cancelStalePendingReviewDraftsForClient,
     applyActiveFungiStoryUrlToTemplateVars,
-    INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES
+    INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES,
+    withAuditUrlVars
 } from '../services/interestedAutoResponder.js';
 import { resolveTemplateVars, renderTemplate } from '../services/followUpSender.js';
 
@@ -278,6 +279,8 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             templateVars = applyActiveFungiStoryUrlToTemplateVars(templateVars, {
                 domain: contact.company_domain || null
             });
+        } else {
+            templateVars = withAuditUrlVars(templateVars, auditPreviewUrl);
         }
 
         if (!openaiKey) {

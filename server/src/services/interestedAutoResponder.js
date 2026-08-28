@@ -196,7 +196,10 @@ export function buildVulcanShoppingAuditUrl(domain) {
 /**
  * Trigger Vulcan shopping-ad profit audit generation for a domain.
  * POST /api/audits { domain } with Bearer AUDITS_TRIGGER_SECRET.
- * Optionally polls GET /api/audit until ready (or timeout), then returns the public page URL.
+ * Always returns the public page URL once the domain is valid — trigger/wait
+ * failures must not strip the CTA from the interested reply. Waiting for ready
+ * is opt-in (`waitForReady: true`); review is human-gated so the page can finish
+ * generating after the draft is already in the inbox.
  */
 export async function triggerVulcanShoppingAudit(domain, options = {}) {
     const normalized = normalizeAuditDomain(domain);
@@ -204,13 +207,17 @@ export async function triggerVulcanShoppingAudit(domain, options = {}) {
         console.log('[vulcan-audit] skipped — invalid domain:', domain);
         return null;
     }
-    if (!VULCAN_AUDITS_TRIGGER_SECRET) {
-        console.warn('[vulcan-audit] skipped — VULCAN_AUDITS_TRIGGER_SECRET / AUDITS_TRIGGER_SECRET not set');
-        return null;
-    }
 
     const publicUrl = buildVulcanShoppingAuditUrl(normalized);
-    const waitForReady = options.waitForReady !== false;
+    const waitForReady = options.waitForReady === true;
+
+    if (!VULCAN_AUDITS_TRIGGER_SECRET) {
+        console.warn(
+            `[vulcan-audit] trigger skipped — VULCAN_AUDITS_TRIGGER_SECRET / AUDITS_TRIGGER_SECRET not set; still returning page URL domain=${normalized}`
+        );
+        return publicUrl;
+    }
+
     const start = Date.now();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), VULCAN_AUDIT_TRIGGER_TIMEOUT_MS);
@@ -230,23 +237,24 @@ export async function triggerVulcanShoppingAudit(domain, options = {}) {
         if (response.status !== 202 && !response.ok) {
             const bodyText = await response.text().catch(() => '');
             console.warn(
-                `[vulcan-audit] trigger failed status=${response.status} domain=${normalized} elapsed=${elapsed}ms body=${bodyText.slice(0, 200)}`
+                `[vulcan-audit] trigger failed status=${response.status} domain=${normalized} elapsed=${elapsed}ms body=${bodyText.slice(0, 200)} — still returning page URL`
             );
-            return null;
+        } else {
+            let payload = null;
+            try {
+                payload = await response.json();
+            } catch {
+                payload = null;
+            }
+            console.log(
+                `[vulcan-audit] triggered status=${response.status} domain=${normalized} runId=${payload?.runId || 'n/a'} elapsed=${elapsed}ms`
+            );
         }
-        let payload = null;
-        try {
-            payload = await response.json();
-        } catch {
-            payload = null;
-        }
-        console.log(
-            `[vulcan-audit] triggered status=${response.status} domain=${normalized} runId=${payload?.runId || 'n/a'} elapsed=${elapsed}ms`
-        );
     } catch (err) {
         const reason = err?.name === 'AbortError' ? 'timeout' : err.message;
-        console.error(`[vulcan-audit] trigger error domain=${normalized}: ${reason}`);
-        return null;
+        console.error(
+            `[vulcan-audit] trigger error domain=${normalized}: ${reason} — still returning page URL`
+        );
     } finally {
         clearTimeout(timeoutId);
     }
@@ -389,7 +397,8 @@ export async function generateAuditPreviewUrl(leadEmail, options = {}) {
     if (!domain) return null;
 
     if (options.useVulcanShoppingAudit) {
-        return triggerVulcanShoppingAudit(domain, { waitForReady: options.waitForReady });
+        const triggered = await triggerVulcanShoppingAudit(domain, { waitForReady: options.waitForReady });
+        return triggered || buildVulcanShoppingAuditUrl(domain);
     }
 
     if (options.skipPopupPreview) {
@@ -420,6 +429,34 @@ export function getPublicAppBaseUrl() {
 
 export function buildReviewUrl(token) {
     return `${getPublicAppBaseUrl()}/interested-autoresponder/${encodeURIComponent(token)}`;
+}
+
+/**
+ * Vulcan campaign prompts use a bare `AUDIT_URL` token (and sometimes `[AUDIT_URL]`)
+ * as the audit href. If generation didn't receive a real URL, the model copies the
+ * token into the HTML; the review page then treats it as a relative path
+ * (`/interested-autoresponder/[AUDIT_URL]` → "Review draft not found").
+ * Swap those placeholders for the real shopping-audit URL.
+ */
+export function applyReplyLinkPlaceholders(text, { auditUrl } = {}) {
+    const source = text == null ? '' : String(text);
+    const url = String(auditUrl || '').trim();
+    if (!source || !url) return source;
+    let out = source
+        .replace(/https?:\/\/[^\s"'<>]*\/interested-autoresponder\/\[?AUDIT_URL\]?/gi, url)
+        .replace(/\[AUDIT_URL\]/g, url)
+        .replace(/AUDIT_URL/g, url);
+    // Prompt copies sometimes emit <a href=""> when no audit URL was supplied.
+    if (!/vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app/i.test(out)) {
+        out = out.replace(/<a(\s+)href=(["'])\2/i, `<a$1href=$2${url}$2`);
+    }
+    return out;
+}
+
+export function withAuditUrlVars(vars, auditUrl) {
+    const url = String(auditUrl || '').trim();
+    if (!url) return vars || {};
+    return { ...(vars || {}), audit_url: url };
 }
 
 export function generateReviewToken() {
@@ -792,7 +829,7 @@ export async function generateDraftReply({
     systemPromptOwnsCta = false,
     additionalInstructions = null
 }) {
-    const previewUrl = auditPreviewUrl || essenceAiPreviewUrl || null;
+    const previewUrl = asTrimmedText(auditPreviewUrl) || asTrimmedText(essenceAiPreviewUrl);
     const client = new OpenAI({ apiKey: openaiKey });
     let ctaBlock = '';
     if (!systemPromptOwnsCta) {
@@ -801,7 +838,10 @@ export async function generateDraftReply({
             : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`;
     }
     const briefBlock = formatResearchBriefForPrompt(researchBrief);
-    const effectiveSystemPrompt = prependPriorityInstructions(systemPrompt, additionalInstructions);
+    const effectiveSystemPrompt = applyReplyLinkPlaceholders(
+        prependPriorityInstructions(systemPrompt, additionalInstructions),
+        { auditUrl: previewUrl }
+    );
     const response = await client.chat.completions.create({
         model: DEFAULT_MODEL,
         // temperature: 0.6,
@@ -814,7 +854,10 @@ export async function generateDraftReply({
                     `Lead email: ${leadEmail || 'Unknown lead'}`,
                     `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
                     previewUrl && !systemPromptOwnsCta
-                        ? `Shopping audit URL: ${previewUrl}`
+                        ? [
+                            `Shopping audit URL: ${previewUrl}`,
+                            'Use that exact URL as the audit href. Never output AUDIT_URL, [AUDIT_URL], or any other placeholder in an <a> tag.'
+                        ].join('\n')
                         : '',
                     '',
                     'Write a plain-text reply to the interested lead.',
@@ -842,7 +885,7 @@ export async function generateDraftReply({
     const content = response.choices?.[0]?.message?.content || '';
     return {
         model: response.model || DEFAULT_MODEL,
-        renderedText: String(content).trim()
+        renderedText: applyReplyLinkPlaceholders(String(content).trim(), { auditUrl: previewUrl })
     };
 }
 
@@ -1375,7 +1418,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
             ]);
             const templateVars = useActiveFungiStoryUrl
                 ? applyActiveFungiStoryUrlToTemplateVars(resolvedTemplateVars, { domain: auditDomain })
-                : resolvedTemplateVars;
+                : withAuditUrlVars(resolvedTemplateVars, auditPreviewUrl);
             if (useActiveFungiStoryUrl) {
                 logger(`[interested-autoresponder] active-fungi story_url=${templateVars.story_url}`);
             }
@@ -1523,7 +1566,9 @@ function serializeReviewDraft(draft) {
         leadEmail: draft.lead_email,
         campaignName: draft.campaign_name,
         previousLeadMessage: draft.previous_lead_message,
-        renderedText: draft.rendered_text,
+        renderedText: applyReplyLinkPlaceholders(draft.rendered_text, {
+            auditUrl: buildVulcanShoppingAuditUrl(website.domain)
+        }),
         expiresAt: draft.review_token_expires_at,
         status: draft.status,
         websiteDomain: website.domain,
@@ -1670,8 +1715,12 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
     }
     resolvedSubject = resolveInstantlyReplySubject(resolvedSubject);
 
-    const outgoingText = normalizeOutgoingReplyText(draft.rendered_text);
-    const renderedHtml = String(draft.rendered_text || '').trim();
+    const website = resolveLeadWebsite(draft.company_domain, draft.lead_email);
+    const renderedHtml = applyReplyLinkPlaceholders(
+        String(draft.rendered_text || '').trim(),
+        { auditUrl: buildVulcanShoppingAuditUrl(website.domain) }
+    );
+    const outgoingText = normalizeOutgoingReplyText(renderedHtml);
     const isHtml = /<\/?[a-z][\s\S]*>/i.test(renderedHtml);
     const replyPayload = {
         reply_to_uuid: replyToUuid,
@@ -1879,7 +1928,7 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
 
     const templateVars = useActiveFungiStoryUrl
         ? applyActiveFungiStoryUrlToTemplateVars(resolvedTemplateVars, { domain: auditDomain })
-        : resolvedTemplateVars;
+        : withAuditUrlVars(resolvedTemplateVars, auditPreviewUrl);
     const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
     const generation = await generateDraftReply({
         openaiKey: settings.openaiKey,

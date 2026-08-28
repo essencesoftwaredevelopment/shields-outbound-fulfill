@@ -9,7 +9,10 @@ import {
     applyActiveFungiStoryUrlToTemplateVars,
     normalizeRegenerateInstructions,
     prependPriorityInstructions,
-    resolveLeadWebsite
+    resolveLeadWebsite,
+    applyReplyLinkPlaceholders,
+    withAuditUrlVars,
+    buildVulcanShoppingAuditUrl
 } from '../interestedAutoResponder.js';
 
 test('isEligiblePostAutoresponderReplyCategory accepts positive and neutral while interested', () => {
@@ -118,4 +121,55 @@ test('resolveLeadWebsite prefers company domain then falls back to email domain'
         { domain: 'naked-sundays.com', url: 'https://naked-sundays.com' }
     );
     assert.deepEqual(resolveLeadWebsite(null, 'not-an-email'), { domain: null, url: null });
+});
+
+test('applyReplyLinkPlaceholders swaps AUDIT_URL tokens for the real audit href', () => {
+    const auditUrl = 'https://vulcan-shopping-audit.vercel.app/?domain=tenfoldfairtrade.com';
+    const html = '<p>Hi Martha, sure, here it is: <a href="[AUDIT_URL]">take a look</a></p>';
+    assert.equal(
+        applyReplyLinkPlaceholders(html, { auditUrl }),
+        '<p>Hi Martha, sure, here it is: <a href="https://vulcan-shopping-audit.vercel.app/?domain=tenfoldfairtrade.com">take a look</a></p>'
+    );
+    assert.equal(
+        applyReplyLinkPlaceholders('<a href="AUDIT_URL">take a look</a>', { auditUrl }),
+        `<a href="${auditUrl}">take a look</a>`
+    );
+    assert.equal(
+        applyReplyLinkPlaceholders(
+            '<a href="https://shields-outbound-fulfill.vercel.app/interested-autoresponder/[AUDIT_URL]">take a look</a>',
+            { auditUrl }
+        ),
+        `<a href="${auditUrl}">take a look</a>`
+    );
+    assert.equal(applyReplyLinkPlaceholders(html, {}), html);
+    assert.equal(applyReplyLinkPlaceholders(html, { auditUrl: '' }), html);
+    assert.equal(
+        applyReplyLinkPlaceholders('<p><a href="">take a look</a></p>', { auditUrl }),
+        `<p><a href="${auditUrl}">take a look</a></p>`
+    );
+});
+
+test('applyReplyLinkPlaceholders leaves real vulcan audit links untouched', () => {
+    const auditUrl = 'https://vulcan-shopping-audit.vercel.app/?domain=voomcart.com';
+    const html = `<a href="${auditUrl}">take a look</a>`;
+    assert.equal(applyReplyLinkPlaceholders(html, { auditUrl }), html);
+});
+
+test('withAuditUrlVars adds audit_url for {{audit_url}} prompt substitution', () => {
+    assert.deepEqual(
+        withAuditUrlVars({ first_name: 'Martha' }, 'https://vulcan-shopping-audit.vercel.app/?domain=tenfoldfairtrade.com'),
+        {
+            first_name: 'Martha',
+            audit_url: 'https://vulcan-shopping-audit.vercel.app/?domain=tenfoldfairtrade.com'
+        }
+    );
+    assert.deepEqual(withAuditUrlVars({ first_name: 'Martha' }, null), { first_name: 'Martha' });
+});
+
+test('buildVulcanShoppingAuditUrl matches the public audit page', () => {
+    assert.equal(
+        buildVulcanShoppingAuditUrl('tenfoldfairtrade.com'),
+        'https://vulcan-shopping-audit.vercel.app/?domain=tenfoldfairtrade.com'
+    );
+    assert.equal(buildVulcanShoppingAuditUrl('not a domain'), null);
 });

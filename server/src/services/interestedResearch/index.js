@@ -29,7 +29,8 @@ import {
     humanizeDomainAsCompanyName,
     normalizeAuditDomain,
     resolveContactSignalContext,
-    sendNtfyNotification
+    sendNtfyNotification,
+    withAuditUrlVars
 } from '../interestedAutoResponder.js';
 import {
     buildSerperQueries,
@@ -412,6 +413,8 @@ export async function runPopupGeneration({ draftId, agencyId }) {
         domain: auditDomain,
         useVulcanShoppingAudit: useShoppingAuditReply,
         skipPopupPreview: Boolean(settings.skipPopupPreview),
+        // Human-gated review: don't hold the workflow step for audit readiness.
+        waitForReady: false,
         ...(brief
             ? {
                 industry: brief.industry || null,
@@ -483,7 +486,7 @@ export async function finalizeResearchDraft({
     const useActiveFungiStoryUrl = Boolean(settings.useActiveFungiStoryUrl);
     const templateVars = useActiveFungiStoryUrl
         ? applyActiveFungiStoryUrlToTemplateVars(resolvedTemplateVars, { domain })
-        : resolvedTemplateVars;
+        : withAuditUrlVars(resolvedTemplateVars, auditPreviewUrl);
     const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
 
     const generation = await generateDraftReply({
