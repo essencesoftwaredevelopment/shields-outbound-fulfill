@@ -6,7 +6,6 @@ import {
     agencyFeaturesFromSettings,
     isTryKittPaidAccount, mergeAgencyFeatures } from '../services/db/agencySettings.js';
 import { validateFeaturesPatch, featureFlagRegistryForClient } from '../services/db/featureFlagRegistry.js';
-import { isPlatformAdminEmail, requirePlatformAdmin } from '../middleware/platformAdmin.js';
 
 const router = express.Router();
 
@@ -41,8 +40,8 @@ router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
     }
 });
 
-// Feature flags for the caller's own agency. Anyone signed in can view; only
-// platform admins can change them (several flags spend money or change runners).
+// Feature flags for the caller's own agency. Anyone signed into the agency
+// account can view and change them.
 router.get('/agency/features', verifySupabaseToken, async (req, res) => {
     try {
         const settings = await getAgencySettings(req.agencyId);
@@ -50,7 +49,7 @@ router.get('/agency/features', verifySupabaseToken, async (req, res) => {
             agencyId: req.agencyId,
             features: agencyFeaturesFromSettings(settings),
             registry: featureFlagRegistryForClient(),
-            canEdit: isPlatformAdminEmail(req.auth?.email)
+            canEdit: true
         });
     } catch (error) {
         console.error('GET agency features error:', error);
@@ -58,7 +57,7 @@ router.get('/agency/features', verifySupabaseToken, async (req, res) => {
     }
 });
 
-router.patch('/agency/features', verifySupabaseToken, requirePlatformAdmin, async (req, res) => {
+router.patch('/agency/features', verifySupabaseToken, async (req, res) => {
     try {
         const validated = validateFeaturesPatch(req.body?.patch);
         if (!validated.ok) return res.status(400).json({ error: validated.errors.join('; ') });
