@@ -33,15 +33,23 @@ interface DealFlowBoardProps {
     onOpenLead?: (contactId: number, email: string) => void;
 }
 
+// Higher position = newer = nearer the top. Reconcile seeds position from the
+// Instantly interest timestamp, so untouched columns read newest → oldest.
 function sortByPosition(list: Deal[]): Deal[] {
-    return [...list].sort((a, b) => a.position - b.position || a.id - b.id);
+    return [...list].sort((a, b) => b.position - a.position || b.id - a.id);
 }
 
-function positionBetween(prev: Deal | undefined, next: Deal | undefined): number {
-    if (prev && next) return (prev.position + next.position) / 2;
-    if (prev) return prev.position + GAP;
-    if (next) return next.position - GAP;
-    return GAP;
+/** Position for a card placed between `above` and `below` (either may be absent). */
+function positionBetween(above: Deal | undefined, below: Deal | undefined): number {
+    if (above && below) return (above.position + below.position) / 2;
+    if (above) return above.position - GAP;
+    if (below) return below.position + GAP;
+    return Date.now() / 1000;
+}
+
+/** Position that puts a card at the top of a column. */
+function topPosition(column: Deal[]): number {
+    return positionBetween(undefined, column[0]);
 }
 
 export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
@@ -120,6 +128,10 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
         setSelectedDealId(null);
     }, []);
 
+    const isCollapsed = useCallback((stage: DealStage) => (
+        collapsedOverrides.get(stage.id) ?? stage.kind !== "open"
+    ), [collapsedOverrides]);
+
     const onDragOver = useCallback((event: DragOverEvent) => {
         const data = event.active.data.current as { dealId?: number } | undefined;
         const dealId = data?.dealId;
@@ -127,13 +139,18 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
         if (!dealId || targetStageId === null) return;
         const current = dealsRef.current.find((d) => d.id === dealId);
         if (!current || current.stageId === targetStageId) return;
-        // Hovering a different column: show the card at the end of that column.
-        const column = dealsRef.current.filter((d) => d.stageId === targetStageId && d.id !== dealId);
-        const last = sortByPosition(column).at(-1);
+        // A collapsed column renders no cards; relocating the card there mid-drag
+        // would unmount the dragged node and abort the drag. Leave it in place —
+        // onDragEnd still commits the drop from the droppable target.
+        const targetStage = stageById.get(targetStageId);
+        if (targetStage && isCollapsed(targetStage)) return;
+        // Hovering a different column: show the card at the top of that column.
+        const column = sortByPosition(dealsRef.current.filter((d) => d.stageId === targetStageId && d.id !== dealId));
+        const position = topPosition(column);
         setDeals((prev) => prev.map((d) => (
-            d.id === dealId ? { ...d, stageId: targetStageId, position: positionBetween(last, undefined) } : d
+            d.id === dealId ? { ...d, stageId: targetStageId, position } : d
         )));
-    }, [setDeals, stageIdForOver]);
+    }, [isCollapsed, setDeals, stageById, stageIdForOver]);
 
     const onDragCancel = useCallback(() => {
         if (snapshotRef.current) setDeals(snapshotRef.current);
@@ -158,7 +175,8 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
 
         const column = sortByPosition(dealsRef.current.filter((d) => d.stageId === targetStageId && d.id !== dealId));
         const overData = event.over?.data.current as { type?: string; dealId?: number } | undefined;
-        let index = column.length;
+        // Default (dropped on the column itself, not a card): top of the column.
+        let index = 0;
         if (overData?.type === "deal" && overData.dealId !== dealId) {
             const overIndex = column.findIndex((d) => d.id === overData.dealId);
             if (overIndex >= 0) {
@@ -179,19 +197,18 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
 
         const patch: DealPatch = { position };
         if (original.stageId !== targetStageId) patch.stageId = targetStageId;
-        void patchDeal(dealId, patch, snapshot).catch((err: unknown) => {
-            toast.error(err instanceof Error ? err.message : "Could not move the deal.");
-        });
-    }, [patchDeal, setDeals, stageIdForOver]);
+        void patchDeal(dealId, patch, snapshot)
+            .then(() => { if (patch.stageId !== undefined) void load(); })
+            .catch((err: unknown) => {
+                toast.error(err instanceof Error ? err.message : "Could not move the deal.");
+            });
+    }, [load, patchDeal, setDeals, stageIdForOver]);
 
     const moveToStage = useCallback(async (deal: Deal, stageId: number) => {
         const column = sortByPosition(dealsRef.current.filter((d) => d.stageId === stageId && d.id !== deal.id));
-        await patchDeal(deal.id, { stageId, position: positionBetween(column.at(-1), undefined) });
-    }, [patchDeal]);
-
-    const isCollapsed = useCallback((stage: DealStage) => (
-        collapsedOverrides.get(stage.id) ?? stage.kind !== "open"
-    ), [collapsedOverrides]);
+        await patchDeal(deal.id, { stageId, position: topPosition(column) });
+        void load();
+    }, [load, patchDeal]);
 
     const toggleCollapse = useCallback((stageId: number) => {
         const stage = stageById.get(stageId);

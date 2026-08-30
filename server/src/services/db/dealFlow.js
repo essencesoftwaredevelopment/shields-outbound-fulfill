@@ -244,7 +244,7 @@ export async function loadBoard(clientRow, { closedSinceDays = 60 } = {}) {
              WHERE d.client_id = $1
                AND d.archived_at IS NULL
                AND (s.kind = 'open' OR COALESCE(d.closed_at, d.stage_changed_at) >= NOW() - ($3::int * INTERVAL '1 day'))
-             ORDER BY d.stage_id, d.position, d.id`,
+             ORDER BY d.stage_id, d.position DESC, d.id DESC`,
             [clientRow.id, OPEN_DRAFT_STATUSES, days]
         );
 
@@ -274,12 +274,13 @@ async function getStageRow(db, clientId, stageId) {
 }
 
 async function renormalizeIfNeeded(db, stageId) {
+    // Higher position = nearer the top of the column.
     const result = await db.query(
-        `SELECT id, position FROM deals WHERE stage_id = $1 AND archived_at IS NULL ORDER BY position, id`,
+        `SELECT id, position FROM deals WHERE stage_id = $1 AND archived_at IS NULL ORDER BY position DESC, id DESC`,
         [stageId]
     );
     const rows = result.rows;
-    let needs = false;
+    let needs = rows.some((r) => Number(r.position) <= 0);
     for (let i = 1; i < rows.length; i += 1) {
         if (Math.abs(Number(rows[i].position) - Number(rows[i - 1].position)) < 1e-6) {
             needs = true;
@@ -288,7 +289,7 @@ async function renormalizeIfNeeded(db, stageId) {
     }
     if (!needs) return;
     for (let i = 0; i < rows.length; i += 1) {
-        await db.query(`UPDATE deals SET position = $2 WHERE id = $1`, [rows[i].id, (i + 1) * 1000]);
+        await db.query(`UPDATE deals SET position = $2 WHERE id = $1`, [rows[i].id, (rows.length - i) * 1000]);
     }
 }
 
