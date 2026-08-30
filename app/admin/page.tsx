@@ -6,6 +6,7 @@ import AppShell from "@/components/app-shell";
 import { useAuth } from "@/hooks/use-auth";
 import { usePlatformAdmin } from "@/lib/hooks/usePlatformAdmin";
 import { apiJson } from "@/lib/api/http";
+import { FeatureFlagsEditor } from "@/components/feature-flags/FeatureFlagsEditor";
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -37,6 +38,7 @@ export default function AdminPage() {
     const [creating, setCreating] = useState(false);
     const [createError, setCreateError] = useState<string | null>(null);
     const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+    const [featuresAgency, setFeaturesAgency] = useState<AgencyRow | null>(null);
 
     useEffect(() => {
         if (authLoading || adminLoading) return;
@@ -235,6 +237,7 @@ export default function AdminPage() {
                                                 <th style={{ padding: "0.75rem 0.5rem" }}>Clients</th>
                                                 <th style={{ padding: "0.75rem 0.5rem" }}>Email confirmed</th>
                                                 <th style={{ padding: "0.75rem 0.5rem" }}>Note</th>
+                                                <th style={{ padding: "0.75rem 0.5rem" }}></th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -252,6 +255,16 @@ export default function AdminPage() {
                                                         {agency.emailConfirmed ? "Yes" : "No"}
                                                     </td>
                                                     <td style={{ padding: "0.75rem 0.5rem" }}>{agency.note || "—"}</td>
+                                                    <td style={{ padding: "0.75rem 0.5rem", whiteSpace: "nowrap" }}>
+                                                        <button
+                                                            type="button"
+                                                            className="df-btn"
+                                                            onClick={() => setFeaturesAgency((prev) => (prev?.agencyId === agency.agencyId ? null : agency))}
+                                                            aria-expanded={featuresAgency?.agencyId === agency.agencyId}
+                                                        >
+                                                            {featuresAgency?.agencyId === agency.agencyId ? "Close features" : "Features"}
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>
@@ -259,6 +272,33 @@ export default function AdminPage() {
                                 </div>
                             )}
                         </div>
+
+                        {featuresAgency && (
+                            <div
+                                style={{
+                                    marginTop: "2rem",
+                                    padding: "1.5rem",
+                                    borderRadius: "20px",
+                                    border: "1px solid var(--app-border-mid)",
+                                    background: "var(--app-surface-1)",
+                                }}
+                            >
+                                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "1rem", marginBottom: "1rem" }}>
+                                    <div>
+                                        <h2 style={{ fontSize: "1.25rem", fontWeight: 600, marginBottom: "0.25rem" }}>
+                                            Features — {featuresAgency.email || featuresAgency.agencyId}
+                                        </h2>
+                                        <p style={{ color: "var(--app-text-muted)", margin: 0, fontFamily: "monospace", fontSize: "0.8rem" }}>
+                                            {featuresAgency.agencyId}
+                                        </p>
+                                    </div>
+                                    <button type="button" className="df-btn df-btn--ghost" onClick={() => setFeaturesAgency(null)}>
+                                        Close
+                                    </button>
+                                </div>
+                                <FeatureFlagsEditor key={featuresAgency.agencyId} agencyId={featuresAgency.agencyId} />
+                            </div>
+                        )}
                     </div>
                 </div>
             </section>

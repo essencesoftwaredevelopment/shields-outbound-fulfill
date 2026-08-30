@@ -4,6 +4,10 @@ import { pool } from '../lib/db.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import { notifyEssenceAiDemoBooked } from './discoveryCallResend.js';
 import { resolveCaseStudyIndustry } from './discoveryCallCaseStudy.js';
+import {
+    ESSENCE_RETENTION_AGENCY_ID,
+    ESSENCE_RETENTION_CLIENT_SLUG
+} from './resendScope.js';
 
 const CALENDLY_API_BASE = 'https://api.calendly.com';
 
@@ -180,6 +184,27 @@ async function findContactByEmail(email, { agencyId = null, clientId = null } = 
         params
     );
 
+    return result.rows[0] || null;
+}
+
+async function findEssenceRetentionContactByEmail(email) {
+    if (!email) return null;
+    const result = await pool.query(
+        `SELECT c.id, c.agency_id, c.client_id, c.full_name, c.email,
+                co.domain_normalized AS domain,
+                ci.uses_klaviyo,
+                cl.slug AS client_slug
+         FROM contacts c
+         JOIN clients cl ON cl.id = c.client_id AND cl.agency_id = c.agency_id
+         LEFT JOIN companies co ON co.id = c.company_id
+         LEFT JOIN contact_insights ci ON ci.contact_id = c.id
+         WHERE LOWER(c.email) = $1
+           AND c.agency_id = $2
+           AND cl.slug = $3
+         ORDER BY c.last_contacted_at DESC NULLS LAST, c.updated_at DESC
+         LIMIT 1`,
+        [email, ESSENCE_RETENTION_AGENCY_ID, ESSENCE_RETENTION_CLIENT_SLUG]
+    );
     return result.rows[0] || null;
 }
 
@@ -566,22 +591,29 @@ export async function processCalendlyWebhook({
     let resendNotify = null;
     if (eventType === 'invitee.created') {
         try {
-            const industry = await findResearchIndustryForContact(contact?.id);
-            resendNotify = await notifyEssenceAiDemoBooked({
-                eventType,
-                eventName,
-                email,
-                inviteeName,
-                invitee,
-                enrichedInvitee,
-                payload,
-                scheduledEvent,
-                questionsAndAnswers,
-                location,
-                startTime,
-                contact,
-                industry
-            });
+            const resendContact = await findEssenceRetentionContactByEmail(email);
+            if (!resendContact) {
+                resendNotify = { skipped: true, reason: 'not_essence_retention_client' };
+            } else {
+                const industry = await findResearchIndustryForContact(resendContact.id);
+                resendNotify = await notifyEssenceAiDemoBooked({
+                    eventType,
+                    eventName,
+                    email,
+                    inviteeName,
+                    invitee,
+                    enrichedInvitee,
+                    payload,
+                    scheduledEvent,
+                    questionsAndAnswers,
+                    location,
+                    startTime,
+                    contact: resendContact,
+                    agencyId: resendContact.agency_id,
+                    clientSlug: resendContact.client_slug,
+                    industry
+                });
+            }
         } catch (error) {
             console.warn('[calendly-webhook] resend discovery notify failed:', error?.message || error);
             resendNotify = { skipped: false, success: false, error: error?.message || String(error) };

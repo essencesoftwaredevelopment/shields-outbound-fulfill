@@ -12,6 +12,7 @@ import { apiJson } from "@/lib/api/http";
 import { getAccessToken } from "@/lib/supabase/session";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import { useMemo, useState, useEffect } from "react";
+import { FeatureFlagsEditor } from "@/components/feature-flags/FeatureFlagsEditor";
 
 async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -210,6 +211,18 @@ export default function AccountPage() {
                             </Alert>
                         )}
                     </div>
+                </div>
+
+                <Separator />
+
+                <div className="flex flex-col gap-4">
+                    <div>
+                        <h2 className="text-lg font-semibold">Features</h2>
+                        <p className="text-sm text-muted-foreground">
+                            Which optional features and tuning values are enabled for your agency.
+                        </p>
+                    </div>
+                    {user && <FeatureFlagsEditor />}
                 </div>
             </div>
         </AppShell>

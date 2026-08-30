@@ -1,13 +1,17 @@
 /**
  * Resend email webhooks → lead activity timeline.
  *
- * Matches recipients to existing contacts by email (same global lookup as the
- * Calendly webhook) and inserts contact_instantly_events with source=resend.
+ * Matches recipients only on the essence-retention client in the Essence
+ * Retention agency, then inserts contact_instantly_events with source=resend.
  */
 
 import crypto from 'crypto';
 import { pool } from '../lib/db.js';
 import { normalizeEmailForMatch } from '../utils/instantlyImportMerge.js';
+import {
+    ESSENCE_RETENTION_AGENCY_ID,
+    ESSENCE_RETENTION_CLIENT_SLUG
+} from './resendScope.js';
 
 export const RESEND_EVENT_SOURCE = 'resend';
 export const SVIX_TIMESTAMP_TOLERANCE_SEC = 300;
@@ -166,9 +170,12 @@ async function findContactsByEmails(emails) {
     const result = await pool.query(
         `SELECT c.id, c.agency_id, c.client_id, c.full_name, c.email
          FROM contacts c
+         JOIN clients cl ON cl.id = c.client_id AND cl.agency_id = c.agency_id
          WHERE LOWER(c.email) = ANY($1::text[])
+           AND c.agency_id = $2
+           AND cl.slug = $3
          ORDER BY c.last_contacted_at DESC NULLS LAST, c.updated_at DESC, c.id DESC`,
-        [emails]
+        [emails, ESSENCE_RETENTION_AGENCY_ID, ESSENCE_RETENTION_CLIENT_SLUG]
     );
     return result.rows;
 }

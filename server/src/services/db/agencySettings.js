@@ -53,6 +53,24 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
     );
 }
 
+/**
+ * Shallow-merge `patch` into agency_settings.features. A `null` value removes
+ * that key (so a flag can fall back to its default), which the `||`-only
+ * merge in upsertAgencySettings cannot express. Returns the resulting features.
+ */
+export async function mergeAgencyFeatures(agencyId, patch) {
+    const result = await pool.query(
+        `INSERT INTO agency_settings (agency_id, features, updated_at)
+         VALUES ($1, jsonb_strip_nulls($2::jsonb), NOW())
+         ON CONFLICT (agency_id) DO UPDATE SET
+            features = jsonb_strip_nulls(COALESCE(agency_settings.features, '{}'::jsonb) || $2::jsonb),
+            updated_at = NOW()
+         RETURNING features`,
+        [agencyId, JSON.stringify(patch || {})]
+    );
+    return result.rows[0]?.features || {};
+}
+
 export function apiKeysFromSettings(settings) {
     if (!settings) return { openai: '', serper: '', trykitt: '' };
     return {

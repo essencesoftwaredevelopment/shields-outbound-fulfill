@@ -2,12 +2,15 @@
  * Fires the Resend "Discovery Pre Call" automation when an ESSENCE AI Demo
  * Calendly invitee is created. Upserts the Resend contact first so
  * contact.first_name / contact.email resolve in the template.
+ *
+ * Only the essence-retention client on the Essence Retention agency.
  */
 
 import { Resend } from 'resend';
 import { env } from '../config/env.js';
 import { normalizeDomain } from '../utils/domain.js';
 import { resolveCaseStudyIndustry } from './discoveryCallCaseStudy.js';
+import { isEssenceRetentionClient } from './resendScope.js';
 
 export const DISCOVERY_CALL_BOOKED_EVENT = 'Discovery Call Booked';
 export const ESSENCE_AI_DEMO_EVENT_TYPE_ID = '30336f6d-1955-4c5f-ad3c-49f319bd61e3';
@@ -295,6 +298,12 @@ export async function notifyEssenceAiDemoBooked(context = {}, { client } = {}) {
     }
     if (!isEssenceAiDemoEvent(context)) {
         return { skipped: true, reason: 'not_essence_ai_demo' };
+    }
+    if (!isEssenceRetentionClient({
+        agencyId: context.agencyId ?? context.contact?.agency_id,
+        clientSlug: context.clientSlug ?? context.contact?.client_slug
+    })) {
+        return { skipped: true, reason: 'not_essence_retention_client' };
     }
 
     const built = buildDiscoveryCallBookedPayload(context);

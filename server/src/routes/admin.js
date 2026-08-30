@@ -3,7 +3,8 @@ import { verifySupabaseToken } from '../middleware/auth.js';
 import { requirePlatformAdmin, isPlatformAdminEmail } from '../middleware/platformAdmin.js';
 import { getSupabaseAdmin } from '../config/supabase.js';
 import { upsertAgencyAuthMap, listAgencyAuthMaps } from '../services/db/agencyAuthMap.js';
-import { upsertAgencySettings } from '../services/db/agencySettings.js';
+import { agencyFeaturesFromSettings, getAgencySettings, mergeAgencyFeatures, upsertAgencySettings } from '../services/db/agencySettings.js';
+import { validateFeaturesPatch, featureFlagRegistryForClient } from '../services/db/featureFlagRegistry.js';
 import { pool } from '../config/db.js';
 
 const router = express.Router();
@@ -113,6 +114,37 @@ router.post('/admin/agencies', verifySupabaseToken, requirePlatformAdmin, async 
     } catch (error) {
         console.error('POST /admin/agencies error:', error);
         res.status(500).json({ error: error.message || 'Failed to create agency account' });
+    }
+});
+
+router.get('/admin/agencies/:agencyId/features', verifySupabaseToken, requirePlatformAdmin, async (req, res) => {
+    try {
+        const agencyId = String(req.params.agencyId || '').trim();
+        if (!agencyId) return res.status(400).json({ error: 'agencyId is required' });
+        const settings = await getAgencySettings(agencyId);
+        res.json({
+            agencyId,
+            features: agencyFeaturesFromSettings(settings),
+            registry: featureFlagRegistryForClient(),
+            canEdit: true
+        });
+    } catch (error) {
+        console.error('GET /admin/agencies/:agencyId/features error:', error);
+        res.status(500).json({ error: 'Failed to load features' });
+    }
+});
+
+router.patch('/admin/agencies/:agencyId/features', verifySupabaseToken, requirePlatformAdmin, async (req, res) => {
+    try {
+        const agencyId = String(req.params.agencyId || '').trim();
+        if (!agencyId) return res.status(400).json({ error: 'agencyId is required' });
+        const validated = validateFeaturesPatch(req.body?.patch);
+        if (!validated.ok) return res.status(400).json({ error: validated.errors.join('; ') });
+        const features = await mergeAgencyFeatures(agencyId, validated.patch);
+        res.json({ agencyId, features });
+    } catch (error) {
+        console.error('PATCH /admin/agencies/:agencyId/features error:', error);
+        res.status(500).json({ error: 'Failed to save features' });
     }
 });
 

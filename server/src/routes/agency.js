@@ -4,8 +4,9 @@ import {
     getAgencySettings,
     upsertAgencySettings,
     agencyFeaturesFromSettings,
-    isTryKittPaidAccount
-} from '../services/db/agencySettings.js';
+    isTryKittPaidAccount, mergeAgencyFeatures } from '../services/db/agencySettings.js';
+import { validateFeaturesPatch, featureFlagRegistryForClient } from '../services/db/featureFlagRegistry.js';
+import { isPlatformAdminEmail, requirePlatformAdmin } from '../middleware/platformAdmin.js';
 
 const router = express.Router();
 
@@ -37,6 +38,35 @@ router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
     } catch (error) {
         console.error('GET agency settings error:', error);
         res.status(500).json({ error: 'Failed to load settings' });
+    }
+});
+
+// Feature flags for the caller's own agency. Anyone signed in can view; only
+// platform admins can change them (several flags spend money or change runners).
+router.get('/agency/features', verifySupabaseToken, async (req, res) => {
+    try {
+        const settings = await getAgencySettings(req.agencyId);
+        res.json({
+            agencyId: req.agencyId,
+            features: agencyFeaturesFromSettings(settings),
+            registry: featureFlagRegistryForClient(),
+            canEdit: isPlatformAdminEmail(req.auth?.email)
+        });
+    } catch (error) {
+        console.error('GET agency features error:', error);
+        res.status(500).json({ error: 'Failed to load features' });
+    }
+});
+
+router.patch('/agency/features', verifySupabaseToken, requirePlatformAdmin, async (req, res) => {
+    try {
+        const validated = validateFeaturesPatch(req.body?.patch);
+        if (!validated.ok) return res.status(400).json({ error: validated.errors.join('; ') });
+        const features = await mergeAgencyFeatures(req.agencyId, validated.patch);
+        res.json({ agencyId: req.agencyId, features });
+    } catch (error) {
+        console.error('PATCH agency features error:', error);
+        res.status(500).json({ error: 'Failed to save features' });
     }
 });
 

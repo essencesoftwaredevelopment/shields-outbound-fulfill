@@ -9,6 +9,15 @@ import {
     notifyEssenceAiDemoBooked,
     splitPersonName
 } from '../discoveryCallResend.js';
+import {
+    ESSENCE_RETENTION_AGENCY_ID,
+    ESSENCE_RETENTION_CLIENT_SLUG
+} from '../resendScope.js';
+
+const ESSENCE_RETENTION_SCOPE = {
+    agencyId: ESSENCE_RETENTION_AGENCY_ID,
+    clientSlug: ESSENCE_RETENTION_CLIENT_SLUG
+};
 
 const DEMO_EVENT_TYPE = 'https://api.calendly.com/event_types/30336f6d-1955-4c5f-ad3c-49f319bd61e3';
 
@@ -128,6 +137,20 @@ test('buildDiscoveryCallBookedPayload: maps unrouted industries to fashion fallb
     assert.equal(built.eventPayload.industry, 'fashion_apparel');
 });
 
+test('buildDiscoveryCallBookedPayload: keeps a live food industry', () => {
+    const built = buildDiscoveryCallBookedPayload({
+        email: 'a@b.com',
+        invitee: { first_name: 'A', last_name: 'B', timezone: 'UTC' },
+        scheduledEvent: {
+            location: { join_url: 'https://calendly.com/events/x/google_meet' }
+        },
+        startTime: '2026-08-13T18:00:00.000Z',
+        industry: 'food_beverage',
+        now: new Date('2026-08-12T15:00:00.000Z')
+    });
+    assert.equal(built.eventPayload.industry, 'food_beverage');
+});
+
 test('buildDiscoveryCallBookedPayload: missing industry still falls back to fashion', () => {
     const built = buildDiscoveryCallBookedPayload({
         email: 'a@b.com',
@@ -186,6 +209,7 @@ test('notifyEssenceAiDemoBooked: upserts contact then sends event', async () => 
     const result = await notifyEssenceAiDemoBooked({
         eventType: 'invitee.created',
         eventName: 'ESSENCE AI Demo',
+        ...ESSENCE_RETENTION_SCOPE,
         email: 'celia@thewoodsspiritco.com',
         inviteeName: 'Celia Chiang',
         invitee: {
@@ -244,6 +268,7 @@ test('notifyEssenceAiDemoBooked: updates existing Resend contact', async () => {
     const result = await notifyEssenceAiDemoBooked({
         eventType: 'invitee.created',
         eventName: 'ESSENCE AI Demo',
+        ...ESSENCE_RETENTION_SCOPE,
         email: 'kjem@girlsjustwannabox.com',
         invitee: { first_name: 'Kristina', last_name: 'Ejem', timezone: 'UTC' },
         scheduledEvent: {
@@ -255,4 +280,47 @@ test('notifyEssenceAiDemoBooked: updates existing Resend contact', async () => {
     assert.equal(result.skipped, false);
     assert.equal(result.contact_created, false);
     assert.equal(result.contact_id, 'existing_1');
+});
+
+test('notifyEssenceAiDemoBooked: skips bookings outside essence-retention', async () => {
+    const client = {
+        contacts: {
+            get: async () => {
+                throw new Error('should not touch Resend');
+            }
+        },
+        events: {
+            send: async () => {
+                throw new Error('should not touch Resend');
+            }
+        }
+    };
+    const demo = {
+        eventType: 'invitee.created',
+        eventName: 'ESSENCE AI Demo',
+        email: 'a@b.com',
+        invitee: { first_name: 'A', timezone: 'UTC' },
+        scheduledEvent: { location: { join_url: 'https://meet.example/join' } },
+        startTime: '2026-08-13T18:00:00.000Z'
+    };
+
+    const missing = await notifyEssenceAiDemoBooked(demo, { client });
+    assert.equal(missing.skipped, true);
+    assert.equal(missing.reason, 'not_essence_retention_client');
+
+    const otherClient = await notifyEssenceAiDemoBooked({
+        ...demo,
+        agencyId: ESSENCE_RETENTION_AGENCY_ID,
+        clientSlug: 'vulcan-digital'
+    }, { client });
+    assert.equal(otherClient.skipped, true);
+    assert.equal(otherClient.reason, 'not_essence_retention_client');
+
+    const otherAgency = await notifyEssenceAiDemoBooked({
+        ...demo,
+        agencyId: 'efddb63d-a4c9-44d9-a204-baa052fd0fd8',
+        clientSlug: ESSENCE_RETENTION_CLIENT_SLUG
+    }, { client });
+    assert.equal(otherAgency.skipped, true);
+    assert.equal(otherAgency.reason, 'not_essence_retention_client');
 });

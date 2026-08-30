@@ -24,6 +24,7 @@ import webhooksRouter from './routes/webhooks.js';
 import domainsRouter from './routes/domains.js';
 import microserviceRouter from './routes/microservice.js';
 import interestedAutoResponderRouter from './routes/interestedAutoResponder.js';
+import dealFlowRouter from './routes/dealFlow.js';
 import calendlyWebhookRouter from './routes/calendlyWebhook.js';
 import resendWebhookRouter from './routes/resendWebhook.js';
 import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobPipeline.js';
@@ -101,6 +102,7 @@ app.use('/api', leadsRouter);
 app.use('/api', domainsRouter);
 app.use('/api', microserviceRouter);
 app.use('/api', interestedAutoResponderRouter);
+app.use('/api', dealFlowRouter);
 app.use('/webhook', webhooksRouter);
 
 app.get('/health', (req, res) => {

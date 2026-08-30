@@ -14,6 +14,7 @@ import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAuth } from "@/hooks/use-auth";
 import { useAgencyId } from "@/lib/hooks/useAgencyId";
 import { apiFetch, apiJson } from "@/lib/api/http";
+import { DealFlowBoard } from "@/components/deal-flow/DealFlowBoard";
 import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
@@ -1542,7 +1543,7 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
     const { agencyId } = useAgencyId();
-    const allowedTabs = ["analytics", "info", "campaigns", "leads", "follow-ups"] as const;
+    const allowedTabs = ["analytics", "info", "campaigns", "leads", "follow-ups", "deal-flow"] as const;
     type ClientTab = typeof allowedTabs[number];
     const initialTab = searchParams?.get("tab");
 
@@ -1655,6 +1656,7 @@ export default function ClientPage() {
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
     const [personalizeFirstLine, setPersonalizeFirstLine] = useState(false);
     const [shoppingAuditEnabled, setShoppingAuditEnabled] = useState(false);
+    const [dealFlowEnabled, setDealFlowEnabled] = useState(false);
     const [useShoppingAuditPipeline, setUseShoppingAuditPipeline] = useState(false);
     const [productPromptUseNew, setProductPromptUseNew] = useState(false);
     const [productPromptUseOld, setProductPromptUseOld] = useState(true);
@@ -2731,12 +2733,12 @@ export default function ClientPage() {
                 const headers = { Authorization: `Bearer ${token}` };
 
                 // Prefer Next internal route — production Express may not expose features yet.
-                let features: { shoppingAudit?: boolean } | undefined;
+                let features: { shoppingAudit?: boolean; dealFlow?: boolean } | undefined;
                 try {
                     const internal = await fetch('/internal/agency/features', { headers });
                     if (internal.ok) {
                         const payload = (await internal.json()) as {
-                            features?: { shoppingAudit?: boolean };
+                            features?: { shoppingAudit?: boolean; dealFlow?: boolean };
                             shoppingAudit?: boolean;
                         };
                         features = payload.features;
@@ -2757,7 +2759,7 @@ export default function ClientPage() {
                     }
                     const data = (await response.json()) as {
                         email_verification_provider?: string;
-                        features?: { shoppingAudit?: boolean };
+                        features?: { shoppingAudit?: boolean; dealFlow?: boolean };
                     };
                     features = data.features;
                     if (!cancelled) {
@@ -2772,6 +2774,7 @@ export default function ClientPage() {
                         features?.shoppingAudit === true
                         || process.env.NEXT_PUBLIC_SHOPPING_AUDIT_ENABLED === 'true'
                     );
+                    setDealFlowEnabled(features?.dealFlow === true);
                 }
             } catch {
                 /* keep default */
@@ -8471,6 +8474,14 @@ export default function ClientPage() {
                         >
                             Follow-Ups
                         </button>
+                        {dealFlowEnabled && (
+                            <button
+                                className={`tab-nav__button ${activeTab === "deal-flow" ? "tab-nav__button--active" : ""}`}
+                                onClick={() => setActiveTab("deal-flow")}
+                            >
+                                Deal Flow
+                            </button>
+                        )}
                         <button
                             className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
                             onClick={() => setActiveTab("info")}
@@ -10535,6 +10546,14 @@ export default function ClientPage() {
                                 </button>
                             </div>
                         </div>
+                    )}
+
+                    {/* Deal Flow Tab */}
+                    {activeTab === "deal-flow" && dealFlowEnabled && (
+                        <DealFlowBoard
+                            clientId={clientId}
+                            onOpenLead={(contactId, email) => { void openLeadDetail({ contactId: String(contactId), email }); }}
+                        />
                     )}
 
                     {/* Follow-Ups Tab */}
