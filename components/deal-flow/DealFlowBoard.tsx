@@ -24,7 +24,6 @@ import { StageSettingsDialog } from "./StageSettingsDialog";
 import { useDealFlow } from "./useDealFlow";
 import type { Deal, DealPatch, DealStage } from "./types";
 
-const CLOSED_SINCE_DAYS = 60;
 const POLL_MS = 60_000;
 const GAP = 1000;
 
@@ -53,12 +52,15 @@ function topPosition(column: Deal[]): number {
 }
 
 export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
-    const { stages, deals, loading, loadedOnce, error, load, setDeals, patchDeal, removeDeal, saveStages } = useDealFlow(clientId);
+    const {
+        stages, deals, loading, loadedOnce, error, loadingMore,
+        load, refresh, loadMore, hasMore, setDeals, patchDeal, removeDeal, saveStages,
+    } = useDealFlow(clientId);
 
     const [activeDeal, setActiveDeal] = useState<Deal | null>(null);
     const [selectedDealId, setSelectedDealId] = useState<number | null>(null);
     const [stagesOpen, setStagesOpen] = useState(false);
-    // Won/Lost start collapsed; the user can override per column.
+    // Every column starts expanded; the user can collapse any of them.
     const [collapsedOverrides, setCollapsedOverrides] = useState<Map<number, boolean>>(new Map());
     const [search, setSearch] = useState("");
     const [campaignFilter, setCampaignFilter] = useState<string>("all");
@@ -70,7 +72,7 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
     }, [deals]);
     const snapshotRef = useRef<Deal[] | null>(null);
 
-    useIntervalWhenVisible(() => { void load(); }, POLL_MS, !activeDeal && !stagesOpen);
+    useIntervalWhenVisible(() => { void refresh(); }, POLL_MS, !activeDeal && !stagesOpen);
 
     const campaigns = useMemo(() => {
         const map = new Map<number, string>();
@@ -129,7 +131,7 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
     }, []);
 
     const isCollapsed = useCallback((stage: DealStage) => (
-        collapsedOverrides.get(stage.id) ?? stage.kind !== "open"
+        collapsedOverrides.get(stage.id) ?? false
     ), [collapsedOverrides]);
 
     const onDragOver = useCallback((event: DragOverEvent) => {
@@ -197,25 +199,22 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
 
         const patch: DealPatch = { position };
         if (original.stageId !== targetStageId) patch.stageId = targetStageId;
-        void patchDeal(dealId, patch, snapshot)
-            .then(() => { if (patch.stageId !== undefined) void load(); })
-            .catch((err: unknown) => {
-                toast.error(err instanceof Error ? err.message : "Could not move the deal.");
-            });
-    }, [load, patchDeal, setDeals, stageIdForOver]);
+        void patchDeal(dealId, patch, snapshot).catch((err: unknown) => {
+            toast.error(err instanceof Error ? err.message : "Could not move the deal.");
+        });
+    }, [patchDeal, setDeals, stageIdForOver]);
 
     const moveToStage = useCallback(async (deal: Deal, stageId: number) => {
         const column = sortByPosition(dealsRef.current.filter((d) => d.stageId === stageId && d.id !== deal.id));
         await patchDeal(deal.id, { stageId, position: topPosition(column) });
-        void load();
-    }, [load, patchDeal]);
+    }, [patchDeal]);
 
     const toggleCollapse = useCallback((stageId: number) => {
         const stage = stageById.get(stageId);
         if (!stage) return;
         setCollapsedOverrides((prev) => {
             const next = new Map(prev);
-            next.set(stageId, !(prev.get(stageId) ?? stage.kind !== "open"));
+            next.set(stageId, !(prev.get(stageId) ?? false));
             return next;
         });
     }, [stageById]);
@@ -232,7 +231,7 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
         return (
             <div className="df-state df-state--error">
                 {error}
-                <button type="button" className="df-btn" onClick={() => void load()} style={{ marginLeft: 12 }}>Retry</button>
+                <button type="button" className="df-btn" onClick={() => void load({ reconcile: true })} style={{ marginLeft: 12 }}>Retry</button>
             </div>
         );
     }
@@ -269,7 +268,7 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
                 </div>
                 <div className="df-toolbar__right">
                     <span className="df-hint">{openCount} open</span>
-                    <button type="button" className="df-btn df-btn--ghost" onClick={() => void load()} disabled={loading} title="Refresh">
+                    <button type="button" className="df-btn df-btn--ghost" onClick={() => void load({ reconcile: true })} disabled={loading} title="Refresh">
                         {loading ? "Refreshing…" : "Refresh"}
                     </button>
                     <button type="button" className="df-btn" onClick={() => setStagesOpen(true)}>Edit stages</button>
@@ -299,7 +298,9 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
                             stage={stage}
                             deals={dealsByStage.get(stage.id) ?? []}
                             collapsed={isCollapsed(stage)}
-                            closedSinceDays={CLOSED_SINCE_DAYS}
+                            hasMore={hasMore(stage)}
+                            loadingMore={loadingMore.has(stage.id)}
+                            onLoadMore={(id) => { void loadMore(id).catch((err: unknown) => toast.error(err instanceof Error ? err.message : "Could not load more.")); }}
                             onToggleCollapse={toggleCollapse}
                             onSelect={(deal) => setSelectedDealId(deal.id)}
                         />

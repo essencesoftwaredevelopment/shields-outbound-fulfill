@@ -8,7 +8,7 @@
 import express from 'express';
 import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
 import { resolveClientRow } from '../services/db/queries.js';
-import { loadBoard, updateDeal, createDeal, archiveDeal, saveStages } from '../services/db/dealFlow.js';
+import { loadBoard, listStageDeals, updateDeal, createDeal, archiveDeal, saveStages, DEFAULT_PAGE_SIZE } from '../services/db/dealFlow.js';
 
 const router = express.Router();
 
@@ -41,11 +41,29 @@ router.get('/clients/:clientId/deal-flow', requireAuth, async (req, res) => {
         setNoStoreHeaders(res);
         const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
-        const closedSinceDays = Number.parseInt(String(req.query.closedSinceDays || '60'), 10);
-        const board = await loadBoard(clientRow, { closedSinceDays });
+        const pageSize = Number.parseInt(String(req.query.limit || DEFAULT_PAGE_SIZE), 10);
+        // Reconcile (create deals for newly interested leads) on explicit loads; polls skip it.
+        const reconcile = String(req.query.reconcile ?? '1') !== '0';
+        const board = await loadBoard(clientRow, { pageSize, reconcile });
         res.json(board);
     } catch (error) {
         sendError(res, error, 'Failed to load deal flow.');
+    }
+});
+
+router.get('/clients/:clientId/deal-flow/stages/:stageId/deals', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+        const stageId = parseId(req.params.stageId);
+        if (!stageId) return res.status(400).json({ error: 'Valid stageId is required.' });
+        const beforeId = req.query.beforeId !== undefined ? parseId(req.query.beforeId) : null;
+        const limit = Number.parseInt(String(req.query.limit || DEFAULT_PAGE_SIZE), 10);
+        const page = await listStageDeals(clientRow, stageId, { beforeId, limit });
+        res.json(page);
+    } catch (error) {
+        sendError(res, error, 'Failed to load more deals.');
     }
 });
 

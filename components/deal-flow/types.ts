@@ -41,8 +41,15 @@ export interface Deal {
 export interface BoardResponse {
     stages: DealStage[];
     deals: Deal[];
-    closedSinceDays: number;
+    pageSize: number;
     reconciled: number;
+}
+
+export interface StagePageResponse {
+    deals: Deal[];
+    /** Rows older than the request cursor, this page included. */
+    remaining: number;
+    pageSize: number;
 }
 
 export interface DealPatch {

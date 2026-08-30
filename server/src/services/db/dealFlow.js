@@ -216,18 +216,36 @@ const DEAL_SELECT = `
     ) dr ON TRUE
 `;
 
-/**
- * Ensure default stages exist, reconcile new deals, and return the board.
- * Closed (won/lost) stages only return deals closed within `closedSinceDays`,
- * plus a total count per stage.
- */
-export async function loadBoard(clientRow, { closedSinceDays = 60 } = {}) {
-    const days = Number.isFinite(closedSinceDays) && closedSinceDays > 0 ? Math.min(closedSinceDays, 3650) : 60;
-    return withClientLock(clientRow.id, async (db) => {
-        await seedDefaultStages(db, clientRow);
-        const reconciled = await reconcileDeals(db, clientRow);
+export const DEFAULT_PAGE_SIZE = 25;
+export const MAX_PAGE_SIZE = 500;
 
-        const stagesResult = await db.query(
+function clampPageSize(value, fallback = DEFAULT_PAGE_SIZE) {
+    const n = Number.parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.min(n, MAX_PAGE_SIZE);
+}
+
+/**
+ * Ensure default stages exist, optionally reconcile new deals, and return the
+ * first `pageSize` deals of every stage (newest first) plus a total count per
+ * stage. Older deals are fetched per stage with listStageDeals().
+ */
+export async function loadBoard(clientRow, { pageSize = DEFAULT_PAGE_SIZE, reconcile = true } = {}) {
+    const limit = clampPageSize(pageSize);
+
+    // Write phase (first open / explicit refresh only): seed stages + reconcile
+    // under the per-client lock. Background polls skip this entirely so they
+    // cost two round trips, not a transaction.
+    let reconciled = 0;
+    if (reconcile) {
+        reconciled = await withClientLock(clientRow.id, async (db) => {
+            await seedDefaultStages(db, clientRow);
+            return reconcileDeals(db, clientRow);
+        });
+    }
+
+    const [stagesResult, dealsResult] = await Promise.all([
+        pool.query(
             `SELECT s.*, (
                  SELECT COUNT(*)::int FROM deals d
                  WHERE d.stage_id = s.id AND d.archived_at IS NULL
@@ -236,25 +254,65 @@ export async function loadBoard(clientRow, { closedSinceDays = 60 } = {}) {
              WHERE s.client_id = $1
              ORDER BY s.position, s.id`,
             [clientRow.id]
-        );
-
-        const dealsResult = await db.query(
-            `${DEAL_SELECT}
-             JOIN deal_stages s ON s.id = d.stage_id
-             WHERE d.client_id = $1
-               AND d.archived_at IS NULL
-               AND (s.kind = 'open' OR COALESCE(d.closed_at, d.stage_changed_at) >= NOW() - ($3::int * INTERVAL '1 day'))
+        ),
+        pool.query(
+            `WITH ranked AS (
+                 SELECT id, ROW_NUMBER() OVER (PARTITION BY stage_id ORDER BY position DESC, id DESC) AS rn
+                 FROM deals
+                 WHERE client_id = $1 AND archived_at IS NULL
+             )
+             ${DEAL_SELECT}
+             JOIN ranked r ON r.id = d.id
+             WHERE d.client_id = $1 AND r.rn <= $3
              ORDER BY d.stage_id, d.position DESC, d.id DESC`,
-            [clientRow.id, OPEN_DRAFT_STATUSES, days]
-        );
+            [clientRow.id, OPEN_DRAFT_STATUSES, limit]
+        )
+    ]);
 
-        return {
-            stages: stagesResult.rows.map(mapStage),
-            deals: dealsResult.rows.map(mapDeal),
-            closedSinceDays: days,
-            reconciled
-        };
-    });
+    // A client whose board has never been opened has no stages yet; seed once.
+    if (stagesResult.rows.length === 0 && !reconcile) {
+        return loadBoard(clientRow, { pageSize: limit, reconcile: true });
+    }
+
+    return {
+        stages: stagesResult.rows.map(mapStage),
+        deals: dealsResult.rows.map(mapDeal),
+        pageSize: limit,
+        reconciled
+    };
+}
+
+/**
+ * Next page of one stage, keyset-paginated on (position, id) descending.
+ * The cursor is the id of the last loaded deal; its position is looked up
+ * here rather than trusted from the client — float8 leaves the server with
+ * 15 significant digits, and epoch-based positions have exactly 15, so a
+ * client-supplied position can land on either side of the stored value.
+ */
+export async function listStageDeals(clientRow, stageId, { beforeId = null, limit = DEFAULT_PAGE_SIZE } = {}) {
+    const size = clampPageSize(limit);
+    const hasCursor = Number.isInteger(beforeId) && beforeId > 0;
+    // total_count via window function so one round trip serves both.
+    const result = await pool.query(
+        `${DEAL_SELECT.replace('SELECT d.id,', 'SELECT COUNT(*) OVER () AS total_count, d.id,')}
+         WHERE d.client_id = $1
+           AND d.stage_id = $3
+           AND d.archived_at IS NULL
+           AND (
+               $4::boolean = FALSE
+               OR (d.position, d.id) < (
+                   SELECT cur.position, cur.id FROM deals cur
+                   WHERE cur.id = $5::bigint AND cur.client_id = $1
+               )
+           )
+         ORDER BY d.position DESC, d.id DESC
+         LIMIT $6`,
+        [clientRow.id, OPEN_DRAFT_STATUSES, stageId, hasCursor, hasCursor ? beforeId : 0, size]
+    );
+    // COUNT(*) OVER () counts rows matching the cursor, i.e. the remaining tail;
+    // loaded-so-far is what the client already has, so total = loaded + remaining.
+    const remaining = result.rows.length ? Number(result.rows[0].total_count) : 0;
+    return { deals: result.rows.map(mapDeal), remaining, pageSize: size };
 }
 
 async function getDealRow(db, clientId, dealId) {
@@ -282,7 +340,9 @@ async function renormalizeIfNeeded(db, stageId) {
     const rows = result.rows;
     let needs = rows.some((r) => Number(r.position) <= 0);
     for (let i = 1; i < rows.length; i += 1) {
-        if (Math.abs(Number(rows[i].position) - Number(rows[i - 1].position)) < 1e-6) {
+        // 1e-3 (not 1e-6): float8 is shown to clients with 15 significant digits,
+        // so at ~1.8e9 anything closer than ~1e-5 is indistinguishable client-side.
+        if (Math.abs(Number(rows[i].position) - Number(rows[i - 1].position)) < 1e-3) {
             needs = true;
             break;
         }

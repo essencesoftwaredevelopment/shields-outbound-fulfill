@@ -13,6 +13,7 @@
 
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import { env } from './config/env.js';
 import { testConnection, pool } from './config/db.js';
 import jobsRouter from './routes/jobs.js';
@@ -39,6 +40,14 @@ app.set('etag', false);
 
 // Middleware
 app.use(cors());
+// gzip JSON responses (board payloads, lead lists). Skips event streams if any are added.
+app.use(compression({
+    filter: (req, res) => {
+        const type = String(res.getHeader('Content-Type') || '');
+        if (type.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+    }
+}));
 app.use('/api', (_req, res, next) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.set('Pragma', 'no-cache');

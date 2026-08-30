@@ -13,19 +13,21 @@ interface DealColumnProps {
     stage: DealStage;
     deals: Deal[];
     collapsed: boolean;
-    closedSinceDays: number;
+    hasMore: boolean;
+    loadingMore: boolean;
+    onLoadMore: (stageId: number) => void;
     onToggleCollapse: (stageId: number) => void;
     onSelect: (deal: Deal) => void;
 }
 
-export function DealColumn({ stage, deals, collapsed, closedSinceDays, onToggleCollapse, onSelect }: DealColumnProps) {
+export function DealColumn({ stage, deals, collapsed, hasMore, loadingMore, onLoadMore, onToggleCollapse, onSelect }: DealColumnProps) {
     const { setNodeRef, isOver } = useDroppable({
         id: stageDndId(stage.id),
         data: { type: "stage", stageId: stage.id },
     });
 
     const total = stage.totalCount ?? deals.length;
-    const isClosedKind = stage.kind !== "open";
+    const remaining = Math.max(0, total - deals.length);
 
     if (collapsed) {
         return (
@@ -56,17 +58,15 @@ export function DealColumn({ stage, deals, collapsed, closedSinceDays, onToggleC
                     <span className="df-col__name">{stage.name}</span>
                     <span className="df-col__count">{total}</span>
                 </span>
-                {isClosedKind && (
-                    <button
-                        type="button"
-                        className="df-col__collapse"
-                        onClick={() => onToggleCollapse(stage.id)}
-                        aria-label={`Collapse ${stage.name}`}
-                        title="Collapse"
-                    >
-                        ‹
-                    </button>
-                )}
+                <button
+                    type="button"
+                    className="df-col__collapse"
+                    onClick={() => onToggleCollapse(stage.id)}
+                    aria-label={`Collapse ${stage.name}`}
+                    title="Collapse"
+                >
+                    ‹
+                </button>
             </div>
             <SortableContext items={deals.map((d) => dealDndId(d.id))} strategy={verticalListSortingStrategy}>
                 <div className="df-col__body">
@@ -74,17 +74,20 @@ export function DealColumn({ stage, deals, collapsed, closedSinceDays, onToggleC
                         <DealCard key={deal.id} deal={deal} stage={stage} onSelect={onSelect} />
                     ))}
                     {deals.length === 0 && (
-                        <div className="df-col__empty">
-                            {isClosedKind && total > 0
-                                ? `No deals closed in the last ${closedSinceDays} days`
-                                : "Drop a lead here"}
-                        </div>
+                        <div className="df-col__empty">Drop a lead here</div>
+                    )}
+                    {hasMore && (
+                        <button
+                            type="button"
+                            className="df-btn df-btn--ghost df-col__more"
+                            onClick={() => onLoadMore(stage.id)}
+                            disabled={loadingMore}
+                        >
+                            {loadingMore ? "Loading…" : `Load more (${remaining} older)`}
+                        </button>
                     )}
                 </div>
             </SortableContext>
-            {isClosedKind && total > deals.length && (
-                <div className="df-col__foot">Showing last {closedSinceDays} days · {total} total</div>
-            )}
         </div>
     );
 }

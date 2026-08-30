@@ -2829,3 +2829,5 @@ body {
   .ff__row { grid-template-columns: 1fr; }
   .ff__row-control { align-items: flex-start; }
 }
+.df-col__more { width: 100%; font-size: 0.78rem; padding: 0.4rem; border: 1px dashed var(--app-border); flex: 0 0 auto; }
+.df-col__more:hover:not(:disabled) { border-color: var(--app-border-strong); }
