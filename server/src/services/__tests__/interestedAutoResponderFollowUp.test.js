@@ -14,7 +14,9 @@ import {
     withAuditUrlVars,
     buildVulcanShoppingAuditUrl,
     campaignUsesEssenceStorePreview,
-    resolveReplyPreviewBehavior
+    resolveReplyPreviewBehavior,
+    essenceStorePreviewToolDefinition,
+    ESSENCE_STORE_PREVIEW_TOOL_NAME
 } from '../interestedAutoResponder.js';
 
 test('isEligiblePostAutoresponderReplyCategory accepts positive and neutral while interested', () => {
@@ -204,7 +206,7 @@ test('campaignUsesEssenceStorePreview is opt-in via PREVIEW_URL or campaign name
     );
 });
 
-test('resolveReplyPreviewBehavior skips store preview for Cut Klaviyo Bill', () => {
+test('resolveReplyPreviewBehavior skips up-front store preview except Vulcan', () => {
     const essenceSettings = { shoppingAuditReply: false, useActiveFungiStoryUrl: false, skipPopupPreview: false };
     const klaviyo = resolveReplyPreviewBehavior({
         settings: essenceSettings,
@@ -214,15 +216,17 @@ test('resolveReplyPreviewBehavior skips store preview for Cut Klaviyo Bill', () 
     assert.equal(klaviyo.skipPopupPreview, true);
     assert.equal(klaviyo.systemPromptOwnsCta, true);
     assert.equal(klaviyo.usesEssenceStorePreview, false);
+    assert.equal(klaviyo.canGenerateEssenceStorePreview, false);
 
     const essenceAi = resolveReplyPreviewBehavior({
         settings: essenceSettings,
         campaignName: 'ESSENCE AI Email Generation',
         systemPrompt: 'Optional CTA: PREVIEW_URL'
     });
-    assert.equal(essenceAi.skipPopupPreview, false);
-    assert.equal(essenceAi.systemPromptOwnsCta, false);
+    assert.equal(essenceAi.skipPopupPreview, true);
+    assert.equal(essenceAi.systemPromptOwnsCta, true);
     assert.equal(essenceAi.usesEssenceStorePreview, true);
+    assert.equal(essenceAi.canGenerateEssenceStorePreview, true);
 
     const vulcan = resolveReplyPreviewBehavior({
         settings: { shoppingAuditReply: true, useActiveFungiStoryUrl: false, skipPopupPreview: false },
@@ -232,6 +236,15 @@ test('resolveReplyPreviewBehavior skips store preview for Cut Klaviyo Bill', () 
     assert.equal(vulcan.skipPopupPreview, false);
     assert.equal(vulcan.systemPromptOwnsCta, false);
     assert.equal(vulcan.useShoppingAuditReply, true);
+    assert.equal(vulcan.canGenerateEssenceStorePreview, false);
+});
+
+test('essenceStorePreviewToolDefinition exposes generate_store_preview', () => {
+    const tool = essenceStorePreviewToolDefinition();
+    assert.equal(tool.type, 'function');
+    assert.equal(tool.function.name, ESSENCE_STORE_PREVIEW_TOOL_NAME);
+    assert.equal(ESSENCE_STORE_PREVIEW_TOOL_NAME, 'generate_store_preview');
+    assert.match(tool.function.description, /only when the campaign system prompt says the preview is the right CTA/i);
 });
 
 test('buildVulcanShoppingAuditUrl matches the public audit page', () => {

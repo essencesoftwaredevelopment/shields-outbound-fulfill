@@ -404,8 +404,8 @@ export async function runPopupGeneration({ draftId, agencyId }) {
     const useShoppingAuditReply = preview.useShoppingAuditReply;
 
     if (preview.useActiveFungiStoryUrl || preview.skipPopupPreview) {
-        // Story URL is built from template vars at draft time; Cut Klaviyo Bill
-        // and other non-preview campaigns skip Essence popup generate entirely.
+        // Story URL is built from template vars at draft time. Essence AI Email
+        // Generation may still build a store preview later via generate_store_preview.
         return { auditPreviewUrl: null, auditDomain };
     }
 
@@ -512,7 +512,9 @@ export async function finalizeResearchDraft({
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: draft.research_brief || null,
         systemPromptOwnsCta: preview.systemPromptOwnsCta,
-        additionalInstructions
+        additionalInstructions,
+        essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
+        previewDomain: domain
     });
 
     const existingToken = String(draft.review_token || '').trim();

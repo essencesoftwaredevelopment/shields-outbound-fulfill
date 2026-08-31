@@ -399,34 +399,100 @@ export function campaignUsesEssenceStorePreview({ campaignName, systemPrompt } =
     return /essence\s*ai\s*email\s*generation/i.test(String(campaignName || ''));
 }
 
+export const ESSENCE_STORE_PREVIEW_TOOL_NAME = 'generate_store_preview';
+
+export function essenceStorePreviewToolDefinition() {
+    return {
+        type: 'function',
+        function: {
+            name: ESSENCE_STORE_PREVIEW_TOOL_NAME,
+            description: [
+                'Generate a live, on-brand list-growth popup preview for this prospect\'s store and return its URL.',
+                'Call this ONLY when the campaign system prompt says the preview is the right CTA:',
+                'the prospect explicitly asked to see a demo/preview before booking, or clearly prefers not to book a call yet.',
+                'Do NOT call this for a normal positive reply — those get the Calendly booking link from the system prompt.',
+                'Never invent a preview URL. If you do not call this tool, do not include a store preview link or output PREVIEW_URL.'
+            ].join(' '),
+            parameters: {
+                type: 'object',
+                properties: {
+                    reason: {
+                        type: 'string',
+                        description: 'Why this reply needs the live store preview instead of the Calendly booking link.'
+                    }
+                },
+                additionalProperties: false
+            }
+        }
+    };
+}
+
 /**
- * Decide whether this reply generates a store/audit preview and whether the
- * campaign prompt already owns the CTA (so generateDraftReply must not inject
- * the shopping-audit / Essence-AI-demo fallback).
+ * Decide whether this reply generates a store/audit preview up front, whether
+ * the draft model may call generate_store_preview, and whether the campaign
+ * prompt already owns the CTA.
  */
 export function resolveReplyPreviewBehavior({ settings, campaignName, systemPrompt } = {}) {
     const useShoppingAuditReply = Boolean(settings?.shoppingAuditReply);
     const useActiveFungiStoryUrl = Boolean(settings?.useActiveFungiStoryUrl);
     const usesEssenceStorePreview = campaignUsesEssenceStorePreview({ campaignName, systemPrompt });
+    const canGenerateEssenceStorePreview = usesEssenceStorePreview
+        && !useShoppingAuditReply
+        && !useActiveFungiStoryUrl
+        && !Boolean(settings?.skipPopupPreview);
+    // Never build the Essence popup up front — Essence AI Email Generation
+    // may request it via generate_store_preview during draft generation.
     const skipPopupPreview = Boolean(settings?.skipPopupPreview)
         || useActiveFungiStoryUrl
-        || (!useShoppingAuditReply && !usesEssenceStorePreview);
-    const systemPromptOwnsCta = useActiveFungiStoryUrl
-        || (!useShoppingAuditReply && !usesEssenceStorePreview);
+        || !useShoppingAuditReply;
+    const systemPromptOwnsCta = useActiveFungiStoryUrl || !useShoppingAuditReply;
     return {
         useShoppingAuditReply,
         useActiveFungiStoryUrl,
         usesEssenceStorePreview,
+        canGenerateEssenceStorePreview,
         skipPopupPreview,
         systemPromptOwnsCta
     };
 }
 
+function popupOptionsFromResearchBrief(researchBrief, domain) {
+    const brief = researchBrief && typeof researchBrief === 'object' ? researchBrief : null;
+    const estimatedVisitors = Number(brief?.estimatedVisitors);
+    const reviewCount = Number(brief?.reviewCount);
+    return {
+        domain: domain || null,
+        ...(brief?.industry ? { industry: brief.industry } : {}),
+        ...(brief?.company ? { companyName: brief.company } : {}),
+        ...(brief?.companyName && !brief?.company ? { companyName: brief.companyName } : {}),
+        ...(brief?.summary ? { researchSummary: brief.summary } : {}),
+        ...(Array.isArray(brief?.talkingPoints) && brief.talkingPoints.length
+            ? { talkingPoints: brief.talkingPoints }
+            : {}),
+        ...(Number.isFinite(estimatedVisitors) && estimatedVisitors > 0
+            ? { estimatedVisitors: Math.round(estimatedVisitors) }
+            : {}),
+        ...(Number.isFinite(reviewCount) && reviewCount > 0
+            ? { reviewCount: Math.round(reviewCount) }
+            : {})
+    };
+}
+
+function parseStorePreviewToolReason(rawArguments) {
+    if (!rawArguments) return null;
+    try {
+        const parsed = JSON.parse(rawArguments);
+        return asTrimmedText(parsed?.reason);
+    } catch {
+        return null;
+    }
+}
+
 /**
  * Build the lead-magnet / audit preview URL for an interested reply.
  * Shopping-audit agencies (Vulcan) → POST vulcan-shopping-audit /api/audits.
- * Active Fungi / campaigns without PREVIEW_URL → no Essence popup.
- * Essence AI Email Generation → legacy Essence popup-form generate.
+ * Essence AI Email Generation → not here; the draft model may call
+ * generate_store_preview. Everyone else → skip.
  */
 export async function generateAuditPreviewUrl(leadEmail, options = {}) {
     const domain = normalizeAuditDomain(options.domain) || domainFromLeadEmail(leadEmail);
@@ -439,7 +505,7 @@ export async function generateAuditPreviewUrl(leadEmail, options = {}) {
 
     if (options.skipPopupPreview) {
         console.log(
-            `[popup-form/generate] skipped — Essence AI store preview not used for this reply domain=${domain}`
+            `[popup-form/generate] skipped — no up-front Essence AI store preview domain=${domain}`
         );
         return null;
     }
@@ -803,9 +869,9 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
         instantlyKey: asTrimmedText(clientRow?.instantly_key),
         clientSlug: clientSlug || null,
         // Reply preview mechanism, NOT pipeline access: only agencies with
-        // features.autoresponderShoppingAudit (Vulcan) build audit previews.
-        // Essence list-growth popup is campaign-opt-in (PREVIEW_URL / ESSENCE
-        // AI Email Generation); Active Fungi and Cut Klaviyo Bill skip it.
+        // features.autoresponderShoppingAudit (Vulcan) build audit previews
+        // up front. Essence AI Email Generation may call generate_store_preview
+        // during draft generation; Cut Klaviyo Bill and Active Fungi never do.
         shoppingAuditReply: hasInterestedReplyShoppingAuditFeature(agencySettings),
         skipPopupPreview: POPUP_PREVIEW_SKIP_CLIENT_SLUGS.has(clientSlug),
         // Durable research workflow before drafting — per-agency opt-in.
@@ -863,12 +929,18 @@ export async function generateDraftReply({
     // produced by the interested-research workflow. Optional — inline drafts pass nothing.
     researchBrief = null,
     // When true, the campaign system prompt already owns the CTA (Active Fungi
-    // story URL, Cut Klaviyo Bill Calendly, etc.). Skip shopping-audit /
-    // Essence-AI-demo CTA instructions so they don't fight it.
+    // story URL, Cut Klaviyo Bill Calendly, Essence AI Calendly-default, etc.).
+    // Skip shopping-audit / Essence-AI-demo CTA instructions so they don't fight it.
     systemPromptOwnsCta = false,
-    additionalInstructions = null
+    additionalInstructions = null,
+    // Essence AI Email Generation: offer generate_store_preview instead of
+    // building the popup up front. The model calls it only when the campaign
+    // prompt says the preview is the right CTA.
+    essenceStorePreviewTool = false,
+    previewDomain = null
 }) {
-    const previewUrl = asTrimmedText(auditPreviewUrl) || asTrimmedText(essenceAiPreviewUrl);
+    let previewUrl = asTrimmedText(auditPreviewUrl) || asTrimmedText(essenceAiPreviewUrl);
+    const enablePreviewTool = Boolean(essenceStorePreviewTool) && !previewUrl;
     const client = new OpenAI({ apiKey: openaiKey });
     let ctaBlock = '';
     if (!systemPromptOwnsCta) {
@@ -881,51 +953,142 @@ export async function generateDraftReply({
         prependPriorityInstructions(systemPrompt, additionalInstructions),
         { auditUrl: previewUrl }
     );
-    const response = await client.chat.completions.create({
-        model: DEFAULT_MODEL,
-        // temperature: 0.6,
-        messages: [
-            { role: 'system', content: effectiveSystemPrompt },
-            {
-                role: 'user',
-                content: [
-                    `Campaign: ${campaignName || 'Unknown campaign'}`,
-                    `Lead email: ${leadEmail || 'Unknown lead'}`,
-                    `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
-                    previewUrl && !systemPromptOwnsCta
-                        ? [
-                            `Shopping audit URL: ${previewUrl}`,
-                            'Use that exact URL as the audit href. Never output AUDIT_URL, [AUDIT_URL], or any other placeholder in an <a> tag.'
-                        ].join('\n')
-                        : '',
-                    '',
-                    'Write a plain-text reply to the interested lead.',
-                    'Do not include a subject line.',
-                    'Do not use markdown.',
-                    'Preserve the conversational context from the lead message below.',
-                    '',
-                    ctaBlock,
-                    '',
-                    briefBlock
-                        ? [
-                            'Research brief on the lead\'s company (verified via web research).',
-                            'Use it to make the reply specific to their business — reference at most',
-                            'one or two of these facts naturally; never invent facts beyond the brief:',
-                            briefBlock,
-                            ''
-                        ].join('\n')
-                        : '',
-                    'Lead message/thread context:',
-                    previousLeadMessage || '(no message text available)'
-                ].filter(Boolean).join('\n')
-            }
-        ]
+    const userContent = [
+        `Campaign: ${campaignName || 'Unknown campaign'}`,
+        `Lead email: ${leadEmail || 'Unknown lead'}`,
+        `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
+        previewUrl && !systemPromptOwnsCta
+            ? [
+                `Shopping audit URL: ${previewUrl}`,
+                'Use that exact URL as the audit href. Never output AUDIT_URL, [AUDIT_URL], or any other placeholder in an <a> tag.'
+            ].join('\n')
+            : '',
+        enablePreviewTool
+            ? [
+                `A ${ESSENCE_STORE_PREVIEW_TOOL_NAME} tool is available.`,
+                'Call it only when the campaign system prompt says to send the store preview',
+                '(they asked to see a demo/preview, or are not ready to book).',
+                'After it returns a URL, use that exact href in place of PREVIEW_URL.',
+                'If you do not call the tool, use the Calendly CTA from the system prompt',
+                'and do not mention a store preview or output PREVIEW_URL.'
+            ].join(' ')
+            : '',
+        '',
+        'Write a plain-text reply to the interested lead.',
+        'Do not include a subject line.',
+        'Do not use markdown.',
+        'Preserve the conversational context from the lead message below.',
+        '',
+        ctaBlock,
+        '',
+        briefBlock
+            ? [
+                'Research brief on the lead\'s company (verified via web research).',
+                'Use it to make the reply specific to their business — reference at most',
+                'one or two of these facts naturally; never invent facts beyond the brief:',
+                briefBlock,
+                ''
+            ].join('\n')
+            : '',
+        'Lead message/thread context:',
+        previousLeadMessage || '(no message text available)'
+    ].filter(Boolean).join('\n');
+
+    const messages = [
+        { role: 'system', content: effectiveSystemPrompt },
+        { role: 'user', content: userContent }
+    ];
+    const tools = enablePreviewTool ? [essenceStorePreviewToolDefinition()] : null;
+    const response = await runDraftChat({
+        client,
+        messages,
+        tools,
+        leadEmail,
+        previewDomain,
+        researchBrief,
+        onPreviewUrl: (url) => {
+            previewUrl = url;
+        }
     });
     const content = response.choices?.[0]?.message?.content || '';
     return {
         model: response.model || DEFAULT_MODEL,
-        renderedText: applyReplyLinkPlaceholders(String(content).trim(), { auditUrl: previewUrl })
+        renderedText: applyReplyLinkPlaceholders(String(content).trim(), { auditUrl: previewUrl }),
+        previewUrl: previewUrl || null
     };
+}
+
+async function runDraftChat({
+    client,
+    messages,
+    tools,
+    leadEmail,
+    previewDomain,
+    researchBrief,
+    onPreviewUrl
+}) {
+    const first = await client.chat.completions.create({
+        model: DEFAULT_MODEL,
+        messages,
+        ...(tools ? { tools, tool_choice: 'auto', parallel_tool_calls: false } : {})
+    });
+    if (!tools) return first;
+
+    const message = first.choices?.[0]?.message;
+    const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+    if (!toolCalls.length) return first;
+
+    messages.push({
+        role: 'assistant',
+        content: message.content ?? null,
+        tool_calls: toolCalls
+    });
+
+    let generatedPreviewUrl = null;
+    for (const call of toolCalls) {
+        const toolCallId = call?.id;
+        const name = call?.function?.name;
+        if (!toolCallId) continue;
+        if (name !== ESSENCE_STORE_PREVIEW_TOOL_NAME) {
+            messages.push({
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: JSON.stringify({ error: 'unknown_tool' })
+            });
+            continue;
+        }
+        if (!generatedPreviewUrl) {
+            const domain = normalizeAuditDomain(previewDomain) || domainFromLeadEmail(leadEmail);
+            const reason = parseStorePreviewToolReason(call.function?.arguments);
+            console.log(
+                `[interested-autoresponder] ${ESSENCE_STORE_PREVIEW_TOOL_NAME} domain=${domain || 'none'}`
+                + (reason ? ` reason=${reason}` : '')
+            );
+            generatedPreviewUrl = domain
+                ? await callPopupFormGenerate(leadEmail, popupOptionsFromResearchBrief(researchBrief, domain))
+                : null;
+            if (generatedPreviewUrl) onPreviewUrl?.(generatedPreviewUrl);
+        }
+        messages.push({
+            role: 'tool',
+            tool_call_id: toolCallId,
+            content: JSON.stringify(
+                generatedPreviewUrl
+                    ? {
+                        previewUrl: generatedPreviewUrl,
+                        instruction: 'Use this exact URL in place of PREVIEW_URL. Do not output the placeholder.'
+                    }
+                    : {
+                        error: 'Preview generation failed. Do not invent a URL. Use the Calendly booking link from the system prompt instead.'
+                    }
+            )
+        });
+    }
+
+    return client.chat.completions.create({
+        model: DEFAULT_MODEL,
+        messages
+    });
 }
 
 export async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false }) {
@@ -1439,22 +1602,24 @@ export async function createInterestedAutoResponderDraftFromEvent({
             const useShoppingAuditReply = preview.useShoppingAuditReply;
             const useActiveFungiStoryUrl = preview.useActiveFungiStoryUrl;
             const [auditPreviewUrl, resolvedTemplateVars] = await Promise.all([
-                generateAuditPreviewUrl(normalizedLeadEmail, {
-                    domain: auditDomain,
-                    useVulcanShoppingAudit: useShoppingAuditReply,
-                    skipPopupPreview: preview.skipPopupPreview,
-                    // Signal context only for shopping-audit reply agencies: passing it
-                    // for anyone else flips the popup-form call into the shopping-
-                    // preview ad, which list-growth agencies must never send.
-                    ...(useShoppingAuditReply
-                        ? {
-                            signalEmissionId: signalRow.signal_emission_id || null,
-                            signalType: signalRow.signal_type || null,
-                            observed: signalRow.observed || null,
-                            expected: signalRow.expected || null
-                        }
-                        : {})
-                }),
+                preview.skipPopupPreview
+                    ? Promise.resolve(null)
+                    : generateAuditPreviewUrl(normalizedLeadEmail, {
+                        domain: auditDomain,
+                        useVulcanShoppingAudit: useShoppingAuditReply,
+                        skipPopupPreview: preview.skipPopupPreview,
+                        // Signal context only for shopping-audit reply agencies: passing it
+                        // for anyone else flips the popup-form call into the shopping-
+                        // preview ad, which list-growth agencies must never send.
+                        ...(useShoppingAuditReply
+                            ? {
+                                signalEmissionId: signalRow.signal_emission_id || null,
+                                signalType: signalRow.signal_type || null,
+                                observed: signalRow.observed || null,
+                                expected: signalRow.expected || null
+                            }
+                            : {})
+                    }),
                 resolveTemplateVars(client, contactId, campaignId, {
                     clientId,
                     emailAccount: eaccount
@@ -1476,7 +1641,9 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 previousLeadMessage,
                 // Never feed the Active Fungi story URL into the shopping-audit CTA path.
                 auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
-                systemPromptOwnsCta: preview.systemPromptOwnsCta
+                systemPromptOwnsCta: preview.systemPromptOwnsCta,
+                essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
+                previewDomain: auditDomain
             });
         } catch (error) {
             const failedDraft = await insertDraftRow(client, {
@@ -1956,19 +2123,21 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
     const useActiveFungiStoryUrl = preview.useActiveFungiStoryUrl;
 
     const [auditPreviewUrl, resolvedTemplateVars] = await Promise.all([
-        generateAuditPreviewUrl(draft.lead_email, {
-            domain: auditDomain,
-            useVulcanShoppingAudit: useShoppingAuditReply,
-            skipPopupPreview: preview.skipPopupPreview,
-            ...(useShoppingAuditReply
-                ? {
-                    signalEmissionId: signalRow.signal_emission_id || null,
-                    signalType: signalRow.signal_type || null,
-                    observed: signalRow.observed || null,
-                    expected: signalRow.expected || null
-                }
-                : {})
-        }),
+        preview.skipPopupPreview
+            ? Promise.resolve(null)
+            : generateAuditPreviewUrl(draft.lead_email, {
+                domain: auditDomain,
+                useVulcanShoppingAudit: useShoppingAuditReply,
+                skipPopupPreview: preview.skipPopupPreview,
+                ...(useShoppingAuditReply
+                    ? {
+                        signalEmissionId: signalRow.signal_emission_id || null,
+                        signalType: signalRow.signal_type || null,
+                        observed: signalRow.observed || null,
+                        expected: signalRow.expected || null
+                    }
+                    : {})
+            }),
         resolveTemplateVars(pool, draft.contact_id, draft.campaign_id, {
             clientId: draft.client_id,
             emailAccount: draft.eaccount
@@ -1989,7 +2158,9 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: null,
         systemPromptOwnsCta: preview.systemPromptOwnsCta,
-        additionalInstructions
+        additionalInstructions,
+        essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
+        previewDomain: auditDomain
     });
 
     const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();

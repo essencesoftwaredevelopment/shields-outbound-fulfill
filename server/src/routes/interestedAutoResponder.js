@@ -269,6 +269,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                     campaignName: prompt.campaign_name,
                     systemPrompt: prompt.system_prompt
                 });
+                if (preview.skipPopupPreview) return null;
                 return generateAuditPreviewUrl(contact.email, {
                     domain: contact.company_domain || null,
                     useVulcanShoppingAudit: preview.useShoppingAuditReply,
@@ -313,7 +314,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         // Substitute template variables in the system prompt
         const renderedSystemPrompt = renderTemplate(prompt.system_prompt, templateVars);
 
-        const { renderedText, model } = await generateDraftReply({
+        const { renderedText, model, previewUrl: generatedPreviewUrl } = await generateDraftReply({
             openaiKey,
             systemPrompt: renderedSystemPrompt,
             campaignName: prompt.campaign_name,
@@ -321,7 +322,9 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             threadSubject,
             previousLeadMessage,
             auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
-            systemPromptOwnsCta: preview.systemPromptOwnsCta
+            systemPromptOwnsCta: preview.systemPromptOwnsCta,
+            essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
+            previewDomain: contact.company_domain || null
         });
 
         // Create a real pending_review draft so we can send a clickable review link
@@ -359,7 +362,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             reviewUrl,
             previewUrl: useActiveFungiStoryUrl
                 ? (templateVars.story_url || null)
-                : (auditPreviewUrl || null),
+                : (generatedPreviewUrl || auditPreviewUrl || null),
             debug: {
                 lead: {
                     email: contact.email,
