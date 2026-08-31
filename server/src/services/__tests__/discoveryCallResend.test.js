@@ -137,6 +137,20 @@ test('buildDiscoveryCallBookedPayload: maps unrouted industries to fashion fallb
     assert.equal(built.eventPayload.industry, 'fashion_apparel');
 });
 
+test('buildDiscoveryCallBookedPayload: keeps a live electronics industry', () => {
+    const built = buildDiscoveryCallBookedPayload({
+        email: 'a@b.com',
+        invitee: { first_name: 'A', last_name: 'B', timezone: 'UTC' },
+        scheduledEvent: {
+            location: { join_url: 'https://calendly.com/events/x/google_meet' }
+        },
+        startTime: '2026-08-13T18:00:00.000Z',
+        industry: 'electronics',
+        now: new Date('2026-08-12T15:00:00.000Z')
+    });
+    assert.equal(built.eventPayload.industry, 'electronics');
+});
+
 test('buildDiscoveryCallBookedPayload: keeps a live food industry', () => {
     const built = buildDiscoveryCallBookedPayload({
         email: 'a@b.com',

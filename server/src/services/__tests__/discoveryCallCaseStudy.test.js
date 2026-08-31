@@ -10,6 +10,8 @@ test('resolveCaseStudyIndustry: keeps a live industry', () => {
     assert.equal(resolveCaseStudyIndustry('Beauty Skincare'), 'beauty_skincare');
     assert.equal(resolveCaseStudyIndustry('food_beverage'), 'food_beverage');
     assert.equal(resolveCaseStudyIndustry('Food Beverage'), 'food_beverage');
+    assert.equal(resolveCaseStudyIndustry('electronics'), 'electronics');
+    assert.equal(resolveCaseStudyIndustry('Electronics'), 'electronics');
 });
 
 test('resolveCaseStudyIndustry: maps stub industries to fashion fallback', () => {

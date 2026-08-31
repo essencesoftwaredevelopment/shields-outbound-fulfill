@@ -25,7 +25,8 @@ export const CASE_STUDY_FALLBACK_INDUSTRY = 'fashion_apparel';
 /** Templates that currently have real case-study copy, not Aer stubs. */
 export const CASE_STUDY_LIVE_INDUSTRIES = Object.freeze([
     'beauty_skincare',
-    'food_beverage'
+    'food_beverage',
+    'electronics'
 ]);
 
 export const CASE_STUDY_TEMPLATES = Object.freeze({
@@ -43,7 +44,8 @@ const LIVE_INDUSTRY_SET = new Set(CASE_STUDY_LIVE_INDUSTRIES);
 
 /**
  * Always returns a code the automation can send a real case study for.
- * Beauty → Aer. Food → Linear Bar. Anything else, including missing, → Spicy Wear.
+ * Beauty → Aer. Food → Linear Bar. Electronics → Custom Puddle Lights.
+ * Anything else, including missing, → Spicy Wear.
  */
 export function resolveCaseStudyIndustry(raw) {
     const normalized = normalizeResearchIndustry(raw);
