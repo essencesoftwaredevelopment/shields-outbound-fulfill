@@ -8,10 +8,15 @@ const MAX_RANGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const ESSENCE_AI_DEMO_EVENT_TYPE_URI = `${EVENT_TYPE_URI_PREFIX}${ESSENCE_AI_DEMO_EVENT_TYPE_ID}`;
 
-function httpError(statusCode, message) {
+export function calendlyHttpError(statusCode, message, details) {
     const error = new Error(message);
     error.statusCode = statusCode;
+    if (details !== undefined) error.details = details;
     return error;
+}
+
+function httpError(statusCode, message, details) {
+    return calendlyHttpError(statusCode, message, details);
 }
 
 export function toEventTypeUri(eventType) {
