@@ -13,12 +13,22 @@ import { useJobStageCounts } from "@/lib/hooks/useJobStageCounts";
 import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAuth } from "@/hooks/use-auth";
 import { useAgencyId } from "@/lib/hooks/useAgencyId";
+import dynamic from "next/dynamic";
 import { apiFetch, apiJson } from "@/lib/api/http";
-import { DealFlowBoard } from "@/components/deal-flow/DealFlowBoard";
 import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
-import InstantlyEventAnalyticsChart from "@/components/instantly-event-analytics-chart";
+
+// Loaded lazily so dnd-kit and recharts stay out of this route's initial chunk;
+// both only render behind a tab/section, so first paint never needs them.
+const DealFlowBoard = dynamic(
+    () => import("@/components/deal-flow/DealFlowBoard").then((mod) => mod.DealFlowBoard),
+    { ssr: false },
+);
+const InstantlyEventAnalyticsChart = dynamic(
+    () => import("@/components/instantly-event-analytics-chart"),
+    { ssr: false },
+);
 import { CalendarCheck, Download, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
 import {
     ALL_PIPELINE_STAGE_KEYS,

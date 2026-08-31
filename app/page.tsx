@@ -2,6 +2,7 @@
 
 import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
+import Link from "next/link";
 import { ArrowRight, Plus, User } from "lucide-react";
 import { useAuth } from "@/hooks/use-auth";
 import { getAccessToken } from "@/lib/supabase/session";
@@ -490,10 +491,10 @@ function HomeContent() {
             </Card>
           ) : (
             clients.map((client) => (
+              // Link (not router.push) so Next prefetches the route chunk while the card is in view.
+              <Link key={client.id} href={`/clients/${client.id}`} className="focus-visible:outline-none">
               <Card
-                key={client.id}
-                className="cursor-pointer transition-colors hover:bg-muted/40"
-                onClick={() => router.push(`/clients/${client.id}`)}
+                className="h-full cursor-pointer transition-colors hover:bg-muted/40"
               >
                 <CardHeader>
                   <div className="flex items-start gap-3">
@@ -522,6 +523,7 @@ function HomeContent() {
                   </Button>
                 </CardFooter>
               </Card>
+              </Link>
             ))
           )}
         </div>
