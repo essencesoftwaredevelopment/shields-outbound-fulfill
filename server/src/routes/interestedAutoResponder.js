@@ -15,6 +15,7 @@ import {
     cancelStalePendingReviewDraftsForClient,
     applyActiveFungiStoryUrlToTemplateVars,
     INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES,
+    resolveReplyPreviewBehavior,
     withAuditUrlVars
 } from '../services/interestedAutoResponder.js';
 import { resolveTemplateVars, renderTemplate } from '../services/followUpSender.js';
@@ -241,7 +242,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
 
         // Fetch thread context in parallel; template vars resolved after we know the eaccount
         const settingsPromise = fetchAgencyAndClientSettings(req.agencyId, req.params.clientId);
-        const [{ openaiKey, ntfyTopic, useActiveFungiStoryUrl }, threadResult, auditPreviewUrl] = await Promise.all([
+        const [settings, threadResult, auditPreviewUrl] = await Promise.all([
             settingsPromise,
             pool.query(
                 `SELECT
@@ -262,12 +263,25 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                  LIMIT 5`,
                 [contactId, prompt.campaign_id]
             ),
-            settingsPromise.then((settings) => generateAuditPreviewUrl(contact.email, {
-                domain: contact.company_domain || null,
-                useVulcanShoppingAudit: Boolean(settings.shoppingAuditReply),
-                skipPopupPreview: Boolean(settings.skipPopupPreview)
-            }))
+            settingsPromise.then((loadedSettings) => {
+                const preview = resolveReplyPreviewBehavior({
+                    settings: loadedSettings,
+                    campaignName: prompt.campaign_name,
+                    systemPrompt: prompt.system_prompt
+                });
+                return generateAuditPreviewUrl(contact.email, {
+                    domain: contact.company_domain || null,
+                    useVulcanShoppingAudit: preview.useShoppingAuditReply,
+                    skipPopupPreview: preview.skipPopupPreview
+                });
+            })
         ]);
+        const { openaiKey, ntfyTopic, useActiveFungiStoryUrl } = settings;
+        const preview = resolveReplyPreviewBehavior({
+            settings,
+            campaignName: prompt.campaign_name,
+            systemPrompt: prompt.system_prompt
+        });
 
         // Derive eaccount from most recent thread event that has one
         const previewEaccount = threadResult.rows.find(r => r.email_account)?.email_account || null;
@@ -307,7 +321,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             threadSubject,
             previousLeadMessage,
             auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
-            systemPromptOwnsCta: Boolean(useActiveFungiStoryUrl)
+            systemPromptOwnsCta: preview.systemPromptOwnsCta
         });
 
         // Create a real pending_review draft so we can send a clickable review link

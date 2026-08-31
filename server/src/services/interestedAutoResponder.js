@@ -387,10 +387,46 @@ export async function callPopupFormGenerate(leadEmail, options = {}) {
 }
 
 /**
+ * Essence list-growth store preview (`preview-popup`) is campaign-opt-in.
+ * "ESSENCE AI Email Generation" uses a `PREVIEW_URL` placeholder. Other
+ * Essence Retention campaigns (e.g. Cut Klaviyo Bill) own their own Calendly
+ * CTA and must not generate or inject a store preview.
+ */
+export function campaignUsesEssenceStorePreview({ campaignName, systemPrompt } = {}) {
+    const prompt = String(systemPrompt || '');
+    if (/\bPREVIEW_URL\b/.test(prompt)) return true;
+    if (/essence-ai\.app\/(?:preview-popup|shopping-preview|preview)\b/i.test(prompt)) return true;
+    return /essence\s*ai\s*email\s*generation/i.test(String(campaignName || ''));
+}
+
+/**
+ * Decide whether this reply generates a store/audit preview and whether the
+ * campaign prompt already owns the CTA (so generateDraftReply must not inject
+ * the shopping-audit / Essence-AI-demo fallback).
+ */
+export function resolveReplyPreviewBehavior({ settings, campaignName, systemPrompt } = {}) {
+    const useShoppingAuditReply = Boolean(settings?.shoppingAuditReply);
+    const useActiveFungiStoryUrl = Boolean(settings?.useActiveFungiStoryUrl);
+    const usesEssenceStorePreview = campaignUsesEssenceStorePreview({ campaignName, systemPrompt });
+    const skipPopupPreview = Boolean(settings?.skipPopupPreview)
+        || useActiveFungiStoryUrl
+        || (!useShoppingAuditReply && !usesEssenceStorePreview);
+    const systemPromptOwnsCta = useActiveFungiStoryUrl
+        || (!useShoppingAuditReply && !usesEssenceStorePreview);
+    return {
+        useShoppingAuditReply,
+        useActiveFungiStoryUrl,
+        usesEssenceStorePreview,
+        skipPopupPreview,
+        systemPromptOwnsCta
+    };
+}
+
+/**
  * Build the lead-magnet / audit preview URL for an interested reply.
  * Shopping-audit agencies (Vulcan) → POST vulcan-shopping-audit /api/audits.
- * Active Fungi → no Essence popup (story URL is built separately via template vars).
- * Everyone else → legacy Essence popup-form generate.
+ * Active Fungi / campaigns without PREVIEW_URL → no Essence popup.
+ * Essence AI Email Generation → legacy Essence popup-form generate.
  */
 export async function generateAuditPreviewUrl(leadEmail, options = {}) {
     const domain = normalizeAuditDomain(options.domain) || domainFromLeadEmail(leadEmail);
@@ -403,7 +439,7 @@ export async function generateAuditPreviewUrl(leadEmail, options = {}) {
 
     if (options.skipPopupPreview) {
         console.log(
-            `[popup-form/generate] skipped — client opted out of Essence AI popup preview domain=${domain}`
+            `[popup-form/generate] skipped — Essence AI store preview not used for this reply domain=${domain}`
         );
         return null;
     }
@@ -445,7 +481,9 @@ export function applyReplyLinkPlaceholders(text, { auditUrl } = {}) {
     let out = source
         .replace(/https?:\/\/[^\s"'<>]*\/interested-autoresponder\/\[?AUDIT_URL\]?/gi, url)
         .replace(/\[AUDIT_URL\]/g, url)
-        .replace(/AUDIT_URL/g, url);
+        .replace(/AUDIT_URL/g, url)
+        .replace(/\[PREVIEW_URL\]/g, url)
+        .replace(/\bPREVIEW_URL\b/g, url);
     // Prompt copies sometimes emit <a href=""> when no audit URL was supplied.
     if (!/vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app/i.test(out)) {
         out = out.replace(/<a(\s+)href=(["'])\2/i, `<a$1href=$2${url}$2`);
@@ -765,9 +803,9 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
         instantlyKey: asTrimmedText(clientRow?.instantly_key),
         clientSlug: clientSlug || null,
         // Reply preview mechanism, NOT pipeline access: only agencies with
-        // features.autoresponderShoppingAudit (Vulcan) build audit previews;
-        // everyone else gets the legacy list-growth popup (unless the client
-        // is explicitly opted out — e.g. Active Fungi).
+        // features.autoresponderShoppingAudit (Vulcan) build audit previews.
+        // Essence list-growth popup is campaign-opt-in (PREVIEW_URL / ESSENCE
+        // AI Email Generation); Active Fungi and Cut Klaviyo Bill skip it.
         shoppingAuditReply: hasInterestedReplyShoppingAuditFeature(agencySettings),
         skipPopupPreview: POPUP_PREVIEW_SKIP_CLIENT_SLUGS.has(clientSlug),
         // Durable research workflow before drafting — per-agency opt-in.
@@ -824,8 +862,9 @@ export async function generateDraftReply({
     // risks, sources, reviewCount, estimatedVisitors })
     // produced by the interested-research workflow. Optional — inline drafts pass nothing.
     researchBrief = null,
-    // When true, the system prompt already owns the CTA (Active Fungi story URL).
-    // Skip shopping-audit / Essence Calendly CTA instructions so they don't fight it.
+    // When true, the campaign system prompt already owns the CTA (Active Fungi
+    // story URL, Cut Klaviyo Bill Calendly, etc.). Skip shopping-audit /
+    // Essence-AI-demo CTA instructions so they don't fight it.
     systemPromptOwnsCta = false,
     additionalInstructions = null
 }) {
@@ -1392,13 +1431,18 @@ export async function createInterestedAutoResponderDraftFromEvent({
             const signalRow = await resolveContactSignalContext(client, contactId);
             const auditDomain = normalizeAuditDomain(signalRow.company_domain)
                 || domainFromLeadEmail(normalizedLeadEmail);
-            const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);
-            const useActiveFungiStoryUrl = Boolean(settings.useActiveFungiStoryUrl);
+            const preview = resolveReplyPreviewBehavior({
+                settings,
+                campaignName: promptConfig.campaign_name,
+                systemPrompt: promptConfig.system_prompt
+            });
+            const useShoppingAuditReply = preview.useShoppingAuditReply;
+            const useActiveFungiStoryUrl = preview.useActiveFungiStoryUrl;
             const [auditPreviewUrl, resolvedTemplateVars] = await Promise.all([
                 generateAuditPreviewUrl(normalizedLeadEmail, {
                     domain: auditDomain,
                     useVulcanShoppingAudit: useShoppingAuditReply,
-                    skipPopupPreview: Boolean(settings.skipPopupPreview),
+                    skipPopupPreview: preview.skipPopupPreview,
                     // Signal context only for shopping-audit reply agencies: passing it
                     // for anyone else flips the popup-form call into the shopping-
                     // preview ad, which list-growth agencies must never send.
@@ -1432,7 +1476,7 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 previousLeadMessage,
                 // Never feed the Active Fungi story URL into the shopping-audit CTA path.
                 auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
-                systemPromptOwnsCta: useActiveFungiStoryUrl
+                systemPromptOwnsCta: preview.systemPromptOwnsCta
             });
         } catch (error) {
             const failedDraft = await insertDraftRow(client, {
@@ -1903,14 +1947,19 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
     const signalRow = await resolveContactSignalContext(pool, draft.contact_id);
     const auditDomain = normalizeAuditDomain(signalRow.company_domain)
         || domainFromLeadEmail(draft.lead_email);
-    const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);
-    const useActiveFungiStoryUrl = Boolean(settings.useActiveFungiStoryUrl);
+    const preview = resolveReplyPreviewBehavior({
+        settings,
+        campaignName: promptConfig.campaign_name,
+        systemPrompt: promptConfig.system_prompt
+    });
+    const useShoppingAuditReply = preview.useShoppingAuditReply;
+    const useActiveFungiStoryUrl = preview.useActiveFungiStoryUrl;
 
     const [auditPreviewUrl, resolvedTemplateVars] = await Promise.all([
         generateAuditPreviewUrl(draft.lead_email, {
             domain: auditDomain,
             useVulcanShoppingAudit: useShoppingAuditReply,
-            skipPopupPreview: Boolean(settings.skipPopupPreview),
+            skipPopupPreview: preview.skipPopupPreview,
             ...(useShoppingAuditReply
                 ? {
                     signalEmissionId: signalRow.signal_emission_id || null,
@@ -1939,7 +1988,7 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
         previousLeadMessage: draft.previous_lead_message,
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: null,
-        systemPromptOwnsCta: useActiveFungiStoryUrl,
+        systemPromptOwnsCta: preview.systemPromptOwnsCta,
         additionalInstructions
     });
 

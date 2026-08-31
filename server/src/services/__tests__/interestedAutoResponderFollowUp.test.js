@@ -12,7 +12,9 @@ import {
     resolveLeadWebsite,
     applyReplyLinkPlaceholders,
     withAuditUrlVars,
-    buildVulcanShoppingAuditUrl
+    buildVulcanShoppingAuditUrl,
+    campaignUsesEssenceStorePreview,
+    resolveReplyPreviewBehavior
 } from '../interestedAutoResponder.js';
 
 test('isEligiblePostAutoresponderReplyCategory accepts positive and neutral while interested', () => {
@@ -147,6 +149,11 @@ test('applyReplyLinkPlaceholders swaps AUDIT_URL tokens for the real audit href'
         applyReplyLinkPlaceholders('<p><a href="">take a look</a></p>', { auditUrl }),
         `<p><a href="${auditUrl}">take a look</a></p>`
     );
+    const essencePreview = 'https://essence-ai.app/preview-popup?domain=nomad.coffee';
+    assert.equal(
+        applyReplyLinkPlaceholders('<a href="PREVIEW_URL">Take a look here</a>', { auditUrl: essencePreview }),
+        `<a href="${essencePreview}">Take a look here</a>`
+    );
 });
 
 test('applyReplyLinkPlaceholders leaves real vulcan audit links untouched', () => {
@@ -164,6 +171,67 @@ test('withAuditUrlVars adds audit_url for {{audit_url}} prompt substitution', ()
         }
     );
     assert.deepEqual(withAuditUrlVars({ first_name: 'Martha' }, null), { first_name: 'Martha' });
+});
+
+test('campaignUsesEssenceStorePreview is opt-in via PREVIEW_URL or campaign name', () => {
+    assert.equal(
+        campaignUsesEssenceStorePreview({
+            campaignName: 'ESSENCE AI Email Generation',
+            systemPrompt: 'Send PREVIEW_URL only if they ask to see it first.'
+        }),
+        true
+    );
+    assert.equal(
+        campaignUsesEssenceStorePreview({
+            campaignName: 'ESSENCE AI Email Generation',
+            systemPrompt: 'Book a call. No preview placeholder.'
+        }),
+        true
+    );
+    assert.equal(
+        campaignUsesEssenceStorePreview({
+            campaignName: 'Cut Klaviyo Bill',
+            systemPrompt: 'Default CTA is Calendly. Use PREFILLED_CALENDLY_URL. No store preview.'
+        }),
+        false
+    );
+    assert.equal(
+        campaignUsesEssenceStorePreview({
+            campaignName: 'Cut Klaviyo Bill',
+            systemPrompt: 'https://calendly.com/essencesoftwaredevelopment/essence-retention-meeting'
+        }),
+        false
+    );
+});
+
+test('resolveReplyPreviewBehavior skips store preview for Cut Klaviyo Bill', () => {
+    const essenceSettings = { shoppingAuditReply: false, useActiveFungiStoryUrl: false, skipPopupPreview: false };
+    const klaviyo = resolveReplyPreviewBehavior({
+        settings: essenceSettings,
+        campaignName: 'Cut Klaviyo Bill',
+        systemPrompt: 'Use PREFILLED_CALENDLY_URL as the only CTA.'
+    });
+    assert.equal(klaviyo.skipPopupPreview, true);
+    assert.equal(klaviyo.systemPromptOwnsCta, true);
+    assert.equal(klaviyo.usesEssenceStorePreview, false);
+
+    const essenceAi = resolveReplyPreviewBehavior({
+        settings: essenceSettings,
+        campaignName: 'ESSENCE AI Email Generation',
+        systemPrompt: 'Optional CTA: PREVIEW_URL'
+    });
+    assert.equal(essenceAi.skipPopupPreview, false);
+    assert.equal(essenceAi.systemPromptOwnsCta, false);
+    assert.equal(essenceAi.usesEssenceStorePreview, true);
+
+    const vulcan = resolveReplyPreviewBehavior({
+        settings: { shoppingAuditReply: true, useActiveFungiStoryUrl: false, skipPopupPreview: false },
+        campaignName: 'General Ads',
+        systemPrompt: 'Use AUDIT_URL from the user message.'
+    });
+    assert.equal(vulcan.skipPopupPreview, false);
+    assert.equal(vulcan.systemPromptOwnsCta, false);
+    assert.equal(vulcan.useShoppingAuditReply, true);
 });
 
 test('buildVulcanShoppingAuditUrl matches the public audit page', () => {

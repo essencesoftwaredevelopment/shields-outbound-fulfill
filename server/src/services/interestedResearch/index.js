@@ -25,6 +25,7 @@ import {
     fetchPromptConfig,
     generateAuditPreviewUrl,
     generateDraftReply,
+    resolveReplyPreviewBehavior,
     generateReviewToken,
     humanizeDomainAsCompanyName,
     normalizeAuditDomain,
@@ -383,21 +384,28 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
 
 /**
  * Step 4 — external popup / lead-magnet URL, exactly as the inline path does it:
- * Vulcan audit for shopping-audit reply agencies, Essence popup otherwise,
- * skipped for opted-out clients. Popup generation stays external by design.
+ * Vulcan audit for shopping-audit reply agencies, Essence popup only when the
+ * campaign prompt uses it, skipped otherwise. Popup generation stays external.
  */
 export async function runPopupGeneration({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
-    const [settings, signalRow] = await Promise.all([
+    const [settings, signalRow, promptConfig] = await Promise.all([
         fetchAgencyAndClientSettings(agencyId, draft.client_id),
-        resolveContactSignalContext(pool, draft.contact_id)
+        resolveContactSignalContext(pool, draft.contact_id),
+        fetchPromptConfig(pool, draft.client_id, draft.campaign_id)
     ]);
     const auditDomain = normalizeAuditDomain(signalRow.company_domain)
         || domainFromLeadEmail(draft.lead_email);
-    const useShoppingAuditReply = Boolean(settings.shoppingAuditReply);
+    const preview = resolveReplyPreviewBehavior({
+        settings,
+        campaignName: promptConfig?.campaign_name,
+        systemPrompt: promptConfig?.system_prompt
+    });
+    const useShoppingAuditReply = preview.useShoppingAuditReply;
 
-    if (settings.useActiveFungiStoryUrl) {
-        // Story URL is built from template vars at draft time — no external call.
+    if (preview.useActiveFungiStoryUrl || preview.skipPopupPreview) {
+        // Story URL is built from template vars at draft time; Cut Klaviyo Bill
+        // and other non-preview campaigns skip Essence popup generate entirely.
         return { auditPreviewUrl: null, auditDomain };
     }
 
@@ -412,7 +420,7 @@ export async function runPopupGeneration({ draftId, agencyId }) {
     const auditPreviewUrl = await generateAuditPreviewUrl(draft.lead_email, {
         domain: auditDomain,
         useVulcanShoppingAudit: useShoppingAuditReply,
-        skipPopupPreview: Boolean(settings.skipPopupPreview),
+        skipPopupPreview: preview.skipPopupPreview,
         // Human-gated review: don't hold the workflow step for audit readiness.
         waitForReady: false,
         ...(brief
@@ -483,7 +491,12 @@ export async function finalizeResearchDraft({
         clientId: draft.client_id,
         emailAccount: draft.eaccount
     });
-    const useActiveFungiStoryUrl = Boolean(settings.useActiveFungiStoryUrl);
+    const preview = resolveReplyPreviewBehavior({
+        settings,
+        campaignName: promptConfig.campaign_name,
+        systemPrompt: promptConfig.system_prompt
+    });
+    const useActiveFungiStoryUrl = preview.useActiveFungiStoryUrl;
     const templateVars = useActiveFungiStoryUrl
         ? applyActiveFungiStoryUrlToTemplateVars(resolvedTemplateVars, { domain })
         : withAuditUrlVars(resolvedTemplateVars, auditPreviewUrl);
@@ -498,7 +511,7 @@ export async function finalizeResearchDraft({
         previousLeadMessage: draft.previous_lead_message,
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: draft.research_brief || null,
-        systemPromptOwnsCta: useActiveFungiStoryUrl,
+        systemPromptOwnsCta: preview.systemPromptOwnsCta,
         additionalInstructions
     });
 
