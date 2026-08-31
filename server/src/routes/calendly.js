@@ -1,11 +1,13 @@
 /**
- * Authenticated Calendly reads for the essence-retention client.
+ * Public Calendly availability for the essence-retention client.
  * Uses the shared CALENDLY_PAT (same token the webhook uses to enrich bookings).
  */
 import express from 'express';
-import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
 import { resolveClientRow } from '../services/db/queries.js';
-import { isEssenceRetentionClient } from '../services/resendScope.js';
+import {
+    ESSENCE_RETENTION_AGENCY_ID,
+    isEssenceRetentionClient
+} from '../services/resendScope.js';
 import { listEventTypeAvailableTimes } from '../services/calendlyAvailability.js';
 
 const router = express.Router();
@@ -24,10 +26,10 @@ function sendError(res, error, fallback) {
     res.status(status).json({ error: status >= 500 ? fallback : (error?.message || fallback) });
 }
 
-router.get('/clients/:clientId/calendly/available-times', requireAuth, async (req, res) => {
+router.get('/clients/:clientId/calendly/available-times', async (req, res) => {
     try {
         setNoStoreHeaders(res);
-        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        const clientRow = await resolveClientRow(ESSENCE_RETENTION_AGENCY_ID, req.params.clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
 
         if (!isEssenceRetentionClient({
