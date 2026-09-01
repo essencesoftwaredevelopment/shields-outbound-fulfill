@@ -1124,6 +1124,30 @@ body {
   to { opacity: 1; }
 }
 
+/* Recent Events + Pending Review side-by-side row; stacks below the
+   sidebar-collapse breakpoint so the fixed-width column can't overflow phones. */
+.analytics-activity-row {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.analytics-activity-row__pending {
+  width: 340px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 900px) {
+  .analytics-activity-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .analytics-activity-row__pending {
+    width: 100%;
+  }
+}
+
 .analytics-skeleton {
   background: linear-gradient(
     90deg,

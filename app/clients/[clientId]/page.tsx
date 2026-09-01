@@ -8822,7 +8822,7 @@ export default function ClientPage() {
                                 }
                             />
 
-                            <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start" }}>
+                            <div className="analytics-activity-row">
 
                             <div style={{
                                 padding: "1.25rem",
@@ -8830,7 +8830,8 @@ export default function ClientPage() {
                                 background: "var(--app-surface-3)",
                                 border: "1px solid var(--app-border)",
                                 flex: 1,
-                                minWidth: 0
+                                minWidth: 0,
+                                maxWidth: "100%"
                             }}>
                                 <p className="eyebrow eyebrow--muted" style={{ paddingBottom: "15px" }}>Recent Events</p>
 
@@ -9162,9 +9163,7 @@ export default function ClientPage() {
                             </div>
 
                             {/* Pending Review Drafts column */}
-                            <div style={{
-                                width: "340px",
-                                flexShrink: 0,
+                            <div className="analytics-activity-row__pending" style={{
                                 padding: "1.25rem",
                                 borderRadius: "16px",
                                 background: "var(--app-surface-3)",
