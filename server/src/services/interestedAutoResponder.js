@@ -1725,10 +1725,13 @@ async function loadDraftByReviewToken(token) {
                 c.instantly_key AS client_instantly_key,
                 c.warm_follow_up_interest_value AS client_warm_follow_up_interest_value,
                 c.warm_follow_up_interest_label AS client_warm_follow_up_interest_label,
-                co.domain_normalized AS company_domain
+                co.domain_normalized AS company_domain,
+                COALESCE(s.features->>'autoresponderShoppingAudit', 'false') = 'true'
+                    AS agency_shopping_audit_reply
          FROM interested_autoresponder_drafts d
          JOIN instantly_campaigns ic ON ic.id = d.campaign_id
          JOIN clients c ON c.id = d.client_id AND c.agency_id = d.agency_id
+         LEFT JOIN agency_settings s ON s.agency_id = d.agency_id
          LEFT JOIN contacts ct ON ct.id = d.contact_id
          LEFT JOIN companies co ON co.id = ct.company_id
          WHERE d.review_token = $1
@@ -1770,6 +1773,43 @@ async function loadPendingReviewDraft(token) {
     return draft;
 }
 
+/**
+ * The Vulcan shopping-audit URL is a per-agency reply mechanism, never a
+ * default. Only agencies with features.autoresponderShoppingAudit may have it
+ * substituted into a draft — otherwise a draft that left an empty `<a href="">`
+ * or an AUDIT_URL/PREVIEW_URL token would get the Vulcan audit link injected on
+ * the review page and at send time, which is exactly how an Essence Retention
+ * reply once went out pointing at the shopping audit.
+ */
+export function draftAuditUrl(draft) {
+    if (!draft?.agency_shopping_audit_reply) return null;
+    const website = resolveLeadWebsite(draft?.company_domain, draft?.lead_email);
+    return buildVulcanShoppingAuditUrl(website.domain);
+}
+
+/**
+ * Last line of defence before an email leaves: a draft belonging to a
+ * non-shopping-audit client must never carry a vulcan-shopping-audit link, even
+ * if one was baked into rendered_text by an older build. Swap it for the
+ * campaign's own booking URL when we have one, otherwise unwrap the anchor so
+ * the copy sends as plain text rather than linking to the wrong product.
+ */
+export function stripForeignAuditLinks(html, { fallbackUrl = null } = {}) {
+    const source = html == null ? '' : String(html);
+    if (!/vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app/i.test(source)) return source;
+    const replacement = String(fallbackUrl || '').trim();
+    if (replacement) {
+        return source.replace(
+            /https?:\/\/vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app[^\s"'<>]*/gi,
+            replacement
+        );
+    }
+    return source.replace(
+        /<a\b[^>]*href=(["'])https?:\/\/vulcan-shopping-audit(?:-[a-z0-9-]+)?\.vercel\.app[^"']*\1[^>]*>([\s\S]*?)<\/a>/gi,
+        '$2'
+    );
+}
+
 function serializeReviewDraft(draft) {
     const website = resolveLeadWebsite(draft.company_domain, draft.lead_email);
     return {
@@ -1778,7 +1818,7 @@ function serializeReviewDraft(draft) {
         campaignName: draft.campaign_name,
         previousLeadMessage: draft.previous_lead_message,
         renderedText: applyReplyLinkPlaceholders(draft.rendered_text, {
-            auditUrl: buildVulcanShoppingAuditUrl(website.domain)
+            auditUrl: draftAuditUrl(draft)
         }),
         expiresAt: draft.review_token_expires_at,
         status: draft.status,
@@ -1886,6 +1926,26 @@ async function persistSentAutoResponderActivity(db, {
     return result.rows[0]?.id || null;
 }
 
+/**
+ * Booking/CTA URL for a draft, from the campaign's template vars. Used only to
+ * repair a draft that carries a foreign audit link; failures resolve to null so
+ * a send is never blocked on it.
+ */
+async function resolveDraftFallbackCtaUrl(draft) {
+    try {
+        const vars = await resolveTemplateVars(pool, draft.contact_id, draft.campaign_id, {
+            clientId: draft.client_id,
+            emailAccount: draft.eaccount
+        });
+        return asTrimmedText(vars?.booking_url) || asTrimmedText(vars?.calendly_url) || null;
+    } catch (error) {
+        console.warn(
+            `[interested-autoresponder] fallback CTA lookup failed draft=${draft?.id}: ${error?.message || error}`
+        );
+        return null;
+    }
+}
+
 export async function sendInterestedAutoResponderDraftByToken({ token }) {
     const draft = await loadPendingReviewDraft(token);
     const metadata = await fetchLatestThreadMetadata(pool, draft.contact_id, draft.campaign_id);
@@ -1926,11 +1986,18 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
     }
     resolvedSubject = resolveInstantlyReplySubject(resolvedSubject);
 
-    const website = resolveLeadWebsite(draft.company_domain, draft.lead_email);
-    const renderedHtml = applyReplyLinkPlaceholders(
+    const auditUrl = draftAuditUrl(draft);
+    let renderedHtml = applyReplyLinkPlaceholders(
         String(draft.rendered_text || '').trim(),
-        { auditUrl: buildVulcanShoppingAuditUrl(website.domain) }
+        { auditUrl }
     );
+    if (!auditUrl) {
+        // Non-shopping-audit client: never let a vulcan-shopping-audit link out,
+        // whatever is sitting in rendered_text. Prefer the campaign's own booking
+        // URL from the template vars; unwrap the anchor when there isn't one.
+        const fallbackUrl = await resolveDraftFallbackCtaUrl(draft);
+        renderedHtml = stripForeignAuditLinks(renderedHtml, { fallbackUrl });
+    }
     const outgoingText = normalizeOutgoingReplyText(renderedHtml);
     const isHtml = /<\/?[a-z][\s\S]*>/i.test(renderedHtml);
     const replyPayload = {

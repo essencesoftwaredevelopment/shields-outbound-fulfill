@@ -285,6 +285,46 @@ export function htmlToPlainText(html) {
         .trim();
 }
 
+// ─── Essence Retention booking URL ────────────────────────────────────────────
+
+export const ESSENCE_BOOKING_URL = 'https://essenceretention.com/booking';
+
+/**
+ * Query-param names the /booking page accepts, in preference order.
+ * Only the first alias is written onto the URL; the rest are fallbacks
+ * when reading lead data.
+ */
+const BOOKING_QUERY_FIELDS = [
+    { param: 'firstname', keys: ['first_name', 'firstName', 'firstname', 'fname', 'first'] },
+    { param: 'lastname', keys: ['last_name', 'lastName', 'lastname', 'lname', 'last'] },
+    { param: 'email', keys: ['email', 'mail'] },
+    { param: 'website', keys: ['company_domain', 'website', 'url', 'site', 'domain'] }
+];
+
+function firstNonEmptyVar(vars, keys) {
+    for (const key of keys) {
+        const value = vars?.[key];
+        if (value == null) continue;
+        const trimmed = String(value).trim();
+        if (trimmed) return trimmed;
+    }
+    return '';
+}
+
+/**
+ * Build https://essenceretention.com/booking with lead prefill params.
+ * Omits any field we do not have. Values are URL-encoded.
+ */
+export function buildEssenceBookingUrl(vars = {}) {
+    const parts = [];
+    for (const { param, keys } of BOOKING_QUERY_FIELDS) {
+        const value = firstNonEmptyVar(vars, keys);
+        if (!value) continue;
+        parts.push(`${encodeURIComponent(param)}=${encodeURIComponent(value)}`);
+    }
+    return parts.length ? `${ESSENCE_BOOKING_URL}?${parts.join('&')}` : ESSENCE_BOOKING_URL;
+}
+
 // ─── Template variable resolution ────────────────────────────────────────────
 
 /**
@@ -332,7 +372,7 @@ export async function resolveTemplateVars(db, contactId, campaignId, options = {
     const firstName = attributes.firstName || attributes.first_name || nameParts[0] || '';
     const lastName = attributes.lastName || attributes.last_name || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : '');
 
-    return {
+    const vars = {
         first_name: firstName,
         last_name: lastName,
         full_name: fullName,
@@ -350,6 +390,11 @@ export async function resolveTemplateVars(db, contactId, campaignId, options = {
                 .filter(([, v]) => v !== null && v !== undefined && typeof v !== 'object')
                 .map(([k, v]) => [k, String(v)])
         ),
+    };
+
+    return {
+        ...vars,
+        booking_url: buildEssenceBookingUrl(vars)
     };
 }
 

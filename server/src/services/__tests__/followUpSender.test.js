@@ -19,6 +19,8 @@ import {
     sanitizeHtml,
     htmlToPlainText,
     resolveThreadReplyAnchor,
+    buildEssenceBookingUrl,
+    ESSENCE_BOOKING_URL,
 } from '../followUpSender.js';
 
 // ─── Template rendering ───────────────────────────────────────────────────────
@@ -56,6 +58,79 @@ test('renderTemplate returns empty string for non-string template', () => {
 test('renderTemplate leaves unrelated double-brace patterns alone when var missing', () => {
     const result = renderTemplate('{{unknown_var}}', {});
     assert.equal(result, '');
+});
+
+test('buildEssenceBookingUrl includes only available lead fields', () => {
+    assert.equal(buildEssenceBookingUrl({}), ESSENCE_BOOKING_URL);
+    assert.equal(
+        buildEssenceBookingUrl({
+            first_name: 'Marcus',
+            last_name: 'Chen',
+            email: 'marcus@store.com',
+            company_domain: 'store.com'
+        }),
+        `${ESSENCE_BOOKING_URL}?firstname=Marcus&lastname=Chen&email=marcus%40store.com&website=store.com`
+    );
+    assert.equal(
+        buildEssenceBookingUrl({ first_name: 'Marcus', email: 'marcus@store.com' }),
+        `${ESSENCE_BOOKING_URL}?firstname=Marcus&email=marcus%40store.com`
+    );
+});
+
+test('buildEssenceBookingUrl reads booking-page aliases and encodes spaces', () => {
+    assert.equal(
+        buildEssenceBookingUrl({
+            fname: 'John Smith',
+            lname: 'Doe',
+            mail: 'john@store.com',
+            domain: 'store.com'
+        }),
+        `${ESSENCE_BOOKING_URL}?firstname=John%20Smith&lastname=Doe&email=john%40store.com&website=store.com`
+    );
+});
+
+test('buildEssenceBookingUrl accepts every documented alias for each field', () => {
+    // The /booking page's alias table. Each row must resolve to the canonical param.
+    const table = [
+        { param: 'firstname', value: 'Ada', aliases: ['firstname', 'first_name', 'fname', 'first'] },
+        { param: 'lastname', value: 'Lovelace', aliases: ['lastname', 'last_name', 'lname', 'last'] },
+        { param: 'email', value: 'ada@store.com', aliases: ['email', 'mail'] },
+        { param: 'website', value: 'store.com', aliases: ['website', 'url', 'site', 'domain'] }
+    ];
+    for (const { param, value, aliases } of table) {
+        for (const alias of aliases) {
+            assert.equal(
+                buildEssenceBookingUrl({ [alias]: value }),
+                `${ESSENCE_BOOKING_URL}?${param}=${encodeURIComponent(value)}`,
+                `alias ${alias} should populate ${param}`
+            );
+        }
+    }
+});
+
+test('buildEssenceBookingUrl keeps params in field order and never renders empty', () => {
+    // A prompt writes this straight into href="{{booking_url}}", so the bare
+    // booking page is the floor — an empty href is what let a foreign audit
+    // link get substituted in at send time.
+    assert.equal(buildEssenceBookingUrl(), ESSENCE_BOOKING_URL);
+    assert.equal(buildEssenceBookingUrl({ first_name: '   ', email: '' }), ESSENCE_BOOKING_URL);
+    assert.match(
+        buildEssenceBookingUrl({
+            domain: 'store.com',
+            mail: 'ada@store.com',
+            last: 'Lovelace',
+            first: 'Ada'
+        }),
+        /\?firstname=Ada&lastname=Lovelace&email=ada%40store\.com&website=store\.com$/
+    );
+});
+
+test('renderTemplate substitutes booking_url', () => {
+    const bookingUrl = buildEssenceBookingUrl({ first_name: 'Ada', email: 'ada@store.com' });
+    const result = renderTemplate('<a href="{{booking_url}}">Grab a time here</a>', {
+        booking_url: bookingUrl
+    });
+    assert.equal(result, `<a href="${bookingUrl}">Grab a time here</a>`);
 });
 
 // ─── HTML sanitization ────────────────────────────────────────────────────────

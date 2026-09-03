@@ -16,6 +16,8 @@ import {
     campaignUsesEssenceStorePreview,
     resolveReplyPreviewBehavior,
     essenceStorePreviewToolDefinition,
+    draftAuditUrl,
+    stripForeignAuditLinks,
     ESSENCE_STORE_PREVIEW_TOOL_NAME
 } from '../interestedAutoResponder.js';
 
@@ -253,4 +255,63 @@ test('buildVulcanShoppingAuditUrl matches the public audit page', () => {
         'https://vulcan-shopping-audit.vercel.app/?domain=tenfoldfairtrade.com'
     );
     assert.equal(buildVulcanShoppingAuditUrl('not a domain'), null);
+});
+
+
+test('draftAuditUrl only builds the Vulcan URL for shopping-audit agencies', () => {
+    const vulcanDraft = {
+        agency_shopping_audit_reply: true,
+        company_domain: 'snydergolfusa.com',
+        lead_email: 'andreas@snydergolfusa.com'
+    };
+    assert.equal(
+        draftAuditUrl(vulcanDraft),
+        'https://vulcan-shopping-audit.vercel.app/?domain=snydergolfusa.com'
+    );
+
+    // Essence Retention shares no audit flag — it must never get the audit link,
+    // which is what put a shopping-audit URL into a retention reply.
+    const retentionDraft = {
+        agency_shopping_audit_reply: false,
+        company_domain: 'maddleboards.com',
+        lead_email: 'julien@maddleboards.com'
+    };
+    assert.equal(draftAuditUrl(retentionDraft), null);
+    assert.equal(draftAuditUrl({ company_domain: 'maddleboards.com' }), null);
+    assert.equal(draftAuditUrl(null), null);
+});
+
+test('a non-audit draft with an empty href is never filled with the audit URL', () => {
+    const draft = {
+        agency_shopping_audit_reply: false,
+        company_domain: 'maddleboards.com',
+        lead_email: 'julien@maddleboards.com'
+    };
+    const html = '<p>Our founder can walk you through it. <a href="">Book a time here</a>.</p>';
+    const out = applyReplyLinkPlaceholders(html, { auditUrl: draftAuditUrl(draft) });
+    assert.equal(out, html);
+    assert.ok(!/vulcan-shopping-audit/.test(out));
+});
+
+test('stripForeignAuditLinks swaps a stale audit link for the booking URL', () => {
+    const html = '<p><a href="https://vulcan-shopping-audit.vercel.app/?domain=maddleboards.com">'
+        + 'Book a time here</a></p>';
+    const booking = 'https://essenceretention.com/booking?firstname=Julien';
+    assert.equal(
+        stripForeignAuditLinks(html, { fallbackUrl: booking }),
+        `<p><a href="${booking}">Book a time here</a></p>`
+    );
+});
+
+test('stripForeignAuditLinks unwraps the anchor when there is no fallback URL', () => {
+    const html = '<p>Sure — <a href="https://vulcan-shopping-audit.vercel.app/?domain=x.com">'
+        + 'Book a time here</a>.</p>';
+    assert.equal(stripForeignAuditLinks(html), '<p>Sure — Book a time here.</p>');
+});
+
+test('stripForeignAuditLinks leaves clean copy untouched', () => {
+    const html = '<p><a href="https://essenceretention.com/booking">Book a time here</a></p>';
+    assert.equal(stripForeignAuditLinks(html, { fallbackUrl: null }), html);
+    assert.equal(stripForeignAuditLinks('', {}), '');
+    assert.equal(stripForeignAuditLinks(null, {}), '');
 });
