@@ -999,6 +999,12 @@ body {
   border-color: var(--chip-campaign-more-border);
 }
 
+.lead-pastel-chip--list {
+  color: var(--app-text-mid);
+  background: var(--app-surface-3);
+  border-color: var(--app-border-mid);
+}
+
 .pipeline-panel__log-stream {
   max-height: 280px;
   overflow-y: auto;
@@ -1942,13 +1948,69 @@ body {
   line-height: 1.5;
 }
 
+.leads-table {
+  width: 100%;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.leads-table--all-leads {
+  table-layout: fixed;
+  min-width: max(100%, 1080px);
+}
+
+.leads-table--all-leads .leads-table__col-check { width: 44px; }
+.leads-table--all-leads .leads-table__col-name { width: 13%; }
+.leads-table--all-leads .leads-table__col-email { width: 20%; }
+.leads-table--all-leads .leads-table__col-status { width: 11%; }
+.leads-table--all-leads .leads-table__col-lead-status { width: 12%; }
+.leads-table--all-leads .leads-table__col-domain { width: 12%; }
+.leads-table--all-leads .leads-table__col-campaign { width: 16%; }
+.leads-table--all-leads .leads-table__col-lists { width: auto; }
+
+.leads-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background-color: var(--app-bg);
+  box-shadow: inset 0 -1px 0 var(--app-border);
+  text-align: left;
+  padding: 0.75rem 1rem;
+  font-weight: 600;
+  color: var(--app-text-high);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.leads-table--all-leads thead th:first-child,
+.leads-table--all-leads td:first-child {
+  text-align: center;
+  padding: 0.75rem;
+}
+
 .leads-table td {
   color: var(--app-text);
   padding: 0.75rem 1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 
 .leads-table tbody tr:nth-child(even) {
   background-color: var(--app-surface-3);
+}
+
+.leads-table .lead-pastel-chip-list {
+  flex-wrap: nowrap;
+}
+
+.leads-table .lead-pastel-chip--campaign,
+.leads-table .lead-pastel-chip--list {
+  max-width: 100%;
 }
 
 @media (max-width: 900px) {

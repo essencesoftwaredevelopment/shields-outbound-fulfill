@@ -17,6 +17,7 @@ import { parse as csvParse } from 'csv-parse';
 import { verifyFirebaseToken } from '../middleware/auth.js';
 import * as leadsService from '../services/leads.js';
 import * as leadImportService from '../services/leadImport.js';
+import { listLeadLists, parseLeadListId } from '../services/leadLists.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
 import { queryWithStatementTimeout } from '../config/db.js';
@@ -840,6 +841,21 @@ const LEAD_FILTER_FIELDS = [
             { key: 'not_empty', label: 'Any Import' }
         ]
     },
+    {
+        key: 'list',
+        label: 'List',
+        type: 'enum',
+        // Options are per-client (lead_lists) — injected by the filter-fields
+        // endpoint when a clientId is provided.
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' },
+            { key: 'is_empty', label: 'Not On A List' },
+            { key: 'not_empty', label: 'On Any List' }
+        ]
+    },
     // ── Serper Shopping Audit (ad_observations / signal_emissions) ──────────
     {
         key: 'shopping_audit_state',
@@ -1173,6 +1189,7 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         createdAfter,
         createdBefore,
         instantlyCampaignId,
+        listId,
         searchField: explicitSearchFieldRaw
     } = queryInput;
 
@@ -1215,6 +1232,7 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         || createdAfter
         || createdBefore
         || instantlyCampaignId
+        || listId
         || dynamicFilters.length > 0
     );
 
@@ -1369,6 +1387,29 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
                 AND cic_filter.active = TRUE
             )`;
         params.push(sqlInstantlyCampaignId);
+        paramIndex++;
+        paramsState.paramIndex = paramIndex;
+    }
+
+    const parsedListId = parseLeadListId(listId);
+    if (listId != null && String(listId).trim() !== '' && !parsedListId) {
+        return { emptyResult: true, hasAnyLeadFilters, requiresFilterCampaignStats, requiresFilterInsights };
+    }
+    if (parsedListId) {
+        const listRow = await pool.query(
+            `SELECT id FROM lead_lists WHERE agency_id = $1 AND client_id = $2 AND id = $3 LIMIT 1`,
+            [agencyId, clientId, parsedListId]
+        );
+        if (!listRow.rows[0]) {
+            return { emptyResult: true, hasAnyLeadFilters, requiresFilterCampaignStats, requiresFilterInsights };
+        }
+        whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM lead_list_members llm_filter
+                WHERE llm_filter.list_id = $${paramIndex}::bigint
+                AND llm_filter.contact_id = c.id
+            )`;
+        params.push(parsedListId);
         paramIndex++;
         paramsState.paramIndex = paramIndex;
     }
@@ -1600,6 +1641,47 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
             } else if (operatorKey === 'not_in') {
                 const refs = bindArray(ids);
                 clauses.push(`(c.import_batch_id IS NULL OR c.import_batch_id <> ALL(ARRAY[${refs.join(', ')}]::bigint[]))`);
+            }
+            continue;
+        }
+
+        // ── list (lead_list_members, scoped to this tenant) ────────────────
+        if (fieldKey === 'list') {
+            const listExists = (condition) => `EXISTS (
+                SELECT 1 FROM lead_list_members llm
+                JOIN lead_lists ll ON ll.id = llm.list_id
+                    AND ll.agency_id = $1
+                    AND ll.client_id = $2
+                WHERE llm.contact_id = c.id${condition ? ` AND ${condition}` : ''}
+            )`;
+            if (operatorKey === 'is_empty') {
+                clauses.push(`NOT ${listExists('')}`);
+                continue;
+            }
+            if (operatorKey === 'not_empty') {
+                clauses.push(listExists(''));
+                continue;
+            }
+            const rawIds = operatorKey === 'in' || operatorKey === 'not_in'
+                ? (Array.isArray(normalizedValue) ? normalizedValue : [])
+                : [String(normalizedValue)];
+            const ids = rawIds
+                .map((value) => String(value).trim())
+                .filter((value) => /^\d+$/.test(value));
+            if (!ids.length) continue;
+
+            if (operatorKey === 'eq') {
+                const ref = bindParam(ids[0]);
+                clauses.push(listExists(`llm.list_id = ${ref}::bigint`));
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(ids[0]);
+                clauses.push(`NOT ${listExists(`llm.list_id = ${ref}::bigint`)}`);
+            } else if (operatorKey === 'in') {
+                const refs = bindArray(ids);
+                clauses.push(listExists(`llm.list_id = ANY(ARRAY[${refs.join(', ')}]::bigint[])`));
+            } else if (operatorKey === 'not_in') {
+                const refs = bindArray(ids);
+                clauses.push(`NOT ${listExists(`llm.list_id = ANY(ARRAY[${refs.join(', ')}]::bigint[])`)}`);
             }
             continue;
         }
@@ -2280,6 +2362,20 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 HAVING COUNT(*) > 0
             ) pcs ON TRUE`;
 
+        const pagedListsLateralJoin = `
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(
+                    json_agg(
+                        json_build_object('id', ll.id, 'name', ll.name)
+                        ORDER BY lower(ll.name), ll.id
+                    ),
+                    '[]'::json
+                ) AS lists
+                FROM lead_list_members llm
+                JOIN lead_lists ll ON ll.id = llm.list_id
+                WHERE llm.contact_id = pc.id
+            ) pll ON TRUE`;
+
         const latestEventSelect = shouldIncludeLatestEvent
             ? `
                 le.event_type AS latest_event_type,
@@ -2343,9 +2439,11 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pcs.campaign_count_active,
                 pcs.last_campaign_added_at,
                 ${latestEventSelect}
-                pcs.campaigns_data
+                pcs.campaigns_data,
+                pll.lists
             FROM paged_contacts pc
             ${pagedCampaignStatsLateralJoin}
+            ${pagedListsLateralJoin}
             LEFT JOIN contact_insights ci ON ci.contact_id = pc.id
             ${latestEventJoin}
             ORDER BY ${requiresFilterCampaignStats ? 'pc.last_campaign_added_at DESC NULLS LAST, ' : ''}pc.created_at DESC, pc.id DESC
@@ -2385,6 +2483,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             campaignCountActive: row.campaign_count_active,
             lastCampaignAddedAt: row.last_campaign_added_at,
             campaignsData: row.campaigns_data || [],
+            lists: Array.isArray(row.lists) ? row.lists : [],
             latestEvent: row.latest_event_type
                 ? {
                     eventType: row.latest_event_type,
@@ -2434,6 +2533,11 @@ router.get('/leads/filter-fields', verifyFirebaseToken, async (req, res) => {
             dynamicOptions.import_batch = batches.map((batch) => ({
                 value: String(batch.id),
                 label: `${batch.file_name || 'Import'} — ${batch.created_at ? new Date(batch.created_at).toLocaleDateString('en-GB') : ''} (#${batch.id})`
+            }));
+            const lists = await listLeadLists(agencyId, clientId);
+            dynamicOptions.list = lists.map((list) => ({
+                value: String(list.id),
+                label: `${list.name} (${list.memberCount.toLocaleString()})`
             }));
         }
 
@@ -2699,7 +2803,19 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                     JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
                     WHERE cic.contact_id = c.id
                       AND cic.active = TRUE
-                ) AS campaigns_data
+                ) AS campaigns_data,
+                (
+                    SELECT COALESCE(
+                        json_agg(
+                            json_build_object('id', ll.id, 'name', ll.name)
+                            ORDER BY lower(ll.name), ll.id
+                        ),
+                        '[]'::json
+                    )
+                    FROM lead_list_members llm
+                    JOIN lead_lists ll ON ll.id = llm.list_id
+                    WHERE llm.contact_id = c.id
+                ) AS lists
              FROM contacts c
              JOIN companies co ON co.id = c.company_id
              LEFT JOIN contact_insights ci ON ci.contact_id = c.id
@@ -2747,6 +2863,7 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                 campaignCountActive: row.campaign_count_active,
                 lastCampaignAddedAt: row.last_campaign_added_at,
                 campaignsData: row.campaigns_data || [],
+                lists: Array.isArray(row.lists) ? row.lists : [],
                 latestEvent: null,
                 insights: {
                     annualRevenueText: row.annual_revenue_text,
@@ -3554,7 +3671,8 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
             jobId,
             createdAfter,
             createdBefore,
-            instantlyCampaignId
+            instantlyCampaignId,
+            listId
         } = queryInput;
 
         let dynamicFilters = [];
@@ -3730,6 +3848,53 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
                 AND cic_filter.active = TRUE
             )`;
             params.push(sqlInstantlyCampaignId);
+            paramIndex++;
+            paramsState.paramIndex = paramIndex;
+        }
+
+        const parsedKlaviyoListId = parseLeadListId(listId);
+        if (listId != null && String(listId).trim() !== '' && !parsedKlaviyoListId) {
+            return res.json({
+                clientId: clientSlug,
+                requestedDomainCount: 0,
+                checkedDomainCount: 0,
+                skippedAlreadyScoredCount: 0,
+                matchedDomainCount: 0,
+                matchedContactCount: 0,
+                upsertedCount: 0,
+                klaviyoDetectedCount: 0,
+                klaviyoDetectedDomains: [],
+                unresolvedDomains: [],
+                notFoundDomains: []
+            });
+        }
+        if (parsedKlaviyoListId) {
+            const listRow = await pool.query(
+                `SELECT id FROM lead_lists WHERE agency_id = $1 AND client_id = $2 AND id = $3 LIMIT 1`,
+                [agencyId, clientId, parsedKlaviyoListId]
+            );
+            if (!listRow.rows[0]) {
+                return res.json({
+                    clientId: clientSlug,
+                    requestedDomainCount: 0,
+                    checkedDomainCount: 0,
+                    skippedAlreadyScoredCount: 0,
+                    matchedDomainCount: 0,
+                    matchedContactCount: 0,
+                    upsertedCount: 0,
+                    klaviyoDetectedCount: 0,
+                    klaviyoDetectedDomains: [],
+                    unresolvedDomains: [],
+                    notFoundDomains: []
+                });
+            }
+            whereClause += ` AND EXISTS (
+                SELECT 1
+                FROM lead_list_members llm_filter
+                WHERE llm_filter.list_id = $${paramIndex}::bigint
+                AND llm_filter.contact_id = c.id
+            )`;
+            params.push(parsedKlaviyoListId);
             paramIndex++;
             paramsState.paramIndex = paramIndex;
         }

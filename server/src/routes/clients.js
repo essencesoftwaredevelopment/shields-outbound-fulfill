@@ -55,7 +55,8 @@ import { runFollowUpsForClient } from '../services/followUpSender.js';
 import {
     loadInstantlyEventAnalytics,
     loadInstantlyEventAnalyticsCore,
-    loadInstantlyEventAnalyticsDetails
+    loadInstantlyEventAnalyticsDetails,
+    parseAnalyticsCampaignId
 } from '../utils/instantlyEventAnalytics.js';
 
 const router = express.Router();
@@ -787,6 +788,7 @@ function buildInstantlyAnalyticsPayload({
     sqlClientId,
     periodConfig,
     eventTypeFilter,
+    campaignId = null,
     analytics,
     scope,
     availableEventTypes = [{ value: 'all', label: formatInstantlyEventTypeLabel('all') }]
@@ -805,6 +807,9 @@ function buildInstantlyAnalyticsPayload({
         eventType: {
             value: eventTypeFilter.normalized,
             label: formatInstantlyEventTypeLabel(eventTypeFilter.normalized)
+        },
+        campaign: {
+            id: campaignId
         },
         availableEventTypes,
         summary: {
@@ -828,6 +833,7 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
         const periodConfig = INSTANTLY_ANALYTICS_PERIODS[requestedPeriod] || INSTANTLY_ANALYTICS_PERIODS['24h'];
         const requestedEventType = String(req.query?.eventType || 'all').trim().toLowerCase();
         const eventTypeFilter = buildInstantlyEventTypeFilterClause(requestedEventType, 'cie', '$3');
+        const campaignId = parseAnalyticsCampaignId(req.query?.campaignId);
         const requestedScope = String(req.query?.scope || 'full').trim().toLowerCase();
         const scope = requestedScope === 'core' || requestedScope === 'details' ? requestedScope : 'full';
 
@@ -836,7 +842,8 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             agencyId,
             sqlClientId,
             periodConfig,
-            eventTypeFilter
+            eventTypeFilter,
+            campaignId
         };
 
         if (scope === 'core') {
@@ -845,6 +852,7 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
                 sqlClientId,
                 periodConfig,
                 eventTypeFilter,
+                campaignId,
                 analytics,
                 scope: 'core'
             }));
@@ -856,6 +864,7 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
                 sqlClientId,
                 periodConfig,
                 eventTypeFilter,
+                campaignId,
                 analytics,
                 scope: 'details',
                 availableEventTypes: buildInstantlyAnalyticsEventTypes(analytics.eventTypeRows)
@@ -867,6 +876,7 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
             sqlClientId,
             periodConfig,
             eventTypeFilter,
+            campaignId,
             analytics,
             scope: 'full',
             availableEventTypes: buildInstantlyAnalyticsEventTypes(analytics.eventTypeRows)

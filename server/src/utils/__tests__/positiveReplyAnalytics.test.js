@@ -142,3 +142,9 @@ test('positive replies core SQL uses exact lead_interested for the type index', 
     assert.match(sql, /AS buckets/);
     assert.match(sql, /Bad Fit|bad fit/);
 });
+
+test('positive replies core SQL can scope to a campaign', () => {
+    const sql = buildPositiveRepliesCoreSql(`NOW() - INTERVAL '90 days'`, 'day', ' AND cie.campaign_id = $3');
+
+    assert.equal([...sql.matchAll(/cie\.campaign_id = \$3/g)].length, 2);
+});

@@ -81,6 +81,7 @@ export interface CreatePipelineJobOptions {
 export interface LeadFilterSnapshot {
     search?: string;
     instantlyCampaignId?: string;
+    listId?: string;
     filters?: { clauses: Array<{ id?: string; field: string; op: string; value: string; joinOp?: 'AND' | 'OR' }> };
     rowLimit?: number;
 }

@@ -28,8 +28,18 @@ function pruneAnalyticsCache() {
     }
 }
 
-function buildAnalyticsCacheKey(agencyId, sqlClientId, period, eventType, scope = 'full') {
-    return `${agencyId}:${sqlClientId}:${period}:${eventType}:${scope}`;
+function buildAnalyticsCacheKey(agencyId, sqlClientId, period, eventType, scope = 'full', campaignId = 'all') {
+    return `${agencyId}:${sqlClientId}:${period}:${eventType}:${scope}:${campaignId || 'all'}`;
+}
+
+export function parseAnalyticsCampaignId(raw) {
+    const id = Number.parseInt(String(raw ?? ''), 10);
+    return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+export function buildCampaignIdFilterClause(campaignId, tableAlias = 'cie', placeholder = '$3') {
+    if (!campaignId) return '';
+    return ` AND ${tableAlias}.campaign_id = ${placeholder}`;
 }
 
 export function buildInstantlyEventPeriodFilterSql(eventFloorSql, tableAlias = 'cie') {
@@ -38,7 +48,7 @@ export function buildInstantlyEventPeriodFilterSql(eventFloorSql, tableAlias = '
           AND ${tableAlias}.agency_id = $1`;
 }
 
-export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType, tableAlias = 'cie') {
+export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType, tableAlias = 'cie', extraClause = '') {
     if (!TYPED_EVENT_TYPES.has(eventType)) {
         throw new Error(`Unsupported typed analytics event_type: ${eventType}`);
     }
@@ -46,7 +56,7 @@ export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType
     return `${tableAlias}.agency_id = $1
           AND ${tableAlias}.client_id = $2
           AND ${tableAlias}.event_type = '${eventType}'
-          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}`;
+          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}${extraClause}`;
 }
 
 export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilterClause) {
@@ -83,12 +93,14 @@ export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilter
  * Multiple sources (Calendly + Instantly status/webhook/manual/reconcile) for the
  * same lead collapse to one booking, attributed to the earliest event timestamp.
  */
-export function buildMeetingsBookedByBucketQuery(periodConfig) {
+export function buildMeetingsBookedByBucketQuery(periodConfig, extraClause = '') {
     const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
 
     const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
         periodConfig.eventFloorSql,
-        'lead_meeting_booked'
+        'lead_meeting_booked',
+        'cie',
+        extraClause
     );
 
     return `
@@ -110,11 +122,13 @@ export function buildMeetingsBookedByBucketQuery(periodConfig) {
     `;
 }
 
-export function buildMeetingsBookedCoreSql(periodConfig) {
+export function buildMeetingsBookedCoreSql(periodConfig, extraClause = '') {
     const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
     const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
         periodConfig.eventFloorSql,
-        'lead_meeting_booked'
+        'lead_meeting_booked',
+        'cie',
+        extraClause
     );
 
     return `
@@ -142,10 +156,12 @@ export function buildMeetingsBookedCoreSql(periodConfig) {
     `;
 }
 
-export function buildEmailsSentByBucketQuery(periodConfig) {
+export function buildEmailsSentByBucketQuery(periodConfig, extraClause = '') {
     const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
         periodConfig.eventFloorSql,
-        'email_sent'
+        'email_sent',
+        'cie',
+        extraClause
     );
     const bucketTruncSql = periodConfig.bucketTruncSql;
 
@@ -160,10 +176,12 @@ export function buildEmailsSentByBucketQuery(periodConfig) {
     `;
 }
 
-export function buildEmailsSentCoreSql(periodConfig) {
+export function buildEmailsSentCoreSql(periodConfig, extraClause = '') {
     const typedFilterSql = buildTypedInstantlyEventPeriodFilterSql(
         periodConfig.eventFloorSql,
-        'email_sent'
+        'email_sent',
+        'cie',
+        extraClause
     );
     const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
 
@@ -215,13 +233,13 @@ export function buildInstantlyEventTypesQuery(periodFilterSql, eventTypeFilterCl
     `;
 }
 
-export function buildFollowUpStatsQuery(eventFloorSql) {
+export function buildFollowUpStatsQuery(eventFloorSql, extraClause = '') {
     return `
         SELECT COUNT(*)::int AS follow_up_sent
         FROM follow_up_sends fus
         WHERE fus.client_id = $1
           AND fus.status = 'sent'
-          AND fus.updated_at >= ${eventFloorSql}
+          AND fus.updated_at >= ${eventFloorSql}${extraClause}
     `;
 }
 
@@ -399,6 +417,7 @@ export async function loadInstantlyEventAnalyticsCore({
     agencyId,
     sqlClientId,
     periodConfig,
+    campaignId = null,
     skipCache = false
 }) {
     const cacheKey = buildAnalyticsCacheKey(
@@ -406,18 +425,20 @@ export async function loadInstantlyEventAnalyticsCore({
         sqlClientId,
         periodConfig.period,
         'all',
-        'core'
+        'core',
+        campaignId
     );
-    const lifecycleParams = [agencyId, sqlClientId];
+    const extraClause = buildCampaignIdFilterClause(campaignId, 'cie', '$3');
+    const lifecycleParams = campaignId ? [agencyId, sqlClientId, campaignId] : [agencyId, sqlClientId];
 
     return withAnalyticsCache(cacheKey, skipCache, async () => {
         const [emailsResult, positiveResult, meetingsResult] = await Promise.all([
-            pool.query(buildEmailsSentCoreSql(periodConfig), lifecycleParams),
+            pool.query(buildEmailsSentCoreSql(periodConfig, extraClause), lifecycleParams),
             pool.query(
-                buildPositiveRepliesCoreSql(periodConfig.eventFloorSql, periodConfig.bucketUnit),
+                buildPositiveRepliesCoreSql(periodConfig.eventFloorSql, periodConfig.bucketUnit, extraClause),
                 lifecycleParams
             ),
-            pool.query(buildMeetingsBookedCoreSql(periodConfig), lifecycleParams)
+            pool.query(buildMeetingsBookedCoreSql(periodConfig, extraClause), lifecycleParams)
         ]);
 
         const emailsRow = emailsResult.rows[0] || {};
@@ -448,6 +469,7 @@ export async function loadInstantlyEventAnalyticsDetails({
     sqlClientId,
     periodConfig,
     eventTypeFilter,
+    campaignId = null,
     skipCache = false
 }) {
     const cacheKey = buildAnalyticsCacheKey(
@@ -455,10 +477,18 @@ export async function loadInstantlyEventAnalyticsDetails({
         sqlClientId,
         periodConfig.period,
         eventTypeFilter.normalized,
-        'details'
+        'details',
+        campaignId
     );
-    const analyticsParams = [agencyId, sqlClientId, ...eventTypeFilter.params];
+    const campaignPlaceholder = eventTypeFilter.params.length ? '$4' : '$3';
+    const campaignClause = buildCampaignIdFilterClause(campaignId, 'cie', campaignPlaceholder);
+    const extraClause = `${eventTypeFilter.clause}${campaignClause}`;
+    const analyticsParams = campaignId
+        ? [agencyId, sqlClientId, ...eventTypeFilter.params, campaignId]
+        : [agencyId, sqlClientId, ...eventTypeFilter.params];
     const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
+    const followUpClause = buildCampaignIdFilterClause(campaignId, 'fus', '$2');
+    const followUpParams = campaignId ? [sqlClientId, campaignId] : [sqlClientId];
 
     return withAnalyticsCache(cacheKey, skipCache, async () => {
         const [
@@ -469,28 +499,28 @@ export async function loadInstantlyEventAnalyticsDetails({
             followUpStatsResult
         ] = await Promise.all([
             pool.query(
-                buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilter.clause),
+                buildInstantlyEventSummaryQuery(periodFilterSql, extraClause),
                 analyticsParams
             ),
             pool.query(
                 buildInstantlyEventBucketCountsQuery(
                     periodConfig,
                     periodFilterSql,
-                    eventTypeFilter.clause
+                    extraClause
                 ),
                 analyticsParams
             ),
             pool.query(
-                buildInstantlyEventTypesQuery(periodFilterSql, eventTypeFilter.clause),
+                buildInstantlyEventTypesQuery(periodFilterSql, extraClause),
                 analyticsParams
             ),
             pool.query(
-                buildInstantlyRecentEventsQuery(periodConfig.eventFloorSql, eventTypeFilter.clause),
+                buildInstantlyRecentEventsQuery(periodConfig.eventFloorSql, extraClause),
                 analyticsParams
             ),
             pool.query(
-                buildFollowUpStatsQuery(periodConfig.eventFloorSql),
-                [sqlClientId]
+                buildFollowUpStatsQuery(periodConfig.eventFloorSql, followUpClause),
+                followUpParams
             )
         ]);
 
@@ -521,6 +551,7 @@ export async function loadInstantlyEventAnalytics({
     sqlClientId,
     periodConfig,
     eventTypeFilter,
+    campaignId = null,
     skipCache = false
 }) {
     const core = await loadInstantlyEventAnalyticsCore({
@@ -528,6 +559,7 @@ export async function loadInstantlyEventAnalytics({
         agencyId,
         sqlClientId,
         periodConfig,
+        campaignId,
         skipCache
     });
     const details = await loadInstantlyEventAnalyticsDetails({
@@ -536,6 +568,7 @@ export async function loadInstantlyEventAnalytics({
         sqlClientId,
         periodConfig,
         eventTypeFilter,
+        campaignId,
         skipCache
     });
 

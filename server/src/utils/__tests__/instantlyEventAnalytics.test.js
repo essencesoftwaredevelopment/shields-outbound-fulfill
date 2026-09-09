@@ -11,6 +11,8 @@ import {
     buildEmailsSentByBucketQuery,
     buildEmailsSentCoreSql,
     buildMeetingsBookedByBucketQuery,
+    buildCampaignIdFilterClause,
+    parseAnalyticsCampaignId,
     generateBucketSeries,
     mergeAnalyticsBuckets,
     mergeCoreAndDetailsAnalytics
@@ -110,6 +112,26 @@ test('follow-up stats query filters by selected window and sent status', () => {
     assert.match(sql, /fus\.client_id = \$1/);
     assert.match(sql, /fus\.status = 'sent'/);
     assert.match(sql, /fus\.updated_at >= NOW\(\) - INTERVAL '7 days'/);
+});
+
+test('campaign filter clause binds campaign_id to the given placeholder', () => {
+    assert.equal(parseAnalyticsCampaignId(''), null);
+    assert.equal(parseAnalyticsCampaignId('all'), null);
+    assert.equal(parseAnalyticsCampaignId('42'), 42);
+    assert.equal(buildCampaignIdFilterClause(null), '');
+    assert.equal(buildCampaignIdFilterClause(42, 'cie', '$3'), ' AND cie.campaign_id = $3');
+});
+
+test('typed and follow-up queries append a campaign_id filter', () => {
+    const extraClause = buildCampaignIdFilterClause(42, 'cie', '$3');
+    const emailsSql = buildEmailsSentCoreSql(PERIOD_CONFIG_7D, extraClause);
+    const followUpSql = buildFollowUpStatsQuery(
+        `NOW() - INTERVAL '7 days'`,
+        buildCampaignIdFilterClause(42, 'fus', '$2')
+    );
+
+    assert.match(emailsSql, /cie\.campaign_id = \$3/);
+    assert.match(followUpSql, /fus\.campaign_id = \$2/);
 });
 
 test('recent events query keeps client_id-first filter and limit', () => {

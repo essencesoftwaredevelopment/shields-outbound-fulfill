@@ -155,6 +155,15 @@ type Lead = {
         notes?: string | null;
         attributes?: Record<string, unknown>;
     };
+    lists?: Array<{ id: number; name: string }>;
+};
+
+type LeadList = {
+    id: number;
+    name: string;
+    memberCount: number;
+    createdAt?: string;
+    updatedAt?: string;
 };
 
 type LeadStatusChipVariant =
@@ -343,18 +352,26 @@ type InstantlyEventAnalyticsPayload = {
     realtimeConfig: InstantlyEventRealtimeConfig | null;
     window: InstantlyEventAnalyticsWindow;
     eventType: InstantlyEventAnalyticsEventTypeOption;
+    campaign?: { id: number | null };
     availableEventTypes: InstantlyEventAnalyticsEventTypeOption[];
     summary: InstantlyEventAnalyticsSummary;
     byHour: InstantlyEventAnalyticsByHourRow[];
     recentEvents: InstantlyEventAnalyticsRecentEvent[];
 };
 
+function analyticsCampaignKey(payload: InstantlyEventAnalyticsPayload | null) {
+    return payload?.campaign?.id != null ? String(payload.campaign.id) : "";
+}
+
 function analyticsFiltersMatch(
     payload: InstantlyEventAnalyticsPayload | null,
     period: InstantlyEventAnalyticsPeriod,
-    eventType: string
+    eventType: string,
+    campaignId = ""
 ) {
-    return payload?.window?.period === period && payload?.eventType?.value === eventType;
+    return payload?.window?.period === period
+        && payload?.eventType?.value === eventType
+        && analyticsCampaignKey(payload) === (campaignId || "");
 }
 
 function mergeAnalyticsPayloads(
@@ -1777,6 +1794,7 @@ export default function ClientPage() {
     const [instantlyEventAnalytics, setInstantlyEventAnalytics] = useState<InstantlyEventAnalyticsPayload | null>(null);
     const [instantlyEventAnalyticsPeriod, setInstantlyEventAnalyticsPeriod] = useState<InstantlyEventAnalyticsPeriod>("24h");
     const [instantlyEventAnalyticsEventType, setInstantlyEventAnalyticsEventType] = useState<string>("all");
+    const [instantlyEventAnalyticsCampaignId, setInstantlyEventAnalyticsCampaignId] = useState<string>("");
     const [animatedRecentEventIds, setAnimatedRecentEventIds] = useState<Set<string>>(new Set());
     const [expandedRecentEventId, setExpandedRecentEventId] = useState<string | null>(null);
     const [instantlyEventAnalyticsLoading, setInstantlyEventAnalyticsLoading] = useState(false);
@@ -2369,6 +2387,16 @@ export default function ClientPage() {
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
     const [campaignFilterId, setCampaignFilterId] = useState<string>("");
+    const [listFilterId, setListFilterId] = useState<string>("");
+    const [leadLists, setLeadLists] = useState<LeadList[]>([]);
+    const [leadListsLoading, setLeadListsLoading] = useState(false);
+    const [listModalOpen, setListModalOpen] = useState(false);
+    const [listModalMode, setListModalMode] = useState<'save' | 'add' | 'add-one'>('save');
+    const [listModalName, setListModalName] = useState("");
+    const [listModalTargetId, setListModalTargetId] = useState<string>("");
+    const [listModalContactId, setListModalContactId] = useState<string>("");
+    const [listModalBusy, setListModalBusy] = useState(false);
+    const [mutatingLists, setMutatingLists] = useState(false);
     const [leadSearch, setLeadSearch] = useState<string>("");
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState<string>("");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
@@ -3504,6 +3532,7 @@ export default function ClientPage() {
         if (!user || !clientId) return;
         const shouldSkipTotalForSingleLeadSearch = isSingleLeadEmailSearch(debouncedLeadSearch)
             && !campaignFilterId
+            && !listFilterId
             && appliedLeadFilters.length === 0;
         
         // Reset and refetch when applied lead filters change
@@ -3515,7 +3544,7 @@ export default function ClientPage() {
             fetchLeadTotal();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user?.id, clientId, debouncedLeadSearch, campaignFilterId, appliedLeadFilters, leadQueryNonce]);
+    }, [user?.id, clientId, debouncedLeadSearch, campaignFilterId, listFilterId, appliedLeadFilters, leadQueryNonce]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -3549,6 +3578,40 @@ export default function ClientPage() {
 
         fetchInstantlyCampaigns();
     }, [user, clientId, uploadModalOpen, activeTab]);
+
+    useEffect(() => {
+        if (!user || !clientId) return;
+        let cancelled = false;
+
+        const fetchLeadLists = async () => {
+            setLeadListsLoading(true);
+            try {
+                const idToken = await getAccessToken();
+                if (!idToken) return;
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists`,
+                    { headers: { Authorization: `Bearer ${idToken}` } }
+                );
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch lists: ${response.statusText}`);
+                }
+                const data = await response.json();
+                if (!cancelled) {
+                    setLeadLists(Array.isArray(data.lists) ? data.lists : []);
+                }
+            } catch (error) {
+                console.error('Failed to fetch lead lists:', error);
+                if (!cancelled) setLeadLists([]);
+            } finally {
+                if (!cancelled) setLeadListsLoading(false);
+            }
+        };
+
+        fetchLeadLists();
+        return () => {
+            cancelled = true;
+        };
+    }, [user, clientId]);
 
     // Reset column mapping custom flags when modal opens
     useEffect(() => {
@@ -3746,6 +3809,10 @@ export default function ClientPage() {
             params.append('instantlyCampaignId', campaignFilterId);
         }
 
+        if (listFilterId) {
+            params.append('listId', listFilterId);
+        }
+
         if (debouncedLeadSearch.trim()) {
             params.append('search', debouncedLeadSearch.trim());
         }
@@ -3771,13 +3838,14 @@ export default function ClientPage() {
         }
 
         return params;
-    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch]);
+    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch, listFilterId]);
 
     const buildLeadDeleteQuery = useCallback(() => ({
         search: debouncedLeadSearch.trim() || undefined,
         instantlyCampaignId: campaignFilterId || undefined,
+        listId: listFilterId || undefined,
         filters: appliedLeadFilters.length > 0 ? { clauses: appliedLeadFilters } : undefined
-    }), [appliedLeadFilters, campaignFilterId, debouncedLeadSearch]);
+    }), [appliedLeadFilters, campaignFilterId, debouncedLeadSearch, listFilterId]);
 
     const clearLeadSelection = useCallback(() => {
         setSelectedLeadIds([]);
@@ -3786,7 +3854,7 @@ export default function ClientPage() {
 
     useEffect(() => {
         clearLeadSelection();
-    }, [debouncedLeadSearch, campaignFilterId, appliedLeadFilters, leadQueryNonce, clearLeadSelection]);
+    }, [debouncedLeadSearch, campaignFilterId, listFilterId, appliedLeadFilters, leadQueryNonce, clearLeadSelection]);
 
     const mapApiLeadRow = useCallback((row: any): Lead => ({
         id: row.id,
@@ -3811,6 +3879,7 @@ export default function ClientPage() {
         lastCampaignAddedAt: row.lastCampaignAddedAt || "",
         campaigns: row.campaigns || [],
         campaignsData: row.campaignsData || [],
+        lists: Array.isArray(row.lists) ? row.lists : [],
         insights: row.insights || undefined,
         latestEvent: row.latestEvent || null
     }), []);
@@ -3957,6 +4026,7 @@ export default function ClientPage() {
             const shouldUseResultCountAsTotal = reset
                 && isSingleLeadEmailSearch(debouncedLeadSearch)
                 && !campaignFilterId
+                && !listFilterId
                 && appliedLeadFilters.length === 0;
             setStats((prev) => ({
                 total: shouldUseResultCountAsTotal ? mapped.length : prev.total,
@@ -3997,6 +4067,7 @@ export default function ClientPage() {
         mapApiLeadRow,
         debouncedLeadSearch,
         campaignFilterId,
+        listFilterId,
         appliedLeadFilters.length
     ]);
 
@@ -4107,6 +4178,7 @@ export default function ClientPage() {
                     query: {
                         search: debouncedLeadSearch.trim() || undefined,
                         instantlyCampaignId: campaignFilterId || undefined,
+                        listId: listFilterId || undefined,
                         filters: appliedLeadFilters.length > 0
                             ? { clauses: appliedLeadFilters }
                             : undefined
@@ -4136,7 +4208,7 @@ export default function ClientPage() {
         } finally {
             setCheckingKlaviyo(false);
         }
-    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch, fetchLeadTotal, fetchLeads, user]);
+    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch, fetchLeadTotal, fetchLeads, listFilterId, user]);
 
     const fetchInstantlySyncRun = useCallback(async (runId: number) => {
         if (!user || !clientId || !runId) return null;
@@ -4673,6 +4745,7 @@ export default function ClientPage() {
         const requestId = ++analyticsRequestIdRef.current;
         const period = instantlyEventAnalyticsPeriod;
         const eventType = instantlyEventAnalyticsEventType;
+        const campaignId = instantlyEventAnalyticsCampaignId;
         const loadCore = eventType === "all";
 
         try {
@@ -4692,6 +4765,7 @@ export default function ClientPage() {
                     eventType,
                     scope
                 });
+                if (campaignId) params.set("campaignId", campaignId);
                 const response = await fetchWithRetry(
                     `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/analytics/instantly-events?${params.toString()}`,
                     {
@@ -4740,7 +4814,7 @@ export default function ClientPage() {
                 const corePayload = await fetchScope("core");
                 if (requestId !== analyticsRequestIdRef.current) return;
                 setInstantlyEventAnalytics((prev) => {
-                    if (analyticsFiltersMatch(prev, period, eventType) && (prev?.scope === "details" || prev?.scope === "full")) {
+                    if (analyticsFiltersMatch(prev, period, eventType, campaignId) && (prev?.scope === "details" || prev?.scope === "full")) {
                         return mergeAnalyticsPayloads(corePayload, prev);
                     }
                     return mergeAnalyticsPayloads(corePayload, null);
@@ -4755,7 +4829,7 @@ export default function ClientPage() {
             if (requestId !== analyticsRequestIdRef.current) return;
             applyRecentEventAnimation(detailsPayload);
             setInstantlyEventAnalytics((prev) => {
-                if (analyticsFiltersMatch(prev, period, eventType) && (prev?.scope === "core" || prev?.scope === "full")) {
+                if (analyticsFiltersMatch(prev, period, eventType, campaignId) && (prev?.scope === "core" || prev?.scope === "full")) {
                     return mergeAnalyticsPayloads(prev, detailsPayload);
                 }
                 return mergeAnalyticsPayloads(null, detailsPayload);
@@ -4772,7 +4846,7 @@ export default function ClientPage() {
                 setInstantlyEventAnalyticsLoading(false);
             }
         }
-    }, [user, clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+    }, [user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
 
     const fetchPendingReviewDrafts = useCallback(async (showLoading = true) => {
         if (!user || !clientId) return;
@@ -4841,7 +4915,7 @@ export default function ClientPage() {
 
         fetchInstantlyEventAnalytics(true);
         fetchPendingReviewDrafts();
-    }, [activeTab, user, clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
+    }, [activeTab, user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
 
     useEffect(() => {
         if (activeTab !== 'follow-ups' || !user || !clientId) return;
@@ -4908,7 +4982,11 @@ export default function ClientPage() {
             clearTimeout(pendingDraftAnimationTimeoutRef.current);
             pendingDraftAnimationTimeoutRef.current = null;
         }
-    }, [clientId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+    }, [clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+
+    useEffect(() => {
+        setInstantlyEventAnalyticsCampaignId("");
+    }, [clientId]);
 
     useEffect(() => () => {
         if (recentEventAnimationTimeoutRef.current) {
@@ -7852,6 +7930,272 @@ export default function ClientPage() {
         user
     ]);
 
+    const refreshLeadLists = useCallback(async () => {
+        if (!user || !clientId) return;
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists`,
+                { headers: { Authorization: `Bearer ${idToken}` } }
+            );
+            if (!response.ok) return;
+            const data = await response.json();
+            setLeadLists(Array.isArray(data.lists) ? data.lists : []);
+            setLeadFilterFieldsNonce((nonce) => nonce + 1);
+        } catch (error) {
+            console.error('Failed to refresh lead lists:', error);
+        }
+    }, [clientId, user]);
+
+    const leadListMembershipBody = useCallback(() => (
+        selectAllMatchingLeadResults
+            ? { selectAllMatching: true, query: buildLeadDeleteQuery() }
+            : { contactIds: selectedLeadIds }
+    ), [buildLeadDeleteQuery, selectAllMatchingLeadResults, selectedLeadIds]);
+
+    const openSaveListModal = useCallback(() => {
+        setListModalMode('save');
+        setListModalName('');
+        setListModalTargetId('');
+        setListModalContactId('');
+        setListModalOpen(true);
+    }, []);
+
+    const openAddToListModal = useCallback((contactId?: string) => {
+        setListModalMode(contactId ? 'add-one' : 'add');
+        setListModalName('');
+        setListModalTargetId(leadLists[0] ? String(leadLists[0].id) : '__new__');
+        setListModalContactId(contactId || '');
+        setListModalOpen(true);
+    }, [leadLists]);
+
+    const handleSubmitListModal = useCallback(async () => {
+        if (!user || !clientId) return;
+        const creatingNew = listModalMode === 'save' || listModalTargetId === '__new__' || !listModalTargetId;
+        const name = listModalName.trim();
+        if (creatingNew && !name) {
+            setToastMessage('List name is required');
+            setToastVisible(true);
+            return;
+        }
+
+        setListModalBusy(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const headers = {
+                Authorization: `Bearer ${idToken}`,
+                'Content-Type': 'application/json'
+            };
+            const membership = listModalMode === 'add-one'
+                ? { contactIds: [listModalContactId] }
+                : listModalMode === 'save'
+                    ? { selectAllMatching: true, query: buildLeadDeleteQuery() }
+                    : leadListMembershipBody();
+
+            let response: Response;
+            if (creatingNew) {
+                response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists`,
+                    {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ name, ...membership })
+                    }
+                );
+            } else {
+                response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists/${encodeURIComponent(listModalTargetId)}/members`,
+                    {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify(membership)
+                    }
+                );
+            }
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || 'Failed to update list');
+            }
+
+            const addedCount = Number(data?.addedCount || 0);
+            const listName = data?.list?.name || name;
+            setToastMessage(
+                creatingNew
+                    ? `Created “${listName}” with ${addedCount.toLocaleString()} lead${addedCount === 1 ? '' : 's'}.`
+                    : `Added ${addedCount.toLocaleString()} lead${addedCount === 1 ? '' : 's'} to “${listName}”.`
+            );
+            setToastVisible(true);
+            setListModalOpen(false);
+            clearLeadSelection();
+            if (listModalMode === 'add-one' && data?.list && listModalContactId) {
+                const added = { id: data.list.id, name: data.list.name };
+                setSelectedLead((prev) => {
+                    if (!prev || String(prev.id) !== String(listModalContactId)) return prev;
+                    const lists = prev.lists || [];
+                    if (lists.some((item) => Number(item.id) === Number(added.id))) return prev;
+                    return { ...prev, lists: [...lists, added] };
+                });
+            }
+            await refreshLeadLists();
+            await fetchLeads(true);
+            await fetchLeadTotal();
+        } catch (error) {
+            console.error('Failed to update lead list:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to update list');
+            setToastVisible(true);
+        } finally {
+            setListModalBusy(false);
+        }
+    }, [
+        buildLeadDeleteQuery,
+        clearLeadSelection,
+        clientId,
+        fetchLeadTotal,
+        fetchLeads,
+        leadListMembershipBody,
+        listModalContactId,
+        listModalMode,
+        listModalName,
+        listModalTargetId,
+        refreshLeadLists,
+        user
+    ]);
+
+    const handleRemoveSelectedFromList = useCallback(async () => {
+        if (!user || !clientId || !listFilterId) return;
+        if (selectedLeadDeleteCount <= 0) return;
+        const list = leadLists.find((item) => String(item.id) === listFilterId);
+        const countLabel = selectedLeadDeleteCount.toLocaleString();
+        const confirmed = window.confirm(
+            selectAllMatchingLeadResults
+                ? `Remove all ${countLabel} matching leads from “${list?.name || 'this list'}”? Leads are not deleted.`
+                : `Remove ${countLabel} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'} from “${list?.name || 'this list'}”? Leads are not deleted.`
+        );
+        if (!confirmed) return;
+
+        setMutatingLists(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists/${encodeURIComponent(listFilterId)}/members/remove`,
+                {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${idToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(leadListMembershipBody())
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || 'Failed to remove leads from list');
+            }
+            const removedCount = Number(data?.removedCount || 0);
+            setToastMessage(`Removed ${removedCount.toLocaleString()} lead${removedCount === 1 ? '' : 's'} from “${list?.name || 'list'}”.`);
+            setToastVisible(true);
+            clearLeadSelection();
+            await refreshLeadLists();
+            await fetchLeads(true);
+            await fetchLeadTotal();
+        } catch (error) {
+            console.error('Failed to remove leads from list:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to remove leads from list');
+            setToastVisible(true);
+        } finally {
+            setMutatingLists(false);
+        }
+    }, [
+        clientId,
+        clearLeadSelection,
+        fetchLeadTotal,
+        fetchLeads,
+        leadListMembershipBody,
+        leadLists,
+        listFilterId,
+        selectAllMatchingLeadResults,
+        selectedLeadDeleteCount,
+        user
+    ]);
+
+    const handleDeleteCurrentList = useCallback(async () => {
+        if (!user || !clientId || !listFilterId) return;
+        const list = leadLists.find((item) => String(item.id) === listFilterId);
+        const confirmed = window.confirm(
+            `Delete list “${list?.name || 'this list'}”? Leads are not deleted — only the list is removed.`
+        );
+        if (!confirmed) return;
+        setMutatingLists(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists/${encodeURIComponent(listFilterId)}`,
+                {
+                    method: 'DELETE',
+                    headers: { Authorization: `Bearer ${idToken}` }
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || 'Failed to delete list');
+            }
+            setListFilterId('');
+            setToastMessage(`Deleted list “${list?.name || 'list'}”.`);
+            setToastVisible(true);
+            await refreshLeadLists();
+            await fetchLeads(true);
+            await fetchLeadTotal();
+        } catch (error) {
+            console.error('Failed to delete list:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to delete list');
+            setToastVisible(true);
+        } finally {
+            setMutatingLists(false);
+        }
+    }, [clientId, fetchLeadTotal, fetchLeads, leadLists, listFilterId, refreshLeadLists, user]);
+
+    const handleRemoveLeadFromList = useCallback(async (contactId: string, listId: number) => {
+        if (!user || !clientId) return;
+        setMutatingLists(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/lead-lists/${listId}/members/remove`,
+                {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${idToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ contactIds: [contactId] })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data?.error || 'Failed to remove from list');
+            }
+            await refreshLeadLists();
+            await fetchLeads(true);
+            if (selectedLead && String(selectedLead.id) === String(contactId)) {
+                setSelectedLead((prev) => prev
+                    ? { ...prev, lists: (prev.lists || []).filter((item) => Number(item.id) !== Number(listId)) }
+                    : prev);
+            }
+        } catch (error) {
+            console.error('Failed to remove lead from list:', error);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to remove from list');
+            setToastVisible(true);
+        } finally {
+            setMutatingLists(false);
+        }
+    }, [clientId, fetchLeads, refreshLeadLists, selectedLead, user]);
+
     const uploadDisabled = !selectedFile || uploading;
 
     const leadTabContent = (
@@ -7862,7 +8206,7 @@ export default function ClientPage() {
                 marginTop: '2rem',
                 flexWrap: 'wrap'
             }}>
-                {campaignFilterId || leadSearch.trim() || appliedLeadFilters.length > 0 ? (
+                {campaignFilterId || listFilterId || leadSearch.trim() || appliedLeadFilters.length > 0 ? (
                     <div className="metric-chip">
                         <span className="metric-chip__label">Filtered Total</span>
                         <span className="metric-chip__value">{displayedLeadTotalLabel}</span>
@@ -7895,6 +8239,32 @@ export default function ClientPage() {
                         ))}
                     </select>
                 </label>
+                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '220px' }}>
+                    <span className="settings-field__label">List</span>
+                    <select
+                        value={listFilterId}
+                        onChange={(e) => setListFilterId(e.target.value)}
+                        disabled={leadListsLoading}
+                    >
+                        <option value="">All lists</option>
+                        {leadLists.map((list) => (
+                            <option key={list.id} value={String(list.id)}>
+                                {list.name} ({list.memberCount.toLocaleString()})
+                            </option>
+                        ))}
+                    </select>
+                </label>
+                {listFilterId && (
+                    <button
+                        type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={handleDeleteCurrentList}
+                        disabled={mutatingLists || leadsLoading}
+                        style={{ flex: '0 0 auto' }}
+                    >
+                        Delete list
+                    </button>
+                )}
                 <label className="settings-field" style={{ flex: '2 1 260px', minWidth: '260px' }}>
                     <span className="settings-field__label">Search leads</span>
                     <input
@@ -7963,7 +8333,16 @@ export default function ClientPage() {
                             `📥 Export CSV (${allLeadsCached ? filteredLeads.length : (displayedLeadTotal === null ? '...' : displayedLeadTotal)})`
                         )}
                     </button>
-                    {(appliedLeadFilters.length > 0 || leadFilters.length > 0 || leadSearch.trim() || campaignFilterId) && (
+                    <button
+                        type="button"
+                        className="secondary-button secondary-button--active"
+                        onClick={openSaveListModal}
+                        style={{ flex: '0 0 auto' }}
+                        disabled={leadsLoading || listModalBusy}
+                    >
+                        Save results as list
+                    </button>
+                    {(appliedLeadFilters.length > 0 || leadFilters.length > 0 || leadSearch.trim() || campaignFilterId || listFilterId) && (
                         <button
                             type="button"
                             className="secondary-button secondary-button--active"
@@ -7972,6 +8351,7 @@ export default function ClientPage() {
                                 setAppliedLeadFilters([]);
                                 setLeadSearch("");
                                 setCampaignFilterId("");
+                                setListFilterId("");
                             }}
                             style={{ flex: '0 0 auto' }}
                             disabled={leadsLoading}
@@ -8096,6 +8476,26 @@ export default function ClientPage() {
                                     ? 'Deleting...'
                                     : `Delete (${selectAllMatchingLeadResults ? displayedLeadTotalLabel : selectedLeadDeleteCount.toLocaleString()})`}
                             </button>
+                            <button
+                                type="button"
+                                className="secondary-button secondary-button--active"
+                                onClick={() => openAddToListModal()}
+                                disabled={leadsLoading || listModalBusy || mutatingLists || selectedLeadDeleteCount <= 0}
+                                style={{ padding: '0.35rem 0.65rem', fontSize: '0.82rem', flex: '0 0 auto', height: 'auto', minHeight: 0 }}
+                            >
+                                Add to list
+                            </button>
+                            {listFilterId && (
+                                <button
+                                    type="button"
+                                    className="secondary-button secondary-button--active"
+                                    onClick={handleRemoveSelectedFromList}
+                                    disabled={leadsLoading || mutatingLists || selectedLeadDeleteCount <= 0}
+                                    style={{ padding: '0.35rem 0.65rem', fontSize: '0.82rem', flex: '0 0 auto', height: 'auto', minHeight: 0 }}
+                                >
+                                    {mutatingLists ? 'Removing...' : `Remove from list (${selectAllMatchingLeadResults ? displayedLeadTotalLabel : selectedLeadDeleteCount.toLocaleString()})`}
+                                </button>
+                            )}
                             {canSelectAllMatchingResults && (
                                 <button
                                     type="button"
@@ -8131,12 +8531,11 @@ export default function ClientPage() {
                         </div>
                     ) : (
                         <div style={{
-                            overflowX: 'auto',
+                            overflow: 'hidden',
                             border: '1px solid var(--app-border)',
                             borderRadius: '8px',
                             backgroundColor: 'var(--app-bg-inset)',
                             maxHeight: '520px',
-                            overflowY: 'auto',
                             position: 'relative'
                         }}>
                             {leadsLoading && filteredLeads.length > 0 && (
@@ -8174,31 +8573,22 @@ export default function ClientPage() {
                             <div
                                 ref={leadsContainerRef}
                                 onScroll={handleLeadsScroll}
-                                style={{ maxHeight: '520px', overflowY: 'auto' }}
+                                style={{ maxHeight: '520px', overflow: 'auto' }}
                             >
-                                <table className="leads-table" style={{
-                                    width: '100%',
-                                    borderCollapse: 'separate',
-                                    borderSpacing: 0,
-                                    fontSize: '0.875rem'
-                                }}>
+                                <table className="leads-table leads-table--all-leads" style={{ fontSize: '0.875rem' }}>
+                                    <colgroup>
+                                        <col className="leads-table__col-check" />
+                                        <col className="leads-table__col-name" />
+                                        <col className="leads-table__col-email" />
+                                        <col className="leads-table__col-status" />
+                                        <col className="leads-table__col-lead-status" />
+                                        <col className="leads-table__col-domain" />
+                                        <col className="leads-table__col-campaign" />
+                                        <col className="leads-table__col-lists" />
+                                    </colgroup>
                                     <thead>
-                                        <tr style={{
-                                            backgroundColor: 'var(--app-surface-2)',
-                                            borderBottom: '1px solid var(--app-border)'
-                                        }}>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'center',
-                                                padding: '0.75rem 0.75rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)',
-                                                width: '44px'
-                                            }}>
+                                        <tr>
+                                            <th>
                                                 <input
                                                     type="checkbox"
                                                     aria-label="Select all leads in view"
@@ -8215,72 +8605,13 @@ export default function ClientPage() {
                                                     disabled={deletingLeads || filteredLeads.length === 0}
                                                 />
                                             </th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
-                                            }}>Founder Name</th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
-                                            }}>Email</th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
-                                            }}>Verification</th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
-                                            }}>Lead Status</th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
-                                            }}>Domain</th>
-                                            <th style={{
-                                                position: 'sticky',
-                                                top: 0,
-                                                zIndex: 2,
-                                                backgroundColor: 'var(--app-bg)',
-                                                textAlign: 'left',
-                                                padding: '0.75rem 1rem',
-                                                fontWeight: 600,
-                                                color: 'var(--app-text-high)',
-                                                borderBottom: '1px solid var(--app-border)'
-                                            }}>Campaign</th>
+                                            <th>Founder Name</th>
+                                            <th>Email</th>
+                                            <th>Verification</th>
+                                            <th>Lead Status</th>
+                                            <th>Domain</th>
+                                            <th>Campaign</th>
+                                            <th>Lists</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -8297,14 +8628,7 @@ export default function ClientPage() {
                                                 onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--app-surface-2)'}
                                                 onMouseLeave={(e) => e.currentTarget.style.backgroundColor = index % 2 === 0 ? 'transparent' : 'var(--app-surface-3)'}
                                             >
-                                                <td
-                                                    style={{
-                                                        padding: '0.75rem 0.75rem',
-                                                        textAlign: 'center',
-                                                        width: '44px'
-                                                    }}
-                                                    onClick={(e) => e.stopPropagation()}
-                                                >
+                                                <td onClick={(e) => e.stopPropagation()}>
                                                     <input
                                                         type="checkbox"
                                                         aria-label={`Select ${lead.founderName || lead.email || lead.domain || 'lead'}`}
@@ -8313,24 +8637,9 @@ export default function ClientPage() {
                                                         disabled={deletingLeads || selectAllMatchingLeadResults}
                                                     />
                                                 </td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    maxWidth: '220px',
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap'
-                                                }}>{renderFounderNameCell(lead.founderName, lead.founderFindCompletedAt)}</td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    maxWidth: '320px',
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap'
-                                                }}>{renderEmailCell(lead.email, lead.emailFindCompletedAt)}</td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    minWidth: '140px'
-                                                }}>
+                                                <td>{renderFounderNameCell(lead.founderName, lead.founderFindCompletedAt)}</td>
+                                                <td>{renderEmailCell(lead.email, lead.emailFindCompletedAt)}</td>
+                                                <td>
                                                     {(() => {
                                                         const meta = getLeadStatusChipMeta(
                                                             lead.status,
@@ -8345,10 +8654,7 @@ export default function ClientPage() {
                                                         );
                                                     })()}
                                                 </td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    minWidth: '140px'
-                                                }}>
+                                                <td>
                                                     {(() => {
                                                         const latestCampaignData = lead.campaignsData?.[0];
                                                         const raw = latestCampaignData?.interestStatus || latestCampaignData?.leadStatus;
@@ -8360,20 +8666,11 @@ export default function ClientPage() {
                                                         );
                                                     })()}
                                                 </td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    maxWidth: '220px',
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap'
-                                                }}>{lead.domain || '—'}</td>
-                                                <td style={{
-                                                    padding: '0.75rem 1rem',
-                                                    minWidth: '200px'
-                                                }}>
+                                                <td>{lead.domain || '—'}</td>
+                                                <td>
                                                     {(() => {
                                                         const names = getCampaignNamesForLead(lead);
-                                                        if (!names.length) return '—';
+                                                        if (!names.length) return <span style={{ color: 'var(--app-text-ghost)' }}>—</span>;
                                                         const hiddenCount = names.length - 1;
                                                         return (
                                                             <div className="lead-pastel-chip-list">
@@ -8382,6 +8679,31 @@ export default function ClientPage() {
                                                                     style={{ paddingInline: '0.75rem' }}
                                                                 >
                                                                     {names[0]}
+                                                                </span>
+                                                                {hiddenCount > 0 && (
+                                                                    <span
+                                                                        className="lead-pastel-chip lead-pastel-chip--campaign-more"
+                                                                        style={{ paddingInline: '0.75rem' }}
+                                                                    >
+                                                                        +{hiddenCount}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })()}
+                                                </td>
+                                                <td>
+                                                    {(() => {
+                                                        const lists = lead.lists || [];
+                                                        if (!lists.length) return <span style={{ color: 'var(--app-text-ghost)' }}>—</span>;
+                                                        const hiddenCount = lists.length - 1;
+                                                        return (
+                                                            <div className="lead-pastel-chip-list">
+                                                                <span
+                                                                    className="lead-pastel-chip lead-pastel-chip--list"
+                                                                    style={{ paddingInline: '0.75rem' }}
+                                                                >
+                                                                    {lists[0].name}
                                                                 </span>
                                                                 {hiddenCount > 0 && (
                                                                     <span
@@ -8521,6 +8843,21 @@ export default function ClientPage() {
                                         Live
                                     </span>
                                     <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginLeft: "auto" }}>
+                                        <label className="settings-field" style={{ minWidth: "220px" }}>
+                                            <span className="settings-field__label">Campaign</span>
+                                            <select
+                                                value={instantlyEventAnalyticsCampaignId}
+                                                onChange={(e) => setInstantlyEventAnalyticsCampaignId(e.target.value)}
+                                                disabled={instantlyEventAnalyticsCoreLoading && instantlyEventAnalyticsDetailsLoading}
+                                            >
+                                                <option value="">All campaigns</option>
+                                                {[...campaigns]
+                                                    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }))
+                                                    .map((campaign) => (
+                                                        <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
+                                                    ))}
+                                            </select>
+                                        </label>
                                         <label className="settings-field" style={{ minWidth: "180px" }}>
                                             <span className="settings-field__label">Event Type</span>
                                             <select
@@ -8589,7 +8926,8 @@ export default function ClientPage() {
                                 const analyticsMatchesFilters = analyticsFiltersMatch(
                                     instantlyEventAnalytics,
                                     instantlyEventAnalyticsPeriod,
-                                    instantlyEventAnalyticsEventType
+                                    instantlyEventAnalyticsEventType,
+                                    instantlyEventAnalyticsCampaignId
                                 );
                                 const displayAnalytics = analyticsMatchesFilters ? instantlyEventAnalytics : null;
                                 const summary = displayAnalytics?.summary;
@@ -8789,7 +9127,8 @@ export default function ClientPage() {
                                     analyticsFiltersMatch(
                                         instantlyEventAnalytics,
                                         instantlyEventAnalyticsPeriod,
-                                        instantlyEventAnalyticsEventType
+                                        instantlyEventAnalyticsEventType,
+                                        instantlyEventAnalyticsCampaignId
                                     ) && (instantlyEventAnalyticsEventType !== "all" || instantlyEventAnalytics?.scope !== "details")
                                         ? instantlyEventAnalytics?.byHour || []
                                         : []
@@ -8812,12 +9151,14 @@ export default function ClientPage() {
                                         ? (instantlyEventAnalyticsCoreLoading || !analyticsFiltersMatch(
                                             instantlyEventAnalytics,
                                             instantlyEventAnalyticsPeriod,
-                                            instantlyEventAnalyticsEventType
+                                            instantlyEventAnalyticsEventType,
+                                            instantlyEventAnalyticsCampaignId
                                         ))
                                         : (instantlyEventAnalyticsDetailsLoading || !analyticsFiltersMatch(
                                             instantlyEventAnalytics,
                                             instantlyEventAnalyticsPeriod,
-                                            instantlyEventAnalyticsEventType
+                                            instantlyEventAnalyticsEventType,
+                                            instantlyEventAnalyticsCampaignId
                                         ))
                                 }
                             />
@@ -8842,7 +9183,8 @@ export default function ClientPage() {
                                         || !analyticsFiltersMatch(
                                             instantlyEventAnalytics,
                                             instantlyEventAnalyticsPeriod,
-                                            instantlyEventAnalyticsEventType
+                                            instantlyEventAnalyticsEventType,
+                                            instantlyEventAnalyticsCampaignId
                                         );
                                     if (recentEventsLoading) {
                                         return (
@@ -13658,6 +14000,79 @@ export default function ClientPage() {
                 </div>
             )}
 
+            {listModalOpen && (
+                <>
+                    <div
+                        className="modal-overlay"
+                        onClick={() => !listModalBusy && setListModalOpen(false)}
+                    />
+                    <div className="modal" style={{ maxWidth: '420px' }} onClick={(e) => e.stopPropagation()}>
+                        <div className="modal__header">
+                            <div>
+                                <h2 style={{ margin: 0 }}>
+                                    {listModalMode === 'save' ? 'Save results as list' : 'Add to list'}
+                                </h2>
+                                <p className="modal__subtitle" style={{ margin: '0.35rem 0 0', color: 'var(--app-text-muted)' }}>
+                                    {listModalMode === 'save'
+                                        ? `Creates a list from the ${displayedLeadTotalLabel} currently matching leads.`
+                                        : listModalMode === 'add-one'
+                                            ? 'Add this lead to an existing list or create a new one.'
+                                            : `Add ${selectAllMatchingLeadResults ? displayedLeadTotalLabel : selectedLeadDeleteCount.toLocaleString()} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'}.`}
+                                </p>
+                            </div>
+                        </div>
+                        <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            {listModalMode !== 'save' && (
+                                <label className="settings-field">
+                                    <span className="settings-field__label">List</span>
+                                    <select
+                                        value={listModalTargetId}
+                                        onChange={(e) => setListModalTargetId(e.target.value)}
+                                        disabled={listModalBusy}
+                                    >
+                                        {leadLists.map((list) => (
+                                            <option key={list.id} value={String(list.id)}>{list.name}</option>
+                                        ))}
+                                        <option value="__new__">New list…</option>
+                                    </select>
+                                </label>
+                            )}
+                            {(listModalMode === 'save' || listModalTargetId === '__new__' || !listModalTargetId) && (
+                                <label className="settings-field">
+                                    <span className="settings-field__label">List name</span>
+                                    <input
+                                        type="text"
+                                        value={listModalName}
+                                        onChange={(e) => setListModalName(e.target.value)}
+                                        placeholder="e.g. Q2 founders"
+                                        maxLength={80}
+                                        disabled={listModalBusy}
+                                    />
+                                </label>
+                            )}
+                            <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
+                                <button
+                                    type="button"
+                                    className="secondary-button"
+                                    onClick={() => setListModalOpen(false)}
+                                    disabled={listModalBusy}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    className="primary-button"
+                                    onClick={handleSubmitListModal}
+                                    disabled={listModalBusy}
+                                >
+                                    {listModalBusy ? 'Saving...' : (listModalMode === 'save' ? 'Create list' : 'Add')}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </>
+            )}
+
             {/* Segment Modal */}
             {segmentModalOpen && (
                 <div
@@ -14084,6 +14499,55 @@ export default function ClientPage() {
                                 </div>
                             </div>
 
+
+                            {/* Lists */}
+                            <div style={{ marginBottom: '1.25rem' }}>
+                                <p style={{
+                                    margin: '0 0 0.4rem',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.06em',
+                                    color: 'var(--app-text-ghost)'
+                                }}>Lists</p>
+                                <div className="lead-pastel-chip-list">
+                                    {(selectedLead.lists || []).map((list) => (
+                                        <span
+                                            key={list.id}
+                                            className="lead-pastel-chip lead-pastel-chip--list"
+                                            style={{ gap: '0.35rem' }}
+                                        >
+                                            {list.name}
+                                            <button
+                                                type="button"
+                                                onClick={() => handleRemoveLeadFromList(String(selectedLead.id), Number(list.id))}
+                                                disabled={mutatingLists}
+                                                aria-label={`Remove from ${list.name}`}
+                                                style={{
+                                                    border: 'none',
+                                                    background: 'transparent',
+                                                    color: 'inherit',
+                                                    cursor: mutatingLists ? 'not-allowed' : 'pointer',
+                                                    padding: 0,
+                                                    lineHeight: 1,
+                                                    fontSize: '0.9rem'
+                                                }}
+                                            >
+                                                ×
+                                            </button>
+                                        </span>
+                                    ))}
+                                    <button
+                                        type="button"
+                                        className="secondary-button secondary-button--active"
+                                        onClick={() => openAddToListModal(String(selectedLead.id))}
+                                        disabled={mutatingLists || listModalBusy}
+                                        style={{ padding: '0.2rem 0.65rem', fontSize: '0.75rem', height: 'auto', minHeight: 0 }}
+                                    >
+                                        Add to list
+                                    </button>
+                                </div>
+                            </div>
 
                             {/* First Line */}
                             {selectedLead.firstLine && (

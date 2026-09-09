@@ -476,6 +476,9 @@ function sanitizeLeadFilterInput(rawLeadFilter) {
     const instantlyCampaignId = typeof rawLeadFilter.instantlyCampaignId === 'string'
         ? rawLeadFilter.instantlyCampaignId.trim()
         : '';
+    const listId = typeof rawLeadFilter.listId === 'string'
+        ? rawLeadFilter.listId.trim()
+        : (rawLeadFilter.listId != null ? String(rawLeadFilter.listId).trim() : '');
     const filters = rawLeadFilter.filters && typeof rawLeadFilter.filters === 'object'
         ? rawLeadFilter.filters
         : undefined;
@@ -484,6 +487,7 @@ function sanitizeLeadFilterInput(rawLeadFilter) {
     return {
         ...(search ? { search } : {}),
         ...(instantlyCampaignId ? { instantlyCampaignId } : {}),
+        ...(listId ? { listId } : {}),
         ...(filters ? { filters } : {}),
         ...(rowLimit ? { rowLimit } : {})
     };
