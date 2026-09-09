@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Shields Outbound">
+  <rect width="512" height="512" fill="#111111"/>
+  <path d="M256 78 405 132v111c0 93-57 158-149 191-92-33-149-98-149-191V132L256 78Z" fill="#f7f7f5"/>
+  <path d="M256 130v246c61-28 94-72 94-133v-73l-94-40Z" fill="#111111"/>
+  <path d="m198 248 38 38 82-88" fill="none" stroke="#111111" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

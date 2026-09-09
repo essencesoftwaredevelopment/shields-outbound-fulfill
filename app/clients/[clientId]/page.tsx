@@ -7855,8 +7855,8 @@ export default function ClientPage() {
     const uploadDisabled = !selectedFile || uploading;
 
     const leadTabContent = (
-        <div>
-            <div style={{
+        <div className="lead-workspace">
+            <div className="lead-summary" style={{
                 display: 'flex',
                 gap: '1rem',
                 marginTop: '2rem',
@@ -7875,7 +7875,7 @@ export default function ClientPage() {
                 )}
             </div>
 
-            <div style={{
+            <div className="lead-controls" style={{
                 marginTop: '1rem',
                 display: 'flex',
                 gap: '0.75rem',
@@ -7904,7 +7904,7 @@ export default function ClientPage() {
                         placeholder="Search by domain, email, or founder name"
                     />
                 </label>
-                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'flex-end', marginLeft: 'auto' }}>
+                <div className="lead-toolbar-actions" style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'flex-end', marginLeft: 'auto' }}>
                     <button
                         type="button"
                         className="secondary-button secondary-button--active"
@@ -8425,7 +8425,7 @@ export default function ClientPage() {
     return (
         <>
             <AppShell>
-                <section className="hero-panel">
+                <section className="hero-panel client-workspace">
                     <header className="client-page-header">
                         <button
                             type="button"

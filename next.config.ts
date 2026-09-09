@@ -11,6 +11,17 @@ const nextConfig: NextConfig = {
   httpAgentOptions: {
     keepAlive: true,
   },
+  async headers() {
+    return [
+      {
+        source: "/sw.js",
+        headers: [
+          { key: "Cache-Control", value: "public, max-age=0, must-revalidate" },
+          { key: "Service-Worker-Allowed", value: "/" },
+        ],
+      },
+    ];
+  },
   async rewrites() {
     // Proxy API calls to the Express server during dev
     const base = process.env.SERVER_URL && /^(http:\/\/|https:\/\/)/.test(process.env.SERVER_URL)
