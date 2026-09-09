@@ -106,6 +106,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                             className={`sidebar__btn${isActive("/") ? " sidebar__btn--active" : ""}`}
                             onClick={() => router.push("/")}
                             title="Home"
+                            aria-current={isActive("/") ? "page" : undefined}
                         >
                             <span className="sidebar__btn-icon" aria-hidden="true"><House size={18} /></span>
                             <span className="sidebar__btn-label">Home</span>
@@ -115,6 +116,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                             className={`sidebar__btn${isActive("/account") ? " sidebar__btn--active" : ""}`}
                             onClick={() => router.push("/account")}
                             title="Account"
+                            aria-current={isActive("/account") ? "page" : undefined}
                         >
                             <span className="sidebar__btn-icon" aria-hidden="true"><User size={18} /></span>
                             <span className="sidebar__btn-label">Account</span>
@@ -125,6 +127,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
                                 className={`sidebar__btn${isActive("/admin") ? " sidebar__btn--active" : ""}`}
                                 onClick={() => router.push("/admin")}
                                 title="Admin"
+                                aria-current={isActive("/admin") ? "page" : undefined}
                             >
                                 <span className="sidebar__btn-icon" aria-hidden="true"><Shield size={18} /></span>
                                 <span className="sidebar__btn-label">Admin</span>
