@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { AppSelect } from "@/components/app-select";
+import { DatePicker } from "@/components/date-picker";
 import { formatDaysInStage, humanizeLabel, instantlyDivergence } from "./DealCard";
 import type { Deal, DealPatch, DealStage } from "./types";
 
@@ -97,21 +99,18 @@ export function DealDetailSheet({ deal, stages, onClose, onPatch, onMoveToStage,
 
                 <div className="df-sheet__body">
                     <div className="df-field">
-                        <label className="df-label" htmlFor={`df-stage-${deal.id}`}>Stage</label>
-                        <select
-                            id={`df-stage-${deal.id}`}
-                            className="df-select"
-                            value={deal.stageId}
+                        <div className="df-label">Stage</div>
+                        <AppSelect
+                            value={String(deal.stageId)}
                             disabled={saving}
-                            onChange={(event) => {
-                                const stageId = Number(event.target.value);
+                            aria-label="Stage"
+                            triggerClassName="df-select-trigger"
+                            options={stages.map((s) => ({ value: String(s.id), label: s.name }))}
+                            onChange={(value) => {
+                                const stageId = Number(value);
                                 if (stageId !== deal.stageId) void run(() => onMoveToStage(deal, stageId));
                             }}
-                        >
-                            {stages.map((s) => (
-                                <option key={s.id} value={s.id}>{s.name}</option>
-                            ))}
-                        </select>
+                        />
                         <div className="df-hint">In this stage for {formatDaysInStage(deal.stageChangedAt)}</div>
                     </div>
 
@@ -159,14 +158,14 @@ export function DealDetailSheet({ deal, stages, onClose, onPatch, onMoveToStage,
                     )}
 
                     <div className="df-field">
-                        <label className="df-label" htmlFor={`df-next-${deal.id}`}>Next action</label>
-                        <input
-                            id={`df-next-${deal.id}`}
-                            className="df-input"
-                            type="datetime-local"
+                        <div className="df-label">Next action</div>
+                        <DatePicker
                             value={nextAction}
-                            onChange={(event) => setNextAction(event.target.value)}
+                            includeTime
                             disabled={saving}
+                            placeholder="No next action"
+                            aria-label="Next action"
+                            onChange={setNextAction}
                         />
                     </div>
 

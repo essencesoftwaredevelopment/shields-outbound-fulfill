@@ -18,6 +18,14 @@ import { verifyFirebaseToken } from '../middleware/auth.js';
 import * as leadsService from '../services/leads.js';
 import * as leadImportService from '../services/leadImport.js';
 import { listLeadLists, parseLeadListId } from '../services/leadLists.js';
+import {
+    LEAD_ACTIVITY_FIELD_KEY,
+    buildLeadActivityFilterSql,
+    getLeadActivityFilterField,
+    leadActivityFilterNeedsJoins
+} from '../services/leadActivityFilter.js';
+import { annotateLeadFilterField } from '../services/leadFilterFieldGroups.js';
+import { isLeadListTableView, mapLeadListRow, leadListNeedsWarmFollowUpConfig } from '../services/leadListView.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
 import { queryWithStatementTimeout } from '../config/db.js';
@@ -704,6 +712,7 @@ const LEAD_FILTER_FIELDS = [
             { key: 'not_empty', label: 'Is Not Empty' }
         ]
     },
+    getLeadActivityFilterField(),
     {
         key: 'instantly_status',
         label: 'Instantly Status',
@@ -728,6 +737,7 @@ const LEAD_FILTER_FIELDS = [
             { value: 'won', label: 'Won' },
             { value: 'out_of_office', label: 'Out Of Office' },
             { value: 'not_interested', label: 'Not Interested' },
+            { value: 'bad fit', label: 'Bad Fit' },
             { value: 'wrong_person', label: 'Wrong Person' },
             { value: 'lost', label: 'Lost' },
             { value: 'no_show', label: 'No Show' }
@@ -902,13 +912,21 @@ const LEAD_FILTER_FIELDS = [
 const LEAD_FILTER_FIELD_MAP = new Map(LEAD_FILTER_FIELDS.map((field) => [field.key, field]));
 
 function getLeadFilterFieldsPayload(dynamicOptions = {}) {
-    return LEAD_FILTER_FIELDS.map((field) => ({
-        key: field.key,
-        label: field.label,
-        type: field.type,
-        operators: field.operators,
-        options: dynamicOptions[field.key] || field.options || []
-    }));
+    return LEAD_FILTER_FIELDS.map((field) => {
+        const resolved = field.key === LEAD_ACTIVITY_FIELD_KEY
+            ? getLeadActivityFilterField(dynamicOptions)
+            : field;
+        return annotateLeadFilterField({
+            key: resolved.key,
+            label: resolved.label,
+            type: resolved.type,
+            operators: resolved.operators,
+            options: dynamicOptions[resolved.key] || resolved.options || [],
+            ...(resolved.timeframes ? { timeframes: resolved.timeframes } : {}),
+            ...(resolved.units ? { units: resolved.units } : {}),
+            ...(resolved.whereDimensions ? { whereDimensions: resolved.whereDimensions } : {})
+        });
+    });
 }
 
 function parseLeadFiltersQuery(rawFilters) {
@@ -1055,6 +1073,7 @@ function buildLeadListBaseWithClause(
                     uses_klaviyo,
                     uses_shopify,
                     discovery_call_held,
+                    last_discovery_call_at,
                     annual_revenue_min,
                     annual_revenue_max
                 FROM contact_insights
@@ -1193,19 +1212,22 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         searchField: explicitSearchFieldRaw
     } = queryInput;
 
-    const warmFollowUpConfigResult = await pool.query(
-        `SELECT warm_follow_up_interest_value
-         FROM clients
-         WHERE id = $1
-         LIMIT 1`,
-        [clientId]
-    );
-    const warmFollowUpInterestValueRaw = warmFollowUpConfigResult.rows[0]?.warm_follow_up_interest_value;
-    const warmFollowUpInterestValue = Number.isFinite(Number(warmFollowUpInterestValueRaw))
-        ? Number(warmFollowUpInterestValueRaw)
-        : null;
-
     const { clauses: dynamicFilters } = parseLeadFiltersInput(rawFilters);
+    let warmFollowUpInterestValue = null;
+    if (leadListNeedsWarmFollowUpConfig({ instantlyStatus, filters: dynamicFilters })) {
+        const warmFollowUpConfigResult = await pool.query(
+            `SELECT warm_follow_up_interest_value
+             FROM clients
+             WHERE id = $1
+             LIMIT 1`,
+            [clientId]
+        );
+        const warmFollowUpInterestValueRaw = warmFollowUpConfigResult.rows[0]?.warm_follow_up_interest_value;
+        warmFollowUpInterestValue = Number.isFinite(Number(warmFollowUpInterestValueRaw))
+            ? Number(warmFollowUpInterestValueRaw)
+            : null;
+    }
+
     const rawSearchTerm = typeof search === 'string' ? search.trim() : '';
     const searchClassification = classifyLeadSearch(rawSearchTerm);
     const explicitSearchField = typeof explicitSearchFieldRaw === 'string'
@@ -1458,7 +1480,11 @@ const INSIGHTS_FILTER_FIELDS = new Set([
 function leadFiltersRequireCampaignStats(filters) {
     return filters.some((filter) => {
         const fieldKey = normalizeOptionalText(filter?.field)?.toLowerCase() || '';
-        return CAMPAIGN_STATS_FILTER_FIELDS.has(fieldKey);
+        if (CAMPAIGN_STATS_FILTER_FIELDS.has(fieldKey)) return true;
+        if (fieldKey === LEAD_ACTIVITY_FIELD_KEY) {
+            return leadActivityFilterNeedsJoins(filter?.op, filter?.value).campaignStats;
+        }
+        return false;
     });
 }
 
@@ -1476,7 +1502,11 @@ function leadFiltersRequireStatusLabels(filters) {
 function leadFiltersRequireInsights(filters) {
     return filters.some((filter) => {
         const fieldKey = normalizeOptionalText(filter?.field)?.toLowerCase() || '';
-        return INSIGHTS_FILTER_FIELDS.has(fieldKey);
+        if (INSIGHTS_FILTER_FIELDS.has(fieldKey)) return true;
+        if (fieldKey === LEAD_ACTIVITY_FIELD_KEY) {
+            return leadActivityFilterNeedsJoins(filter?.op, filter?.value).insights;
+        }
+        return false;
     });
 }
 
@@ -1607,6 +1637,12 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
         const fieldDef = LEAD_FILTER_FIELD_MAP.get(fieldKey);
         if (!fieldDef) continue;
         if (!fieldDef.operators.some((op) => op.key === operatorKey)) continue;
+
+        if (fieldKey === LEAD_ACTIVITY_FIELD_KEY) {
+            const activitySql = buildLeadActivityFilterSql(operatorKey, rawFilter.value, bindParam);
+            if (activitySql) clauses.push(activitySql);
+            continue;
+        }
 
         const normalizedValue = normalizeLeadFilterValue(fieldKey, operatorKey, rawFilter.value);
         if (!NO_VALUE_OPS.has(operatorKey) && normalizedValue === null) continue;
@@ -2205,6 +2241,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             includeLatestEvent,
             includeTotal,
             countOnly,
+            view,
             limit = 200,
             offset = 0
         } = req.query;
@@ -2224,7 +2261,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
 
         const parsedLimit = Math.min(parseInt(limit, 10) || 200, 5000);
         const parsedOffset = parseInt(offset, 10) || 0;
-        const shouldIncludeLatestEvent = includeLatestEvent === 'true' || includeLatestEvent === '1';
+        const isTableView = isLeadListTableView(view);
+        const shouldIncludeLatestEvent = !isTableView && (includeLatestEvent === 'true' || includeLatestEvent === '1');
         const shouldIncludeTotal = includeTotal === 'true' || includeTotal === '1';
         const isCountOnly = countOnly === 'true' || countOnly === '1';
 
@@ -2290,10 +2328,19 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             });
         }
 
-        const pagedWithClause = `
-            ${baseWithClause},
-            paged_contacts AS (
-                SELECT
+        const pagedContactColumns = isTableView
+            ? `
+                    c.id,
+                    c.full_name,
+                    c.email,
+                    c.email_status,
+                    c.email_find_completed_at,
+                    c.email_verify_completed_at,
+                    c.founder_find_completed_at,
+                    c.created_at,
+                    co.domain_normalized
+                    ${requiresFilterCampaignStats ? ', cs.last_campaign_added_at' : ''}`
+            : `
                     c.id,
                     c.agency_id,
                     c.company_id,
@@ -2314,9 +2361,15 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     ${requiresFilterCampaignStats ? `,
                     cs.campaign_count_all_time,
                     cs.campaign_count_active,
-                    cs.last_campaign_added_at` : ''}
+                    cs.last_campaign_added_at` : ''}`;
+
+        const pagedWithClause = `
+            ${baseWithClause},
+            paged_contacts AS (
+                SELECT
+                    ${pagedContactColumns}
                 FROM contacts c
-                JOIN scoped_companies co ON c.company_id = co.id
+                JOIN ${isTableView ? 'companies co ON co.id = c.company_id' : 'scoped_companies co ON c.company_id = co.id'}
                 ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
                 ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
                 WHERE ${whereClause}
@@ -2333,8 +2386,27 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
          * The lateral pins that decision: one indexed probe per paged contact,
          * bounded by the page size. HAVING keeps old LEFT JOIN semantics —
          * contacts with no campaign memberships get NULL stats, not zeroes.
+         * Table view skips counts and campaign telemetry the grid never renders.
          */
-        const pagedCampaignStatsLateralJoin = `
+        const pagedCampaignStatsLateralJoin = isTableView
+            ? `
+            LEFT JOIN LATERAL (
+                SELECT
+                    json_agg(
+                        json_build_object(
+                            'campaignId', ic.instantly_campaign_id,
+                            'campaignName', ic.name,
+                            'leadStatus', cic.lead_status_label,
+                            'interestStatus', cic.interest_status_label
+                        )
+                        ORDER BY COALESCE(cic.last_synced_at, cic.added_at) DESC NULLS LAST, cic.added_at DESC NULLS LAST
+                    ) AS campaigns_data
+                FROM contact_instantly_campaigns cic
+                JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+                WHERE cic.contact_id = pc.id
+                  AND cic.active = TRUE
+            ) pcs ON TRUE`
+            : `
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*)::int AS campaign_count_all_time,
@@ -2409,22 +2481,25 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             ${pagedWithClause}
             SELECT
                 pc.id,
+                ${isTableView ? '' : `
                 pc.agency_id,
                 pc.company_id,
-                pc.role_type,
+                pc.role_type,`}
                 pc.full_name,
                 pc.email,
                 pc.email_status,
                 pc.email_find_completed_at,
                 pc.email_verify_completed_at,
                 pc.founder_find_completed_at,
+                ${isTableView ? '' : `
                 pc.last_contacted_at,
                 pc.confidence,
                 pc.personalization_first_line,
                 pc.job_id,
                 pc.created_at,
-                pc.updated_at,
+                pc.updated_at,`}
                 pc.domain_normalized,
+                ${isTableView ? '' : `
                 ci.annual_revenue_text,
                 ci.annual_revenue_min,
                 ci.annual_revenue_max,
@@ -2437,20 +2512,25 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 ci.attributes AS insight_attributes,
                 pcs.campaign_count_all_time,
                 pcs.campaign_count_active,
-                pcs.last_campaign_added_at,
+                pcs.last_campaign_added_at,`}
                 ${latestEventSelect}
                 pcs.campaigns_data,
                 pll.lists
             FROM paged_contacts pc
             ${pagedCampaignStatsLateralJoin}
             ${pagedListsLateralJoin}
-            LEFT JOIN contact_insights ci ON ci.contact_id = pc.id
+            ${isTableView ? '' : 'LEFT JOIN contact_insights ci ON ci.contact_id = pc.id'}
             ${latestEventJoin}
             ORDER BY ${requiresFilterCampaignStats ? 'pc.last_campaign_added_at DESC NULLS LAST, ' : ''}pc.created_at DESC, pc.id DESC
         `;
         params.push(parsedLimit + 1, parsedOffset);
 
-        const result = await queryWithStatementTimeout(contactsQuery, params);
+        // Table pages are a LIMIT 101 index read (~2ms). Wrapping them in
+        // BEGIN/SET LOCAL/COMMIT costs four round trips to a remote Postgres
+        // (~200ms RTT each from this app). Export still uses the timeout wrapper.
+        const result = isTableView
+            ? await pool.query(contactsQuery, params)
+            : await queryWithStatementTimeout(contactsQuery, params);
         const hasMore = result.rows.length > parsedLimit;
         const pagedRows = hasMore ? result.rows.slice(0, parsedLimit) : result.rows;
         let total = null;
@@ -2460,53 +2540,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             total = parseInt(countResult.rows[0]?.count || 0, 10);
         }
 
-        const leads = pagedRows.map((row) => ({
-            id: row.id,
-            domain: row.domain_normalized,
-            email: row.email,
-            founderName: row.full_name,
-            roleType: typeof row.role_type === 'string' && row.role_type.startsWith('instantly:')
-                ? 'instantly_lead'
-                : row.role_type,
-            status: row.email_status,
-            verified: row.email_status === 'valid',
-            confidence: row.confidence,
-            emailFindCompletedAt: row.email_find_completed_at,
-            emailVerifyCompletedAt: row.email_verify_completed_at,
-            founderFindCompletedAt: row.founder_find_completed_at,
-            lastContactedAt: row.last_contacted_at,
-            firstLine: row.personalization_first_line,
-            jobId: row.job_id,
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
-            campaignCountAllTime: row.campaign_count_all_time,
-            campaignCountActive: row.campaign_count_active,
-            lastCampaignAddedAt: row.last_campaign_added_at,
-            campaignsData: row.campaigns_data || [],
-            lists: Array.isArray(row.lists) ? row.lists : [],
-            latestEvent: row.latest_event_type
-                ? {
-                    eventType: row.latest_event_type,
-                    replyCategory: row.latest_event_reply_category,
-                    messageText: row.latest_event_message_text,
-                    replyTextSnippet: row.latest_event_reply_text_snippet,
-                    eventTimestamp: row.latest_event_timestamp,
-                    emailAccount: row.latest_event_email_account
-                }
-                : null,
-            insights: {
-                annualRevenueText: row.annual_revenue_text,
-                annualRevenueMin: row.annual_revenue_min,
-                annualRevenueMax: row.annual_revenue_max,
-                usesKlaviyo: row.uses_klaviyo,
-                klaviyoPercent: row.klaviyo_percent,
-                discoveryCallHeld: row.discovery_call_held,
-                lastDiscoveryCallAt: row.last_discovery_call_at,
-                source: row.insight_source,
-                notes: row.insight_notes,
-                attributes: row.insight_attributes || {}
-            }
-        }));
+        const leads = pagedRows.map((row) => mapLeadListRow(row, { tableView: isTableView }));
 
         res.json({
             leads,
@@ -2539,6 +2573,22 @@ router.get('/leads/filter-fields', verifyFirebaseToken, async (req, res) => {
                 value: String(list.id),
                 label: `${list.name} (${list.memberCount.toLocaleString()})`
             }));
+            try {
+                const campaigns = await pool.query(
+                    `SELECT instantly_campaign_id AS id, name
+                     FROM instantly_campaigns
+                     WHERE agency_id = $1 AND client_id = $2
+                     ORDER BY LOWER(name) ASC, instantly_campaign_id ASC`,
+                    [agencyId, clientId]
+                );
+                dynamicOptions.campaign = campaigns.rows.map((row) => ({
+                    value: String(row.id),
+                    label: row.name || String(row.id)
+                }));
+            } catch (error) {
+                console.error('Error loading campaign filter options:', error);
+                dynamicOptions.campaign = [];
+            }
         }
 
         res.json({
@@ -2840,44 +2890,7 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
         }
 
         res.json({
-            lead: {
-                id: row.id,
-                domain: row.domain_normalized,
-                email: row.email,
-                founderName: row.full_name,
-                roleType: typeof row.role_type === 'string' && row.role_type.startsWith('instantly:')
-                    ? 'instantly_lead'
-                    : row.role_type,
-                status: row.email_status,
-                verified: row.email_status === 'valid',
-                confidence: row.confidence,
-                emailFindCompletedAt: row.email_find_completed_at,
-                emailVerifyCompletedAt: row.email_verify_completed_at,
-                founderFindCompletedAt: row.founder_find_completed_at,
-                lastContactedAt: row.last_contacted_at,
-                firstLine: row.personalization_first_line,
-                jobId: row.job_id,
-                createdAt: row.created_at,
-                updatedAt: row.updated_at,
-                campaignCountAllTime: row.campaign_count_all_time,
-                campaignCountActive: row.campaign_count_active,
-                lastCampaignAddedAt: row.last_campaign_added_at,
-                campaignsData: row.campaigns_data || [],
-                lists: Array.isArray(row.lists) ? row.lists : [],
-                latestEvent: null,
-                insights: {
-                    annualRevenueText: row.annual_revenue_text,
-                    annualRevenueMin: row.annual_revenue_min,
-                    annualRevenueMax: row.annual_revenue_max,
-                    usesKlaviyo: row.uses_klaviyo,
-                    klaviyoPercent: row.klaviyo_percent,
-                    discoveryCallHeld: row.discovery_call_held,
-                    lastDiscoveryCallAt: row.last_discovery_call_at,
-                    source: row.insight_source,
-                    notes: row.insight_notes,
-                    attributes: row.insight_attributes || {}
-                }
-            }
+            lead: mapLeadListRow(row)
         });
     } catch (error) {
         console.error('Error looking up lead:', error);

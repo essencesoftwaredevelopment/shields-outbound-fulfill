@@ -17,6 +17,7 @@ import {
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { toast } from "sonner";
 import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
+import { AppSelect } from "@/components/app-select";
 import { DealCard, isNextActionDue } from "./DealCard";
 import { DealColumn } from "./DealColumn";
 import { DealDetailSheet } from "./DealDetailSheet";
@@ -249,17 +250,16 @@ export function DealFlowBoard({ clientId, onOpenLead }: DealFlowBoardProps) {
                         aria-label="Search deals"
                     />
                     {campaigns.length > 1 && (
-                        <select
-                            className="df-select"
+                        <AppSelect
                             value={campaignFilter}
-                            onChange={(event) => setCampaignFilter(event.target.value)}
                             aria-label="Filter by campaign"
-                        >
-                            <option value="all">All campaigns</option>
-                            {campaigns.map(([id, name]) => (
-                                <option key={id} value={String(id)}>{name}</option>
-                            ))}
-                        </select>
+                            triggerClassName="df-select-trigger min-w-[10rem] w-auto"
+                            options={[
+                                { value: "all", label: "All campaigns" },
+                                ...campaigns.map(([id, name]) => ({ value: String(id), label: name }))
+                            ]}
+                            onChange={setCampaignFilter}
+                        />
                     )}
                     <label className="df-check">
                         <input type="checkbox" checked={dueOnly} onChange={(event) => setDueOnly(event.target.checked)} />

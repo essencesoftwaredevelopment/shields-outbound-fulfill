@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { AppSelect } from "@/components/app-select";
 import { STAGE_COLORS, type DealStage, type StageDeletion, type StageDraft, type StageKind } from "./types";
 
 interface StageSettingsDialogProps {
@@ -145,15 +146,16 @@ export function StageSettingsDialog({ stages, onClose, onSave }: StageSettingsDi
                                             {draft.totalCount > 0 && (
                                                 <>
                                                     {" "}and move its {draft.totalCount} deal{draft.totalCount === 1 ? "" : "s"} to{" "}
-                                                    <select
-                                                        className="df-select df-select--inline"
-                                                        value={deletions.get(draft.id as number)}
-                                                        onChange={(event) => setDeletions((prev) => new Map(prev).set(draft.id as number, Number(event.target.value)))}
-                                                    >
-                                                        {moveTargets.filter((t) => t.id !== draft.id).map((t) => (
-                                                            <option key={t.localKey} value={t.id as number}>{t.name || "(unnamed)"}</option>
-                                                        ))}
-                                                    </select>
+                                                    <AppSelect
+                                                        value={String(deletions.get(draft.id as number) ?? "")}
+                                                        size="sm"
+                                                        triggerClassName="df-select-trigger df-select-trigger--inline"
+                                                        options={moveTargets.filter((t) => t.id !== draft.id).map((t) => ({
+                                                            value: String(t.id as number),
+                                                            label: t.name || "(unnamed)"
+                                                        }))}
+                                                        onChange={(value) => setDeletions((prev) => new Map(prev).set(draft.id as number, Number(value)))}
+                                                    />
                                                 </>
                                             )}
                                         </span>
@@ -183,17 +185,18 @@ export function StageSettingsDialog({ stages, onClose, onSave }: StageSettingsDi
                                             disabled={saving}
                                             aria-label="Stage name"
                                         />
-                                        <select
-                                            className="df-select"
+                                        <AppSelect
                                             value={draft.kind}
-                                            onChange={(event) => update(draft.localKey, { kind: event.target.value as StageKind })}
                                             disabled={saving}
                                             aria-label="Stage type"
-                                        >
-                                            <option value="open">Open</option>
-                                            <option value="won">Won</option>
-                                            <option value="lost">Lost</option>
-                                        </select>
+                                            triggerClassName="df-select-trigger w-[7.5rem]"
+                                            options={[
+                                                { value: "open", label: "Open" },
+                                                { value: "won", label: "Won" },
+                                                { value: "lost", label: "Lost" }
+                                            ]}
+                                            onChange={(value) => update(draft.localKey, { kind: value as StageKind })}
+                                        />
                                         <label className="df-stage-row__entry" title="New interested leads land here">
                                             <input
                                                 type="radio"

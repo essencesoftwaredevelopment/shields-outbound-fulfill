@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AppSelect } from "@/components/app-select";
 import { apiJson } from "@/lib/api/http";
 
 type Scalar = string | number | boolean;
@@ -302,17 +303,14 @@ function FlagRow({ flag, value, savedValue, disabled, onChange }: FlagRowProps) 
     } else if (flag.type === "enum") {
         const current = isSet ? String(value) : String(flag.default ?? "");
         control = (
-            <select
-                className="df-select"
+            <AppSelect
                 value={current}
                 disabled={disabled}
-                onChange={(event) => onChange(event.target.value)}
                 aria-label={flag.label}
-            >
-                {flag.options?.map((o) => (
-                    <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-            </select>
+                triggerClassName="df-select-trigger"
+                options={(flag.options || []).map((o) => ({ value: o.value, label: o.label }))}
+                onChange={(value) => onChange(value)}
+            />
         );
     } else if (flag.type === "number") {
         control = (

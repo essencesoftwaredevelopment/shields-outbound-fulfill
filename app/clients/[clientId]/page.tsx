@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, ReactNode, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
 import { getAccessToken } from "@/lib/supabase/session";
 import {
     useJobRealtime,
@@ -44,6 +44,18 @@ import {
     shouldShowCreditExhaustionNotice,
 } from "@/lib/pipeline/creditExhaustion";
 import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
+import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
+import { AppMultiSelect, AppSelect } from "@/components/app-select";
+import { LeadToolbarMoreMenu } from "@/components/lead-toolbar-more-menu";
+import { DatePicker } from "@/components/date-picker";
+import {
+    DEFAULT_ACTIVITY_OP,
+    LEAD_ACTIVITY_FIELD_KEY,
+    defaultLeadActivityValue,
+    isLeadActivityFilterComplete,
+    serializeLeadActivityValue,
+} from "@/lib/leads/activityFilter";
+import { singleListIdFromLeadFilters } from "@/lib/leads/filterFieldGroups";
 import instantlyLogo from "@/app/assets/instantly.png";
 import calendlyLogo from "@/app/assets/Calendly.png";
 
@@ -183,14 +195,27 @@ type LeadFilterOperator = {
 type LeadFilterOption = {
     value: string;
     label: string;
+    source?: string;
+    group?: string;
 };
 
 type LeadFilterField = {
     key: string;
     label: string;
-    type: "text" | "number" | "date" | "enum" | "boolean";
+    type: "text" | "number" | "date" | "enum" | "boolean" | "activity";
     operators: LeadFilterOperator[];
     options: LeadFilterOption[];
+    timeframes?: LeadFilterOperator[];
+    units?: LeadFilterOperator[];
+    group?: "activity" | "property";
+    groupLabel?: string;
+    whereDimensions?: Array<{
+        key: string;
+        label: string;
+        eventTypes?: string[];
+        operators: LeadFilterOperator[];
+        options: LeadFilterOption[];
+    }>;
 };
 
 type LeadFilterClause = {
@@ -1563,20 +1588,40 @@ const calculateJobProgress = (job: PipelineJob): { processed: number; total: num
     return { processed, total, percent };
 };
 
+const CLIENT_TABS = ["analytics", "info", "campaigns", "leads", "follow-ups", "deal-flow"] as const;
+type ClientTab = typeof CLIENT_TABS[number];
+
+function parseClientTab(raw: string | null | undefined): ClientTab {
+    if (raw && (CLIENT_TABS as readonly string[]).includes(raw)) {
+        return raw as ClientTab;
+    }
+    return "analytics";
+}
+
 export default function ClientPage() {
     const router = useRouter();
     const params = useParams();
+    const pathname = usePathname();
     const searchParams = useSearchParams();
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
     const { agencyId } = useAgencyId();
-    const allowedTabs = ["analytics", "info", "campaigns", "leads", "follow-ups", "deal-flow"] as const;
-    type ClientTab = typeof allowedTabs[number];
-    const initialTab = searchParams?.get("tab");
 
-    const [activeTab, setActiveTab] = useState<ClientTab>(
-        initialTab && allowedTabs.includes(initialTab as ClientTab) ? (initialTab as ClientTab) : "analytics"
-    );
+    const [activeTab, setActiveTabState] = useState<ClientTab>(() => parseClientTab(searchParams?.get("tab")));
+    const selectTab = useCallback((tab: ClientTab) => {
+        setActiveTabState(tab);
+        const nextParams = new URLSearchParams(searchParams?.toString() ?? "");
+        if (nextParams.get("tab") === tab) return;
+        nextParams.set("tab", tab);
+        const queryString = nextParams.toString();
+        const path = pathname || `/clients/${clientId}`;
+        router.replace(queryString ? `${path}?${queryString}` : path, { scroll: false });
+    }, [clientId, pathname, router, searchParams]);
+
+    useEffect(() => {
+        const fromUrl = parseClientTab(searchParams?.get("tab"));
+        setActiveTabState((current) => (current === fromUrl ? current : fromUrl));
+    }, [searchParams]);
     const [clientName, setClientName] = useState<string>(clientId);
     const [clientIndustry, setClientIndustry] = useState<Niche["id"]>("ecom");
     const [clientInstantlyKey, setClientInstantlyKey] = useState<string>("");
@@ -2374,6 +2419,7 @@ export default function ClientPage() {
     const [allLeadsCached, setAllLeadsCached] = useState(false); // Track if we've fetched all leads for filtering
     const [stats, setStats] = useState<{ total: number | null; verified: number; unverified: number }>(() => ({ total: null, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
+    const leadDetailRequestSeqRef = useRef(0);
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [emailCopied, setEmailCopied] = useState(false);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
@@ -2384,12 +2430,10 @@ export default function ClientPage() {
     const [savingLeadInstantlyStatus, setSavingLeadInstantlyStatus] = useState(false);
     const [expandedLeadActivityIds, setExpandedLeadActivityIds] = useState<string[]>([]);
     const [leadsLoading, setLeadsLoading] = useState(false);
+    const [leadsLoadingMore, setLeadsLoadingMore] = useState(false);
     const [leadsHasMore, setLeadsHasMore] = useState(true);
     const [leadsCursor, setLeadsCursor] = useState<number>(0);
-    const [campaignFilterId, setCampaignFilterId] = useState<string>("");
-    const [listFilterId, setListFilterId] = useState<string>("");
     const [leadLists, setLeadLists] = useState<LeadList[]>([]);
-    const [leadListsLoading, setLeadListsLoading] = useState(false);
     const [listModalOpen, setListModalOpen] = useState(false);
     const [listModalMode, setListModalMode] = useState<'save' | 'add' | 'add-one'>('save');
     const [listModalName, setListModalName] = useState("");
@@ -2404,9 +2448,13 @@ export default function ClientPage() {
     const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
     const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>([]);
     const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string; joinOp: 'AND' | 'OR' }>>([]);
+    const [leadFilterDrawerOpen, setLeadFilterDrawerOpen] = useState(false);
+    const listFilterId = useMemo(
+        () => singleListIdFromLeadFilters(appliedLeadFilters),
+        [appliedLeadFilters]
+    );
     // Bumped on each "Run Query" press so the query re-runs even when filters are unchanged (underlying data is dynamic)
     const [leadQueryNonce, setLeadQueryNonce] = useState(0);
-    const [checkingKlaviyo, setCheckingKlaviyo] = useState(false);
     const [exportingCsv, setExportingCsv] = useState(false);
     const [leadExportModalOpen, setLeadExportModalOpen] = useState(false);
     const [selectedLeadExportFields, setSelectedLeadExportFields] = useState<string[]>(DEFAULT_LEAD_EXPORT_FIELD_KEYS);
@@ -3135,22 +3183,15 @@ export default function ClientPage() {
         return !noValueOps.includes(operatorKey);
     }, [leadFilterFieldMap]);
 
-    const getLeadFilterInputMode = useCallback((fieldKey: string, operatorKey: string): string | null => {
-        const field = leadFilterFieldMap.get(fieldKey);
-        if (!field) return null;
-        if (!doesLeadFilterRequireValue(fieldKey, operatorKey)) return null;
-        if (operatorKey === 'older_than_days') return 'number';
-        if (operatorKey === 'between') return 'between';
-        if (operatorKey === 'in' || operatorKey === 'not_in') return 'multi';
-        return field.type;
-    }, [doesLeadFilterRequireValue, leadFilterFieldMap]);
-
     const normalizedLeadFilters = useMemo(() => {
         return leadFilters
             .filter((filter) => {
                 const field = leadFilterFieldMap.get(filter.field);
                 if (!field) return false;
                 if (!field.operators.some((operator) => operator.key === filter.op)) return false;
+                if (field.type === 'activity' || filter.field === LEAD_ACTIVITY_FIELD_KEY) {
+                    return isLeadActivityFilterComplete(filter.op, filter.value);
+                }
                 if (!doesLeadFilterRequireValue(filter.field, filter.op)) return true;
                 return String(filter.value || '').trim() !== '';
             })
@@ -3168,6 +3209,21 @@ export default function ClientPage() {
 
     const addLeadFilter = useCallback(() => {
         setLeadFilters((prev) => {
+            const activityField = leadFilterFields.find((item) => (
+                item.type === 'activity' || item.key === LEAD_ACTIVITY_FIELD_KEY
+            ));
+            if (activityField) {
+                return [
+                    ...prev,
+                    {
+                        id: createLeadFilterId(),
+                        field: activityField.key,
+                        op: activityField.operators[0]?.key || DEFAULT_ACTIVITY_OP,
+                        value: serializeLeadActivityValue(defaultLeadActivityValue(activityField.options[0]?.value)),
+                        joinOp: 'AND'
+                    }
+                ];
+            }
             const firstField = leadFilterFields[0];
             if (!firstField) return prev;
             return [
@@ -3199,6 +3255,12 @@ export default function ClientPage() {
         setLeadQueryNonce((nonce) => nonce + 1);
     }, [normalizedLeadFilters]);
 
+    useEffect(() => {
+        if (leadFilters.length > 0 || appliedLeadFilters.length > 0) {
+            setLeadFilterDrawerOpen(true);
+        }
+    }, [appliedLeadFilters.length, leadFilters.length]);
+
     const leadFilterContent = useMemo(() => {
         if (leadFilterFieldsLoading) {
             return (
@@ -3227,132 +3289,16 @@ export default function ClientPage() {
 
         const renderClauseRow = (filter: LeadFilterClause) => {
             const field = leadFilterFieldMap.get(filter.field) || leadFilterFields[0];
-            const operators = field?.operators || [];
-            const selectedOperator = operators.find((operator) => operator.key === filter.op) || operators[0];
-            const valueMode = getLeadFilterInputMode(filter.field, selectedOperator?.key || '');
-
-            const parsedArrayValue: string[] = (() => {
-                try { return JSON.parse(filter.value || '[]'); } catch { return []; }
-            })();
-            const setArrayValue = (arr: string[]) => updateLeadFilter(filter.id, { value: JSON.stringify(arr) });
-
+            if (!field) return null;
             return (
-                <div key={filter.id} className="lead-filter-row">
-                    <label className="settings-field">
-                        <span className="settings-field__label">Field</span>
-                        <select
-                            value={filter.field}
-                            onChange={(e) => {
-                                const nextField = leadFilterFieldMap.get(e.target.value) || leadFilterFields[0];
-                                updateLeadFilter(filter.id, {
-                                    field: nextField?.key || '',
-                                    op: nextField?.operators[0]?.key || '',
-                                    value: ''
-                                });
-                            }}
-                        >
-                            {leadFilterFields.map((item) => (
-                                <option key={item.key} value={item.key}>{item.label}</option>
-                            ))}
-                        </select>
-                    </label>
-
-                    <label className="settings-field">
-                        <span className="settings-field__label">Operator</span>
-                        <select
-                            value={filter.op}
-                            onChange={(e) => {
-                                const nextOp = e.target.value;
-                                updateLeadFilter(filter.id, {
-                                    op: nextOp,
-                                    value: doesLeadFilterRequireValue(filter.field, nextOp) ? filter.value : ''
-                                });
-                            }}
-                        >
-                            {operators.map((operator) => (
-                                <option key={operator.key} value={operator.key}>{operator.label}</option>
-                            ))}
-                        </select>
-                    </label>
-
-                    <label className="settings-field">
-                        <span className="settings-field__label">Value</span>
-                        {!valueMode ? (
-                            <div style={{
-                                minHeight: '42px',
-                                display: 'flex',
-                                alignItems: 'center',
-                                padding: '0 0.9rem',
-                                borderRadius: '10px',
-                                border: '1px solid var(--app-border)',
-                                background: 'var(--app-surface-2)',
-                                color: 'var(--app-text-muted)',
-                                fontSize: '0.9rem'
-                            }}>
-                                No value needed
-                            </div>
-                        ) : valueMode === 'enum' ? (
-                            <select
-                                value={filter.value}
-                                onChange={(e) => updateLeadFilter(filter.id, { value: e.target.value })}
-                            >
-                                <option value="">Select value</option>
-                                {(field?.options || []).map((option) => (
-                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                ))}
-                            </select>
-                        ) : valueMode === 'multi' ? (
-                            <select
-                                multiple
-                                value={parsedArrayValue}
-                                onChange={(e) => {
-                                    const selected = Array.from(e.target.selectedOptions).map((o) => o.value);
-                                    setArrayValue(selected);
-                                }}
-                                style={{ minHeight: '80px' }}
-                            >
-                                {(field?.options || []).map((option) => (
-                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                ))}
-                            </select>
-                        ) : valueMode === 'between' ? (
-                            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                                <input
-                                    type="date"
-                                    value={parsedArrayValue[0] || ''}
-                                    onChange={(e) => setArrayValue([e.target.value, parsedArrayValue[1] || ''])}
-                                    style={{ flex: 1 }}
-                                />
-                                <span style={{ color: 'var(--app-text-faint)', fontSize: '0.8rem' }}>to</span>
-                                <input
-                                    type="date"
-                                    value={parsedArrayValue[1] || ''}
-                                    onChange={(e) => setArrayValue([parsedArrayValue[0] || '', e.target.value])}
-                                    style={{ flex: 1 }}
-                                />
-                            </div>
-                        ) : (
-                            <input
-                                type={valueMode === 'number' ? 'number' : valueMode === 'date' ? 'date' : 'text'}
-                                value={filter.value}
-                                onChange={(e) => updateLeadFilter(filter.id, { value: e.target.value })}
-                                placeholder={valueMode === 'number'
-                                    ? 'Enter number'
-                                    : valueMode === 'date'
-                                        ? ''
-                                        : 'Enter value'}
-                            />
-                        )}
-                    </label>
-
-                    <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={() => removeLeadFilter(filter.id)}
-                    >
-                        Remove
-                    </button>
-                </div>
+                <LeadActivityFilterRow
+                    key={filter.id}
+                    filter={filter}
+                    fields={leadFilterFields}
+                    field={field}
+                    onChange={updateLeadFilter}
+                    onRemove={removeLeadFilter}
+                />
             );
         };
 
@@ -3432,8 +3378,6 @@ export default function ClientPage() {
             );
         });
     }, [
-        doesLeadFilterRequireValue,
-        getLeadFilterInputMode,
         leadFilterFieldMap,
         leadFilterFields,
         leadFilterFieldsLoading,
@@ -3529,10 +3473,45 @@ export default function ClientPage() {
     }, [user?.id, clientId, agencyId, stopInstantlySyncPolling]);
 
     useEffect(() => {
+        setClientTotalLeads(0);
+    }, [clientId]);
+
+    useEffect(() => {
+        if (!user || !clientId) return;
+        let cancelled = false;
+
+        const fetchUnfilteredTotal = async () => {
+            try {
+                const idToken = await getAccessToken();
+                if (!idToken) return;
+                const params = new URLSearchParams();
+                params.append('clientId', clientId);
+                params.append('limit', '1');
+                params.append('includeTotal', 'true');
+                params.append('countOnly', 'true');
+                const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
+                    headers: { Authorization: `Bearer ${idToken}` }
+                });
+                if (!response.ok) return;
+                const data = await response.json();
+                const total = Number(data?.total);
+                if (!cancelled && Number.isFinite(total)) {
+                    setClientTotalLeads(total);
+                }
+            } catch (error) {
+                console.error('Failed to fetch unfiltered lead total:', error);
+            }
+        };
+
+        fetchUnfilteredTotal();
+        return () => {
+            cancelled = true;
+        };
+    }, [user?.id, clientId]);
+
+    useEffect(() => {
         if (!user || !clientId) return;
         const shouldSkipTotalForSingleLeadSearch = isSingleLeadEmailSearch(debouncedLeadSearch)
-            && !campaignFilterId
-            && !listFilterId
             && appliedLeadFilters.length === 0;
         
         // Reset and refetch when applied lead filters change
@@ -3544,7 +3523,7 @@ export default function ClientPage() {
             fetchLeadTotal();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user?.id, clientId, debouncedLeadSearch, campaignFilterId, listFilterId, appliedLeadFilters, leadQueryNonce]);
+    }, [user?.id, clientId, debouncedLeadSearch, appliedLeadFilters, leadQueryNonce]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -3584,7 +3563,6 @@ export default function ClientPage() {
         let cancelled = false;
 
         const fetchLeadLists = async () => {
-            setLeadListsLoading(true);
             try {
                 const idToken = await getAccessToken();
                 if (!idToken) return;
@@ -3602,8 +3580,6 @@ export default function ClientPage() {
             } catch (error) {
                 console.error('Failed to fetch lead lists:', error);
                 if (!cancelled) setLeadLists([]);
-            } finally {
-                if (!cancelled) setLeadListsLoading(false);
             }
         };
 
@@ -3800,18 +3776,10 @@ export default function ClientPage() {
         debouncedRefreshJobHistory();
     }, [debouncedRefreshJobHistory]);
 
-    const buildLeadQueryParams = useCallback(({ limit, offset, includeTotal, countOnly, includeLatestEvent }: { limit: number; offset?: number; includeTotal?: boolean; countOnly?: boolean; includeLatestEvent?: boolean }) => {
+    const buildLeadQueryParams = useCallback(({ limit, offset, includeTotal, countOnly, includeLatestEvent, view }: { limit: number; offset?: number; includeTotal?: boolean; countOnly?: boolean; includeLatestEvent?: boolean; view?: 'table' }) => {
         const params = new URLSearchParams();
         params.append('clientId', clientId);
         params.append('limit', String(limit));
-
-        if (campaignFilterId) {
-            params.append('instantlyCampaignId', campaignFilterId);
-        }
-
-        if (listFilterId) {
-            params.append('listId', listFilterId);
-        }
 
         if (debouncedLeadSearch.trim()) {
             params.append('search', debouncedLeadSearch.trim());
@@ -3837,15 +3805,17 @@ export default function ClientPage() {
             params.append('includeLatestEvent', 'true');
         }
 
+        if (view) {
+            params.append('view', view);
+        }
+
         return params;
-    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch, listFilterId]);
+    }, [appliedLeadFilters, clientId, debouncedLeadSearch]);
 
     const buildLeadDeleteQuery = useCallback(() => ({
         search: debouncedLeadSearch.trim() || undefined,
-        instantlyCampaignId: campaignFilterId || undefined,
-        listId: listFilterId || undefined,
         filters: appliedLeadFilters.length > 0 ? { clauses: appliedLeadFilters } : undefined
-    }), [appliedLeadFilters, campaignFilterId, debouncedLeadSearch, listFilterId]);
+    }), [appliedLeadFilters, debouncedLeadSearch]);
 
     const clearLeadSelection = useCallback(() => {
         setSelectedLeadIds([]);
@@ -3854,7 +3824,7 @@ export default function ClientPage() {
 
     useEffect(() => {
         clearLeadSelection();
-    }, [debouncedLeadSearch, campaignFilterId, listFilterId, appliedLeadFilters, leadQueryNonce, clearLeadSelection]);
+    }, [debouncedLeadSearch, appliedLeadFilters, leadQueryNonce, clearLeadSelection]);
 
     const mapApiLeadRow = useCallback((row: any): Lead => ({
         id: row.id,
@@ -3891,27 +3861,26 @@ export default function ClientPage() {
         if ((!trimmedEmail && !normalizedContactId) || !user || !clientId) return;
 
         const cachedLead = leads.find((lead) => (
-            (normalizedContactId && lead.id === normalizedContactId)
+            (normalizedContactId && String(lead.id) === normalizedContactId)
             || (normalizedEmail && lead.email?.toLowerCase() === normalizedEmail)
         ));
         if (cachedLead) {
             setSelectedLead(cachedLead);
-            setLeadModalTab('detail');
-            setShowLeadAdvanced(false);
-            return;
+        } else {
+            setSelectedLead({
+                id: normalizedContactId,
+                email: trimmedEmail,
+                domain: '',
+                status: '',
+                verified: false,
+                firstLine: '',
+                founderName: '',
+            });
         }
-
-        setSelectedLead({
-            id: normalizedContactId,
-            email: trimmedEmail,
-            domain: '',
-            status: '',
-            verified: false,
-            firstLine: '',
-            founderName: '',
-        });
         setLeadModalTab('detail');
         setShowLeadAdvanced(false);
+
+        const requestSeq = ++leadDetailRequestSeqRef.current;
 
         try {
             const idToken = await getAccessToken();
@@ -3929,16 +3898,22 @@ export default function ClientPage() {
                 throw new Error(`Failed to fetch lead (${response.status})`);
             }
             const data = await response.json();
+            if (requestSeq !== leadDetailRequestSeqRef.current) return;
             if (!data?.lead) {
-                setSelectedLead(null);
-                setToastMessage(trimmedEmail ? `No lead found for ${trimmedEmail}` : 'Lead not found.');
+                if (!cachedLead) {
+                    setSelectedLead(null);
+                    setToastMessage(trimmedEmail ? `No lead found for ${trimmedEmail}` : 'Lead not found.');
+                }
                 return;
             }
             setSelectedLead(mapApiLeadRow(data.lead));
         } catch (error) {
             console.error('Error opening lead detail:', error);
-            setSelectedLead(null);
-            setToastMessage('Failed to open lead detail.');
+            if (requestSeq !== leadDetailRequestSeqRef.current) return;
+            if (!cachedLead) {
+                setSelectedLead(null);
+                setToastMessage('Failed to open lead detail.');
+            }
         }
     }, [clientId, leads, mapApiLeadRow, user]);
 
@@ -3969,6 +3944,9 @@ export default function ClientPage() {
                 verified: prev.verified,
                 unverified: total === null ? 0 : Math.max(0, total - prev.verified),
             }));
+            if (!debouncedLeadSearch.trim() && appliedLeadFilters.length === 0 && total != null) {
+                setClientTotalLeads(total);
+            }
         } catch (error) {
             console.error('Failed to fetch lead total:', error);
             setStats((prev) => ({
@@ -3977,7 +3955,7 @@ export default function ClientPage() {
                 unverified: 0,
             }));
         }
-    }, [buildLeadQueryParams, clientId, user]);
+    }, [appliedLeadFilters.length, buildLeadQueryParams, clientId, debouncedLeadSearch, user]);
 
     const fetchLeads = useCallback(async (reset = false) => {
         if (!user || !clientId) return;
@@ -3987,8 +3965,10 @@ export default function ClientPage() {
                 verified: prev.verified,
                 unverified: 0,
             }));
+            setLeadsLoading(true);
+        } else {
+            setLeadsLoadingMore(true);
         }
-        setLeadsLoading(true);
         try {
             // Get Firebase ID token for authentication
             const idToken = await getAccessToken();
@@ -3997,7 +3977,8 @@ export default function ClientPage() {
             // Build query parameters
             const params = buildLeadQueryParams({
                 limit: 100,
-                offset: !reset && leadsCursor ? leadsCursor : undefined
+                offset: !reset && leadsCursor ? leadsCursor : undefined,
+                view: 'table'
             });
 
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
@@ -4025,8 +4006,6 @@ export default function ClientPage() {
             const verifiedCount = apiLeads.filter((r: any) => r.verified).length;
             const shouldUseResultCountAsTotal = reset
                 && isSingleLeadEmailSearch(debouncedLeadSearch)
-                && !campaignFilterId
-                && !listFilterId
                 && appliedLeadFilters.length === 0;
             setStats((prev) => ({
                 total: shouldUseResultCountAsTotal ? mapped.length : prev.total,
@@ -4058,6 +4037,7 @@ export default function ClientPage() {
             setLeadsHasMore(false);
         } finally {
             setLeadsLoading(false);
+            setLeadsLoadingMore(false);
         }
     }, [
         user,
@@ -4066,8 +4046,6 @@ export default function ClientPage() {
         buildLeadQueryParams,
         mapApiLeadRow,
         debouncedLeadSearch,
-        campaignFilterId,
-        listFilterId,
         appliedLeadFilters.length
     ]);
 
@@ -4157,58 +4135,6 @@ export default function ClientPage() {
         })();
         return () => { cancelled = true; };
     }, [clientId, debouncedAutoResponderTestLeadSearch, autoResponderTestModalOpen, mapApiLeadRow, user]);
-
-    const handleCheckKlaviyo = useCallback(async () => {
-        if (!user || !clientId) return;
-
-        setCheckingKlaviyo(true);
-        try {
-            const idToken = await getAccessToken();
-            if (!idToken) return;
-
-            const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads/insights/klaviyo/query`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${idToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    clientId,
-                    onlyNullUsesKlaviyo: true,
-                    query: {
-                        search: debouncedLeadSearch.trim() || undefined,
-                        instantlyCampaignId: campaignFilterId || undefined,
-                        listId: listFilterId || undefined,
-                        filters: appliedLeadFilters.length > 0
-                            ? { clauses: appliedLeadFilters }
-                            : undefined
-                    }
-                })
-            });
-
-            const data = await response.json().catch(() => ({}));
-            if (!response.ok) {
-                throw new Error(data?.error || `Failed to check Klaviyo (${response.status})`);
-            }
-
-            const checkedDomainCount = Number(data?.checkedDomainCount || 0);
-            const detectedCount = Number(data?.klaviyoDetectedCount || 0);
-            const skippedCount = Number(data?.skippedAlreadyScoredCount || 0);
-            const unresolvedCount = Array.isArray(data?.unresolvedDomains) ? data.unresolvedDomains.length : 0;
-
-            setToastMessage(`Klaviyo check complete: ${detectedCount}/${checkedDomainCount} detected (${skippedCount} skipped, ${unresolvedCount} unresolved).`);
-            setToastVisible(true);
-
-            await fetchLeads(true);
-            await fetchLeadTotal();
-        } catch (error) {
-            console.error('Failed to run Klaviyo check:', error);
-            setToastMessage(error instanceof Error ? error.message : 'Failed to run Klaviyo check');
-            setToastVisible(true);
-        } finally {
-            setCheckingKlaviyo(false);
-        }
-    }, [appliedLeadFilters, campaignFilterId, clientId, debouncedLeadSearch, fetchLeadTotal, fetchLeads, listFilterId, user]);
 
     const fetchInstantlySyncRun = useCallback(async (runId: number) => {
         if (!user || !clientId || !runId) return null;
@@ -4305,9 +4231,9 @@ export default function ClientPage() {
     }, [instantlySyncRun?.id, instantlySyncRun?.status, fetchInstantlySyncRun, stopInstantlySyncPolling]);
 
     const loadMoreLeads = useCallback(() => {
-        if (leadsLoading || !leadsHasMore) return;
+        if (leadsLoading || leadsLoadingMore || !leadsHasMore) return;
         fetchLeads(false);
-    }, [fetchLeads, leadsHasMore, leadsLoading]);
+    }, [fetchLeads, leadsHasMore, leadsLoading, leadsLoadingMore]);
 
     useEffect(() => {
         const currentStatus = instantlySyncRun?.status || null;
@@ -4335,6 +4261,22 @@ export default function ClientPage() {
 
     const displayedLeadTotal = displayedStats.total;
     const displayedLeadTotalLabel = displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString();
+    const hasActiveLeadQuery = Boolean(leadSearch.trim() || appliedLeadFilters.length > 0);
+    const leadQueryShare = useMemo(() => {
+        if (!hasActiveLeadQuery) {
+            return { percent: 100, label: '100%' };
+        }
+        if (displayedLeadTotal === null || clientTotalLeads <= 0) {
+            return { percent: null, label: '...' };
+        }
+        const percent = Math.max(0, Math.min(100, (displayedLeadTotal / clientTotalLeads) * 100));
+        let label = '0%';
+        if (percent >= 99.95) label = '100%';
+        else if (percent >= 10) label = `${percent.toFixed(0)}%`;
+        else if (percent >= 1) label = `${percent.toFixed(1)}%`;
+        else if (percent > 0) label = '<1%';
+        return { percent, label };
+    }, [clientTotalLeads, displayedLeadTotal, hasActiveLeadQuery]);
 
     useEffect(() => {
         return () => {
@@ -5485,7 +5427,6 @@ export default function ClientPage() {
                 clientId,
                 leadFilter: {
                     search: snapshot.search,
-                    instantlyCampaignId: snapshot.instantlyCampaignId,
                     filters: snapshot.filters,
                     ...(Number.isInteger(parsedRowLimit) && parsedRowLimit > 0 ? { rowLimit: parsedRowLimit } : {})
                 },
@@ -8144,7 +8085,8 @@ export default function ClientPage() {
             if (!response.ok) {
                 throw new Error(data?.error || 'Failed to delete list');
             }
-            setListFilterId('');
+            setLeadFilters((prev) => prev.filter((filter) => filter.field !== 'list'));
+            setAppliedLeadFilters((prev) => prev.filter((filter) => filter.field !== 'list'));
             setToastMessage(`Deleted list “${list?.name || 'list'}”.`);
             setToastVisible(true);
             await refreshLeadLists();
@@ -8200,59 +8142,25 @@ export default function ClientPage() {
 
     const leadTabContent = (
         <div className="lead-workspace">
-            <div className="lead-summary" style={{
-                display: 'flex',
-                gap: '1rem',
-                marginTop: '2rem',
-                flexWrap: 'wrap'
-            }}>
-                {campaignFilterId || listFilterId || leadSearch.trim() || appliedLeadFilters.length > 0 ? (
-                    <div className="metric-chip">
-                        <span className="metric-chip__label">Filtered Total</span>
-                        <span className="metric-chip__value">{displayedLeadTotalLabel}</span>
-                    </div>
-                ) : (
-                    <div className="metric-chip">
-                        <span className="metric-chip__label">Total Leads</span>
-                        <span className="metric-chip__value">{displayedLeadTotalLabel}</span>
-                    </div>
-                )}
-            </div>
-
-            <div className="lead-controls" style={{
-                marginTop: '1rem',
-                display: 'flex',
-                gap: '0.75rem',
-                flexWrap: 'wrap',
-                alignItems: 'flex-end'
-            }}>
-                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '220px' }}>
-                    <span className="settings-field__label">Filter by Campaign</span>
-                    <select
-                        value={campaignFilterId}
-                        onChange={(e) => setCampaignFilterId(e.target.value)}
-                        disabled={instantlyCampaignsLoading}
-                    >
-                        <option value="">All campaigns</option>
-                        {instantlyCampaigns.map((c) => (
-                            <option key={c.id} value={c.id}>{c.name}</option>
-                        ))}
-                    </select>
-                </label>
-                <label className="settings-field" style={{ flex: '1 1 200px', minWidth: '220px' }}>
-                    <span className="settings-field__label">List</span>
-                    <select
-                        value={listFilterId}
-                        onChange={(e) => setListFilterId(e.target.value)}
-                        disabled={leadListsLoading}
-                    >
-                        <option value="">All lists</option>
-                        {leadLists.map((list) => (
-                            <option key={list.id} value={String(list.id)}>
-                                {list.name} ({list.memberCount.toLocaleString()})
-                            </option>
-                        ))}
-                    </select>
+            <div className="lead-query-layout">
+                <div className="lead-query-panel">
+                    <div className="lead-controls" style={{
+                        display: 'flex',
+                        gap: '0.75rem',
+                        flexWrap: 'wrap',
+                        alignItems: 'flex-end'
+                    }}>
+                <label className="settings-field" style={{ flex: '2 1 260px', minWidth: '260px' }}>
+                    <span className="settings-field__label">Search leads</span>
+                    <input
+                        type="text"
+                        value={leadSearch}
+                        onChange={(e) => setLeadSearch(e.target.value)}
+                        onFocus={() => setLeadFilterDrawerOpen(true)}
+                        placeholder="Search by domain, email, or founder name"
+                        aria-expanded={leadFilterDrawerOpen}
+                        aria-controls="lead-filter-drawer"
+                    />
                 </label>
                 {listFilterId && (
                     <button
@@ -8265,84 +8173,36 @@ export default function ClientPage() {
                         Delete list
                     </button>
                 )}
-                <label className="settings-field" style={{ flex: '2 1 260px', minWidth: '260px' }}>
-                    <span className="settings-field__label">Search leads</span>
-                    <input
-                        type="text"
-                        value={leadSearch}
-                        onChange={(e) => setLeadSearch(e.target.value)}
-                        placeholder="Search by domain, email, or founder name"
-                    />
-                </label>
                 <div className="lead-toolbar-actions" style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'flex-end', marginLeft: 'auto' }}>
-                    <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={handleCheckKlaviyo}
-                        style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading || checkingKlaviyo || leads.length === 0}
-                    >
-                        {checkingKlaviyo ? 'Checking Klaviyo...' : 'Check Klaviyo'}
-                    </button>
-                    <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={handleOpenVerificationImportModal}
-                        style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading}
-                    >
-                        📋 Import Verification CSV
-                    </button>
-                    <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={handleOpenLeadImportModal}
-                        style={{ flex: '0 0 auto' }}
-                        disabled={leadImportStarting}
-                    >
-                        📥 Import Leads CSV
-                    </button>
-                    <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={handleOpenFilteredEnrichModal}
-                        style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading || filteredEnrichPreviewLoading || (jobState !== null && (jobState.status === 'running' || jobState.status === 'queued'))}
-                        title={jobState && (jobState.status === 'running' || jobState.status === 'queued')
-                            ? 'Another enrichment job is already active for this client.'
-                            : 'Start an enrichment job on the currently filtered leads'}
-                    >
-                        ⚡ Enrich Filtered ({displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString()})
-                    </button>
-                    <button
-                        type="button"
-                        className="primary-button"
-                        onClick={() => setLeadExportModalOpen(true)}
-                        style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading || exportingCsv || checkingKlaviyo || deletingLeads}
-                    >
-                        {exportingCsv ? (
-                            <>
-                                <svg className="spinner" style={{ width: '14px', height: '14px', marginRight: '0.5rem' }} viewBox="0 0 24 24" fill="none">
-                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
-                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
-                                </svg>
-                                Exporting...
-                            </>
-                        ) : (
-                            `📥 Export CSV (${allLeadsCached ? filteredLeads.length : (displayedLeadTotal === null ? '...' : displayedLeadTotal)})`
-                        )}
-                    </button>
-                    <button
-                        type="button"
-                        className="secondary-button secondary-button--active"
-                        onClick={openSaveListModal}
-                        style={{ flex: '0 0 auto' }}
-                        disabled={leadsLoading || listModalBusy}
-                    >
-                        Save results as list
-                    </button>
-                    {(appliedLeadFilters.length > 0 || leadFilters.length > 0 || leadSearch.trim() || campaignFilterId || listFilterId) && (
+                    <LeadToolbarMoreMenu
+                        items={[
+                            {
+                                id: 'import-verification',
+                                label: 'Import verification CSV',
+                                onSelect: handleOpenVerificationImportModal,
+                                disabled: leadsLoading
+                            },
+                            {
+                                id: 'import-leads',
+                                label: 'Import leads CSV',
+                                onSelect: handleOpenLeadImportModal,
+                                disabled: leadImportStarting
+                            },
+                            {
+                                id: 'enrich-filtered',
+                                label: `Enrich filtered (${displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString()})`,
+                                onSelect: handleOpenFilteredEnrichModal,
+                                disabled: leadsLoading || filteredEnrichPreviewLoading || (jobState !== null && (jobState.status === 'running' || jobState.status === 'queued'))
+                            },
+                            {
+                                id: 'save-list',
+                                label: 'Save results as list',
+                                onSelect: openSaveListModal,
+                                disabled: leadsLoading || listModalBusy
+                            }
+                        ]}
+                    />
+                    {(appliedLeadFilters.length > 0 || leadFilters.length > 0 || leadSearch.trim()) && (
                         <button
                             type="button"
                             className="secondary-button secondary-button--active"
@@ -8350,8 +8210,6 @@ export default function ClientPage() {
                                 setLeadFilters([]);
                                 setAppliedLeadFilters([]);
                                 setLeadSearch("");
-                                setCampaignFilterId("");
-                                setListFilterId("");
                             }}
                             style={{ flex: '0 0 auto' }}
                             disabled={leadsLoading}
@@ -8362,58 +8220,101 @@ export default function ClientPage() {
                 </div>
             </div>
 
+                <div
+                    id="lead-filter-drawer"
+                    className={`lead-filter-drawer${leadFilterDrawerOpen ? ' is-open' : ''}`}
+                >
+                    <div className="lead-filter-drawer__inner">
+                        <div className="lead-filter-drawer__panel">
+                            <div className="leads-filter-actions">
+                                <button
+                                    type="button"
+                                    className={leadFilters.length === 0 ? 'primary-button' : 'secondary-button secondary-button--active'}
+                                    onClick={addLeadFilter}
+                                    disabled={leadFilterFieldsLoading || leadFilterFields.length === 0}
+                                >
+                                    + Add Filter
+                                </button>
+                                <div className="leads-filter-actions__end">
+                                    {leadFiltersDirty && leadFilters.length > 0 && (
+                                        <span style={{ fontSize: '0.82rem', color: '#fbbf24', fontWeight: 600 }}>
+                                            Unapplied changes
+                                        </span>
+                                    )}
+                                    {leadFilters.length > 0 && (
+                                        <button
+                                            type="button"
+                                            className="primary-button"
+                                            onClick={applyLeadFilters}
+                                            disabled={leadsLoading}
+                                        >
+                                            Run Query
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                            {leadFilterContent}
+                        </div>
+                    </div>
+                </div>
+                </div>
+                <div className="lead-query-total">
+                    <div className="lead-query-count">
+                        <span className="settings-field__label">
+                            {hasActiveLeadQuery ? 'Filtered Total' : 'Total Leads'}
+                        </span>
+                        <span className={`lead-query-count__value${leadsLoading ? ' is-loading' : ''}`}>
+                            {leadsLoading ? (
+                                <svg className="lead-query-count__spinner spinner" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                </svg>
+                            ) : null}
+                            {displayedLeadTotalLabel}
+                        </span>
+                    </div>
+                    <div
+                        className="lead-query-share"
+                        aria-label={`${leadQueryShare.label} of total leads`}
+                    >
+                        <div className="lead-query-share__meta">
+                            <span className="settings-field__label">% of total leads</span>
+                            <span className="lead-query-share__value">{leadsLoading ? '...' : leadQueryShare.label}</span>
+                        </div>
+                        <div
+                            className={`lead-query-share__bar${leadsLoading ? ' is-loading' : ''}`}
+                            role="progressbar"
+                            aria-busy={leadsLoading}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={leadsLoading ? undefined : (leadQueryShare.percent ?? undefined)}
+                            aria-valuetext={leadsLoading ? 'Searching' : leadQueryShare.label}
+                        >
+                            <div
+                                className="lead-query-share__bar-fill"
+                                style={leadsLoading ? undefined : { transform: `scaleX(${(leadQueryShare.percent ?? 0) / 100})` }}
+                            />
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        className="secondary-button secondary-button--active lead-query-export"
+                        onClick={() => setLeadExportModalOpen(true)}
+                        disabled={leadsLoading || exportingCsv || deletingLeads}
+                    >
+                        {exportingCsv
+                            ? 'Exporting...'
+                            : `Export CSV (${allLeadsCached ? filteredLeads.length.toLocaleString() : (displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString())})`}
+                    </button>
+                </div>
+            </div>
+
             <div style={{
                 marginTop: '0.75rem',
                 display: 'flex',
                 flexDirection: 'column',
                 gap: '0.75rem'
             }}>
-                <div style={{
-                    padding: '1rem',
-                    border: '1px solid var(--app-border)',
-                    borderRadius: '10px',
-                    background: 'var(--app-surface-3)',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '0.75rem'
-                }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                        <div>
-                            <div style={{ fontSize: '0.78rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--app-text-faint)' }}>
-                                Filters
-                            </div>
-                            <div style={{ fontSize: '0.88rem', color: 'var(--app-text-muted)', marginTop: '0.2rem' }}>
-                                Build lead filters locally, then run the query when you are ready.
-                            </div>
-                        </div>
-                        <div className="leads-filter-actions">
-                            {leadFiltersDirty && (
-                                <span style={{ fontSize: '0.82rem', color: '#fbbf24', fontWeight: 600 }}>
-                                    Unapplied changes
-                                </span>
-                            )}
-                            <button
-                                type="button"
-                                className="secondary-button secondary-button--active"
-                                onClick={addLeadFilter}
-                                disabled={leadFilterFieldsLoading || leadFilterFields.length === 0}
-                            >
-                                + Add Filter
-                            </button>
-                            <button
-                                type="button"
-                                className="primary-button"
-                                onClick={applyLeadFilters}
-                                disabled={leadsLoading}
-                            >
-                                Run Query
-                            </button>
-                        </div>
-                    </div>
-
-                    {leadFilterContent}
-                </div>
-
                 <div style={{
                     display: 'flex',
                     gap: '0.75rem',
@@ -8618,7 +8519,7 @@ export default function ClientPage() {
                                         {filteredLeads.map((lead, index) => (
                                             <tr
                                                 key={lead.id}
-                                                onClick={() => setSelectedLead(lead)}
+                                                onClick={() => void openLeadDetail({ contactId: String(lead.id), email: lead.email })}
                                                 style={{
                                                     backgroundColor: index % 2 === 0 ? 'transparent' : 'var(--app-surface-3)',
                                                     borderBottom: index < filteredLeads.length - 1 ? '1px solid var(--app-border)' : 'none',
@@ -8721,9 +8622,24 @@ export default function ClientPage() {
                                         ))}
                                     </tbody>
                                 </table>
-                                {(leadsLoading || leadsHasMore) && (
-                                    <div style={{ padding: '0.75rem 1rem', color: 'var(--app-text-muted)' }}>
-                                        {leadsLoading ? 'Loading leads...' : 'Scroll to load more'}
+                                {(leadsLoadingMore || leadsHasMore) && (
+                                    <div style={{
+                                        padding: '0.75rem 1rem',
+                                        color: 'var(--app-text-muted)',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '0.5rem',
+                                        fontSize: '0.8125rem'
+                                    }}>
+                                        {leadsLoadingMore ? (
+                                            <>
+                                                <svg className="spinner" style={{ width: '14px', height: '14px' }} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
+                                                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                                                </svg>
+                                                Loading more
+                                            </>
+                                        ) : 'Scroll to load more'}
                                     </div>
                                 )}
                             </div>
@@ -8774,7 +8690,7 @@ export default function ClientPage() {
                                 }
                             }}
                             onOpenJob={() => {
-                                setActiveTab("campaigns");
+                                selectTab("campaigns");
                                 setPipelineVisible(true);
                                 handleSelectJob(creditExhaustedJob);
                             }}
@@ -8784,39 +8700,39 @@ export default function ClientPage() {
                     <div className="tab-nav">
                         <button
                             className={`tab-nav__button ${activeTab === "analytics" ? "tab-nav__button--active" : ""}`}
-                            onClick={() => setActiveTab("analytics")}
+                            onClick={() => selectTab("analytics")}
                         >
                             Analytics
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "campaigns" ? "tab-nav__button--active" : ""}`}
-                            onClick={() => setActiveTab("campaigns")}
+                            onClick={() => selectTab("campaigns")}
                         >
                             Pipeline
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "leads" ? "tab-nav__button--active" : ""}`}
-                            onClick={() => setActiveTab("leads")}
+                            onClick={() => selectTab("leads")}
                         >
                             All Leads
                         </button>
                         <button
                             className={`tab-nav__button ${activeTab === "follow-ups" ? "tab-nav__button--active" : ""}`}
-                            onClick={() => setActiveTab("follow-ups")}
+                            onClick={() => selectTab("follow-ups")}
                         >
                             Follow-Ups
                         </button>
                         {dealFlowEnabled && (
                             <button
                                 className={`tab-nav__button ${activeTab === "deal-flow" ? "tab-nav__button--active" : ""}`}
-                                onClick={() => setActiveTab("deal-flow")}
+                                onClick={() => selectTab("deal-flow")}
                             >
                                 Deal Flow
                             </button>
                         )}
                         <button
                             className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
-                            onClick={() => setActiveTab("info")}
+                            onClick={() => selectTab("info")}
                         >
                             Info
                         </button>
@@ -8845,42 +8761,39 @@ export default function ClientPage() {
                                     <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginLeft: "auto" }}>
                                         <label className="settings-field" style={{ minWidth: "220px" }}>
                                             <span className="settings-field__label">Campaign</span>
-                                            <select
+                                            <AppSelect
                                                 value={instantlyEventAnalyticsCampaignId}
-                                                onChange={(e) => setInstantlyEventAnalyticsCampaignId(e.target.value)}
+                                                emptyLabel="All campaigns"
                                                 disabled={instantlyEventAnalyticsCoreLoading && instantlyEventAnalyticsDetailsLoading}
-                                            >
-                                                <option value="">All campaigns</option>
-                                                {[...campaigns]
+                                                options={[...campaigns]
                                                     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }))
-                                                    .map((campaign) => (
-                                                        <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
-                                                    ))}
-                                            </select>
+                                                    .map((campaign) => ({ value: campaign.id, label: campaign.name }))}
+                                                onChange={setInstantlyEventAnalyticsCampaignId}
+                                            />
                                         </label>
                                         <label className="settings-field" style={{ minWidth: "180px" }}>
                                             <span className="settings-field__label">Event Type</span>
-                                            <select
+                                            <AppSelect
                                                 value={instantlyEventAnalyticsEventType}
-                                                onChange={(e) => setInstantlyEventAnalyticsEventType(e.target.value)}
                                                 disabled={instantlyEventAnalyticsCoreLoading && instantlyEventAnalyticsDetailsLoading}
-                                            >
-                                                {(instantlyEventAnalytics?.availableEventTypes || [{ value: "all", label: "All event types" }]).map((option) => (
-                                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                                ))}
-                                            </select>
+                                                options={(instantlyEventAnalytics?.availableEventTypes || [{ value: "all", label: "All event types" }]).map((option) => ({
+                                                    value: option.value,
+                                                    label: option.label
+                                                }))}
+                                                onChange={setInstantlyEventAnalyticsEventType}
+                                            />
                                         </label>
                                         <label className="settings-field" style={{ minWidth: "180px" }}>
                                             <span className="settings-field__label">Time Period</span>
-                                            <select
+                                            <AppSelect
                                                 value={instantlyEventAnalyticsPeriod}
-                                                onChange={(e) => setInstantlyEventAnalyticsPeriod(e.target.value as InstantlyEventAnalyticsPeriod)}
                                                 disabled={instantlyEventAnalyticsCoreLoading && instantlyEventAnalyticsDetailsLoading}
-                                            >
-                                                {INSTANTLY_ANALYTICS_PERIOD_OPTIONS.map((option) => (
-                                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                                ))}
-                                            </select>
+                                                options={INSTANTLY_ANALYTICS_PERIOD_OPTIONS.map((option) => ({
+                                                    value: option.value,
+                                                    label: option.label
+                                                }))}
+                                                onChange={(value) => setInstantlyEventAnalyticsPeriod(value as InstantlyEventAnalyticsPeriod)}
+                                            />
                                         </label>
                                     </div>
                                 </div>
@@ -9744,8 +9657,7 @@ export default function ClientPage() {
                                                         setLeadFilters([{ id: createLeadFilterId(), ...clause }]);
                                                         setAppliedLeadFilters([clause]);
                                                         setLeadSearch("");
-                                                        setCampaignFilterId("");
-                                                        setActiveTab("leads");
+                                                        selectTab("leads");
                                                     }}
                                                     title="View leads for this job"
                                                     aria-label="View leads for this job"
@@ -10538,7 +10450,7 @@ export default function ClientPage() {
                                                                         }
                                                                     }}
                                                                     onOpenJob={() => {
-                                                                        setActiveTab("campaigns");
+                                                                        selectTab("campaigns");
                                                                         setPipelineVisible(true);
                                                                         handleSelectJob(job);
                                                                     }}
@@ -10667,15 +10579,16 @@ export default function ClientPage() {
                             </label>
                             <label className="settings-field">
                                 <span className="settings-field__label">Industry</span>
-                                <select
+                                <AppSelect
                                     value={clientIndustry}
-                                    onChange={(e) => setClientIndustry(e.target.value as Niche['id'])}
-                                >
-                                    <option value="ecom">E-commerce</option>
-                                    <option value="saas">SaaS</option>
-                                    <option value="agency">Agency</option>
-                                    <option value="local">Local Business</option>
-                                </select>
+                                    options={[
+                                        { value: "ecom", label: "E-commerce" },
+                                        { value: "saas", label: "SaaS" },
+                                        { value: "agency", label: "Agency" },
+                                        { value: "local", label: "Local Business" }
+                                    ]}
+                                    onChange={(value) => setClientIndustry(value as Niche['id'])}
+                                />
                                 <span className="settings-field__hint">Used for personalization defaults.</span>
                             </label>
                             <label className="settings-field">
@@ -10795,18 +10708,13 @@ export default function ClientPage() {
                                 )}
                                 <label className="settings-field" style={{ marginTop: '0.75rem' }}>
                                     <span className="settings-field__label">Sync scope</span>
-                                    <select
+                                    <AppSelect
                                         value={instantlySyncCampaignId}
-                                        onChange={(e) => setInstantlySyncCampaignId(e.target.value)}
+                                        emptyLabel="All campaigns"
                                         disabled={instantlyCampaignsLoading || syncingInstantlyState || stoppingInstantlySync}
-                                    >
-                                        <option value="">All campaigns</option>
-                                        {instantlyCampaigns.map((campaign) => (
-                                            <option key={campaign.id} value={campaign.id}>
-                                                {campaign.name}
-                                            </option>
-                                        ))}
-                                    </select>
+                                        options={instantlyCampaigns.map((campaign) => ({ value: campaign.id, label: campaign.name }))}
+                                        onChange={setInstantlySyncCampaignId}
+                                    />
                                     <span className="settings-field__hint">
                                         {instantlyCampaignsLoading
                                             ? 'Loading campaigns...'
@@ -11153,14 +11061,26 @@ export default function ClientPage() {
                                     </span>
                                 )}
                                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginLeft: 'auto', flexWrap: 'wrap' }}>
-                                    <select
+                                    <AppSelect
                                         value={warmFollowUpStatus ? String(warmFollowUpStatus.interest_value) : ''}
                                         disabled={savingWarmFollowUpStatus || instantlyLeadLabelsLoading}
-                                        onFocus={() => {
-                                            if (instantlyLeadLabels === null) loadInstantlyLeadLabels();
+                                        emptyLabel={instantlyLeadLabelsLoading
+                                            ? 'Loading statuses…'
+                                            : (instantlyLeadLabels === null ? 'Choose status…' : 'Disabled (no status)')}
+                                        options={(instantlyLeadLabels || (warmFollowUpStatus
+                                            ? [{
+                                                value: String(warmFollowUpStatus.interest_value),
+                                                label: warmFollowUpStatus.label || `Status ${warmFollowUpStatus.interest_value}`,
+                                                sentiment: null
+                                            }]
+                                            : [])).map((item) => ({
+                                            value: String(item.value),
+                                            label: `${item.label}${'sentiment' in item && item.sentiment ? ` (${item.sentiment})` : ''}`
+                                        }))}
+                                        onOpenChange={(open) => {
+                                            if (open && instantlyLeadLabels === null) loadInstantlyLeadLabels();
                                         }}
-                                        onChange={(e) => {
-                                            const raw = e.target.value;
+                                        onChange={(raw) => {
                                             if (raw === '') {
                                                 handleSaveWarmFollowUpStatus(null);
                                                 return;
@@ -11170,25 +11090,7 @@ export default function ClientPage() {
                                                 handleSaveWarmFollowUpStatus({ interest_value: option.value, label: option.label });
                                             }
                                         }}
-                                    >
-                                        <option value="">
-                                            {instantlyLeadLabelsLoading
-                                                ? 'Loading statuses…'
-                                                : (instantlyLeadLabels === null ? 'Choose status…' : 'Disabled (no status)')}
-                                        </option>
-                                        {(instantlyLeadLabels || (warmFollowUpStatus
-                                            ? [{
-                                                value: warmFollowUpStatus.interest_value,
-                                                label: warmFollowUpStatus.label || `Status ${warmFollowUpStatus.interest_value}`,
-                                                sentiment: null,
-                                                description: null
-                                            }]
-                                            : [])).map((item) => (
-                                            <option key={item.value} value={String(item.value)}>
-                                                {item.label}{item.sentiment ? ` (${item.sentiment})` : ''}
-                                            </option>
-                                        ))}
-                                    </select>
+                                    />
                                     <button
                                         type="button"
                                         className="secondary-button"
@@ -11319,15 +11221,12 @@ export default function ClientPage() {
                         <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                             <label className="settings-field">
                                 <span className="settings-field__label">Campaign</span>
-                                <select
+                                <AppSelect
                                     value={autoResponderPromptCampaignId}
-                                    onChange={(event) => setAutoResponderPromptCampaignId(event.target.value)}
-                                >
-                                    <option value="">Select campaign…</option>
-                                    {autoResponderCampaigns.map((campaign) => (
-                                        <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
-                                    ))}
-                                </select>
+                                    emptyLabel="Select campaign…"
+                                    options={autoResponderCampaigns.map((campaign) => ({ value: campaign.id, label: campaign.name }))}
+                                    onChange={setAutoResponderPromptCampaignId}
+                                />
                             </label>
                             <label className="settings-field" style={{ maxWidth: '180px' }}>
                                 <span className="settings-field__label">Version</span>
@@ -12144,16 +12043,13 @@ export default function ClientPage() {
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Domain column <span style={{ color: '#f87171' }}>*</span></span>
-                                        <select
+                                        <AppSelect
                                             value={domainColumn}
-                                            onChange={(e) => setDomainColumn(e.target.value)}
+                                            emptyLabel="Select column"
                                             disabled={!csvColumns.length}
-                                        >
-                                            <option value="">Select column</option>
-                                            {csvColumns.map((col) => (
-                                                <option key={col} value={col}>{col}</option>
-                                            ))}
-                                        </select>
+                                            options={csvColumns.map((col) => ({ value: col, label: col }))}
+                                            onChange={setDomainColumn}
+                                        />
                                         <span className="settings-field__hint">
                                             {csvColumns.length === 0 ? 'Upload a CSV in Step 1 to detect columns.' : 'Auto-detected similar names like domain/website/url.'}
                                         </span>
@@ -12161,16 +12057,13 @@ export default function ClientPage() {
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Founder name column (optional)</span>
-                                        <select
+                                        <AppSelect
                                             value={founderColumn}
-                                            onChange={(e) => setFounderColumn(e.target.value)}
+                                            emptyLabel="Select column (or none)"
                                             disabled={!csvColumns.length}
-                                        >
-                                            <option value="">Select column (or none)</option>
-                                            {csvColumns.map((col) => (
-                                                <option key={col} value={col}>{col}</option>
-                                            ))}
-                                        </select>
+                                            options={csvColumns.map((col) => ({ value: col, label: col }))}
+                                            onChange={setFounderColumn}
+                                        />
                                         <span className="settings-field__hint">
                                             {founderColumn
                                                 ? `Using "${founderColumn}" for founder names. Founder finder will be skipped.`
@@ -12180,16 +12073,13 @@ export default function ClientPage() {
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Email column (optional)</span>
-                                        <select
+                                        <AppSelect
                                             value={emailColumn}
-                                            onChange={(e) => setEmailColumn(e.target.value)}
+                                            emptyLabel="Select column (or none)"
                                             disabled={!csvColumns.length}
-                                        >
-                                            <option value="">Select column (or none)</option>
-                                            {csvColumns.map((col) => (
-                                                <option key={col} value={col}>{col}</option>
-                                            ))}
-                                        </select>
+                                            options={csvColumns.map((col) => ({ value: col, label: col }))}
+                                            onChange={setEmailColumn}
+                                        />
                                         <span className="settings-field__hint">
                                             {emailColumn
                                                 ? `Using "${emailColumn}" for email addresses. Email discovery will be skipped.`
@@ -12286,13 +12176,14 @@ export default function ClientPage() {
                                     ) : (
                                     <label className="settings-field">
                                         <span className="settings-field__label">Duplicates</span>
-                                        <select
+                                        <AppSelect
                                             value={dedupeStrategy}
-                                            onChange={(e) => setDedupeStrategy(e.target.value as 'skip' | 'include')}
-                                        >
-                                            <option value="skip">Skip domains already tried</option>
-                                            <option value="include">Re-process existing domains (merge non-empty updates)</option>
-                                        </select>
+                                            options={[
+                                                { value: "skip", label: "Skip domains already tried" },
+                                                { value: "include", label: "Re-process existing domains (merge non-empty updates)" }
+                                            ]}
+                                            onChange={(value) => setDedupeStrategy(value as 'skip' | 'include')}
+                                        />
                                         <span className="settings-field__hint">
                                             {dedupeStrategy === 'include'
                                                 ? 'Re-runs enrichment for domains in this file: only non-empty CSV/API values override DB; blank or "Not Found" cells keep existing data and skip later stages. Mapped email/founder columns define which rows are in scope.'
@@ -12540,15 +12431,16 @@ export default function ClientPage() {
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
                                     <label className="settings-field">
                                         <span className="settings-field__label">Industry</span>
-                                        <select
+                                        <AppSelect
                                             value={clientIndustry}
-                                            onChange={(e) => setClientIndustry(e.target.value as Niche['id'])}
-                                        >
-                                            <option value="ecom">E-commerce</option>
-                                            <option value="saas">SaaS</option>
-                                            <option value="agency">Agency</option>
-                                            <option value="local">Local Business</option>
-                                        </select>
+                                            options={[
+                                                { value: "ecom", label: "E-commerce" },
+                                                { value: "saas", label: "SaaS" },
+                                                { value: "agency", label: "Agency" },
+                                                { value: "local", label: "Local Business" }
+                                            ]}
+                                            onChange={(value) => setClientIndustry(value as Niche['id'])}
+                                        />
                                         <span className="settings-field__hint">Select your target industry for personalization.</span>
                                     </label>
 
@@ -12646,19 +12538,13 @@ export default function ClientPage() {
 
                                                             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: '1.5rem' }}>
                                                                 <span style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>Products:</span>
-                                                                <select
-                                                                    value={productPromptProducts}
-                                                                    onChange={(e) => setProductPromptProducts(Number(e.target.value))}
+                                                                <AppSelect
+                                                                    value={String(productPromptProducts)}
                                                                     disabled={!productPromptUseNew}
-                                                                    style={{
-                                                                        width: '80px',
-                                                                        opacity: productPromptUseNew ? 1 : 0.6
-                                                                    }}
-                                                                >
-                                                                    {[1, 2, 3, 4, 5].map((num) => (
-                                                                        <option key={num} value={num}>{num}</option>
-                                                                    ))}
-                                                                </select>
+                                                                    options={[1, 2, 3, 4, 5].map((num) => ({ value: String(num), label: String(num) }))}
+                                                                    triggerClassName="w-20"
+                                                                    onChange={(value) => setProductPromptProducts(Number(value))}
+                                                                />
                                                             </div>
 
                                                             <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -12839,15 +12725,15 @@ export default function ClientPage() {
                         <div className="modal__body" style={{ maxHeight: '70vh', overflowY: 'auto' }}>
                             <label className="settings-field" style={{ marginBottom: '1.5rem' }}>
                                 <span className="settings-field__label">Campaign *</span>
-                                <select
+                                <AppSelect
                                     value={selectedCampaignId}
-                                    onChange={(e) => setSelectedCampaignId(e.target.value)}
-                                >
-                                    <option value="">Select campaign...</option>
-                                    {(instantlyCampaigns.length ? instantlyCampaigns : campaigns).map((campaign) => (
-                                        <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
-                                    ))}
-                                </select>
+                                    emptyLabel="Select campaign..."
+                                    options={(instantlyCampaigns.length ? instantlyCampaigns : campaigns).map((campaign) => ({
+                                        value: campaign.id,
+                                        label: campaign.name
+                                    }))}
+                                    onChange={setSelectedCampaignId}
+                                />
                             </label>
 
                             <div style={{ marginBottom: '2rem' }}>
@@ -12863,14 +12749,18 @@ export default function ClientPage() {
                                         <div key={field} style={{ marginBottom: '1.5rem' }}>
                                             <label className="settings-field">
                                                 <span className="settings-field__label">{displayName} {field === 'email' && '*'}</span>
-                                                <select
+                                                <AppSelect
                                                     value={
                                                         columnMapping[field]?.isCustom
                                                             ? '__custom__'
                                                             : columnMapping[field]?.column || ''
                                                     }
-                                                    onChange={(e) => {
-                                                        const val = e.target.value;
+                                                    emptyLabel="-- Not mapped --"
+                                                    options={[
+                                                        { value: "__custom__", label: "Use custom variable name" },
+                                                        ...csvHeaders.map((header) => ({ value: header, label: header }))
+                                                    ]}
+                                                    onChange={(val) => {
                                                         if (val === '__custom__') {
                                                             setColumnMapping({
                                                                 ...columnMapping,
@@ -12883,11 +12773,7 @@ export default function ClientPage() {
                                                             });
                                                         }
                                                     }}
-                                                >
-                                                    <option value="">-- Not mapped --</option>
-                                                    <option value="__custom__">🔧 Use custom variable name</option>
-                                                    {csvHeaders.map((header) => (<option key={header} value={header}>{header}</option>))}
-                                                </select>
+                                                />
                                             </label>
                                             {columnMapping[field]?.isCustom && (
                                                 <div style={{ marginTop: '0.75rem', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '0.75rem' }}>
@@ -12906,16 +12792,15 @@ export default function ClientPage() {
                                                     </label>
                                                     <label className="settings-field">
                                                         <span className="settings-field__label">Map to column</span>
-                                                        <select
+                                                        <AppSelect
                                                             value={columnMapping[field]?.column || ''}
-                                                            onChange={(e) => setColumnMapping({
+                                                            emptyLabel="-- Not mapped --"
+                                                            options={csvHeaders.map((header) => ({ value: header, label: header }))}
+                                                            onChange={(value) => setColumnMapping({
                                                                 ...columnMapping,
-                                                                [field]: { ...(columnMapping[field] || { isCustom: true }), column: e.target.value }
+                                                                [field]: { ...(columnMapping[field] || { isCustom: true }), column: value }
                                                             })}
-                                                        >
-                                                            <option value="">-- Not mapped --</option>
-                                                            {csvHeaders.map((header) => (<option key={header} value={header}>{header}</option>))}
-                                                        </select>
+                                                        />
                                                     </label>
                                                 </div>
                                             )}
@@ -13082,10 +12967,11 @@ export default function ClientPage() {
                                                         {target.label}{target.required ? <span style={{ color: '#f87171' }}> *</span> : ''}
                                                         <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', color: 'var(--app-text-faint)' }}>{target.group}</span>
                                                     </span>
-                                                    <select
+                                                    <AppSelect
                                                         value={leadImportMapping[target.key] || ''}
-                                                        onChange={(e) => {
-                                                            const value = e.target.value;
+                                                        emptyLabel="— Not mapped —"
+                                                        options={leadImportHeaders.map((header) => ({ value: header, label: header }))}
+                                                        onChange={(value) => {
                                                             setLeadImportMapping((prev) => {
                                                                 const next = { ...prev };
                                                                 if (value) next[target.key] = value;
@@ -13093,12 +12979,7 @@ export default function ClientPage() {
                                                                 return next;
                                                             });
                                                         }}
-                                                    >
-                                                        <option value="">— Not mapped —</option>
-                                                        {leadImportHeaders.map((header) => (
-                                                            <option key={header} value={header}>{header}</option>
-                                                        ))}
-                                                    </select>
+                                                    />
                                                     {leadImportMapping[target.key] && leadImportPreviewRows.length > 0 && (
                                                         <span className="settings-field__hint" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                             e.g. {leadImportPreviewRows.slice(0, 2).map((row) => row[leadImportMapping[target.key]] || '(empty)').join(' · ')}
@@ -13111,14 +12992,15 @@ export default function ClientPage() {
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">When a lead already exists (same domain)</span>
-                                        <select
+                                        <AppSelect
                                             value={leadImportCollisionStrategy}
-                                            onChange={(e) => setLeadImportCollisionStrategy(e.target.value as 'fill_blanks' | 'overwrite' | 'skip')}
-                                        >
-                                            <option value="fill_blanks">Fill blanks only — never overwrite existing data</option>
-                                            <option value="overwrite">Overwrite with CSV values (blank cells keep existing data)</option>
-                                            <option value="skip">Skip existing leads — only create new domains</option>
-                                        </select>
+                                            options={[
+                                                { value: "fill_blanks", label: "Fill blanks only — never overwrite existing data" },
+                                                { value: "overwrite", label: "Overwrite with CSV values (blank cells keep existing data)" },
+                                                { value: "skip", label: "Skip existing leads — only create new domains" }
+                                            ]}
+                                            onChange={(value) => setLeadImportCollisionStrategy(value as 'fill_blanks' | 'overwrite' | 'skip')}
+                                        />
                                         <span className="settings-field__hint">
                                             {leadImportCollisionStrategy === 'fill_blanks' && 'Safest: enriched emails, verification statuses and first lines are preserved; the CSV only fills what is missing.'}
                                             {leadImportCollisionStrategy === 'overwrite' && 'CSV is the source of truth for mapped columns. Changing an email resets its verification status to the CSV’s status.'}
@@ -13297,31 +13179,25 @@ export default function ClientPage() {
 
                                         <label className="settings-field">
                                             <span className="settings-field__label">Email column *</span>
-                                            <select
+                                            <AppSelect
                                                 value={verificationImportEmailCol}
-                                                onChange={(e) => setVerificationImportEmailCol(e.target.value)}
+                                                emptyLabel="— select —"
                                                 disabled={verificationImportLoading}
-                                            >
-                                                <option value="">— select —</option>
-                                                {verificationImportHeaders.map((h) => (
-                                                    <option key={h} value={h}>{h}</option>
-                                                ))}
-                                            </select>
+                                                options={verificationImportHeaders.map((h) => ({ value: h, label: h }))}
+                                                onChange={setVerificationImportEmailCol}
+                                            />
                                             <span className="settings-field__hint">Column that contains the contact&apos;s email address (used to match existing leads).</span>
                                         </label>
 
                                         <label className="settings-field">
                                             <span className="settings-field__label">Email status column *</span>
-                                            <select
+                                            <AppSelect
                                                 value={verificationImportStatusCol}
-                                                onChange={(e) => setVerificationImportStatusCol(e.target.value)}
+                                                emptyLabel="— select —"
                                                 disabled={verificationImportLoading}
-                                            >
-                                                <option value="">— select —</option>
-                                                {verificationImportHeaders.map((h) => (
-                                                    <option key={h} value={h}>{h}</option>
-                                                ))}
-                                            </select>
+                                                options={verificationImportHeaders.map((h) => ({ value: h, label: h }))}
+                                                onChange={setVerificationImportStatusCol}
+                                            />
                                             <span className="settings-field__hint">
                                                 Accepted values: <strong>valid</strong>, <strong>invalid</strong>, <strong>risky</strong>, <strong>unknown</strong>.
                                                 Common tool values like <em>found / deliverable</em> are mapped automatically.
@@ -13330,16 +13206,13 @@ export default function ClientPage() {
 
                                         <label className="settings-field">
                                             <span className="settings-field__label">Verified at column (optional)</span>
-                                            <select
+                                            <AppSelect
                                                 value={verificationImportVerifiedAtCol}
-                                                onChange={(e) => setVerificationImportVerifiedAtCol(e.target.value)}
+                                                emptyLabel="Use current timestamp (default)"
                                                 disabled={verificationImportLoading}
-                                            >
-                                                <option value="">Use current timestamp (default)</option>
-                                                {verificationImportHeaders.map((h) => (
-                                                    <option key={h} value={h}>{h}</option>
-                                                ))}
-                                            </select>
+                                                options={verificationImportHeaders.map((h) => ({ value: h, label: h }))}
+                                                onChange={setVerificationImportVerifiedAtCol}
+                                            />
                                             <span className="settings-field__hint">If left blank, <em>last verified at</em> is set to right now for every updated lead.</span>
                                         </label>
                                     </div>
@@ -13920,32 +13793,21 @@ export default function ClientPage() {
                                                         <span style={{ fontSize: '0.85rem', color: '#fca5a5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                             {campaignName}
                                                         </span>
-                                                        <select
+                                                        <AppSelect
                                                             value={instantlyCsvCampaignOverrides[campaignName] || ''}
-                                                            onChange={(e) => {
-                                                                const value = e.target.value;
+                                                            emptyLabel="Map manually..."
+                                                            disabled={instantlyCsvImportLoading || instantlyCsvCampaignsLoading}
+                                                            options={instantlyCsvOverrideCampaigns.map((campaign) => ({
+                                                                value: campaign.id,
+                                                                label: campaign.name
+                                                            }))}
+                                                            onChange={(value) => {
                                                                 setInstantlyCsvCampaignOverrides((prev) => ({
                                                                     ...prev,
                                                                     [campaignName]: value
                                                                 }));
                                                             }}
-                                                            disabled={instantlyCsvImportLoading || instantlyCsvCampaignsLoading}
-                                                            style={{
-                                                                width: '100%',
-                                                                padding: '0.4rem 0.5rem',
-                                                                borderRadius: '6px',
-                                                                background: 'rgba(0,0,0,0.2)',
-                                                                color: 'var(--app-text)',
-                                                                border: '1px solid var(--app-border-mid)'
-                                                            }}
-                                                        >
-                                                            <option value="">Map manually...</option>
-                                                            {instantlyCsvOverrideCampaigns.map((campaign) => (
-                                                                <option key={campaign.id} value={campaign.id}>
-                                                                    {campaign.name}
-                                                                </option>
-                                                            ))}
-                                                        </select>
+                                                        />
                                                     </div>
                                                 ))}
                                                 {!instantlyCsvCampaignsLoading && instantlyCsvOverrideCampaigns.length === 0 && (
@@ -14001,11 +13863,13 @@ export default function ClientPage() {
             )}
 
             {listModalOpen && (
-                <>
-                    <div
-                        className="modal-overlay"
-                        onClick={() => !listModalBusy && setListModalOpen(false)}
-                    />
+                <div
+                    className="modal-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    style={{ zIndex: 10020 }}
+                    onClick={() => !listModalBusy && setListModalOpen(false)}
+                >
                     <div className="modal" style={{ maxWidth: '420px' }} onClick={(e) => e.stopPropagation()}>
                         <div className="modal__header">
                             <div>
@@ -14025,16 +13889,15 @@ export default function ClientPage() {
                             {listModalMode !== 'save' && (
                                 <label className="settings-field">
                                     <span className="settings-field__label">List</span>
-                                    <select
+                                    <AppSelect
                                         value={listModalTargetId}
-                                        onChange={(e) => setListModalTargetId(e.target.value)}
                                         disabled={listModalBusy}
-                                    >
-                                        {leadLists.map((list) => (
-                                            <option key={list.id} value={String(list.id)}>{list.name}</option>
-                                        ))}
-                                        <option value="__new__">New list…</option>
-                                    </select>
+                                        options={[
+                                            ...leadLists.map((list) => ({ value: String(list.id), label: list.name })),
+                                            { value: "__new__", label: "New list…" }
+                                        ]}
+                                        onChange={setListModalTargetId}
+                                    />
                                 </label>
                             )}
                             {(listModalMode === 'save' || listModalTargetId === '__new__' || !listModalTargetId) && (
@@ -14070,7 +13933,7 @@ export default function ClientPage() {
                             </div>
                         </div>
                     </div>
-                </>
+                </div>
             )}
 
             {/* Segment Modal */}
@@ -14141,27 +14004,29 @@ export default function ClientPage() {
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Founder</span>
-                                        <select
+                                        <AppSelect
                                             value={segmentFounder}
-                                            onChange={(e) => setSegmentFounder(e.target.value as '' | 'exists' | 'not_found')}
-                                        >
-                                            <option value="">Any</option>
-                                            <option value="exists">Founder Exists</option>
-                                            <option value="not_found">Founder Not Found</option>
-                                        </select>
+                                            emptyLabel="Any"
+                                            options={[
+                                                { value: "exists", label: "Founder Exists" },
+                                                { value: "not_found", label: "Founder Not Found" }
+                                            ]}
+                                            onChange={(value) => setSegmentFounder(value as '' | 'exists' | 'not_found')}
+                                        />
                                     </label>
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Email Status</span>
-                                        <select
+                                        <AppSelect
                                             value={segmentEmail}
-                                            onChange={(e) => setSegmentEmail(e.target.value as '' | 'found' | 'not_found' | 'not_run')}
-                                        >
-                                            <option value="">Any</option>
-                                            <option value="found">Email Found</option>
-                                            <option value="not_found">Email Not Found</option>
-                                            <option value="not_run">Email Not Run</option>
-                                        </select>
+                                            emptyLabel="Any"
+                                            options={[
+                                                { value: "found", label: "Email Found" },
+                                                { value: "not_found", label: "Email Not Found" },
+                                                { value: "not_run", label: "Email Not Run" }
+                                            ]}
+                                            onChange={(value) => setSegmentEmail(value as '' | 'found' | 'not_found' | 'not_run')}
+                                        />
                                     </label>
 
                                     <label className="settings-field">
@@ -14206,19 +14071,19 @@ export default function ClientPage() {
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Created After</span>
-                                        <input
-                                            type="date"
+                                        <DatePicker
                                             value={segmentCreatedAfter}
-                                            onChange={(e) => setSegmentCreatedAfter(e.target.value)}
+                                            onChange={setSegmentCreatedAfter}
+                                            placeholder="Any date"
                                         />
                                     </label>
 
                                     <label className="settings-field">
                                         <span className="settings-field__label">Created Before</span>
-                                        <input
-                                            type="date"
+                                        <DatePicker
                                             value={segmentCreatedBefore}
-                                            onChange={(e) => setSegmentCreatedBefore(e.target.value)}
+                                            onChange={setSegmentCreatedBefore}
+                                            placeholder="Any date"
                                         />
                                     </label>
                                 </div>
@@ -14685,39 +14550,31 @@ export default function ClientPage() {
                                     }}>Instantly status</p>
                                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.45rem', alignItems: 'center' }}>
                                         {(selectedLead.campaignsData || []).length > 1 && (
-                                            <select
+                                            <AppSelect
                                                 value={leadStatusCampaignId || selectedLead.campaignsData?.[0]?.campaignId || ''}
                                                 disabled={savingLeadInstantlyStatus}
-                                                onChange={(e) => setLeadStatusCampaignId(e.target.value)}
-                                                style={{ flex: '1 1 140px', minWidth: 0 }}
-                                            >
-                                                {(selectedLead.campaignsData || []).map((campaign) => (
-                                                    <option key={campaign.campaignId} value={campaign.campaignId}>
-                                                        {campaign.campaignName || campaign.campaignId}
-                                                    </option>
-                                                ))}
-                                            </select>
+                                                triggerClassName="min-w-[8.75rem] flex-[1_1_140px]"
+                                                options={(selectedLead.campaignsData || []).map((campaign) => ({
+                                                    value: campaign.campaignId,
+                                                    label: campaign.campaignName || campaign.campaignId
+                                                }))}
+                                                onChange={setLeadStatusCampaignId}
+                                            />
                                         )}
-                                        <select
+                                        <AppSelect
                                             value={leadStatusInterestValue}
+                                            emptyLabel={instantlyLeadLabelsLoading ? 'Loading statuses…' : 'Choose status…'}
                                             disabled={savingLeadInstantlyStatus || instantlyLeadLabelsLoading}
-                                            onFocus={() => {
-                                                if (instantlyLeadLabels === null) loadInstantlyLeadLabels();
+                                            triggerClassName="min-w-[10rem] flex-[1_1_160px]"
+                                            options={(instantlyLeadLabels || []).map((item) => ({
+                                                value: String(item.value),
+                                                label: item.label
+                                            }))}
+                                            onOpenChange={(open) => {
+                                                if (open && instantlyLeadLabels === null) loadInstantlyLeadLabels();
                                             }}
-                                            onChange={(e) => setLeadStatusInterestValue(e.target.value)}
-                                            style={{ flex: '1 1 160px', minWidth: 0 }}
-                                        >
-                                            <option value="">
-                                                {instantlyLeadLabelsLoading
-                                                    ? 'Loading statuses…'
-                                                    : (instantlyLeadLabels === null ? 'Choose status…' : 'Choose status…')}
-                                            </option>
-                                            {(instantlyLeadLabels || []).map((item) => (
-                                                <option key={item.value} value={String(item.value)}>
-                                                    {item.label}
-                                                </option>
-                                            ))}
-                                        </select>
+                                            onChange={setLeadStatusInterestValue}
+                                        />
                                         <button
                                             type="button"
                                             className="secondary-button"
