@@ -239,10 +239,59 @@ function buildTimelineMessage({ inviteeName, eventName, timelineEventType }) {
         : (eventName || 'Meeting booked');
 }
 
+/**
+ * Attribute a Calendly booking to the Instantly campaign that produced it.
+ * Prefer the contact's most recent non-Calendly event at or before `at`,
+ * then fall back to the most recently active campaign membership.
+ */
+export const LATEST_CAMPAIGN_FOR_CONTACT_SQL = `
+    (
+        SELECT cie.campaign_id, cie.instantly_campaign_id, 1 AS rank
+        FROM contact_instantly_events cie
+        WHERE cie.contact_id = $1
+          AND cie.campaign_id IS NOT NULL
+          AND cie.source <> 'calendly'
+          AND ($2::timestamptz IS NULL OR cie.event_timestamp <= $2)
+        ORDER BY cie.event_timestamp DESC, cie.id DESC
+        LIMIT 1
+    )
+    UNION ALL
+    (
+        SELECT cic.campaign_id, ic.instantly_campaign_id, 2 AS rank
+        FROM contact_instantly_campaigns cic
+        JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
+        WHERE cic.contact_id = $1
+        ORDER BY cic.active DESC,
+            COALESCE(
+                cic.timestamp_last_reply,
+                cic.timestamp_last_interest_change,
+                cic.timestamp_last_contact,
+                cic.added_at
+            ) DESC NULLS LAST,
+            cic.added_at DESC NULLS LAST
+        LIMIT 1
+    )
+    ORDER BY rank
+    LIMIT 1
+`;
+
+export async function resolveLatestCampaignForContact(contactId, { at = null, db = pool } = {}) {
+    if (!contactId) return null;
+    const result = await db.query(LATEST_CAMPAIGN_FOR_CONTACT_SQL, [contactId, at]);
+    const row = result.rows[0];
+    if (!row?.campaign_id) return null;
+    return {
+        campaign_id: row.campaign_id,
+        instantly_campaign_id: row.instantly_campaign_id || null
+    };
+}
+
 async function insertTimelineEvent({
     agencyId,
     clientId,
     contactId,
+    campaignId,
+    instantlyCampaignId,
     timelineEventType,
     email,
     messageText,
@@ -252,16 +301,18 @@ async function insertTimelineEvent({
 }) {
     await pool.query(
         `INSERT INTO contact_instantly_events (
-            agency_id, client_id, contact_id,
+            agency_id, client_id, contact_id, campaign_id, instantly_campaign_id,
             event_type, lead_email,
             message_text, event_timestamp, fingerprint, source, payload
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'calendly', $9::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'calendly', $11::jsonb)
         ON CONFLICT (source, fingerprint) DO NOTHING`,
         [
             agencyId,
             clientId,
             contactId,
+            campaignId,
+            instantlyCampaignId,
             timelineEventType,
             email,
             messageText,
@@ -523,6 +574,7 @@ export async function processCalendlyWebhook({
 
     const contact = await findContactByEmail(email, scope);
     let timelineAdded = false;
+    let campaign = null;
 
     if (contact) {
         const eventTimestamp = resolveTimelineEventTimestamp({
@@ -532,6 +584,7 @@ export async function processCalendlyWebhook({
             body,
             enrichedInvitee
         });
+        campaign = await resolveLatestCampaignForContact(contact.id, { at: eventTimestamp });
         const fingerprint = buildTimelineFingerprint({
             inviteeUri,
             email,
@@ -552,6 +605,7 @@ export async function processCalendlyWebhook({
             reschedule_url: payload.reschedule_url || null,
             questions_and_answers: questionsAndAnswers,
             contact_id: contact.id,
+            campaign_id: campaign?.campaign_id || null,
             raw: body
         };
 
@@ -559,6 +613,8 @@ export async function processCalendlyWebhook({
             agencyId: contact.agency_id,
             clientId: contact.client_id,
             contactId: contact.id,
+            campaignId: campaign?.campaign_id || null,
+            instantlyCampaignId: campaign?.instantly_campaign_id || null,
             timelineEventType,
             email,
             messageText,
@@ -624,6 +680,7 @@ export async function processCalendlyWebhook({
         ...logBase,
         success: true,
         contact_id: contact?.id || null,
+        campaign_id: campaign?.campaign_id || null,
         timeline_added: timelineAdded,
         booking_status: bookingStatus,
         resend: resendNotify,

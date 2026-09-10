@@ -5,7 +5,9 @@ import {
     verifyCalendlySignature,
     parseScheduledEventStartTime,
     parseWebhookPayload,
-    resolveTimelineEventTimestamp
+    resolveTimelineEventTimestamp,
+    resolveLatestCampaignForContact,
+    LATEST_CAMPAIGN_FOR_CONTACT_SQL
 } from '../calendlyWebhook.js';
 
 test('verifyCalendlySignature: valid signature passes', () => {
@@ -137,4 +139,46 @@ test('resolveTimelineEventTimestamp: prefers enriched invitee created_at', () =>
     });
 
     assert.equal(timestamp.toISOString(), '2026-06-17T09:16:50.000Z');
+});
+
+test('LATEST_CAMPAIGN_FOR_CONTACT_SQL prefers Instantly events before membership', () => {
+    assert.match(LATEST_CAMPAIGN_FOR_CONTACT_SQL, /cie\.source <> 'calendly'/);
+    assert.match(LATEST_CAMPAIGN_FOR_CONTACT_SQL, /cie\.event_timestamp <= \$2/);
+    assert.match(LATEST_CAMPAIGN_FOR_CONTACT_SQL, /FROM contact_instantly_campaigns cic/);
+    assert.match(LATEST_CAMPAIGN_FOR_CONTACT_SQL, /ORDER BY rank/);
+});
+
+test('resolveLatestCampaignForContact: returns campaign from db row', async () => {
+    const db = {
+        query: async (sql, params) => {
+            assert.equal(params[0], 41823);
+            assert.equal(params[1].toISOString(), '2026-09-04T21:01:34.133Z');
+            assert.equal(sql, LATEST_CAMPAIGN_FOR_CONTACT_SQL);
+            return {
+                rows: [{ campaign_id: 408824, instantly_campaign_id: 'b206f8eb-afb3-4b8b-bb3a-60bd5bc1fbd3' }]
+            };
+        }
+    };
+
+    const campaign = await resolveLatestCampaignForContact(41823, {
+        at: new Date('2026-09-04T21:01:34.133Z'),
+        db
+    });
+    assert.deepEqual(campaign, {
+        campaign_id: 408824,
+        instantly_campaign_id: 'b206f8eb-afb3-4b8b-bb3a-60bd5bc1fbd3'
+    });
+});
+
+test('resolveLatestCampaignForContact: returns null when contact has no campaign', async () => {
+    const db = { query: async () => ({ rows: [] }) };
+    const campaign = await resolveLatestCampaignForContact(99, { db });
+    assert.equal(campaign, null);
+});
+
+test('resolveLatestCampaignForContact: skips lookup without a contact id', async () => {
+    let called = false;
+    const db = { query: async () => { called = true; return { rows: [] }; } };
+    assert.equal(await resolveLatestCampaignForContact(null, { db }), null);
+    assert.equal(called, false);
 });

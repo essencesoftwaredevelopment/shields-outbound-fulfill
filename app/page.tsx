@@ -146,6 +146,7 @@ function HomeContent() {
   const [jobClientName, setJobClientName] = useState<string>("");
   const [jobClientId, setJobClientId] = useState<string>("");
   const [clients, setClients] = useState<Array<{ id: string; name: string }>>([]);
+  const [clientsLoading, setClientsLoading] = useState(true);
   const [companyCountsByClient, setCompanyCountsByClient] = useState<Record<string, number>>({});
   const [companyCountsLoadingByClient, setCompanyCountsLoadingByClient] = useState<Record<string, boolean>>({});
   const shouldShowKeys = searchParams?.get("showKeys") === "1";
@@ -271,11 +272,13 @@ function HomeContent() {
       setCompanyCountsByClient({});
       setCompanyCountsLoadingByClient({});
       setClients([]);
+      setClientsLoading(false);
       return;
     }
 
     let cancelled = false;
     setVaultLoading(true);
+    setClientsLoading(true);
 
     const loadVaultKeys = async () => {
       try {
@@ -333,6 +336,8 @@ function HomeContent() {
         if (!cancelled) setClients(rows);
       } catch {
         if (!cancelled) setClients([]);
+      } finally {
+        if (!cancelled) setClientsLoading(false);
       }
     };
 
@@ -481,8 +486,28 @@ function HomeContent() {
           </Button>
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {clients.length === 0 ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3" aria-busy={clientsLoading}>
+          {clientsLoading ? (
+            Array.from({ length: 3 }, (_, index) => (
+              <Card key={index} className="h-full">
+                <CardHeader>
+                  <div className="flex items-start gap-3">
+                    <Skeleton className="size-9 shrink-0 rounded-lg" />
+                    <div className="min-w-0 flex-1">
+                      <Skeleton className="h-5 w-2/3" />
+                      <CardDescription className="mt-2">
+                        <Skeleton className="h-7 w-16" />
+                        <span className="mt-0.5 block text-sm">companies in database</span>
+                      </CardDescription>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardFooter className="border-0 bg-transparent pt-0">
+                  <Skeleton className="h-8 w-24" />
+                </CardFooter>
+              </Card>
+            ))
+          ) : clients.length === 0 ? (
             <Card className="col-span-full">
               <CardContent className="flex flex-col items-center justify-center gap-1 py-12 text-center">
                 <p className="font-medium">No clients yet</p>
@@ -491,8 +516,8 @@ function HomeContent() {
             </Card>
           ) : (
             clients.map((client) => (
-              // Link (not router.push) so Next prefetches the route chunk while the card is in view.
-              <Link key={client.id} href={`/clients/${client.id}`} className="focus-visible:outline-none">
+              // Prefetch the full dynamic route (loading shell + page chunk) while the card is in view.
+              <Link key={client.id} href={`/clients/${client.id}`} prefetch={true} className="focus-visible:outline-none">
               <Card
                 className="h-full cursor-pointer transition-colors hover:bg-muted/40"
               >
