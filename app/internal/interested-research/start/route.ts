@@ -57,6 +57,13 @@ export async function POST(request: Request) {
     },
   ]);
 
+  const research = await import('@server/services/interestedResearch/index.js');
+  await research.attachWorkflowRunId({
+    draftId,
+    agencyId,
+    workflowRunId: run.runId,
+  });
+
   return NextResponse.json({
     status: 'started',
     vercelRunId: run.runId,

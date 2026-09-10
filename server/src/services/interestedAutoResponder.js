@@ -11,6 +11,7 @@ import {
     isInterestedResearchWorkflowConfigured,
     triggerInterestedResearchWorkflow
 } from './interestedResearch/trigger.js';
+import { attachWorkflowRunId, stampResearchStep } from './interestedResearch/progress.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import {
     fetchThreadReplyMetadata,
@@ -723,7 +724,7 @@ export async function cancelStalePendingReviewDraftsForClient(db, clientId) {
          WHERE d.client_id = $1
            AND d.contact_id = cic.contact_id
            AND d.campaign_id = cic.campaign_id
-           AND d.status = 'pending_review'
+           AND d.status IN ('pending_review', 'researching')
            AND (
                COALESCE(cic.interest_status, -999) <> 1
                OR (
@@ -1541,6 +1542,8 @@ export async function createInterestedAutoResponderDraftFromEvent({
         // back to the inline path below — an interested lead must never lose its
         // draft to an unreachable workflow runtime.
         if (settings.replyResearchAgent && isInterestedResearchWorkflowConfigured()) {
+            const reviewToken = generateReviewToken();
+            const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();
             const researchDraft = await insertDraftRow(client, {
                 agency_id: agencyId,
                 client_id: clientId,
@@ -1548,8 +1551,8 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 contact_id: contactId,
                 instantly_lead_id: instantlyLeadId || null,
                 source_event_id: sourceEventId,
-                review_token: null,
-                review_token_expires_at: null,
+                review_token: reviewToken,
+                review_token_expires_at: reviewTokenExpiresAt,
                 status: 'researching',
                 blocked_reason: null,
                 reply_to_uuid: replyToUuid,
@@ -1562,16 +1565,24 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 rendered_text: null
             });
             try {
-                await triggerInterestedResearchWorkflow({
+                await stampResearchStep(researchDraft.id, agencyId, 'hydrate', client);
+                const started = await triggerInterestedResearchWorkflow({
                     draftId: researchDraft.id,
                     agencyId,
                     isFollowUp
                 });
+                await attachWorkflowRunId({
+                    draftId: researchDraft.id,
+                    agencyId,
+                    workflowRunId: started?.vercelRunId || started?.runId,
+                    db: client
+                });
+                const reviewUrl = buildReviewUrl(reviewToken);
                 logger(
                     `[interested-autoresponder] research workflow started draft=${researchDraft.id}`
                     + ` contact=${contactId} campaign=${campaignId}`
                 );
-                return { created: true, researching: true, draftId: researchDraft.id, reviewUrl: null };
+                return { created: true, researching: true, draftId: researchDraft.id, reviewUrl };
             } catch (error) {
                 logger(
                     `[interested-autoresponder] research workflow trigger failed draft=${researchDraft.id}`
@@ -1822,6 +1833,7 @@ function serializeReviewDraft(draft) {
         }),
         expiresAt: draft.review_token_expires_at,
         status: draft.status,
+        researchStep: draft.research_step || null,
         websiteDomain: website.domain,
         websiteUrl: website.url
     };
@@ -2127,6 +2139,8 @@ export async function regenerateInterestedAutoResponderDraftByToken({ token, add
              SET status = 'researching',
                  research_brief = NULL,
                  research_completed_at = NULL,
+                 research_step = 'hydrate',
+                 workflow_run_id = NULL,
                  blocked_reason = NULL,
                  updated_at = NOW()
              WHERE id = $1 AND status = 'pending_review'
@@ -2140,17 +2154,26 @@ export async function regenerateInterestedAutoResponderDraftByToken({ token, add
         }
 
         try {
-            await triggerInterestedResearchWorkflow({
+            const started = await triggerInterestedResearchWorkflow({
                 draftId: draft.id,
                 agencyId: draft.agency_id,
                 skipNtfy: true,
                 additionalInstructions: extraInstructions
             });
+            await attachWorkflowRunId({
+                draftId: draft.id,
+                agencyId: draft.agency_id,
+                workflowRunId: started?.vercelRunId || started?.runId
+            });
             return {
                 regenerating: true,
                 status: 'researching',
                 draftId: draft.id,
-                draft: serializeReviewDraft({ ...draft, status: 'researching' })
+                draft: serializeReviewDraft({
+                    ...draft,
+                    status: 'researching',
+                    research_step: 'hydrate'
+                })
             };
         } catch (error) {
             console.error(

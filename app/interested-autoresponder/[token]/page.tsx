@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { ExternalLink, Globe } from "lucide-react";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import {
     normalizeReplyEditorHtml,
     prepareReplyEditorContent,
@@ -17,6 +18,7 @@ type ReviewDraft = {
     renderedText: string;
     expiresAt: string | null;
     status?: "pending_review" | "researching" | string;
+    researchStep?: string | null;
     websiteDomain?: string | null;
     websiteUrl?: string | null;
 };
@@ -163,7 +165,12 @@ export default function InterestedAutoResponderReviewPage() {
                 }
                 const next = data.draft as ReviewDraft | undefined;
                 if (!next) return;
-                if (next.status === "researching") return;
+                if (next.status === "researching") {
+                    setDraft((prev) => prev
+                        ? { ...prev, status: next.status, researchStep: next.researchStep ?? null }
+                        : next);
+                    return;
+                }
                 applyLoadedDraft(next);
                 setError(null);
             } catch (err) {
@@ -173,7 +180,7 @@ export default function InterestedAutoResponderReviewPage() {
                 }
             }
         };
-        const intervalId = setInterval(poll, 3000);
+        const intervalId = setInterval(poll, 1000);
         const timeoutId = setTimeout(() => {
             if (cancelled) return;
             setRegenerating(false);
@@ -798,6 +805,13 @@ export default function InterestedAutoResponderReviewPage() {
                         <div style={{ display: "grid", gap: "0.35rem", fontSize: "0.9rem" }}>
                             <div><strong>Lead:</strong> {draft.leadEmail}</div>
                             <div><strong>Campaign:</strong> {draft.campaignName}</div>
+                            {regenerating && (
+                                <InterestedResearchProgress
+                                    status={draft.status}
+                                    stepId={draft.researchStep}
+                                    tone="dark"
+                                />
+                            )}
                             {(website || previewUrl) && (
                                 <div className="ar-link-btns">
                                     {website && (
@@ -865,7 +879,7 @@ export default function InterestedAutoResponderReviewPage() {
                             />
                             <p style={{ margin: 0, fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
                                 {regenerating
-                                    ? "Regenerating research, popup, and reply… this can take a minute."
+                                    ? `${String(draft.renderedText || "").trim() ? "Research is rewriting" : "Research is writing"} the reply. Send stays locked until the draft is ready.`
                                     : <>Click to edit — changes are saved automatically. Press <kbd style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "4px", padding: "0 4px", fontSize: "0.72rem" }}>⌘K</kbd> to edit a link.</>}
                             </p>
                             <div style={{ display: "flex", flexDirection: "column", gap: "0.65rem" }}>
@@ -887,7 +901,9 @@ export default function InterestedAutoResponderReviewPage() {
                                             opacity: sending || regenerating || archiving ? 0.7 : 1,
                                         }}
                                     >
-                                        {regenerating ? "Regenerating…" : "Regenerate"}
+                                        {regenerating
+                                            ? (String(draft.renderedText || "").trim() ? "Regenerating…" : "Researching…")
+                                            : "Regenerate"}
                                     </button>
                                 )}
                                 <button

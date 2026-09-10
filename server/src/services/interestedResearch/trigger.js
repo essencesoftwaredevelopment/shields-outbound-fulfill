@@ -3,6 +3,9 @@
  * Mirrors server/src/enrichment/trigger.js: the Instantly webhook / sync path
  * stays on PM2 and only fires an HTTP request; the durable research run
  * executes on the Vercel Workflows runtime.
+ *
+ * WORKFLOW_START_URL overrides APP_URL so local Express can hit local Next
+ * (`npm run dev:all`) while APP_URL stays the public review host.
  */
 
 export function isInterestedResearchWorkflowConfigured() {
@@ -12,6 +15,17 @@ export function isInterestedResearchWorkflowConfigured() {
     return Boolean(String(process.env.WORKFLOW_TRIGGER_SECRET || '').trim());
 }
 
+export function resolveWorkflowStartBaseUrl(env = process.env) {
+    const explicit = String(env.WORKFLOW_START_URL || '').trim();
+    const fallback = (
+        env.APP_URL
+        || env.NEXT_PUBLIC_APP_URL
+        || (env.VERCEL_URL ? `https://${env.VERCEL_URL}` : '')
+        || 'http://localhost:3000'
+    );
+    return String(explicit || fallback).replace(/\/$/, '');
+}
+
 export async function triggerInterestedResearchWorkflow({
     draftId,
     agencyId,
@@ -19,12 +33,7 @@ export async function triggerInterestedResearchWorkflow({
     skipNtfy = false,
     additionalInstructions = null
 }) {
-    const baseUrl = (
-        process.env.APP_URL
-        || process.env.NEXT_PUBLIC_APP_URL
-        || process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`
-        || 'http://localhost:3000'
-    ).replace(/\/$/, '');
+    const baseUrl = resolveWorkflowStartBaseUrl();
 
     const secret = process.env.WORKFLOW_TRIGGER_SECRET;
     if (!secret) {
@@ -40,6 +49,14 @@ export async function triggerInterestedResearchWorkflow({
     if (bypass) {
         headers['x-vercel-protection-bypass'] = bypass;
     }
+
+    let host = baseUrl;
+    try {
+        host = new URL(baseUrl).host;
+    } catch {
+        // keep raw baseUrl in logs if it is not a valid URL
+    }
+    console.info(`[interested-research] triggering draft=${draftId} via ${host}`);
 
     const res = await fetch(`${baseUrl}/internal/interested-research/start`, {
         method: 'POST',

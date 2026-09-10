@@ -1402,6 +1402,131 @@ body {
   }
 }
 
+/* Interested-research workflow stepper — transform/opacity only. */
+.irp {
+  --irp-done: #6d5cae;
+  --irp-current: #6d5cae;
+  --irp-todo: var(--app-border);
+  --irp-label: var(--app-text-ghost);
+  --irp-caption: var(--app-text-faint);
+  margin: 0.35rem 0 0;
+  padding-left: 16px;
+}
+
+.irp--dark {
+  --irp-done: #7dd3c0;
+  --irp-current: #7dd3c0;
+  --irp-todo: rgba(255, 255, 255, 0.16);
+  --irp-label: rgba(255, 255, 255, 0.42);
+  --irp-caption: rgba(255, 255, 255, 0.5);
+  padding-left: 0;
+  margin: 0.15rem 0 0.35rem;
+}
+
+.irp__track {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.irp__item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.28rem;
+  min-width: 0;
+}
+
+.irp__rail {
+  position: absolute;
+  top: 4px;
+  right: 50%;
+  width: 100%;
+  height: 1px;
+  background: var(--irp-todo);
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.irp__rail-fill {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: var(--irp-done);
+  transform-origin: left center;
+  transition: transform 420ms cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+}
+
+.irp__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--irp-todo);
+  flex-shrink: 0;
+  z-index: 1;
+}
+
+.irp__item[data-state="done"] .irp__dot {
+  background: var(--irp-done);
+}
+
+.irp__item[data-state="current"] .irp__dot {
+  background: var(--irp-current);
+  animation: irpDotPulse 1.6s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.irp__item[data-state="todo"] .irp__label {
+  opacity: 0.55;
+}
+
+.irp__label {
+  font-size: 0.58rem;
+  letter-spacing: 0.02em;
+  color: var(--irp-label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  line-height: 1.2;
+}
+
+.irp__caption {
+  margin: 0.35rem 0 0;
+  font-size: 0.7rem;
+  color: var(--irp-caption);
+}
+
+.irp--compact .irp__label {
+  display: none;
+}
+
+.irp--compact .irp__item {
+  gap: 0;
+}
+
+.irp--compact .irp__rail {
+  height: 2px;
+  top: 3px;
+}
+
+@keyframes irpDotPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.45); opacity: 0.72; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .irp__item[data-state="current"] .irp__dot,
+  .irp__rail-fill {
+    animation: none;
+    transition: none;
+  }
+}
+
 .analytics-skeleton {
   background: linear-gradient(
     90deg,

@@ -5,9 +5,10 @@
  * POST /internal/interested-research/start after a draft shell is inserted at
  * status='researching'. Single linear run per draft — no fan-out:
  *
- *   hydrate → homepage + Serper research → synthesize brief (persisted on the
- *   draft) → external popup URL (Essence/Vulcan, stays external by design) →
- *   generate reply with the brief → promote to pending_review + ntfy.
+ *   hydrate → homepage + Serper research → synthesize brief (GPT only) →
+ *   persist brief on the draft → external popup URL (Essence/Vulcan, stays
+ *   external by design) → generate reply with the brief → promote to
+ *   pending_review + ntfy.
  *
  * This is deliberately NOT part of the enrichment parent/child pipeline: the
  * reply path is per-event, reply-aware, and human-gated, while enrichment is
@@ -69,6 +70,11 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
       return { status: 'superseded' as const, draftId: input.draftId };
     }
 
+    const persisted = await persistBriefStep(input, brief);
+    if (isResearchSupersededResult(persisted)) {
+      return { status: 'superseded' as const, draftId: input.draftId };
+    }
+
     const popup = await popupStep(input);
     if (isResearchSupersededResult(popup)) {
       return { status: 'superseded' as const, draftId: input.draftId };
@@ -83,7 +89,7 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
       status: 'promoted' as const,
       draftId: ctx.draftId,
       reviewUrl: result.reviewUrl,
-      hadBrief: brief !== null,
+      hadBrief: persisted !== null,
     };
   } catch (err) {
     const errorInfo = toResearchErrorInfo(err);
@@ -157,6 +163,21 @@ async function synthesizeBriefStep(
   }
 }
 
+async function persistBriefStep(
+  input: InterestedResearchInput,
+  brief: Awaited<ReturnType<ResearchModule['synthesizeResearchBrief']>>
+) {
+  'use step';
+
+  const research = await loadResearch();
+  try {
+    return await research.persistResearchBrief({ ...input, brief });
+  } catch (err) {
+    if (isResearchSupersededError(err)) return researchSupersededResult();
+    throw err;
+  }
+}
+
 async function popupStep(input: InterestedResearchInput) {
   'use step';
 
@@ -212,6 +233,8 @@ homepageStep.maxRetries = 1;
 serperStep.maxRetries = 1;
 // A retry would re-bill the OpenAI call; the step degrades to null on failure.
 synthesizeBriefStep.maxRetries = 0;
+// DB write only — safe to retry; never re-runs GPT.
+persistBriefStep.maxRetries = 1;
 // Popup generation has its own internal retry/backoff (mirrors the inline path).
 popupStep.maxRetries = 0;
 // Finalize is guarded by status='researching', so a retry after a mid-step crash

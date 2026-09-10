@@ -18,6 +18,7 @@ import { apiFetch, apiJson } from "@/lib/api/http";
 import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
+import { InterestedResearchProgress } from "@/components/interested-research-progress";
 
 // Loaded lazily so dnd-kit and recharts stay out of this route's initial chunk;
 // both only render behind a tab/section, so first paint never needs them.
@@ -1858,6 +1859,8 @@ export default function ClientPage() {
         thread_subject: string | null;
         rendered_text: string | null;
         review_token: string | null;
+        status?: string | null;
+        research_step?: string | null;
         campaign_name: string | null;
         interest_status?: number | null;
         interest_status_label?: string | null;
@@ -4843,6 +4846,13 @@ export default function ClientPage() {
             }
         }
     }, [user, clientId]);
+
+    const hasResearchingPendingDraft = pendingReviewDrafts.some((draft) => draft.status === "researching");
+    useIntervalWhenVisible(
+        () => { fetchPendingReviewDrafts(false); },
+        800,
+        activeTab === "analytics" && hasResearchingPendingDraft
+    );
 
     useEffect(() => {
         if (jobState) {
@@ -9454,6 +9464,7 @@ export default function ClientPage() {
                                 ) : (
                                     <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
                                         {pendingReviewDrafts.map((draft, idx) => {
+                                            const isResearching = draft.status === "researching";
                                             const isExpanded = expandedDraftId === draft.id;
                                             const isAnimated = animatedPendingDraftIds.has(draft.id);
                                             const draftDate = new Date(draft.created_at);
@@ -9466,6 +9477,7 @@ export default function ClientPage() {
                                             const reviewUrl = draft.review_token
                                                 ? `/interested-autoresponder/${encodeURIComponent(draft.review_token)}`
                                                 : null;
+                                            const canExpand = Boolean(plainText) || isResearching;
 
                                             return (
                                                 <div
@@ -9476,20 +9488,21 @@ export default function ClientPage() {
                                                     <div
                                                         style={{
                                                             padding: "0.6rem 0.25rem",
-                                                            cursor: plainText ? "pointer" : "default",
+                                                            cursor: canExpand ? "pointer" : "default",
                                                             display: "flex",
                                                             flexDirection: "column",
                                                             gap: "0.2rem",
                                                         }}
-                                                        onClick={() => plainText && setExpandedDraftId(isExpanded ? null : draft.id)}
+                                                        onClick={() => canExpand && setExpandedDraftId(isExpanded ? null : draft.id)}
                                                     >
                                                         <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
                                                             <div style={{
                                                                 width: "8px",
                                                                 height: "8px",
                                                                 borderRadius: "50%",
-                                                                background: "#8b5cf6",
-                                                                flexShrink: 0
+                                                                background: isResearching ? "#6d5cae" : "#8b5cf6",
+                                                                flexShrink: 0,
+                                                                animation: isResearching ? "irpDotPulse 1.6s ease-in-out infinite" : undefined,
                                                             }} />
                                                             <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "var(--app-text-high)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                                                                 {draft.lead_email}
@@ -9503,12 +9516,25 @@ export default function ClientPage() {
                                                                 {draft.campaign_name}
                                                             </p>
                                                         )}
-                                                        {snippet && !isExpanded && (
+                                                        {isResearching && !isExpanded && (
+                                                            <p style={{ margin: 0, fontSize: "0.72rem", color: "var(--app-text-faint)", paddingLeft: "16px" }}>
+                                                                Researching reply
+                                                            </p>
+                                                        )}
+                                                        {snippet && !isExpanded && !isResearching && (
                                                             <p style={{ margin: 0, fontSize: "0.76rem", color: "var(--app-text-faint)", lineHeight: 1.45, paddingLeft: "16px", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
                                                                 {snippet}
                                                             </p>
                                                         )}
-                                                        {isExpanded && plainText && (
+                                                        {isExpanded && isResearching && (
+                                                            <InterestedResearchProgress
+                                                                status={draft.status}
+                                                                stepId={draft.research_step}
+                                                                tone="light"
+                                                                compact
+                                                            />
+                                                        )}
+                                                        {isExpanded && plainText && !isResearching && (
                                                             <div style={{ margin: "0.2rem 0 0", fontSize: "0.76rem", color: "var(--app-text-muted)", lineHeight: 1.55, paddingLeft: "16px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                                                                 {plainText}
                                                             </div>
@@ -9530,7 +9556,7 @@ export default function ClientPage() {
                                                                         gap: "0.2rem",
                                                                     }}
                                                                 >
-                                                                    Review draft ↗
+                                                                    {isResearching ? "Watch research" : "Review draft"}
                                                                 </a>
                                                             </div>
                                                         )}

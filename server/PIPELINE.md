@@ -131,7 +131,7 @@ Workflows runtime before the draft is written:
    `WORKFLOW_TRIGGER_SECRET` — same pattern as the enrichment trigger).
 2. `workflows/interested-research.ts` runs one linear pipeline per draft:
    hydrate → homepage fetch + Serper sweep (agency's own Serper key, both
-   best-effort) → LLM-synthesized brief persisted to
+   best-effort) → LLM-synthesized brief → persist to
    `interested_autoresponder_drafts.research_brief`
    (`{ company, domain, industry, summary, talkingPoints, risks, sources,
    reviewCount, siteTraffic }`) → external
@@ -152,10 +152,18 @@ Design rules:
   never kills the run.
 - **Statuses.** `researching` is an open status (counts toward the one-open-draft
   per contact+campaign invariant, cancelled when the lead leaves interested).
-  Migration: `migrations/0048_interested_reply_research.sql`.
+  The shell is minted with a `review_token` immediately, so it appears in
+  Analytics → Pending Review as soon as the workflow starts. Each Vercel step
+  stamps `research_step` (`hydrate` → `research` → `synthesize` → `persist` →
+  `popup` → `finalize`); ntfy still waits until promote to `pending_review`.
+  Migrations: `migrations/0048_interested_reply_research.sql`,
+  `migrations/0055_interested_research_progress.sql`.
 - Env: `WORKFLOW_TRIGGER_SECRET` + `APP_URL` required to trigger;
-  `INTERESTED_RESEARCH_WORKFLOW_DISABLED=true` kills the path globally;
-  `INTERESTED_RESEARCH_MODEL` overrides the brief model.
+  `WORKFLOW_START_URL` (optional) points Express at a different Next host than
+  `APP_URL` — use `http://localhost:3000` with `npm run dev:all` so step stamps
+  run in local Next instead of production Vercel. `APP_URL` stays the public
+  review host. `INTERESTED_RESEARCH_WORKFLOW_DISABLED=true` kills the path
+  globally; `INTERESTED_RESEARCH_MODEL` overrides the brief model.
 
 ## Job Lifecycle
 

@@ -80,24 +80,121 @@ export function extractHomepageSummary(html = '', { textLimit = RESEARCH_HOMEPAG
     return { title, description, text };
 }
 
+/** Registrable label of a host (`thehandtitan.com` → `thehandtitan`). */
+export function registrableSlug(domain) {
+    const host = asText(domain).toLowerCase().replace(/^www\./, '');
+    if (!host) return '';
+    const labels = host.split('.').filter(Boolean);
+    if (
+        labels.length >= 3
+        && ['co', 'com', 'org', 'net', 'gov'].includes(labels[labels.length - 2])
+    ) {
+        return labels[labels.length - 3] || '';
+    }
+    return (labels.length >= 2 ? labels[labels.length - 2] : labels[0]) || '';
+}
+
+/**
+ * True when `companyName` is just the domain slug with spaces/caps
+ * (`Thehandtitan` from `thehandtitan.com`). Those names are too easy for
+ * Google to expand into unrelated "Titan" products, so queries should be
+ * domain-anchored instead.
+ */
+export function isHumanizedDomainCompany(companyName, domain) {
+    const slug = registrableSlug(domain);
+    const collapsed = asText(companyName).toLowerCase().replace(/[\s\-_'’]+/g, '');
+    return Boolean(slug) && collapsed === slug;
+}
+
+/**
+ * First clause of a homepage <title> when it looks like a brand name.
+ * "Hand Titan, natural trigger point…" → "Hand Titan".
+ */
+export function companyNameFromHomepageTitle(title, fallback = '') {
+    const source = asText(title);
+    if (!source) return asText(fallback);
+    const candidate = asText(source.split(/\s*[|–—·•,:]\s*/)[0]);
+    const words = candidate.split(/\s+/).filter(Boolean);
+    if (candidate.length >= 3 && candidate.length <= 80 && words.length <= 6) {
+        return candidate;
+    }
+    return asText(fallback) || candidate;
+}
+
+function hostnameFromUrl(url) {
+    try {
+        return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    } catch {
+        return '';
+    }
+}
+
+function targetMatchNeedles({ companyName, domain }) {
+    const needles = new Set();
+    const host = asText(domain).toLowerCase().replace(/^www\./, '');
+    if (host) needles.add(host);
+    const slug = registrableSlug(domain);
+    if (slug.length >= 4) needles.add(slug);
+    const company = asText(companyName).toLowerCase();
+    if (company.length >= 4) needles.add(company);
+    const collapsed = company.replace(/[\s\-_'’]+/g, '');
+    if (collapsed.length >= 6) needles.add(collapsed);
+    return [...needles];
+}
+
+/**
+ * Keep a search hit only when it is this company: on-domain, or the title /
+ * snippet / URL mentions the host, domain slug, or full company name.
+ * Partial tokens like "Titan" never count on their own.
+ */
+export function isSerperResultAboutTarget(result, { companyName = '', domain = '' } = {}) {
+    const link = asText(result?.link);
+    const host = hostnameFromUrl(link);
+    const targetHost = asText(domain).toLowerCase().replace(/^www\./, '');
+    if (targetHost && host && (host === targetHost || host.endsWith(`.${targetHost}`))) {
+        return true;
+    }
+
+    const needles = targetMatchNeedles({ companyName, domain });
+    if (!needles.length) return true;
+    const haystack = [result?.title, result?.snippet, link, host]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+    return needles.some((needle) => haystack.includes(needle));
+}
+
+/** Drop off-target Serper hits before they reach the brief LLM. */
+export function filterSerperResultsForTarget(results = [], { companyName = '', domain = '' } = {}) {
+    const list = Array.isArray(results) ? results : [];
+    if (!asText(domain) && !asText(companyName)) return list;
+    return list.filter((result) => isSerperResultAboutTarget(result, { companyName, domain }));
+}
+
 /** Serper queries for one lead: overview, news, and review-count sources. */
 export function buildSerperQueries({ companyName, domain }) {
     const company = asText(companyName);
     const host = asText(domain);
-    const subject = company || host;
-    if (!subject) return [];
-    const queries = [];
-    if (host) queries.push({ q: `${subject} ${host}`, num: RESEARCH_SERPER_RESULT_LIMIT });
-    else queries.push({ q: subject, num: RESEARCH_SERPER_RESULT_LIMIT });
-    queries.push({ q: `${subject} news OR launch OR funding OR review`, num: RESEARCH_SERPER_RESULT_LIMIT });
-    // Aimed at Trustpilot / Google / on-site review aggregates for visitor estimate.
-    queries.push({
-        q: host
-            ? `${subject} ${host} Trustpilot OR "customer reviews" OR "product reviews"`
-            : `${subject} Trustpilot OR "customer reviews" OR "product reviews"`,
-        num: RESEARCH_SERPER_RESULT_LIMIT
-    });
-    return queries;
+    if (!host && !company) return [];
+
+    const quotedCompany = company ? `"${company}"` : '';
+    if (!host) {
+        return [
+            { q: quotedCompany, num: RESEARCH_SERPER_RESULT_LIMIT },
+            { q: `${quotedCompany} news OR launch OR funding OR review`, num: RESEARCH_SERPER_RESULT_LIMIT },
+            { q: `${quotedCompany} Trustpilot OR "customer reviews" OR "product reviews"`, num: RESEARCH_SERPER_RESULT_LIMIT }
+        ];
+    }
+
+    // Humanized-domain names ("Thehandtitan") make Google expand to unrelated
+    // "Titan" products. Anchor every query on the host instead.
+    const named = company && !isHumanizedDomainCompany(company, host);
+    const subject = named ? `${quotedCompany} ${host}` : host;
+    return [
+        { q: subject, num: RESEARCH_SERPER_RESULT_LIMIT },
+        { q: `${host} news OR launch OR funding`, num: RESEARCH_SERPER_RESULT_LIMIT },
+        { q: `${host} Trustpilot OR "customer reviews" OR reviews`, num: RESEARCH_SERPER_RESULT_LIMIT }
+    ];
 }
 
 /**
@@ -224,10 +321,15 @@ export function normalizeResearchBrief(raw, { company = '', domain = '', fallbac
             return { title: title || url, url };
         })
         .filter(Boolean)
+        .filter((entry) => isSerperResultAboutTarget(
+            { title: entry.title, link: entry.url, snippet: '' },
+            { companyName: asText(raw.company) || asText(company), domain: asText(raw.domain) || asText(domain) }
+        ))
         .slice(0, RESEARCH_BRIEF_MAX_SOURCES);
 
-    const reviewCount = normalizeReviewCount(raw.reviewCount)
-        ?? normalizeReviewCount(fallbackReviewCount);
+    // Review totals come only from filtered Serper snippets — never from the
+    // LLM, which will copy a "23 reviews" hit from a similarly named product.
+    const reviewCount = normalizeReviewCount(fallbackReviewCount);
     const estimatedVisitors = estimateVisitorsFromReviewCount(reviewCount);
 
     return {

@@ -521,7 +521,7 @@ router.get('/clients/:clientId/interested-autoresponder/drafts/pending-review', 
 
         const result = await pool.query(
             `SELECT d.id, d.lead_email, d.eaccount, d.thread_subject, d.rendered_text,
-                    d.review_token, d.created_at, d.updated_at,
+                    d.review_token, d.status, d.research_step, d.created_at, d.updated_at,
                     ic.name AS campaign_name,
                     cic.interest_status,
                     cic.interest_status_label,
@@ -533,7 +533,7 @@ router.get('/clients/:clientId/interested-autoresponder/drafts/pending-review', 
                  AND cic.campaign_id = d.campaign_id
                  AND cic.active = TRUE
              WHERE d.client_id = $1
-               AND d.status = 'pending_review'
+               AND d.status IN ('pending_review', 'researching')
                AND cic.interest_status = 1
                AND (
                    COALESCE(cic.last_event_type, '') = ''

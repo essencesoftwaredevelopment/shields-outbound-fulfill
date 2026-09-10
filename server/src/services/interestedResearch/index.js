@@ -36,11 +36,16 @@ import {
 import {
     buildSerperQueries,
     compactSerperResults,
+    companyNameFromHomepageTitle,
     extractHomepageSummary,
     extractReviewCountFromSerper,
+    filterSerperResultsForTarget,
     normalizeResearchBrief,
     RESEARCH_INDUSTRIES
 } from './briefUtils.js';
+import { attachWorkflowRunId, stampResearchStep } from './progress.js';
+
+export { attachWorkflowRunId, stampResearchStep };
 
 const RESEARCH_MODEL = String(process.env.INTERESTED_RESEARCH_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -125,6 +130,7 @@ async function resolveDraftResearchTarget(db, draft) {
  */
 export async function hydrateResearchContext({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'hydrate');
     const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
     return {
         draftId: draft.id,
@@ -176,6 +182,7 @@ export async function fetchHomepageForDomain(domain) {
 /** Step 2a — fetch and distill the company homepage. Best-effort: null on any failure. */
 export async function runHomepageResearch({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'research');
     const { domain } = await resolveDraftResearchTarget(pool, draft);
     return fetchHomepageForDomain(domain);
 }
@@ -207,7 +214,14 @@ export async function fetchSerperForTarget({ companyName, domain, serperKey }) {
             return null;
         }
         const payload = await response.json();
-        const results = compactSerperResults(Array.isArray(payload) ? payload : [payload]);
+        const compacted = compactSerperResults(Array.isArray(payload) ? payload : [payload]);
+        const results = filterSerperResultsForTarget(compacted, { companyName, domain });
+        if (compacted.length && results.length < compacted.length) {
+            console.log(
+                `[interested-research] dropped ${compacted.length - results.length}`
+                + ` off-target serper hit(s) domain=${domain || 'none'}`
+            );
+        }
         return results.length ? { results } : null;
     } catch (err) {
         const reason = err?.name === 'AbortError' ? 'timeout' : err?.message || err;
@@ -224,6 +238,7 @@ export async function fetchSerperForTarget({ companyName, domain, serperKey }) {
  */
 export async function runSerperResearch({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'research');
     const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
     const agencySettings = await getAgencySettings(agencyId);
     const serperKey = apiKeysFromSettings(agencySettings).serper;
@@ -256,7 +271,12 @@ export async function synthesizeBriefFromContext({
     homepage = null,
     serper = null
 }) {
-    const hasSignal = Boolean(homepage?.text || homepage?.description || serper?.results?.length);
+    const displayCompany = companyNameFromHomepageTitle(homepage?.title, companyName);
+    const serperResults = filterSerperResultsForTarget(serper?.results, {
+        companyName: displayCompany,
+        domain
+    });
+    const hasSignal = Boolean(homepage?.text || homepage?.description || serperResults.length);
     if (!hasSignal) return null;
 
     const contextBlocks = [];
@@ -268,10 +288,10 @@ export async function synthesizeBriefFromContext({
             homepage.text ? `Content:\n${homepage.text}` : ''
         ].filter(Boolean).join('\n'));
     }
-    if (serper?.results?.length) {
+    if (serperResults.length) {
         contextBlocks.push([
             'Web search results:',
-            ...serper.results.map((result, index) => [
+            ...serperResults.map((result, index) => [
                 `${index + 1}. ${result.title}`,
                 result.link ? `   URL: ${result.link}` : '',
                 result.date ? `   Date: ${result.date}` : '',
@@ -307,13 +327,16 @@ export async function synthesizeBriefFromContext({
                     '}',
                     '',
                     'Only state facts supported by the research below. If the research is too',
-                    'thin to say anything specific, return {"summary": ""}.'
+                    'thin to say anything specific, return {"summary": ""}.',
+                    `Ignore search results that are not about this company (${domain || 'the given domain'}).`,
+                    'Similarly named products or other brands must not appear in the brief.',
+                    'If a review count is not clearly this company\'s own store or Trustpilot total, set reviewCount to null.'
                 ].join('\n')
             },
             {
                 role: 'user',
                 content: [
-                    `Company: ${companyName || '(unknown)'}`,
+                    `Company: ${displayCompany || '(unknown)'}`,
                     `Domain: ${domain || '(unknown)'}`,
                     leadEmail ? `Lead email: ${leadEmail}` : '',
                     '',
@@ -329,18 +352,19 @@ export async function synthesizeBriefFromContext({
     } catch {
         parsed = null;
     }
-    const fallbackReviewCount = extractReviewCountFromSerper(serper?.results);
+    const fallbackReviewCount = extractReviewCountFromSerper(serperResults);
     return normalizeResearchBrief(parsed, {
-        company: companyName,
+        company: displayCompany,
         domain,
         fallbackReviewCount
     });
 }
 
 /**
- * Step 3 — synthesize the structured brief from homepage + Serper context and
- * persist it on the draft (research_brief JSONB). Returns the brief, or null
- * when research was too thin to say anything grounded.
+ * Step 3a — GPT synthesis only. Returns the normalized brief (or null when
+ * research was too thin). Does not write the draft row — persistResearchBrief
+ * is a separate workflow step so LLM time and the DB write are independently
+ * retried and visible in the run trace.
  *
  * @param {{
  *   draftId: number,
@@ -351,6 +375,7 @@ export async function synthesizeBriefFromContext({
  */
 export async function synthesizeResearchBrief({ draftId, agencyId, homepage = null, serper = null }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'synthesize');
     const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
 
     const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
@@ -371,14 +396,38 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
         console.log(`[interested-research] brief too thin for draft=${draftId}`);
         return null;
     }
+    return brief;
+}
 
-    await pool.query(
+/**
+ * Step 3b — persist a synthesized brief onto the researching draft. No-op when
+ * brief is null (thin research → draft without a brief, same as today).
+ *
+ * @param {{
+ *   draftId: number,
+ *   agencyId: string,
+ *   brief?: object | null
+ * }} args
+ * @returns {Promise<object | null>}
+ */
+export async function persistResearchBrief({ draftId, agencyId, brief = null }) {
+    await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'persist');
+    if (!brief || typeof brief !== 'object') return null;
+
+    const result = await pool.query(
         `UPDATE interested_autoresponder_drafts
          SET research_brief = $2::jsonb,
              updated_at = NOW()
-         WHERE id = $1 AND status = 'researching'`,
+         WHERE id = $1 AND status = 'researching'
+         RETURNING id`,
         [draftId, JSON.stringify(brief)]
     );
+    if (!result.rowCount) {
+        throw new ResearchDraftSupersededError(
+            `Draft ${draftId} is no longer researching — superseded or cancelled`
+        );
+    }
     return brief;
 }
 
@@ -389,6 +438,7 @@ export async function synthesizeResearchBrief({ draftId, agencyId, homepage = nu
  */
 export async function runPopupGeneration({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'popup');
     const [settings, signalRow, promptConfig] = await Promise.all([
         fetchAgencyAndClientSettings(agencyId, draft.client_id),
         resolveContactSignalContext(pool, draft.contact_id),
@@ -477,6 +527,7 @@ export async function finalizeResearchDraft({
     additionalInstructions = null
 }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'finalize');
     const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
     if (!settings.openaiKey) {
         throw new Error('missing_openai_key');
