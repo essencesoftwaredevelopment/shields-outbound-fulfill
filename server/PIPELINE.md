@@ -157,7 +157,9 @@ Design rules:
   stamps `research_step` (`hydrate` → `research` → `synthesize` → `persist` →
   `popup` → `finalize`); ntfy still waits until promote to `pending_review`.
   Migrations: `migrations/0048_interested_reply_research.sql`,
-  `migrations/0055_interested_research_progress.sql`.
+  `migrations/0055_interested_research_progress.sql`,
+  `migrations/0056_analytics_realtime_agency_rls.sql` (authenticated
+  `current_agency_id()` SELECT policies so Analytics Realtime is tenant-scoped).
 - Env: `WORKFLOW_TRIGGER_SECRET` + `APP_URL` required to trigger;
   `WORKFLOW_START_URL` (optional) points Express at a different Next host than
   `APP_URL` — use `http://localhost:3000` with `npm run dev:all` so step stamps

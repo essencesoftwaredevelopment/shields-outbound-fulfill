@@ -11,6 +11,7 @@ import {
 } from "@/lib/hooks/useJobRealtime";
 import { useJobStageCounts } from "@/lib/hooks/useJobStageCounts";
 import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
+import { useAnalyticsRealtime } from "@/lib/hooks/useAnalyticsRealtime";
 import { useAuth } from "@/hooks/use-auth";
 import { useAgencyId } from "@/lib/hooks/useAgencyId";
 import dynamic from "next/dynamic";
@@ -4847,13 +4848,6 @@ export default function ClientPage() {
         }
     }, [user, clientId]);
 
-    const hasResearchingPendingDraft = pendingReviewDrafts.some((draft) => draft.status === "researching");
-    useIntervalWhenVisible(
-        () => { fetchPendingReviewDrafts(false); },
-        800,
-        activeTab === "analytics" && hasResearchingPendingDraft
-    );
-
     useEffect(() => {
         if (jobState) {
             setSelectedJobId(jobState.id);
@@ -4949,210 +4943,13 @@ export default function ClientPage() {
         }
     }, []);
 
-    useEffect(() => {
-        if (activeTab !== "analytics") {
-            return;
-        }
-
-        if (!instantlyEventAnalytics?.clientSqlId || !instantlyEventAnalytics?.realtimeConfig?.websocketUrl) {
-            if (instantlyEventAnalytics && !instantlyEventAnalytics.realtimeConfig?.websocketUrl) {
-                setInstantlyEventRealtimeError('Supabase Realtime connection details are unavailable.');
-            }
-            return;
-        }
-
-        const sqlClientId = instantlyEventAnalytics.clientSqlId;
-        const websocketUrl = instantlyEventAnalytics.realtimeConfig.websocketUrl;
-        if (!sqlClientId) {
-            return;
-        }
-
-        const topic = `realtime:analytics-contact-instantly-events-${sqlClientId}`;
-        let messageRef = 0;
-        let joinRef = "1";
-        let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-        let refreshAnalyticsTimeout: ReturnType<typeof setTimeout> | null = null;
-        let refreshDraftsTimeout: ReturnType<typeof setTimeout> | null = null;
-        let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-        let socket: WebSocket | null = null;
-        let closed = false;
-        let reconnectAttempts = 0;
-        const MAX_RECONNECT_ATTEMPTS = 5;
-
-        const nextRef = () => {
-            messageRef += 1;
-            return String(messageRef);
-        };
-
-        const send = (message: Record<string, unknown>) => {
-            if (socket && socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify(message));
-            }
-        };
-
-        const scheduleAnalyticsRefresh = () => {
-            if (refreshAnalyticsTimeout) {
-                clearTimeout(refreshAnalyticsTimeout);
-            }
-            refreshAnalyticsTimeout = setTimeout(() => {
-                fetchInstantlyEventAnalytics(false);
-            }, 250);
-        };
-
-        const scheduleDraftsRefresh = () => {
-            if (refreshDraftsTimeout) {
-                clearTimeout(refreshDraftsTimeout);
-            }
-            refreshDraftsTimeout = setTimeout(() => {
-                fetchPendingReviewDrafts(false);
-            }, 250);
-        };
-
-        const clearHeartbeat = () => {
-            if (heartbeatInterval) {
-                clearInterval(heartbeatInterval);
-                heartbeatInterval = null;
-            }
-        };
-
-        const scheduleReconnect = (message?: string, delay = 1500) => {
-            if (closed || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                if (message && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                    setInstantlyEventRealtimeError(message);
-                }
-                return;
-            }
-            if (reconnectTimeout) {
-                return;
-            }
-            reconnectAttempts += 1;
-            reconnectTimeout = setTimeout(() => {
-                reconnectTimeout = null;
-                connectSocket();
-            }, delay);
-        };
-
-        const connectSocket = () => {
-            clearHeartbeat();
-            socket = new WebSocket(websocketUrl);
-
-            socket.onopen = () => {
-                reconnectAttempts = 0;
-                setInstantlyEventRealtimeError(null);
-            joinRef = nextRef();
-            send({
-                topic,
-                event: "phx_join",
-                payload: {
-                    config: {
-                        broadcast: { ack: false, self: false },
-                        presence: { enabled: false },
-                        postgres_changes: [
-                            {
-                                event: "*",
-                                schema: "public",
-                                table: "contact_instantly_events",
-                                filter: `client_id=eq.${sqlClientId}`
-                            },
-                            {
-                                event: "*",
-                                schema: "public",
-                                table: "interested_autoresponder_drafts",
-                                filter: `client_id=eq.${sqlClientId}`
-                            }
-                        ],
-                        private: false
-                    }
-                },
-                ref: joinRef,
-                join_ref: joinRef
-            });
-
-            heartbeatInterval = setInterval(() => {
-                send({
-                    topic: "phoenix",
-                    event: "heartbeat",
-                    payload: {},
-                    ref: nextRef(),
-                    join_ref: null
-                });
-            }, 20000);
-            };
-
-            socket.onmessage = (event) => {
-                try {
-                    const payload = JSON.parse(event.data);
-                    if (payload?.event === "postgres_changes" && payload?.topic === topic) {
-                        scheduleAnalyticsRefresh();
-                        scheduleDraftsRefresh();
-                        return;
-                    }
-                    if (payload?.event === "system" && payload?.topic === topic) {
-                        const systemMessage = String(payload?.payload?.message || "");
-                        if (systemMessage.includes("InitializingProjectConnection")) {
-                            clearHeartbeat();
-                            socket?.close();
-                            scheduleReconnect(undefined, 2000);
-                        }
-                        return;
-                    }
-                    if (payload?.event === "phx_reply" && payload?.topic === topic && payload?.payload?.status === "error") {
-                        const reason = String(payload?.payload?.response?.reason || "Supabase Realtime join failed.");
-                        if (reason.includes("InitializingProjectConnection")) {
-                            clearHeartbeat();
-                            socket?.close();
-                            scheduleReconnect(undefined, 2000);
-                            return;
-                        }
-                        setInstantlyEventRealtimeError(reason);
-                        return;
-                    }
-                    if (payload?.event === "phx_error") {
-                        scheduleReconnect("Supabase Realtime channel error.");
-                    }
-                } catch (error) {
-                    console.error("Failed to parse Supabase Realtime payload:", error);
-                }
-            };
-
-            socket.onerror = () => {
-                scheduleReconnect("Supabase Realtime connection failed.");
-            };
-
-            socket.onclose = () => {
-                clearHeartbeat();
-                if (!closed) {
-                    scheduleReconnect("Supabase Realtime disconnected.");
-                }
-            };
-        };
-
-        connectSocket();
-
-        return () => {
-            closed = true;
-            if (refreshAnalyticsTimeout) {
-                clearTimeout(refreshAnalyticsTimeout);
-            }
-            if (refreshDraftsTimeout) {
-                clearTimeout(refreshDraftsTimeout);
-            }
-            if (reconnectTimeout) {
-                clearTimeout(reconnectTimeout);
-            }
-            clearHeartbeat();
-            if (socket?.readyState === WebSocket.OPEN) {
-                send({
-                    topic,
-                    event: "phx_leave",
-                    payload: {},
-                    ref: nextRef(),
-                    join_ref: joinRef
-                });
-            }
-            socket?.close();
-        };
-    }, [activeTab, instantlyEventAnalytics?.clientSqlId, instantlyEventAnalytics?.realtimeConfig?.websocketUrl, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
+    useAnalyticsRealtime({
+        clientSqlId: instantlyEventAnalytics?.clientSqlId ?? null,
+        enabled: activeTab === "analytics",
+        onEventsChange: () => { fetchInstantlyEventAnalytics(false); },
+        onDraftsChange: () => { fetchPendingReviewDrafts(false); },
+        onError: setInstantlyEventRealtimeError,
+    });
 
     // Instantly upload status: when job list membership changes, not on every pipeline UPDATE.
     useEffect(() => {
