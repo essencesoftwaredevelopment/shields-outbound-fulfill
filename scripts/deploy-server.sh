@@ -30,11 +30,27 @@ HEALTH_URL="${HEALTH_URL:-http://localhost:4000/health}"
 
 PUSH=1
 HEALTH_REQUIRED=1
+COMMIT_MESSAGE=""
+
 for arg in "$@"; do
     case "$arg" in
-        --no-push) PUSH=0 ;;
-        --skip-health) HEALTH_REQUIRED=0 ;;
-        *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+        --no-push)
+            PUSH=0
+            ;;
+        --skip-health)
+            HEALTH_REQUIRED=0
+            ;;
+        --*)
+            echo "Unknown flag: $arg" >&2
+            exit 2
+            ;;
+        *)
+            if [[ -n "$COMMIT_MESSAGE" ]]; then
+                echo "[deploy] Only one commit message can be provided." >&2
+                exit 2
+            fi
+            COMMIT_MESSAGE="$arg"
+            ;;
     esac
 done
 
@@ -55,7 +71,7 @@ if [[ "$PUSH" -eq 1 ]] && [[ -n "$(git status --porcelain)" ]]; then
 
     log "Committing local changes..."
     git add -A
-    git commit -m "chore: deploy $(date '+%Y-%m-%d %H:%M:%S')"
+    git commit -m "${COMMIT_MESSAGE:-chore: deploy $(date '+%Y-%m-%d %H:%M:%S')}"
 fi
 
 if [[ "$PUSH" -eq 1 ]]; then
