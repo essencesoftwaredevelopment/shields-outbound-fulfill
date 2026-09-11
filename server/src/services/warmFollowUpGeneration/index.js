@@ -312,6 +312,12 @@ async function callFollowUpModel({ openaiKey, messages }) {
     };
 }
 
+/**
+ * @param {object} params
+ * @param {number} params.runId
+ * @param {string} params.agencyId
+ * @param {Record<string, unknown> | null} [params.researchBrief]
+ */
 export async function generateFollowUpCopy({ runId, agencyId, researchBrief = null }) {
     await stampGenerationStep(runId, agencyId, 'generate');
     const ctx = await loadRunInputs(runId, agencyId);
