@@ -16,6 +16,7 @@ import {
     normalizeReviewCount,
     registrableSlug,
     RESEARCH_INDUSTRIES,
+    serializeResearchBriefForReview,
     stripHtmlToText,
     VISITORS_PER_REVIEW
 } from '../briefUtils.js';
@@ -315,4 +316,47 @@ test('extractReviewCountFromSerper does not see dropped Titan-glove hits after f
     });
     assert.equal(extractReviewCountFromSerper(mixed), 23);
     assert.equal(extractReviewCountFromSerper(filtered), null);
+});
+
+test('serializeResearchBriefForReview keeps a stored brief intact and drops empty ones', () => {
+    const stored = {
+        company: 'Wild Orchard',
+        domain: 'wildorchard.com',
+        industry: 'food_beverage',
+        summary: 'Regenerative teas from Jeju island.',
+        talkingPoints: ['Launched a matcha line in spring'],
+        risks: ['Do not assume they wholesale'],
+        sources: [{ title: 'Wild Orchard', url: 'https://wildorchard.com/' }],
+        reviewCount: 1200,
+        estimatedVisitors: 120000
+    };
+    const brief = serializeResearchBriefForReview(stored);
+    assert.equal(brief.company, 'Wild Orchard');
+    assert.equal(brief.industry, 'food_beverage');
+    assert.deepEqual(brief.talkingPoints, ['Launched a matcha line in spring']);
+    assert.deepEqual(brief.risks, ['Do not assume they wholesale']);
+    assert.deepEqual(brief.sources, [{ title: 'Wild Orchard', url: 'https://wildorchard.com/' }]);
+    assert.equal(brief.reviewCount, 1200);
+    assert.equal(brief.estimatedVisitors, 1200 * VISITORS_PER_REVIEW);
+
+    assert.equal(serializeResearchBriefForReview(null), null);
+    assert.equal(serializeResearchBriefForReview('not an object'), null);
+    assert.equal(serializeResearchBriefForReview({ company: 'X', summary: '' }), null);
+});
+
+test('serializeResearchBriefForReview coerces a loosely shaped legacy row', () => {
+    const brief = serializeResearchBriefForReview({
+        company: 'Acme',
+        domain: 'acme.com',
+        industry: 'Home / Garden',
+        summary: 'Sells garden tools.',
+        talkingPoints: 'not a list',
+        sources: [{ link: 'https://acme.com/about' }, { title: 'no url' }]
+    });
+    assert.equal(brief.industry, 'home_garden');
+    assert.deepEqual(brief.talkingPoints, []);
+    assert.deepEqual(brief.risks, []);
+    assert.deepEqual(brief.sources, [{ title: 'https://acme.com/about', url: 'https://acme.com/about' }]);
+    assert.equal(brief.reviewCount, null);
+    assert.equal(brief.estimatedVisitors, null);
 });

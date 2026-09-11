@@ -2,13 +2,39 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { ExternalLink, Globe } from "lucide-react";
+import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2 } from "lucide-react";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import {
     normalizeReplyEditorHtml,
     prepareReplyEditorContent,
 } from "@/lib/interested-autoresponder/replyEditorHtml";
+
+type ResearchBriefSource = { title?: string | null; url?: string | null };
+
+/** Mirrors normalizeResearchBrief on the server; every field is optional for legacy rows. */
+type ResearchBrief = {
+    company?: string | null;
+    domain?: string | null;
+    industry?: string | null;
+    summary?: string | null;
+    talkingPoints?: string[] | null;
+    risks?: string[] | null;
+    sources?: ResearchBriefSource[] | null;
+    reviewCount?: number | null;
+    estimatedVisitors?: number | null;
+};
+
+/** One email in the lead's thread (server/src/utils/threadMessages.js). */
+type ThreadMessage = {
+    id: number | string;
+    direction: "inbound" | "outbound";
+    kind: string;
+    from: string | null;
+    subject: string | null;
+    text: string;
+    sentAt: string | null;
+};
 
 type ReviewDraft = {
     id: number;
@@ -21,6 +47,9 @@ type ReviewDraft = {
     researchStep?: string | null;
     websiteDomain?: string | null;
     websiteUrl?: string | null;
+    researchBrief?: ResearchBrief | null;
+    researchCompletedAt?: string | null;
+    thread?: ThreadMessage[] | null;
 };
 
 /** Review-page preview: Vulcan public audit → admin edit; Essence links unchanged. */
@@ -65,6 +94,273 @@ function websiteFromDraft(draft: ReviewDraft): { href: string; domain: string } 
     return { href, domain };
 }
 
+/** Display labels for the research industry enum (server/.../briefUtils.js RESEARCH_INDUSTRIES). */
+const INDUSTRY_LABELS: Record<string, string> = {
+    beauty_skincare: "Beauty & skincare",
+    fashion_apparel: "Fashion & apparel",
+    food_beverage: "Food & beverage",
+    health_wellness: "Health & wellness",
+    home_garden: "Home & garden",
+    electronics: "Electronics",
+    automotive: "Automotive",
+    pets: "Pets",
+    sports_outdoors: "Sports & outdoors",
+    jewelry_accessories: "Jewelry & accessories",
+    kids_baby: "Kids & baby",
+    gifts_collectibles: "Gifts & collectibles",
+};
+
+function industryLabel(value: string | null | undefined): string | null {
+    const key = String(value || "").trim();
+    if (!key) return null;
+    if (INDUSTRY_LABELS[key]) return INDUSTRY_LABELS[key];
+    const words = key.replace(/_/g, " ");
+    return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function hostnameOf(url: string): string {
+    try {
+        return new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+        return "";
+    }
+}
+
+function stringList(value: unknown): string[] {
+    return (Array.isArray(value) ? value : [])
+        .map((entry) => String(entry ?? "").trim())
+        .filter(Boolean);
+}
+
+function positiveInt(value: unknown): number | null {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : null;
+}
+
+function formatShortDate(iso: string | null | undefined): string | null {
+    if (!iso) return null;
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+function formatMessageDate(iso: string | null | undefined): string | null {
+    if (!iso) return null;
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+const THREAD_KIND_LABELS: Record<string, string> = {
+    auto_reply: "Auto-reply",
+    autoresponder: "Auto-responder",
+    manual: "Manual reply",
+    follow_up: "Follow-up",
+    campaign: "Campaign email",
+};
+
+type ThreadViewProps = { messages: ThreadMessage[] };
+
+function messagePreview(text: string): string {
+    const line = text.replace(/\s+/g, " ").trim();
+    return line.length > 140 ? `${line.slice(0, 140)}…` : line;
+}
+
+function ThreadView({ messages }: ThreadViewProps) {
+    // Newest first; every message starts collapsed and opens on click.
+    const ordered = [...messages].sort((a, b) => String(b.sentAt || "").localeCompare(String(a.sentAt || "")));
+    const subject = ordered.find((message) => message.subject)?.subject ?? null;
+    const [expanded, setExpanded] = useState<Set<ThreadMessage["id"]>>(() => new Set());
+
+    const toggle = (id: ThreadMessage["id"]) => {
+        setExpanded((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    };
+
+    return (
+        <div className="ar-thread">
+            {subject && <p className="ar-thread__subject" title={subject}>{subject}</p>}
+            {ordered.map((message) => {
+                const inbound = message.direction === "inbound";
+                const kind = THREAD_KIND_LABELS[message.kind];
+                const when = formatMessageDate(message.sentAt);
+                const open = expanded.has(message.id);
+                const bodyId = `ar-thread-body-${String(message.id)}`;
+                return (
+                    <article
+                        key={message.id}
+                        className={`ar-thread__msg ar-thread__msg--${message.direction}${open ? " ar-thread__msg--open" : ""}`}
+                    >
+                        <button
+                            type="button"
+                            className="ar-thread__head"
+                            onClick={() => toggle(message.id)}
+                            aria-expanded={open}
+                            aria-controls={bodyId}
+                        >
+                            <span className="ar-thread__meta">
+                                <span className={`ar-thread__who${inbound ? " ar-thread__who--inbound" : ""}`}>
+                                    {inbound ? "Lead" : "You"}
+                                </span>
+                                {message.from && <span className="ar-thread__from" title={message.from}>{message.from}</span>}
+                                {kind && <span className="ar-thread__kind">· {kind}</span>}
+                                {when && <span className="ar-thread__date">{when}</span>}
+                                <span className="ar-thread__chevron" aria-hidden="true">
+                                    {open ? <ChevronUp size={14} strokeWidth={2} /> : <ChevronDown size={14} strokeWidth={2} />}
+                                </span>
+                            </span>
+                            {!open && <span className="ar-thread__preview">{messagePreview(message.text)}</span>}
+                        </button>
+                        {open && (
+                            <p id={bodyId} className="ar-thread__body">{message.text}</p>
+                        )}
+                    </article>
+                );
+            })}
+        </div>
+    );
+}
+
+type ResearchPanelProps = {
+    brief: ResearchBrief | null | undefined;
+    completedAt: string | null | undefined;
+    researching: boolean;
+};
+
+function ResearchPanel({ brief, completedAt, researching }: ResearchPanelProps) {
+    const summary = String(brief?.summary || "").trim();
+    const talkingPoints = stringList(brief?.talkingPoints);
+    const risks = stringList(brief?.risks);
+    const rawSources = brief?.sources;
+    const sources = (Array.isArray(rawSources) ? rawSources : [])
+        .map((source) => ({ title: String(source?.title || "").trim(), url: String(source?.url || "").trim() }))
+        .filter((source) => source.url);
+    const reviewCount = positiveInt(brief?.reviewCount);
+    const estimatedVisitors = positiveInt(brief?.estimatedVisitors);
+    const industry = industryLabel(brief?.industry);
+    const company = String(brief?.company || "").trim();
+    const domain = String(brief?.domain || "").trim();
+    const researchedOn = formatShortDate(completedAt);
+
+    return (
+        <div className="ar-panel ar-research" aria-label="Prospect research">
+            <div className="ar-panel__head">
+                <p className="eyebrow eyebrow--muted">Research</p>
+                {!researching && researchedOn && (
+                    <span className="ar-save-state">{researchedOn}</span>
+                )}
+            </div>
+
+            {researching ? (
+                <p className="ar-research__empty">
+                    Research is running. The brief will appear here as soon as the draft is ready.
+                </p>
+            ) : !summary ? (
+                <p className="ar-research__empty">
+                    No research brief for this lead — the reply was drafted from the thread alone.
+                </p>
+            ) : (
+                <>
+                    {(company || domain || industry) && (
+                        <div className="ar-research__company">
+                            {company && <h2 className="ar-research__name">{company}</h2>}
+                            {domain && (
+                                <a
+                                    className="ar-research__domain"
+                                    href={`https://${domain}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                >
+                                    <Globe size={13} strokeWidth={2} />
+                                    {domain}
+                                </a>
+                            )}
+                            {industry && (
+                                <span className="lead-pastel-chip lead-pastel-chip--list ar-research__industry">
+                                    {industry}
+                                </span>
+                            )}
+                        </div>
+                    )}
+
+                    <p className="ar-research__summary">{summary}</p>
+
+                    {talkingPoints.length > 0 && (
+                        <section className="ar-research__section">
+                            <p className="ar-research__label">Talking points</p>
+                            <ul className="ar-research__list">
+                                {talkingPoints.map((point, index) => (
+                                    <li key={`${index}-${point.slice(0, 24)}`}>{point}</li>
+                                ))}
+                            </ul>
+                        </section>
+                    )}
+
+                    {risks.length > 0 && (
+                        <section className="ar-research__section">
+                            <p className="ar-research__label">Avoid claiming</p>
+                            <ul className="ar-research__list ar-research__list--risks">
+                                {risks.map((risk, index) => (
+                                    <li key={`${index}-${risk.slice(0, 24)}`}>{risk}</li>
+                                ))}
+                            </ul>
+                        </section>
+                    )}
+
+                    {(reviewCount !== null || estimatedVisitors !== null) && (
+                        <section className="ar-research__section">
+                            <p className="ar-research__label">Signals</p>
+                            <div className="ar-research__stats">
+                                {reviewCount !== null && (
+                                    <div className="ar-research__stat">
+                                        <span className="ar-research__stat-value">{reviewCount.toLocaleString("en-GB")}</span>
+                                        <span className="ar-research__stat-label">Published reviews</span>
+                                    </div>
+                                )}
+                                {estimatedVisitors !== null && (
+                                    <div className="ar-research__stat" title="Rough DTC heuristic: published reviews × 100">
+                                        <span className="ar-research__stat-value">~{estimatedVisitors.toLocaleString("en-GB")}</span>
+                                        <span className="ar-research__stat-label">Est. site visitors</span>
+                                    </div>
+                                )}
+                            </div>
+                        </section>
+                    )}
+
+                    {sources.length > 0 && (
+                        <section className="ar-research__section">
+                            <p className="ar-research__label">Sources</p>
+                            <ul className="ar-research__sources">
+                                {sources.map((source) => {
+                                    const host = hostnameOf(source.url);
+                                    return (
+                                        <li key={source.url}>
+                                            <a
+                                                className="ar-research__source"
+                                                href={source.url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                title={source.url}
+                                            >
+                                                <span className="ar-research__source-title">{source.title || source.url}</span>
+                                                {host && <span className="ar-research__source-host">{host}</span>}
+                                            </a>
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        </section>
+                    )}
+                </>
+            )}
+        </div>
+    );
+}
+
 export default function InterestedAutoResponderReviewPage() {
     const params = useParams();
     const token = String(params?.token || "");
@@ -82,6 +378,7 @@ export default function InterestedAutoResponderReviewPage() {
     const [error, setError] = useState<string | null>(null);
     const [sendSuccess, setSendSuccess] = useState(false);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+    const [threadOpen, setThreadOpen] = useState(false);
 
     const editorRef = useRef<HTMLDivElement>(null);
     const regenerateInstructionsRef = useRef<HTMLTextAreaElement>(null);
@@ -98,6 +395,12 @@ export default function InterestedAutoResponderReviewPage() {
     const [linkPopup, setLinkPopup] = useState<LinkPopup | null>(null);
     const linkInputRef = useRef<HTMLInputElement>(null);
     const linkPopupRef = useRef<HTMLDivElement>(null);
+    // Touch devices have no ⌘K: when the caret sits in a link, float an
+    // "Edit link" pill under it (document coordinates, like the popover).
+    const [linkBubble, setLinkBubble] = useState<{ top: number; left: number } | null>(null);
+    const linkBubbleRef = useRef<{ top: number; left: number } | null>(null);
+    const [coarsePointer, setCoarsePointer] = useState(false);
+    const bubbleRangeRef = useRef<Range | null>(null);
 
     const applyLoadedDraft = useCallback((loaded: ReviewDraft | null) => {
         if (!loaded) {
@@ -107,7 +410,10 @@ export default function InterestedAutoResponderReviewPage() {
         const initialText = loaded.renderedText || "";
         const preparedText = prepareReplyEditorContent(initialText);
         lastSavedTextRef.current = preparedText;
-        setDraft(loaded);
+        setDraft((prev) => ({
+            ...loaded,
+            thread: Array.isArray(loaded.thread) ? loaded.thread : prev?.thread ?? [],
+        }));
         setRenderedText(preparedText);
         setPreviewUrl(extractReviewPreviewUrl(initialText));
         if (editorRef.current) {
@@ -287,18 +593,64 @@ export default function InterestedAutoResponderReviewPage() {
         syncEditorContent(false);
     }, [syncEditorContent]);
 
-    const openLinkPopup = useCallback(() => {
+    const anchorAtNode = useCallback((node: Node | null | undefined): HTMLAnchorElement | null => {
+        let el: Node | null = node instanceof Element ? node : node?.parentElement ?? null;
+        while (el && el !== editorRef.current) {
+            if (el instanceof HTMLAnchorElement) return el;
+            el = el.parentElement;
+        }
+        return null;
+    }, []);
+
+    useEffect(() => {
+        const media = window.matchMedia("(hover: none) and (pointer: coarse)");
+        const update = () => setCoarsePointer(media.matches);
+        update();
+        media.addEventListener("change", update);
+        return () => media.removeEventListener("change", update);
+    }, []);
+
+    // Follow the caret: show the bubble under the link it sits in, hide otherwise.
+    useEffect(() => {
+        if (!coarsePointer) return;
+        const handler = () => {
+            const sel = window.getSelection();
+            const editor = editorRef.current;
+            const inside = Boolean(sel && editor && sel.anchorNode && editor.contains(sel.anchorNode));
+            const anchor = inside ? anchorAtNode(sel?.anchorNode) : null;
+            let next: { top: number; left: number } | null = null;
+            if (anchor) {
+                const rect = anchor.getBoundingClientRect();
+                next = {
+                    top: Math.round(rect.bottom + window.scrollY + 6),
+                    left: Math.round(Math.max(8, Math.min(rect.left + window.scrollX, window.scrollX + window.innerWidth - 120))),
+                };
+            }
+            const prev = linkBubbleRef.current;
+            if ((prev === null && next === null) || (prev && next && prev.top === next.top && prev.left === next.left)) return;
+            linkBubbleRef.current = next;
+            setLinkBubble(next);
+        };
+        document.addEventListener("selectionchange", handler);
+        return () => {
+            document.removeEventListener("selectionchange", handler);
+            linkBubbleRef.current = null;
+            setLinkBubble(null);
+        };
+    }, [coarsePointer, anchorAtNode]);
+
+    const openLinkPopup = useCallback((rangeOverride?: Range | null) => {
         const sel = window.getSelection();
         if (!sel) return;
 
-        // Find the anchor the cursor is inside (if any)
-        let anchor: HTMLAnchorElement | null = null;
-        const node = sel.anchorNode;
-        let el: Node | null = node instanceof Element ? node : node?.parentElement ?? null;
-        while (el && el !== editorRef.current) {
-            if (el instanceof HTMLAnchorElement) { anchor = el; break; }
-            el = el.parentElement;
+        // A bubble tap can drop the editor selection; put the saved one back first.
+        if (rangeOverride && (sel.rangeCount === 0 || !editorRef.current?.contains(sel.anchorNode))) {
+            sel.removeAllRanges();
+            sel.addRange(rangeOverride);
         }
+
+        // Find the anchor the cursor is inside (if any)
+        const anchor = anchorAtNode(sel.anchorNode);
 
         // Save the current selection range so we can restore it before execCommand
         const savedRange = sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
@@ -310,8 +662,11 @@ export default function InterestedAutoResponderReviewPage() {
         } else if (sel.rangeCount > 0) {
             rect = sel.getRangeAt(0).getBoundingClientRect();
         }
+        // Keep the popover inside the viewport on narrow screens.
+        const popupWidth = Math.min(400, window.innerWidth - 32);
+        const maxLeft = window.scrollX + window.innerWidth - popupWidth - 16;
         const top = rect ? rect.bottom + window.scrollY + 8 : 200;
-        const left = rect ? Math.max(8, rect.left + window.scrollX) : 80;
+        const left = rect ? Math.max(8, Math.min(rect.left + window.scrollX, maxLeft)) : 80;
 
         setLinkPopup({
             url: anchor?.href ?? "",
@@ -322,7 +677,7 @@ export default function InterestedAutoResponderReviewPage() {
         });
         // Focus the input on next tick
         setTimeout(() => linkInputRef.current?.focus(), 0);
-    }, []);
+    }, [anchorAtNode]);
 
     const applyLink = useCallback((url: string) => {
         if (!editorRef.current) return;
@@ -485,231 +840,56 @@ export default function InterestedAutoResponderReviewPage() {
     };
 
     const website = draft ? websiteFromDraft(draft) : null;
+    const editorLocked = sendSuccess || regenerating;
+    const actionsBusy = sending || regenerating || archiving;
+    const hasDraftText = Boolean(String(draft?.renderedText || "").trim());
+    // Right column only earns its space when there is (or will be) a brief.
+    const showResearch = Boolean(draft && (regenerating || draft.researchBrief));
+    const thread: ThreadMessage[] = draft?.thread ?? [];
+    // The quote already shows the latest lead message; the thread adds value once there is more.
+    const canExpandThread = thread.length > 1 || (thread.length === 1 && !draft?.previousLeadMessage);
 
     return (
-        <main style={{ minHeight: "100vh", background: "#0b1020", color: "#fff", padding: "1rem 0.25rem" }}>
-            <style>{`
-                .reply-editor {
-                    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                }
-                .reply-editor,
-                .reply-editor * {
-                    font-family: inherit !important;
-                    font-size: inherit !important;
-                    line-height: inherit !important;
-                }
-                .reply-editor a { color: #60a5fa !important; text-decoration: underline !important; }
-                .reply-editor p,
-                .reply-editor div { margin: 0 0 0.8em; }
-                .reply-editor p:last-child,
-                .reply-editor div:last-child { margin-bottom: 0; }
-                .reply-editor br { display: block; }
-                .reply-editor:focus { box-shadow: 0 0 0 2px rgba(96,165,250,0.3); }
-                .ar-card { padding: 1rem; }
-                @media (min-width: 640px) {
-                    .ar-card { padding: 1.5rem; }
-                    main { padding: 2rem 1rem; }
-                }
-                .link-popup {
-                    position: absolute;
-                    z-index: 9999;
-                    background: #1e2538;
-                    border: 1px solid rgba(255,255,255,0.15);
-                    border-radius: 10px;
-                    padding: 0.6rem 0.75rem;
-                    display: flex;
-                    align-items: center;
-                    gap: 0.5rem;
-                    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-                    min-width: 320px;
-                }
-                .link-popup input {
-                    flex: 1;
-                    background: rgba(0,0,0,0.3);
-                    border: 1px solid rgba(255,255,255,0.12);
-                    border-radius: 6px;
-                    padding: 0.35rem 0.6rem;
-                    color: #fff;
-                    font-size: 0.85rem;
-                    outline: none;
-                }
-                .link-popup input:focus {
-                    border-color: rgba(96,165,250,0.6);
-                    box-shadow: 0 0 0 2px rgba(96,165,250,0.2);
-                }
-                .link-popup button {
-                    flex-shrink: 0;
-                    padding: 0.32rem 0.65rem;
-                    border-radius: 6px;
-                    border: none;
-                    font-size: 0.82rem;
-                    font-weight: 600;
-                    cursor: pointer;
-                }
-                .link-popup .btn-apply { background: #2563eb; color: #fff; }
-                .link-popup .btn-apply:hover { background: #1d4ed8; }
-                .link-popup .btn-remove { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
-                .link-popup .btn-remove:hover { background: rgba(239,68,68,0.25); }
-                .ar-modal-overlay {
-                    position: fixed;
-                    inset: 0;
-                    z-index: 10000;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    padding: 1rem;
-                    background: rgba(0,0,0,0.65);
-                }
-                .ar-modal {
-                    width: 100%;
-                    max-width: 420px;
-                    padding: 1.25rem;
-                    border-radius: 16px;
-                    background: #151b2e;
-                    border: 1px solid rgba(255,255,255,0.12);
-                    box-shadow: 0 24px 64px rgba(0,0,0,0.45);
-                }
-                .ar-modal--wide { max-width: 520px; }
-                .ar-modal textarea {
-                    display: block;
-                    width: 100%;
-                    min-height: 128px;
-                    margin: 0 0 1.25rem;
-                    padding: 0.75rem 0.85rem;
-                    border-radius: 10px;
-                    border: 1px solid rgba(255,255,255,0.12);
-                    background: rgba(0,0,0,0.28);
-                    color: #fff;
-                    font-size: 0.9rem;
-                    line-height: 1.5;
-                    resize: vertical;
-                    outline: none;
-                    font-family: inherit;
-                    box-sizing: border-box;
-                }
-                .ar-modal textarea:focus {
-                    border-color: rgba(96,165,250,0.6);
-                    box-shadow: 0 0 0 2px rgba(96,165,250,0.2);
-                }
-                .ar-modal textarea::placeholder { color: rgba(255,255,255,0.35); }
-                .ar-modal__title {
-                    margin: 0 0 0.5rem;
-                    font-size: 1.1rem;
-                    font-weight: 600;
-                }
-                .ar-modal__body {
-                    margin: 0 0 1.25rem;
-                    color: rgba(255,255,255,0.72);
-                    font-size: 0.9rem;
-                    line-height: 1.55;
-                }
-                .ar-modal__actions {
-                    display: flex;
-                    justify-content: flex-end;
-                    gap: 0.65rem;
-                }
-                .ar-btn-secondary {
-                    padding: 0.65rem 1rem;
-                    border-radius: 8px;
-                    border: 1px solid rgba(255,255,255,0.15);
-                    background: rgba(255,255,255,0.04);
-                    color: #fff;
-                    font-weight: 600;
-                    font-size: 0.9rem;
-                    cursor: pointer;
-                }
-                .ar-btn-secondary:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
-                .ar-btn-destructive {
-                    padding: 0.65rem 1rem;
-                    border-radius: 8px;
-                    border: 1px solid rgba(239,68,68,0.45);
-                    background: rgba(239,68,68,0.18);
-                    color: #fca5a5;
-                    font-weight: 600;
-                    font-size: 0.9rem;
-                    cursor: pointer;
-                }
-                .ar-btn-destructive:hover:not(:disabled) { background: rgba(239,68,68,0.28); }
-                .ar-btn-primary {
-                    padding: 0.65rem 1rem;
-                    border-radius: 8px;
-                    border: none;
-                    background: #2563eb;
-                    color: #fff;
-                    font-weight: 600;
-                    font-size: 0.9rem;
-                    cursor: pointer;
-                }
-                .ar-btn-primary:hover:not(:disabled) { background: #1d4ed8; }
-                .ar-btn-primary:active:not(:disabled) { transform: scale(0.98); }
-                .ar-btn-secondary:disabled,
-                .ar-btn-destructive:disabled,
-                .ar-btn-primary:disabled { opacity: 0.55; cursor: default; }
-                .ar-link-btns {
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 0.55rem;
-                    margin-top: 0.35rem;
-                }
-                .ar-link-btn {
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 0.4rem;
-                    padding: 0.5rem 0.85rem;
-                    border-radius: 8px;
-                    border: 1px solid rgba(255,255,255,0.15);
-                    background: rgba(255,255,255,0.06);
-                    color: #fff;
-                    font-weight: 600;
-                    font-size: 0.85rem;
-                    text-decoration: none;
-                    cursor: pointer;
-                    transition: background 0.15s, border-color 0.15s, transform 0.12s;
-                }
-                .ar-link-btn:hover {
-                    background: rgba(255,255,255,0.11);
-                    border-color: rgba(255,255,255,0.28);
-                }
-                .ar-link-btn:active { transform: scale(0.98); }
-                .ar-link-btn svg { flex-shrink: 0; }
-                .ar-link-btn--preview {
-                    background: rgba(37,99,235,0.16);
-                    border-color: rgba(96,165,250,0.45);
-                    color: #93c5fd;
-                }
-                .ar-link-btn--preview:hover { background: rgba(37,99,235,0.28); }
-            `}</style>
+        <main className="ar-page">
             {regenerateModalOpen && (
                 <div
-                    className="ar-modal-overlay"
+                    className="modal-overlay"
                     role="dialog"
                     aria-modal="true"
                     aria-labelledby="regenerate-draft-title"
                     onClick={() => { if (!regenerating) setRegenerateModalOpen(false); }}
                 >
-                    <div className="ar-modal ar-modal--wide" onClick={(e) => e.stopPropagation()}>
-                        <h2 id="regenerate-draft-title" className="ar-modal__title">Regenerate reply</h2>
-                        <p className="ar-modal__body" style={{ marginBottom: "0.65rem" }}>
-                            Optional extra instructions for this regeneration. They take priority over the campaign system prompt if anything conflicts.
-                        </p>
-                        <textarea
-                            ref={regenerateInstructionsRef}
-                            value={regenerateInstructions}
-                            onChange={(e) => setRegenerateInstructions(e.target.value)}
-                            onKeyDown={(e) => {
-                                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-                                    e.preventDefault();
-                                    if (!regenerating) handleRegenerate();
-                                }
-                            }}
-                            placeholder="e.g. Keep it under 80 words. Mention their new product line. Skip the audit link."
-                            maxLength={4000}
-                            disabled={regenerating}
-                        />
-                        <div className="ar-modal__actions">
+                    <div className="modal" style={{ maxWidth: "560px" }} onClick={(e) => e.stopPropagation()}>
+                        <div className="modal__header">
+                            <div>
+                                <p className="eyebrow eyebrow--muted">Interested Auto-Responder</p>
+                                <h2 id="regenerate-draft-title" className="modal__title">Regenerate reply</h2>
+                                <p className="modal__description">
+                                    Optional extra instructions for this regeneration. They take priority over the campaign system prompt if anything conflicts.
+                                </p>
+                            </div>
+                        </div>
+                        <div className="modal__body">
+                            <textarea
+                                ref={regenerateInstructionsRef}
+                                className="ar-textarea"
+                                value={regenerateInstructions}
+                                onChange={(e) => setRegenerateInstructions(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                                        e.preventDefault();
+                                        if (!regenerating) handleRegenerate();
+                                    }
+                                }}
+                                placeholder="e.g. Keep it under 80 words. Mention their new product line. Skip the audit link."
+                                maxLength={4000}
+                                disabled={regenerating}
+                            />
+                        </div>
+                        <div className="modal__actions">
                             <button
                                 type="button"
-                                className="ar-btn-secondary"
+                                className="secondary-button secondary-button--active"
                                 onClick={() => setRegenerateModalOpen(false)}
                                 disabled={regenerating}
                             >
@@ -717,7 +897,7 @@ export default function InterestedAutoResponderReviewPage() {
                             </button>
                             <button
                                 type="button"
-                                className="ar-btn-primary"
+                                className="primary-button"
                                 onClick={handleRegenerate}
                                 disabled={regenerating}
                             >
@@ -729,21 +909,26 @@ export default function InterestedAutoResponderReviewPage() {
             )}
             {archiveModalOpen && (
                 <div
-                    className="ar-modal-overlay"
+                    className="modal-overlay"
                     role="dialog"
                     aria-modal="true"
                     aria-labelledby="archive-draft-title"
                     onClick={() => { if (!archiving) setArchiveModalOpen(false); }}
                 >
-                    <div className="ar-modal" onClick={(e) => e.stopPropagation()}>
-                        <h2 id="archive-draft-title" className="ar-modal__title">Archive Draft?</h2>
-                        <p className="ar-modal__body">
-                            This will cancel the draft and invalidate this review link. You will not be able to send this reply from here.
-                        </p>
-                        <div className="ar-modal__actions">
+                    <div className="modal" style={{ maxWidth: "480px" }} onClick={(e) => e.stopPropagation()}>
+                        <div className="modal__header">
+                            <div>
+                                <p className="eyebrow eyebrow--muted">Interested Auto-Responder</p>
+                                <h2 id="archive-draft-title" className="modal__title">Archive draft?</h2>
+                                <p className="modal__description">
+                                    This cancels the draft and invalidates this review link. You will not be able to send this reply from here.
+                                </p>
+                            </div>
+                        </div>
+                        <div className="modal__actions">
                             <button
                                 type="button"
-                                className="ar-btn-secondary"
+                                className="secondary-button secondary-button--active"
                                 onClick={() => setArchiveModalOpen(false)}
                                 disabled={archiving}
                             >
@@ -751,27 +936,47 @@ export default function InterestedAutoResponderReviewPage() {
                             </button>
                             <button
                                 type="button"
-                                className="ar-btn-destructive"
+                                className="destructive-button"
                                 onClick={handleArchiveDraft}
                                 disabled={archiving}
                             >
-                                {archiving ? "Archiving…" : "Archive Draft"}
+                                {archiving ? "Archiving…" : "Archive draft"}
                             </button>
                         </div>
                     </div>
                 </div>
             )}
+            {coarsePointer && linkBubble && !linkPopup && !editorLocked && (
+                <button
+                    type="button"
+                    className="ar-link-bubble"
+                    style={{ top: linkBubble.top, left: linkBubble.left }}
+                    // Keep focus and selection in the editor while tapping the bubble.
+                    onPointerDown={(e) => {
+                        e.preventDefault();
+                        const sel = window.getSelection();
+                        bubbleRangeRef.current = sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+                    }}
+                    onClick={() => openLinkPopup(bubbleRangeRef.current)}
+                >
+                    <Link2 size={13} strokeWidth={2} />
+                    Edit link
+                </button>
+            )}
             {linkPopup && (
                 <div
                     ref={linkPopupRef}
-                    className="link-popup"
+                    className="ar-link-popup"
                     style={{ top: linkPopup.top, left: linkPopup.left }}
                 >
-                    <span style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.45)", flexShrink: 0 }}>🔗</span>
+                    <span className="ar-link-popup__icon" aria-hidden="true">
+                        <Link2 size={15} strokeWidth={2} />
+                    </span>
                     <input
                         ref={linkInputRef}
                         type="url"
                         placeholder="https://"
+                        aria-label="Link URL"
                         value={linkPopup.url}
                         onChange={(e) => setLinkPopup(p => p ? { ...p, url: e.target.value } : p)}
                         onKeyDown={(e) => {
@@ -779,188 +984,172 @@ export default function InterestedAutoResponderReviewPage() {
                             if (e.key === "Escape") { e.preventDefault(); setLinkPopup(null); }
                         }}
                     />
-                    <button type="button" className="btn-apply" onClick={() => applyLink(linkPopup.url)}>Apply</button>
+                    <button type="button" className="ar-link-popup__btn" onClick={() => applyLink(linkPopup.url)}>Apply</button>
                     {linkPopup.anchor && (
-                        <button type="button" className="btn-remove" onClick={() => applyLink("")}>Remove</button>
+                        <button type="button" className="ar-link-popup__btn ar-link-popup__btn--remove" onClick={() => applyLink("")}>Remove</button>
                     )}
                 </div>
             )}
-            <div className="ar-card" style={{ maxWidth: "840px", margin: "0 auto", borderRadius: "20px", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)" }}>
-                <p style={{ margin: 0, textTransform: "uppercase", letterSpacing: "0.08em", fontSize: "0.72rem", color: "rgba(255,255,255,0.45)" }}>
-                    Interested Lead Auto-Responder
-                </p>
+
+            <div className="ar-shell">
+                {draft && !archived && (
+                    <header className="ar-header">
+                        <div className="ar-header__row">
+                            <div className="ar-header__identity">
+                                <h1 className="ar-header__title">{draft.leadEmail}</h1>
+                                <p className="ar-header__meta">{draft.campaignName}</p>
+                            </div>
+                            <div className="ar-header__links">
+                                {website && (
+                                    <a
+                                        className="ar-link"
+                                        href={website.href}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        title={website.domain}
+                                    >
+                                        <Globe size={15} strokeWidth={2} />
+                                        Website
+                                    </a>
+                                )}
+                                {previewUrl && (
+                                    <a
+                                        className="ar-link"
+                                        href={previewUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                    >
+                                        <ExternalLink size={15} strokeWidth={2} />
+                                        Preview link
+                                    </a>
+                                )}
+                            </div>
+                        </div>
+                    </header>
+                )}
 
                 {loading ? (
-                    <p style={{ marginTop: "1.5rem", color: "rgba(255,255,255,0.65)" }}>Loading…</p>
-                ) : error ? (
-                    <div style={{ marginTop: "1.5rem", padding: "1rem", borderRadius: "12px", background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.35)", color: "#fca5a5" }}>
-                        {error}
+                    <div className="ar-panel">
+                        <p className="ar-state">Loading…</p>
                     </div>
+                ) : error && !draft ? (
+                    <div className="ar-notice ar-notice--error" role="alert">{error}</div>
                 ) : archived ? (
-                    <div style={{ marginTop: "1.5rem", padding: "1rem", borderRadius: "12px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", color: "rgba(255,255,255,0.82)" }}>
+                    <div className="ar-notice ar-notice--muted">
                         This draft has been archived and is no longer available.
                     </div>
                 ) : draft ? (
-                    <div style={{ marginTop: "1.5rem", display: "flex", flexDirection: "column", gap: "1.25rem" }}>
-                        <div style={{ display: "grid", gap: "0.35rem", fontSize: "0.9rem" }}>
-                            <div><strong>Lead:</strong> {draft.leadEmail}</div>
-                            <div><strong>Campaign:</strong> {draft.campaignName}</div>
+                    <div className={`ar-layout${showResearch ? " ar-layout--with-aside" : ""}`}>
+                        <div className="ar-main">
                             {regenerating && (
                                 <InterestedResearchProgress
                                     status={draft.status}
                                     stepId={draft.researchStep}
-                                    tone="dark"
+                                    tone="light"
                                 />
                             )}
-                            {(website || previewUrl) && (
-                                <div className="ar-link-btns">
-                                    {website && (
-                                        <a
-                                            className="ar-link-btn"
-                                            href={website.href}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            title={website.domain}
-                                        >
-                                            <Globe size={15} strokeWidth={2} />
-                                            Website
-                                        </a>
-                                    )}
-                                    {previewUrl && (
-                                        <a
-                                            className="ar-link-btn ar-link-btn--preview"
-                                            href={previewUrl}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                        >
-                                            <ExternalLink size={15} strokeWidth={2} />
-                                            Preview Link
-                                        </a>
-                                    )}
-                                </div>
-                            )}
-                        </div>
-
-                        {/* Reply editor — rendered HTML, contentEditable */}
-                        <section style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-                                <h2 style={{ margin: 0, fontSize: "1rem" }}>Reply:</h2>
+                            {/* Reply editor — rendered HTML, contentEditable */}
+                            <div className="ar-editor-frame">
+                                <div
+                                    ref={editorRef}
+                                    contentEditable={!editorLocked}
+                                    suppressContentEditableWarning
+                                    onInput={handleEditorInput}
+                                    onBlur={handleEditorBlur}
+                                    onPaste={handleEditorPaste}
+                                    onKeyDown={handleEditorKeyDown}
+                                    className="lead-reply-editor ar-editor"
+                                    aria-label="Reply text"
+                                />
                                 {saveStatus === "saving" && (
-                                    <span style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.45)" }}>Saving…</span>
+                                    <span className="ar-save-state">Saving…</span>
                                 )}
                                 {saveStatus === "saved" && (
-                                    <span style={{ fontSize: "0.75rem", color: "#4ade80" }}>Saved</span>
+                                    <span className="ar-save-state ar-save-state--saved">Saved</span>
                                 )}
                             </div>
-                            <div
-                                ref={editorRef}
-                                contentEditable={!sendSuccess && !regenerating}
-                                suppressContentEditableWarning
-                                onInput={handleEditorInput}
-                                onBlur={handleEditorBlur}
-                                onPaste={handleEditorPaste}
-                                onKeyDown={handleEditorKeyDown}
-                                className="reply-editor"
-                                style={{
-                                    minHeight: "180px",
-                                    padding: "1rem",
-                                    borderRadius: "12px",
-                                    border: "1px solid rgba(255,255,255,0.12)",
-                                    background: "rgba(0,0,0,0.24)",
-                                    color: "#fff",
-                                    outline: "none",
-                                    lineHeight: 1.65,
-                                    fontSize: "0.9rem",
-                                    cursor: sendSuccess || regenerating ? "default" : "text",
-                                    wordBreak: "break-word",
-                                    transition: "box-shadow 0.15s",
-                                    opacity: sendSuccess || regenerating ? 0.7 : 1,
-                                }}
-                            />
-                            <p style={{ margin: 0, fontSize: "0.75rem", color: "rgba(255,255,255,0.35)" }}>
-                                {regenerating
-                                    ? `${String(draft.renderedText || "").trim() ? "Research is rewriting" : "Research is writing"} the reply. Send stays locked until the draft is ready.`
-                                    : <>Click to edit — changes are saved automatically. Press <kbd style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "4px", padding: "0 4px", fontSize: "0.72rem" }}>⌘K</kbd> to edit a link.</>}
-                            </p>
-                            <div style={{ display: "flex", flexDirection: "column", gap: "0.65rem" }}>
+                            <div className="ar-actions">
                                 {!sendSuccess && (
                                     <button
                                         type="button"
+                                        className="secondary-button secondary-button--active"
                                         onClick={() => setRegenerateModalOpen(true)}
-                                        disabled={sending || regenerating || archiving}
-                                        style={{
-                                            width: "100%",
-                                            padding: "0.85rem",
-                                            borderRadius: "10px",
-                                            border: "1px solid rgba(96,165,250,0.45)",
-                                            background: regenerating ? "rgba(37,99,235,0.25)" : "rgba(37,99,235,0.14)",
-                                            color: "#93c5fd",
-                                            cursor: sending || regenerating || archiving ? "default" : "pointer",
-                                            fontWeight: 600,
-                                            fontSize: "0.95rem",
-                                            opacity: sending || regenerating || archiving ? 0.7 : 1,
-                                        }}
+                                        disabled={actionsBusy}
                                     >
                                         {regenerating
-                                            ? (String(draft.renderedText || "").trim() ? "Regenerating…" : "Researching…")
+                                            ? (hasDraftText ? "Regenerating…" : "Researching…")
                                             : "Regenerate"}
+                                    </button>
+                                )}
+                                {!sendSuccess && (
+                                    <button
+                                        type="button"
+                                        className="destructive-button"
+                                        onClick={() => setArchiveModalOpen(true)}
+                                        disabled={actionsBusy}
+                                    >
+                                        Archive draft
                                     </button>
                                 )}
                                 <button
                                     type="button"
+                                    className="primary-button"
                                     onClick={handleSendReply}
                                     disabled={sending || regenerating || !renderedText.trim() || sendSuccess}
-                                    style={{ width: "100%", padding: "0.9rem", borderRadius: "10px", border: "none", background: sendSuccess ? "rgba(34,197,94,0.25)" : "#16a34a", color: "#fff", cursor: sending || regenerating || sendSuccess ? "default" : "pointer", fontWeight: 600, fontSize: "1rem", opacity: regenerating ? 0.55 : 1 }}
                                 >
-                                    {sending ? "Sending…" : sendSuccess ? "Sent ✓" : "Send Reply"}
+                                    {sending ? "Sending…" : sendSuccess ? "Sent ✓" : "Send reply"}
                                 </button>
-                                {!sendSuccess && (
+                            </div>
+                            {sendSuccess && (
+                                <div className="ar-notice ar-notice--success" role="status">
+                                    Reply sent successfully.
+                                </div>
+                            )}
+                            {error && (
+                                <div className="ar-notice ar-notice--error" role="alert">
+                                    {error}
+                                </div>
+                            )}
+
+                            {/* Lead conversation: latest message, expandable to the whole thread */}
+                            <section className="ar-conversation" aria-label="Lead conversation">
+                                {threadOpen && thread.length > 0 ? (
+                                    <ThreadView messages={thread} />
+                                ) : draft.previousLeadMessage ? (
+                                    <blockquote className="ar-quote">{draft.previousLeadMessage}</blockquote>
+                                ) : (
+                                    <p className="ar-quote ar-quote--empty">No prior lead message available.</p>
+                                )}
+                                {canExpandThread && (
                                     <button
                                         type="button"
-                                        onClick={() => setArchiveModalOpen(true)}
-                                        disabled={sending || regenerating || archiving}
-                                        style={{
-                                            width: "100%",
-                                            padding: "0.75rem",
-                                            borderRadius: "10px",
-                                            border: "1px solid rgba(239,68,68,0.45)",
-                                            background: "rgba(239,68,68,0.12)",
-                                            color: "#fca5a5",
-                                            cursor: sending || regenerating || archiving ? "default" : "pointer",
-                                            fontWeight: 600,
-                                            fontSize: "0.95rem",
-                                            opacity: sending || regenerating || archiving ? 0.55 : 1,
-                                        }}
+                                        className="ar-thread-toggle"
+                                        onClick={() => setThreadOpen((open) => !open)}
+                                        aria-expanded={threadOpen}
                                     >
-                                        Archive Draft
+                                        {threadOpen ? <ChevronUp size={14} strokeWidth={2} /> : <ChevronDown size={14} strokeWidth={2} />}
+                                        {threadOpen
+                                            ? "Show latest message only"
+                                            : `Show full thread · ${thread.length} ${thread.length === 1 ? "message" : "messages"}`}
                                     </button>
                                 )}
-                            </div>
-                        </section>
+                            </section>
+                        </div>
 
-                        {/* Previous Lead Message — shown below the reply */}
-                        <section style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-                            <h2 style={{ margin: 0, fontSize: "1rem" }}>Previous Lead Message</h2>
-                            <div style={{ whiteSpace: "pre-wrap", padding: "1rem", borderRadius: "12px", background: "rgba(0,0,0,0.2)", border: "1px solid rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.82)", fontSize: "0.9rem", lineHeight: 1.65 }}>
-                                {draft.previousLeadMessage || "No prior lead message available."}
-                            </div>
-                        </section>
-
-                        {sendSuccess && (
-                            <div style={{ padding: "0.9rem 1rem", borderRadius: "12px", background: "rgba(34,197,94,0.12)", border: "1px solid rgba(34,197,94,0.35)", color: "#86efac" }}>
-                                Reply sent successfully.
-                            </div>
+                        {showResearch && (
+                            <aside className="ar-aside">
+                                <ResearchPanel
+                                    brief={draft.researchBrief}
+                                    completedAt={draft.researchCompletedAt}
+                                    researching={regenerating}
+                                />
+                            </aside>
                         )}
-                        {error && (
-                            <div style={{ padding: "0.9rem 1rem", borderRadius: "12px", background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.35)", color: "#fca5a5" }}>
-                                {error}
-                            </div>
-                        )}
-
-
                     </div>
                 ) : (
-                    <p style={{ marginTop: "1.5rem", color: "rgba(255,255,255,0.65)" }}>Draft not found.</p>
+                    <div className="ar-panel">
+                        <p className="ar-state">Draft not found.</p>
+                    </div>
                 )}
             </div>
         </main>

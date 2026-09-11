@@ -345,6 +345,16 @@ export function normalizeResearchBrief(raw, { company = '', domain = '', fallbac
     };
 }
 
+/**
+ * Brief as exposed to the review page. Re-runs the normalizer so an older row
+ * with a looser shape still renders predictably; null when there is no
+ * summary to show (thin research, inline-path draft, or mid-regeneration).
+ */
+export function serializeResearchBriefForReview(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    return normalizeResearchBrief(raw, { fallbackReviewCount: raw.reviewCount });
+}
+
 /** Render the brief as a compact block for the reply-draft prompt. */
 export function formatResearchBriefForPrompt(brief) {
     if (!brief || typeof brief !== 'object') return '';

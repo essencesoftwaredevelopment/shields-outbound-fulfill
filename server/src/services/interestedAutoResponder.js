@@ -6,7 +6,8 @@ import {
     hasInterestedReplyShoppingAuditFeature,
     hasReplyResearchAgentFeature
 } from './db/agencySettings.js';
-import { formatResearchBriefForPrompt } from './interestedResearch/briefUtils.js';
+import { formatResearchBriefForPrompt, serializeResearchBriefForReview } from './interestedResearch/briefUtils.js';
+import { buildThreadMessages, THREAD_MESSAGE_LIMIT } from '../utils/threadMessages.js';
 import {
     isInterestedResearchWorkflowConfigured,
     triggerInterestedResearchWorkflow
@@ -823,6 +824,31 @@ async function resolvePreviousLeadMessageForDraft(db, {
     if (fromSource) return fromSource;
 
     return fetchRecentThreadMessages(db, contactId, campaignId);
+}
+
+/**
+ * Every email in the contact's thread for the review page, oldest first.
+ * Pulls the event rows that can carry a body and lets buildThreadMessages
+ * classify/dedupe them (Instantly emits several events per email).
+ */
+async function fetchThreadMessagesForReview(db, contactId, campaignId, leadEmail) {
+    if (!contactId || !campaignId) return [];
+    const result = await db.query(
+        `SELECT id, event_type, event_timestamp, lead_email, email_account,
+                message_text, reply_text_snippet, payload
+         FROM contact_instantly_events
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND (
+               message_text IS NOT NULL
+               OR reply_text_snippet IS NOT NULL
+               OR payload ?| ARRAY['email_text', 'email_html', 'reply_text', 'reply_html', 'reply_text_snippet']
+           )
+         ORDER BY event_timestamp DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT $3`,
+        [contactId, campaignId, THREAD_MESSAGE_LIMIT * 3]
+    );
+    return buildThreadMessages(result.rows, { leadEmail });
 }
 
 export async function fetchLatestThreadMetadata(db, contactId, campaignId) {
@@ -1835,7 +1861,9 @@ function serializeReviewDraft(draft) {
         status: draft.status,
         researchStep: draft.research_step || null,
         websiteDomain: website.domain,
-        websiteUrl: website.url
+        websiteUrl: website.url,
+        researchBrief: serializeResearchBriefForReview(draft.research_brief),
+        researchCompletedAt: draft.research_completed_at || null
     };
 }
 
@@ -1846,7 +1874,12 @@ export async function getInterestedAutoResponderDraftByToken(token) {
         error.statusCode = 409;
         throw error;
     }
-    return serializeReviewDraft(draft);
+    const thread = await fetchThreadMessagesForReview(pool, draft.contact_id, draft.campaign_id, draft.lead_email)
+        .catch((error) => {
+            console.warn(`[interested-autoresponder] thread load failed for draft=${draft.id}:`, error?.message || error);
+            return [];
+        });
+    return { ...serializeReviewDraft(draft), thread };
 }
 
 export async function updateInterestedAutoResponderDraftTextByToken({ token, renderedText }) {
