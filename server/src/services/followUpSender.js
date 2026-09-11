@@ -420,7 +420,7 @@ async function getNextScriptForProspect(db, clientId, contactId, campaignId) {
     const sentCount = parseInt(countResult.rows[0]?.sent_count || '0', 10);
 
     const result = await db.query(
-        `SELECT id, name, html_template, text_template, script_order
+        `SELECT id, name, html_template, text_template, step_instruction, script_order
          FROM follow_up_scripts
          WHERE client_id = $1 AND active = TRUE
          ORDER BY script_order ASC
@@ -511,6 +511,16 @@ async function getEligibleProspects(db, clientId, sentForDate) {
                  AND fus.campaign_id = cic.campaign_id
                  AND fus.status = 'sent'
                  AND fus.sent_for_date = $4::date
+           )
+           -- No in-flight AI generation for today
+           AND NOT EXISTS (
+               SELECT 1
+               FROM follow_up_generation_runs gen
+               WHERE gen.contact_id = cic.contact_id
+                 AND gen.campaign_id = cic.campaign_id
+                 AND gen.mode = 'send'
+                 AND gen.status = 'running'
+                 AND gen.sent_for_date = $4::date
            )
            -- Sequence not exhausted: fewer successful sends than active scripts
            AND (
@@ -770,19 +780,58 @@ export async function persistWarmFollowUpAnchorFromAutoresponder(db, {
 async function sendFollowUpForProspect({
     prospect, script, vars, apiKey, agencyId, clientId, sentForDate, logger, dryRun
 }) {
-    const { contact_id: contactId, campaign_id: campaignId, company_id: companyId,
-            instantly_lead_id: instantlyLeadId, reply_to_uuid: replyToUuid,
-            eaccount, email, thread_subject: threadSubject, instantly_campaign_id: instantlyCampaignId } = prospect;
-
-    const renderedSubject = threadSubject || null;
+    const renderedSubject = prospect.thread_subject || null;
     const rawHtml = renderTemplate(script.html_template, vars);
     const renderedHtml = sanitizeHtml(rawHtml);
     const renderedText = script.text_template
         ? renderTemplate(script.text_template, vars)
         : htmlToPlainText(renderedHtml);
 
+    return sendRenderedFollowUp({
+        prospect,
+        script,
+        renderedHtml,
+        renderedText,
+        renderedSubject,
+        apiKey,
+        agencyId,
+        clientId,
+        sentForDate,
+        logger,
+        dryRun
+    });
+}
+
+/**
+ * Persist + send an already-rendered follow-up body via Instantly.
+ * Used by the template path and by the AI generation workflow.
+ */
+export async function sendRenderedFollowUp({
+    prospect,
+    script,
+    renderedHtml,
+    renderedText,
+    renderedSubject,
+    apiKey,
+    agencyId,
+    clientId,
+    sentForDate,
+    logger,
+    dryRun = false
+}) {
+    const { contact_id: contactId, campaign_id: campaignId, company_id: companyId,
+            instantly_lead_id: instantlyLeadId, email, instantly_campaign_id: instantlyCampaignId } = prospect;
+
+    let replyToUuid = prospect.reply_to_uuid || null;
+    let eaccount = prospect.eaccount || null;
+    if (!replyToUuid || !eaccount) {
+        const meta = await fetchThreadReplyMetadata(pool, contactId, campaignId);
+        replyToUuid = replyToUuid || meta.reply_to_uuid;
+        eaccount = eaccount || meta.eaccount;
+    }
+
     const sendId = await persistSend(pool, {
-        clientId, contactId, companyId, campaignId, scriptId: script.id,
+        clientId, contactId, companyId, campaignId, scriptId: script?.id || null,
         instantlyLeadId, replyToUuid, eaccount,
         renderedSubject, renderedHtml, renderedText,
         status: 'pending', errorCode: null, errorMessage: null,
@@ -869,16 +918,18 @@ export async function runFollowUpsForClient({
     batchSize = BATCH_SIZE_DEFAULT,
     logger = () => {}
 }) {
-    const summary = { eligible: 0, sent: 0, blocked: 0, skipped: 0, failed: 0, dryRun: 0 };
+    const summary = { eligible: 0, sent: 0, blocked: 0, skipped: 0, failed: 0, dryRun: 0, queued: 0 };
 
     // Use today in UTC; worker can override sentForDate to apply timezone offset externally
     const sentForDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
     // Enforce client-configured send-day schedule (DOW: 0=Sun … 6=Sat, matching Date.getUTCDay())
     const clientRow = await pool.query(
-        'SELECT follow_up_send_days FROM clients WHERE id = $1',
+        'SELECT follow_up_send_days, follow_up_system_prompt, follow_up_ai_enabled FROM clients WHERE id = $1',
         [clientId]
     );
+    const systemPrompt = clientRow.rows[0]?.follow_up_system_prompt || '';
+    const aiEnabled = clientRow.rows[0]?.follow_up_ai_enabled === true;
     const sendDays = clientRow.rows[0]?.follow_up_send_days ?? [1, 2, 3, 4, 5];
     const todayDow = new Date().getUTCDay();
     if (!sendDays.includes(todayDow)) {
@@ -909,6 +960,53 @@ export async function runFollowUpsForClient({
             continue;
         }
         logger(`[follow-up] contact=${prospect.contact_id} → script_order=${script.script_order} (id=${script.id})`);
+
+        const { shouldUseAiFollowUpCopy } = await import('./warmFollowUpGeneration/prompt.js');
+        if (shouldUseAiFollowUpCopy({
+            enabled: aiEnabled,
+            systemPrompt,
+            stepInstruction: script.step_instruction
+        })) {
+            let queuedRunId = null;
+            try {
+                const { startFollowUpGeneration } = await import('./warmFollowUpGeneration/index.js');
+                const { isWarmFollowUpWorkflowConfigured, triggerWarmFollowUpWorkflow } = await import('./warmFollowUpGeneration/trigger.js');
+                if (!isWarmFollowUpWorkflowConfigured()) {
+                    throw new Error('Warm-follow-up workflow is not configured (WORKFLOW_TRIGGER_SECRET).');
+                }
+                const runMode = dryRun ? 'preview' : 'send';
+                const run = await startFollowUpGeneration({
+                    agencyId,
+                    clientId,
+                    contactId: prospect.contact_id,
+                    campaignId: prospect.campaign_id,
+                    scriptId: script.id,
+                    mode: runMode,
+                    sentForDate
+                });
+                queuedRunId = run.id;
+                await triggerWarmFollowUpWorkflow({ runId: run.id, agencyId });
+                logger(`[follow-up] queued AI ${runMode} run=${run.id} contact=${prospect.contact_id}`);
+                if (dryRun) summary.dryRun += 1;
+                else summary.queued += 1;
+            } catch (err) {
+                logger(`[follow-up] Failed to queue AI follow-up for contact=${prospect.contact_id}: ${err.message}`);
+                if (queuedRunId) {
+                    try {
+                        const { failGenerationRun } = await import('./warmFollowUpGeneration/index.js');
+                        await failGenerationRun({
+                            runId: queuedRunId,
+                            agencyId,
+                            errorInfo: { message: err.message }
+                        });
+                    } catch {
+                        // Keep the original queue failure as the worker outcome.
+                    }
+                }
+                summary.failed += 1;
+            }
+            continue;
+        }
 
         let vars;
         try {
@@ -968,7 +1066,7 @@ export async function runFollowUpsOnce({
         return;
     }
 
-    const overallSummary = { sent: 0, blocked: 0, skipped: 0, failed: 0, dryRun: 0, eligible: 0 };
+    const overallSummary = { sent: 0, blocked: 0, skipped: 0, failed: 0, dryRun: 0, eligible: 0, queued: 0 };
 
     for (const client of selected) {
         const clientId = Number(client.clientId) || null;

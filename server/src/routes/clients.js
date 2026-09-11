@@ -52,6 +52,15 @@ import {
     sanitizeHtml
 } from '../services/followUpSender.js';
 import { runFollowUpsForClient } from '../services/followUpSender.js';
+import { shouldUseAiFollowUpCopy } from '../services/warmFollowUpGeneration/prompt.js';
+import {
+    getGenerationRun,
+    startFollowUpGeneration
+} from '../services/warmFollowUpGeneration/index.js';
+import {
+    isWarmFollowUpWorkflowConfigured,
+    triggerWarmFollowUpWorkflow
+} from '../services/warmFollowUpGeneration/trigger.js';
 import {
     loadInstantlyEventAnalytics,
     loadInstantlyEventAnalyticsCore,
@@ -889,17 +898,17 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
 });
 
 // GET /api/clients/:id/campaigns/list - Fetch campaigns from SQL for dropdown
-router.get('/clients/:clientId/campaigns/list', async (req, res) => {
+router.get('/clients/:clientId/campaigns/list', requireAuth, async (req, res) => {
     try {
         const { clientId } = req.params;
-        const agencyId = req.query.agencyId;
-        
+        const agencyId = req.agencyId || req.query.agencyId;
+
         console.log('[campaigns/list] Request:', { clientId, agencyId });
-        
+
         if (!agencyId) {
-            return res.status(400).json({ error: 'Missing agencyId query parameter.' });
+            return res.status(400).json({ error: 'Missing agencyId.' });
         }
-        
+
         // Get or create SQL client_id using the Firestore client slug
         const sqlClientId = await getOrCreateClient(agencyId, clientId);
         console.log('[campaigns/list] SQL client_id:', sqlClientId);
@@ -1408,7 +1417,8 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
             campaignId,
             scriptId,
             htmlTemplate,
-            textTemplate
+            textTemplate,
+            mode
         } = req.body || {};
 
         if (!contactEmail || typeof contactEmail !== 'string') {
@@ -1460,15 +1470,13 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
         );
         const emailAccount = emailAccountResult.rows[0]?.email_account || null;
 
+        let script = null;
         let templateHtml = typeof htmlTemplate === 'string' ? htmlTemplate : '';
         let templateText = typeof textTemplate === 'string' ? textTemplate : null;
 
-        if (!templateHtml) {
-            if (!scriptId) {
-                return res.status(400).json({ error: 'Provide either scriptId or htmlTemplate' });
-            }
+        if (scriptId) {
             const scriptResult = await pool.query(
-                `SELECT id, html_template, text_template
+                `SELECT id, html_template, text_template, step_instruction
                  FROM follow_up_scripts
                  WHERE id = $1 AND client_id = $2
                  LIMIT 1`,
@@ -1477,8 +1485,59 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
             if (!scriptResult.rows.length) {
                 return res.status(404).json({ error: 'Script not found' });
             }
-            templateHtml = scriptResult.rows[0].html_template || '';
-            templateText = scriptResult.rows[0].text_template || null;
+            script = scriptResult.rows[0];
+            if (!templateHtml) {
+                templateHtml = script.html_template || '';
+                templateText = script.text_template || null;
+            }
+        } else if (!templateHtml) {
+            return res.status(400).json({ error: 'Provide either scriptId or htmlTemplate' });
+        }
+
+        const previewMode = mode === 'ai' || mode === 'static'
+            ? mode
+            : (clientRow.follow_up_ai_enabled === true ? 'ai' : 'static');
+        const useAi = previewMode === 'ai' && shouldUseAiFollowUpCopy({
+            enabled: true,
+            systemPrompt: clientRow.follow_up_system_prompt,
+            stepInstruction: script?.step_instruction
+        });
+
+        if (previewMode === 'ai' && !useAi) {
+            return res.status(400).json({
+                error: 'Add a system prompt or a step instruction, then save, before generating an AI preview.'
+            });
+        }
+
+        if (useAi) {
+            if (!script?.id) {
+                return res.status(400).json({ error: 'scriptId is required to preview an AI follow-up' });
+            }
+            if (!isWarmFollowUpWorkflowConfigured()) {
+                return res.status(503).json({
+                    error: 'AI follow-up preview needs WORKFLOW_TRIGGER_SECRET so it can run on Vercel Workflows.'
+                });
+            }
+            const run = await startFollowUpGeneration({
+                agencyId,
+                clientId: sqlClientId,
+                contactId,
+                campaignId: resolvedCampaignId,
+                scriptId: script.id,
+                mode: 'preview'
+            });
+            await triggerWarmFollowUpWorkflow({ runId: run.id, agencyId });
+            return res.json({
+                run: {
+                    id: run.id,
+                    status: run.status,
+                    generation_step: run.generation_step || 'hydrate',
+                    mode: 'preview',
+                    contactId,
+                    contactEmail: contactResult.rows[0].email,
+                    campaignId: resolvedCampaignId
+                }
+            });
         }
 
         const vars = await resolveTemplateVars(pool, contactId, resolvedCampaignId, {
@@ -1503,7 +1562,73 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
         });
     } catch (err) {
         console.error('POST follow-up-preview error:', err);
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+    }
+});
+
+router.get('/clients/:clientId/follow-up-generations/:runId', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId, runId } = req.params;
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const parsedRunId = Number(runId);
+        if (!Number.isInteger(parsedRunId) || parsedRunId <= 0) {
+            return res.status(400).json({ error: 'Valid runId is required' });
+        }
+        const run = await getGenerationRun(parsedRunId, agencyId, { clientId: clientRow.id });
+        if (!run) return res.status(404).json({ error: 'Generation run not found' });
+        res.json({
+            run: {
+                id: run.id,
+                status: run.status,
+                generation_step: run.generation_step,
+                mode: run.mode,
+                rendered_html: run.rendered_html,
+                rendered_text: run.rendered_text,
+                rendered_subject: run.rendered_subject,
+                used_research_brief: run.used_research_brief,
+                research_brief: run.research_brief,
+                used_template_fallback: run.used_template_fallback,
+                error_message: run.error_message,
+                contact_id: run.contact_id,
+                campaign_id: run.campaign_id
+            }
+        });
+    } catch (err) {
+        console.error('GET follow-up-generation error:', err);
         res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+router.put('/clients/:clientId/follow-up-prompt', requireAuth, async (req, res) => {
+    try {
+        const agencyId = req.agencyId;
+        const { clientId } = req.params;
+        const systemPrompt = typeof req.body?.system_prompt === 'string'
+            ? req.body.system_prompt
+            : (typeof req.body?.systemPrompt === 'string' ? req.body.systemPrompt : null);
+        const aiEnabled = typeof req.body?.ai_enabled === 'boolean'
+            ? req.body.ai_enabled
+            : (typeof req.body?.aiEnabled === 'boolean' ? req.body.aiEnabled : null);
+        const clientRow = await resolveClientRow(agencyId, clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found' });
+        const result = await pool.query(
+            `UPDATE clients
+             SET follow_up_system_prompt = COALESCE($1, follow_up_system_prompt),
+                 follow_up_ai_enabled = COALESCE($2, follow_up_ai_enabled),
+                 updated_at = NOW()
+             WHERE id = $3
+             RETURNING follow_up_system_prompt, follow_up_ai_enabled`,
+            [systemPrompt, aiEnabled, clientRow.id]
+        );
+        res.json({
+            follow_up_system_prompt: result.rows[0]?.follow_up_system_prompt || '',
+            follow_up_ai_enabled: result.rows[0]?.follow_up_ai_enabled === true
+        });
+    } catch (err) {
+        console.error('PUT follow-up-prompt error:', err);
+        res.status(500).json({ error: 'Failed to save follow-up prompt.' });
     }
 });
 
@@ -1516,7 +1641,7 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
         const sqlClientId = clientRow.id;
         const sendDays = clientRow.follow_up_send_days ?? [1, 2, 3, 4, 5];
         const result = await pool.query(
-            `SELECT id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at
+            `SELECT id, client_id, active, script_order, html_template, text_template, step_instruction, metadata, created_at, updated_at
              FROM follow_up_scripts
              WHERE client_id = $1
              ORDER BY script_order ASC`,
@@ -1529,29 +1654,39 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
                 label: clientRow.warm_follow_up_interest_label || null
             }
             : null;
-        res.json({ scripts: result.rows, send_days: sendDays, warm_follow_up_status: warmFollowUpStatus });
+        res.json({
+            scripts: result.rows,
+            send_days: sendDays,
+            warm_follow_up_status: warmFollowUpStatus,
+            follow_up_system_prompt: clientRow.follow_up_system_prompt || '',
+            follow_up_ai_enabled: clientRow.follow_up_ai_enabled === true
+        });
     } catch (err) {
         console.error('GET follow-up-scripts error:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
+const SCRIPT_RETURNING = `id, client_id, active, script_order, html_template, text_template, step_instruction, metadata, created_at, updated_at`;
+
 router.post('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res) => {
     try {
         const agencyId = req.agencyId;
         const { clientId } = req.params;
-        const { active = true, scriptOrder, htmlTemplate, textTemplate } = req.body;
-        if (!htmlTemplate) {
-            return res.status(400).json({ error: 'html_template is required' });
+        const { active = true, scriptOrder, htmlTemplate, textTemplate, stepInstruction } = req.body;
+        const html = typeof htmlTemplate === 'string' ? htmlTemplate : '';
+        const step = typeof stepInstruction === 'string' ? stepInstruction.trim() : '';
+        if (!html.trim() && !step) {
+            return res.status(400).json({ error: 'Provide a step instruction or an HTML fallback template' });
         }
         const clientRow = await resolveClientRow(agencyId, clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found' });
         const sqlClientId = clientRow.id;
         const result = await pool.query(
-            `INSERT INTO follow_up_scripts (client_id, active, script_order, name, subject_template, html_template, text_template)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at`,
-            [sqlClientId, active, scriptOrder || 1, null, '', htmlTemplate, textTemplate || null]
+            `INSERT INTO follow_up_scripts (client_id, active, script_order, name, subject_template, html_template, text_template, step_instruction)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING ${SCRIPT_RETURNING}`,
+            [sqlClientId, active, scriptOrder || 1, null, '', html, textTemplate || null, step || null]
         );
         res.status(201).json({ script: result.rows[0] });
     } catch (err) {
@@ -1567,19 +1702,21 @@ router.put('/clients/:clientId/follow-up-scripts/:id', requireAuth, async (req, 
     try {
         const agencyId = req.agencyId;
         const { clientId, id } = req.params;
-        const { active, scriptOrder, htmlTemplate, textTemplate } = req.body;
-        if (!htmlTemplate) {
-            return res.status(400).json({ error: 'html_template is required' });
+        const { active, scriptOrder, htmlTemplate, textTemplate, stepInstruction } = req.body;
+        const html = typeof htmlTemplate === 'string' ? htmlTemplate : '';
+        const step = typeof stepInstruction === 'string' ? stepInstruction.trim() : '';
+        if (!html.trim() && !step) {
+            return res.status(400).json({ error: 'Provide a step instruction or an HTML fallback template' });
         }
         const clientRow = await resolveClientRow(agencyId, clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found' });
         const sqlClientId = clientRow.id;
         const result = await pool.query(
             `UPDATE follow_up_scripts
-             SET active = $1, script_order = $2, name = $3, subject_template = $4, html_template = $5, text_template = $6, updated_at = NOW()
-             WHERE id = $7 AND client_id = $8
-             RETURNING id, client_id, active, script_order, html_template, text_template, metadata, created_at, updated_at`,
-            [active ?? true, scriptOrder || 1, null, '', htmlTemplate, textTemplate || null, id, sqlClientId]
+             SET active = $1, script_order = $2, name = $3, subject_template = $4, html_template = $5, text_template = $6, step_instruction = $7, updated_at = NOW()
+             WHERE id = $8 AND client_id = $9
+             RETURNING ${SCRIPT_RETURNING}`,
+            [active ?? true, scriptOrder || 1, null, '', html, textTemplate || null, step || null, id, sqlClientId]
         );
         if (!result.rows.length) return res.status(404).json({ error: 'Script not found' });
         res.json({ script: result.rows[0] });

@@ -20,6 +20,8 @@ import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipel
 import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
+import { WarmFollowUpProgress } from "@/components/warm-follow-up-progress";
+import { FOLLOW_UP_CODE_CONTRACT, FOLLOW_UP_MAX_CHARS, formatBriefForFollowUpPrompt } from "@server/services/warmFollowUpGeneration/prompt.js";
 
 // Loaded lazily so dnd-kit and recharts stay out of this route's initial chunk;
 // both only render behind a tab/section, so first paint never needs them.
@@ -1059,6 +1061,7 @@ type FollowUpScript = {
     script_order: number;
     html_template: string;
     text_template: string | null;
+    step_instruction: string | null;
     created_at: string;
     updated_at: string;
 };
@@ -1092,9 +1095,25 @@ type FollowUpPreviewPayload = {
     contactId: number;
     contactEmail: string;
     campaignId: number;
-    vars: Record<string, string>;
+    vars?: Record<string, string>;
     renderedHtml: string;
     renderedText: string;
+    usedResearchBrief?: boolean;
+    usedTemplateFallback?: boolean;
+    researchBrief?: Record<string, unknown> | null;
+};
+
+type FollowUpGenerationRun = {
+    id: number;
+    status: string;
+    generation_step: string | null;
+    mode: "preview" | "send";
+    rendered_html?: string | null;
+    rendered_text?: string | null;
+    used_research_brief?: boolean;
+    used_template_fallback?: boolean;
+    research_brief?: Record<string, unknown> | null;
+    error_message?: string | null;
 };
 
 type InstantlyCsvMergeResult = {    summary: {
@@ -1655,8 +1674,16 @@ export default function ClientPage() {
     const [followUpPreviewSelectedLead, setFollowUpPreviewSelectedLead] = useState<Lead | null>(null);
     const [followUpPreviewLoading, setFollowUpPreviewLoading] = useState(false);
     const [followUpPreviewResult, setFollowUpPreviewResult] = useState<FollowUpPreviewPayload | null>(null);
+    const [followUpPreviewRun, setFollowUpPreviewRun] = useState<FollowUpGenerationRun | null>(null);
+    const [followUpSystemPrompt, setFollowUpSystemPrompt] = useState('');
+    const [followUpAiEnabled, setFollowUpAiEnabled] = useState(false);
+    const [followUpEditorMode, setFollowUpEditorMode] = useState<'static' | 'ai'>('static');
+    const followUpEditorClientRef = useRef<string | null>(null);
+    const [savingFollowUpPrompt, setSavingFollowUpPrompt] = useState(false);
+    const [savingFollowUpAi, setSavingFollowUpAi] = useState(false);
     const [fuScriptOrder, setFuScriptOrder] = useState(1);
     const [fuScriptActive, setFuScriptActive] = useState(true);
+    const [fuScriptInstruction, setFuScriptInstruction] = useState('');
     const [fuScriptHtml, setFuScriptHtml] = useState('');
     const [fuScriptText, setFuScriptText] = useState('');
     const [interestedAutoResponderPrompts, setInterestedAutoResponderPrompts] = useState<InterestedAutoResponderPrompt[]>([]);
@@ -4105,6 +4132,56 @@ export default function ClientPage() {
     }, [clientId, debouncedFollowUpPreviewLeadSearch, followUpPreviewModalOpen, mapApiLeadRow, user]);
 
     useEffect(() => {
+        if (!followUpPreviewModalOpen || !followUpPreviewRun?.id || !user || !clientId) return;
+        if (followUpPreviewRun.status === 'completed' || followUpPreviewRun.status === 'failed') return;
+
+        let cancelled = false;
+        const poll = async () => {
+            try {
+                const idToken = await getAccessToken();
+                if (!idToken) return;
+                const response = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-generations/${followUpPreviewRun.id}`,
+                    { headers: { Authorization: `Bearer ${idToken}` } }
+                );
+                if (!response.ok) return;
+                const data = await response.json();
+                const run = data.run as FollowUpGenerationRun | undefined;
+                if (cancelled || !run) return;
+                setFollowUpPreviewRun(run);
+                if (run.status === 'completed' && (run.rendered_html || run.rendered_text)) {
+                    setFollowUpPreviewResult({
+                        contactId: followUpPreviewSelectedLead?.id ? Number(followUpPreviewSelectedLead.id) || 0 : 0,
+                        contactEmail: followUpPreviewSelectedLead?.email || '',
+                        campaignId: 0,
+                        renderedHtml: run.rendered_html || '',
+                        renderedText: run.rendered_text || '',
+                        usedResearchBrief: Boolean(run.used_research_brief),
+                        usedTemplateFallback: Boolean(run.used_template_fallback),
+                        researchBrief: run.research_brief && typeof run.research_brief === 'object'
+                            ? run.research_brief as Record<string, unknown>
+                            : null,
+                    });
+                    setFollowUpPreviewLoading(false);
+                } else if (run.status === 'failed') {
+                    setToastMessage(run.error_message || 'Follow-up generation failed');
+                    setToastVisible(true);
+                    setFollowUpPreviewLoading(false);
+                }
+            } catch (err) {
+                console.error('Failed to poll follow-up generation:', err);
+            }
+        };
+
+        void poll();
+        const timer = window.setInterval(() => { void poll(); }, 1200);
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+        };
+    }, [clientId, followUpPreviewModalOpen, followUpPreviewRun?.id, followUpPreviewRun?.status, followUpPreviewSelectedLead, user]);
+
+    useEffect(() => {
         if (!autoResponderTestModalOpen || !user || !clientId) return;
         const query = debouncedAutoResponderTestLeadSearch.trim();
         if (!query) {
@@ -4877,7 +4954,10 @@ export default function ClientPage() {
                         headers: { Authorization: `Bearer ${idToken}` }
                     }),
                     fetchInterestedAutoResponderPrompts(),
-                    fetchSqlCampaignList()
+                    fetchSqlCampaignList().catch((error) => {
+                        console.error('Failed to fetch campaigns for follow-ups:', error);
+                        return [] as Campaign[];
+                    })
                 ]);
                 const scriptData = await scriptsResponse.json();
                 if (!cancelled) {
@@ -4886,6 +4966,15 @@ export default function ClientPage() {
                         setFollowUpSendDays(scriptData.send_days);
                     }
                     setWarmFollowUpStatus(scriptData.warm_follow_up_status ?? null);
+                    setFollowUpSystemPrompt(typeof scriptData.follow_up_system_prompt === 'string'
+                        ? scriptData.follow_up_system_prompt
+                        : '');
+                    const liveAi = scriptData.follow_up_ai_enabled === true;
+                    setFollowUpAiEnabled(liveAi);
+                    if (followUpEditorClientRef.current !== clientId) {
+                        followUpEditorClientRef.current = clientId;
+                        if (liveAi) setFollowUpEditorMode('ai');
+                    }
                     setInterestedAutoResponderPrompts(prompts || []);
                     setAutoResponderCampaigns(campaignOptions || []);
                 }
@@ -4900,6 +4989,11 @@ export default function ClientPage() {
         })();
         return () => { cancelled = true; };
     }, [activeTab, user, clientId]);
+
+    useEffect(() => {
+        followUpEditorClientRef.current = null;
+        setFollowUpEditorMode('static');
+    }, [clientId]);
 
     useEffect(() => {
         if (!instantlyEventAnalytics || instantlyEventAnalyticsEventType === "all") {
@@ -6411,12 +6505,14 @@ export default function ClientPage() {
             setEditingFollowUpScript(script);
             setFuScriptOrder(script.script_order);
             setFuScriptActive(script.active);
+            setFuScriptInstruction(script.step_instruction || '');
             setFuScriptHtml(script.html_template);
             setFuScriptText(script.text_template || '');
         } else {
             setEditingFollowUpScript(null);
             setFuScriptOrder(followUpScripts.length + 1);
             setFuScriptActive(true);
+            setFuScriptInstruction('');
             setFuScriptHtml('');
             setFuScriptText('');
         }
@@ -6430,6 +6526,7 @@ export default function ClientPage() {
         setFollowUpPreviewLeadResults([]);
         setFollowUpPreviewSelectedLead(null);
         setFollowUpPreviewResult(null);
+        setFollowUpPreviewRun(null);
         setFollowUpPreviewModalOpen(true);
     };
 
@@ -6441,12 +6538,95 @@ export default function ClientPage() {
         setFollowUpPreviewLeadResults([]);
         setFollowUpPreviewSelectedLead(null);
         setFollowUpPreviewResult(null);
+        setFollowUpPreviewRun(null);
         setFollowUpPreviewLoading(false);
         setFollowUpPreviewSearching(false);
     };
 
+    const handleSaveFollowUpPrompt = async () => {
+        if (!user || !clientId) return;
+        setSavingFollowUpPrompt(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-prompt`,
+                {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ system_prompt: followUpSystemPrompt })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to save follow-up prompt');
+            setFollowUpSystemPrompt(data.follow_up_system_prompt || '');
+            if (typeof data.follow_up_ai_enabled === 'boolean') {
+                setFollowUpAiEnabled(data.follow_up_ai_enabled);
+            }
+            setToastMessage('Follow-up prompt saved. New previews and sends will use it.');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save follow-up prompt');
+            setToastVisible(true);
+        } finally {
+            setSavingFollowUpPrompt(false);
+        }
+    };
+
+    const handleSaveFollowUpAiEnabled = async (enabled: boolean) => {
+        if (!user || !clientId) return;
+        const aiReady = Boolean(
+            followUpSystemPrompt.trim()
+            || followUpScripts.some((script) => Boolean(script.step_instruction?.trim()))
+        );
+        if (enabled) {
+            const confirmed = window.confirm(
+                aiReady
+                    ? 'Switch live warm follow-ups to AI for this client? New sends will generate copy. Static scripts stay as fallback if generation fails.'
+                    : 'No system prompt or step instructions yet. Live AI sends will keep using static templates until you add one. Switch anyway?'
+            );
+            if (!confirmed) return;
+        } else if (!window.confirm('Switch live warm follow-ups back to the static HTML/text scripts?')) {
+            return;
+        }
+        const previous = followUpAiEnabled;
+        setFollowUpAiEnabled(enabled);
+        setSavingFollowUpAi(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-prompt`,
+                {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ ai_enabled: enabled })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to save follow-up mode');
+            setFollowUpAiEnabled(data.follow_up_ai_enabled === true);
+            if (data.follow_up_ai_enabled) {
+                setFollowUpEditorMode('ai');
+            }
+            setToastMessage(
+                data.follow_up_ai_enabled
+                    ? 'Live sends will now generate AI warm follow-ups.'
+                    : 'Live sends will now use the static HTML/text scripts.'
+            );
+            setToastVisible(true);
+        } catch (error) {
+            setFollowUpAiEnabled(previous);
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save follow-up mode');
+            setToastVisible(true);
+        } finally {
+            setSavingFollowUpAi(false);
+        }
+    };
+
     const handleSaveFollowUpScript = async () => {
-        if (!user || !clientId || !fuScriptHtml.trim()) return;
+        if (!user || !clientId) return;
+        if (!fuScriptHtml.trim() && !fuScriptInstruction.trim()) return;
         setSavingFollowUpScript(true);
         try {
             const idToken = await getAccessToken();
@@ -6461,6 +6641,7 @@ export default function ClientPage() {
                 body: JSON.stringify({
                     active: fuScriptActive,
                     scriptOrder: fuScriptOrder,
+                    stepInstruction: fuScriptInstruction.trim() || null,
                     htmlTemplate: fuScriptHtml.trim(),
                     textTemplate: fuScriptText.trim() || null,
                 })
@@ -6514,6 +6695,7 @@ export default function ClientPage() {
         setFollowUpPreviewSelectedLead(lead);
         setFollowUpPreviewLoading(true);
         setFollowUpPreviewResult(null);
+        setFollowUpPreviewRun(null);
         try {
             const idToken = await getAccessToken();
             if (!idToken) return;
@@ -6525,7 +6707,8 @@ export default function ClientPage() {
                 },
                 body: JSON.stringify({
                     contactEmail: lead.email,
-                    scriptId: previewingFollowUpScript.id
+                    scriptId: previewingFollowUpScript.id,
+                    mode: followUpEditorMode
                 })
             });
             if (!response.ok) {
@@ -6533,11 +6716,20 @@ export default function ClientPage() {
                 throw new Error(data.error || `Failed to preview follow-up (${response.status})`);
             }
             const data = await response.json();
+            if (data.run?.id) {
+                setFollowUpPreviewRun({
+                    id: data.run.id,
+                    status: data.run.status || 'running',
+                    generation_step: data.run.generation_step || 'hydrate',
+                    mode: 'preview',
+                });
+                return;
+            }
             setFollowUpPreviewResult(data.preview || null);
+            setFollowUpPreviewLoading(false);
         } catch (err) {
             setToastMessage(err instanceof Error ? err.message : 'Failed to preview follow-up');
             setToastVisible(true);
-        } finally {
             setFollowUpPreviewLoading(false);
         }
     };
@@ -6556,6 +6748,7 @@ export default function ClientPage() {
                     body: JSON.stringify({
                         active: !script.active,
                         scriptOrder: script.script_order,
+                        stepInstruction: script.step_instruction || '',
                         htmlTemplate: script.html_template,
                         textTemplate: script.text_template,
                     })
@@ -6925,11 +7118,13 @@ export default function ClientPage() {
     // Manual upload handlers
     const fetchSqlCampaignList = async () => {
         const token = await getAccessToken();
-        if (!token) return;
-        const campaignsResponse = await fetch(
-            `${getPipelineBaseUrl()}/api/clients/${clientId}/campaigns/list?agencyId=${encodeURIComponent(agencyId || "")}`,
-            { headers: { Authorization: `Bearer ${token}` } }
-        );
+        if (!token) return [];
+        const campaignsUrl = agencyId
+            ? `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/campaigns/list?agencyId=${encodeURIComponent(agencyId)}`
+            : `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/campaigns/list`;
+        const campaignsResponse = await fetch(campaignsUrl, {
+            headers: { Authorization: `Bearer ${token}` }
+        });
 
         if (!campaignsResponse.ok) {
             throw new Error(`Failed to fetch campaigns: ${campaignsResponse.status}`);
@@ -10778,10 +10973,16 @@ export default function ClientPage() {
                                 <div>
                                     <p className="eyebrow eyebrow--muted">Automated Follow-Ups</p>
                                     <p style={{ margin: '0.25rem 0 0', fontSize: '0.875rem', color: 'var(--app-text-faint)' }}>
-                                        Configure same-thread follow-up body templates sent after Warm Follow Up events. The subject always reuses the existing thread subject. Use{' '}
-                                        <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{first_name}}'}</code>,{' '}
-                                        <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{company_domain}}'}</code>,{' '}
-                                        <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{campaign_name}}'}</code>.
+                                        {followUpEditorMode === 'ai'
+                                            ? 'Prep the system prompt and per-step instructions, then generate a lead preview. Live sends stay on static scripts until you switch over.'
+                                            : (
+                                                <>
+                                                    Same-thread follow-up body templates sent after Warm Follow Up events. The subject always reuses the existing thread subject. Use{' '}
+                                                    <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{first_name}}'}</code>,{' '}
+                                                    <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{company_domain}}'}</code>,{' '}
+                                                    <code style={{ background: 'var(--app-surface-3)', padding: '0.1rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem' }}>{'{{campaign_name}}'}</code>.
+                                                </>
+                                            )}
                                     </p>
                                 </div>
                                 <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
@@ -10794,6 +10995,90 @@ export default function ClientPage() {
                                     </button>
                                 </div>
                             </div>
+
+                            <div className="follow-up-mode-bar">
+                                <div className="tab-nav tab-nav--flush follow-up-mode-bar__tabs" role="tablist" aria-label="Follow-up send mode">
+                                    <button
+                                        type="button"
+                                        role="tab"
+                                        aria-selected={followUpEditorMode === 'static'}
+                                        className={`tab-nav__button ${followUpEditorMode === 'static' ? 'tab-nav__button--active' : ''}`}
+                                        onClick={() => setFollowUpEditorMode('static')}
+                                    >
+                                        Static scripts
+                                        {!followUpAiEnabled ? <span className="tab-nav__live">Live</span> : null}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        role="tab"
+                                        aria-selected={followUpEditorMode === 'ai'}
+                                        className={`tab-nav__button ${followUpEditorMode === 'ai' ? 'tab-nav__button--active' : ''}`}
+                                        onClick={() => setFollowUpEditorMode('ai')}
+                                    >
+                                        AI generation
+                                        {followUpAiEnabled ? <span className="tab-nav__live">Live</span> : null}
+                                    </button>
+                                </div>
+                                <div className="follow-up-mode-bar__live">
+                                    <span className={`status-badge ${followUpAiEnabled ? 'status-badge--active' : 'status-badge--inactive'}`}>
+                                        {savingFollowUpAi
+                                            ? 'Saving…'
+                                            : (followUpAiEnabled ? 'Sending AI' : 'Sending static')}
+                                    </span>
+                                    <button
+                                        type="button"
+                                        className={followUpAiEnabled ? 'secondary-button' : 'primary-button'}
+                                        onClick={() => handleSaveFollowUpAiEnabled(!followUpAiEnabled)}
+                                        disabled={savingFollowUpAi}
+                                        style={{ padding: '0.4rem 0.85rem', fontSize: '0.8rem' }}
+                                    >
+                                        {followUpAiEnabled ? 'Switch live to static' : 'Switch live to AI'}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {followUpEditorMode === 'ai' ? (
+                                <>
+                                    {!followUpAiEnabled ? (
+                                        <p style={{ margin: '-0.5rem 0 0', fontSize: '0.8rem', color: 'var(--app-text-faint)' }}>
+                                            This tab is for prep and preview only. Scheduled sends still use the static HTML/text scripts.
+                                        </p>
+                                    ) : (
+                                        <p style={{ margin: '-0.5rem 0 0', fontSize: '0.8rem', color: 'var(--app-text-faint)' }}>
+                                            Live sends generate copy with this prompt. Static templates remain the fallback if generation fails.
+                                        </p>
+                                    )}
+                                    <div className="settings-field">
+                                        <span className="settings-field__label">System instructions</span>
+                                        <pre className="follow-up-contract">{FOLLOW_UP_CODE_CONTRACT}</pre>
+                                        <span className="settings-field__hint">
+                                            Always applied, and they win if they conflict with the prompt below. Drafts over {FOLLOW_UP_MAX_CHARS} characters are retried shorter, then trimmed. Not editable here.
+                                        </span>
+                                    </div>
+                                    <label className="settings-field">
+                                        <span className="settings-field__label">Follow-up prompt</span>
+                                        <textarea
+                                            value={followUpSystemPrompt}
+                                            onChange={(event) => setFollowUpSystemPrompt(event.target.value)}
+                                            rows={8}
+                                            placeholder={"Write like a human SDR continuing this thread. Be direct. One booking or reply CTA. Do not re-pitch the whole product."}
+                                        />
+                                        <span className="settings-field__hint">
+                                            Voice, CTA, and brand for every step. {'{{first_name}}'} is filled in before the model sees it.
+                                        </span>
+                                    </label>
+                                    <div className="modal__actions" style={{ justifyContent: 'flex-start', marginTop: '-0.25rem' }}>
+                                        <button
+                                            type="button"
+                                            className="secondary-button"
+                                            onClick={() => handleSaveFollowUpPrompt()}
+                                            disabled={savingFollowUpPrompt}
+                                        >
+                                            {savingFollowUpPrompt ? 'Saving…' : 'Save Prompt'}
+                                        </button>
+                                    </div>
+                                </>
+                            ) : null}
 
                             {/* Send-day schedule picker */}
                             {(() => {
@@ -10937,7 +11222,9 @@ export default function ClientPage() {
                                     color: 'var(--app-text-ghost)',
                                     fontSize: '0.875rem'
                                 }}>
-                                    No follow-up scripts yet. Add one to get started.
+                                    {followUpEditorMode === 'ai'
+                                        ? 'No follow-up steps yet. Add a script, write a step instruction, then preview a lead before switching live sends to AI.'
+                                        : 'No follow-up scripts yet. Add one to get started.'}
                                 </div>
                             ) : (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
@@ -10962,11 +11249,43 @@ export default function ClientPage() {
                                                     <span className={`status-badge ${script.active ? 'status-badge--active' : 'status-badge--inactive'}`}>
                                                         {script.active ? 'Active' : 'Inactive'}
                                                     </span>
+                                                    {script.step_instruction ? (
+                                                        <span style={{
+                                                            fontSize: '0.72rem',
+                                                            padding: '0.15rem 0.45rem',
+                                                            borderRadius: '999px',
+                                                            background: 'var(--app-surface-3)',
+                                                            color: 'var(--app-text-muted)'
+                                                        }}>
+                                                            AI step
+                                                        </span>
+                                                    ) : followUpEditorMode === 'ai' ? (
+                                                        <span style={{
+                                                            fontSize: '0.72rem',
+                                                            padding: '0.15rem 0.45rem',
+                                                            borderRadius: '999px',
+                                                            background: 'var(--app-surface-3)',
+                                                            color: 'var(--app-text-ghost)'
+                                                        }}>
+                                                            Needs instruction
+                                                        </span>
+                                                    ) : null}
                                                 </div>
-                                                <div
-                                                    className="fu-script-preview"
-                                                    dangerouslySetInnerHTML={{ __html: script.html_template }}
-                                                />
+                                                {followUpEditorMode === 'ai' ? (
+                                                    <p style={{
+                                                        margin: '0.45rem 0 0',
+                                                        fontSize: '0.85rem',
+                                                        color: script.step_instruction ? 'var(--app-text-muted)' : 'var(--app-text-ghost)',
+                                                        whiteSpace: 'pre-wrap'
+                                                    }}>
+                                                        {script.step_instruction || 'No step instruction yet. Edit this step to prep AI copy.'}
+                                                    </p>
+                                                ) : (
+                                                    <div
+                                                        className="fu-script-preview"
+                                                        dangerouslySetInnerHTML={{ __html: script.html_template }}
+                                                    />
+                                                )}
                                             </div>
                                             <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
                                                 <label
@@ -11451,16 +11770,36 @@ export default function ClientPage() {
                                 />
                                 <span className="settings-field__label" style={{ margin: 0 }}>Active</span>
                             </label>
+                            {followUpEditorMode === 'ai' ? (
                             <label className="settings-field">
-                                <span className="settings-field__label">HTML Body Template</span>
+                                <span className="settings-field__label">Step instruction</span>
+                                <textarea
+                                    value={fuScriptInstruction}
+                                    onChange={(e) => setFuScriptInstruction(e.target.value)}
+                                    placeholder="Bump the booking link. Use one unused talking point. Keep it to three sentences."
+                                    rows={4}
+                                />
+                                <span className="settings-field__hint">
+                                    What this send in the sequence should do. The locked system instructions still apply; this is the angle for this step only.
+                                </span>
+                            </label>
+                            ) : null}
+                            <label className="settings-field">
+                                <span className="settings-field__label">
+                                    HTML Body Template
+                                    {followUpEditorMode === 'ai' ? (
+                                        <span style={{ fontWeight: 400, opacity: 0.5 }}> (fallback if generation fails)</span>
+                                    ) : null}
+                                </span>
                                 <textarea
                                     value={fuScriptHtml}
                                     onChange={(e) => setFuScriptHtml(e.target.value)}
                                     placeholder="<p>Hi {{first_name}},</p><p>Just wanted to follow up…</p>"
-                                    rows={8}
+                                    rows={followUpEditorMode === 'ai' ? 5 : 8}
                                     style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}
                                 />
                             </label>
+                            {followUpEditorMode === 'static' ? (
                             <label className="settings-field">
                                 <span className="settings-field__label">Plain Text Body Template <span style={{ fontWeight: 400, opacity: 0.5 }}>(optional)</span></span>
                                 <textarea
@@ -11471,13 +11810,14 @@ export default function ClientPage() {
                                     style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}
                                 />
                             </label>
+                            ) : null}
                         </div>
                         <div className="modal__actions">
                             <button
                                 type="button"
                                 className="primary-button"
                                 onClick={handleSaveFollowUpScript}
-                                disabled={savingFollowUpScript || !fuScriptHtml.trim()}
+                                disabled={savingFollowUpScript || (!fuScriptHtml.trim() && !fuScriptInstruction.trim())}
                             >
                                 {savingFollowUpScript ? 'Saving…' : editingFollowUpScript ? 'Save Changes' : 'Create Script'}
                             </button>
@@ -11507,7 +11847,11 @@ export default function ClientPage() {
                                 <p className="eyebrow eyebrow--muted">Follow-Up Preview</p>
                                 <h2 className="modal__title">Script #{previewingFollowUpScript.script_order}</h2>
                                 <p className="modal__description">
-                                    Search for a lead, then preview the rendered HTML for this follow-up script without sending anything.
+                                    {followUpEditorMode === 'ai'
+                                        ? (followUpAiEnabled
+                                            ? 'Search for a lead, then generate this step through the same Vercel workflow the scheduled send uses. Nothing is sent.'
+                                            : 'Search for a lead, then generate this step through the same workflow live sends will use. Nothing is sent, and live sends stay on static scripts until you switch over.')
+                                        : 'Search for a lead, then preview the rendered HTML for this follow-up script without sending anything.'}
                                 </p>
                             </div>
                         </div>
@@ -11565,7 +11909,9 @@ export default function ClientPage() {
                                                             </div>
                                                         </div>
                                                         <span style={{ fontSize: '0.78rem', color: 'var(--app-text-muted)', flexShrink: 0 }}>
-                                                            {followUpPreviewLoading && isSelected ? 'Rendering…' : 'Preview'}
+                                                            {followUpPreviewLoading && isSelected
+                                                                ? (followUpEditorMode === 'ai' ? 'Generating…' : 'Rendering…')
+                                                                : (followUpEditorMode === 'ai' ? 'Generate' : 'Preview')}
                                                         </span>
                                                     </div>
                                                 </button>
@@ -11574,6 +11920,15 @@ export default function ClientPage() {
                                     </div>
                                 )}
                             </div>
+
+                            {followUpPreviewRun && followUpPreviewLoading && (
+                                <WarmFollowUpProgress
+                                    status={followUpPreviewRun.status}
+                                    stepId={followUpPreviewRun.generation_step}
+                                    mode="preview"
+                                    tone="light"
+                                />
+                            )}
 
                             {followUpPreviewResult && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -11589,11 +11944,36 @@ export default function ClientPage() {
                                         <div style={{ fontWeight: 600, color: 'var(--app-text)' }}>
                                             {followUpPreviewResult.contactEmail}
                                         </div>
+                                        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: '0.45rem' }}>
+                                            {followUpEditorMode === 'ai' ? (
+                                                <>
+                                                    <span className={`status-badge ${followUpPreviewResult.usedResearchBrief ? 'status-badge--active' : 'status-badge--inactive'}`}>
+                                                        {followUpPreviewResult.usedResearchBrief ? 'Used research brief' : 'No research brief'}
+                                                    </span>
+                                                    {followUpPreviewResult.usedTemplateFallback ? (
+                                                        <span className="status-badge status-badge--inactive">Template fallback</span>
+                                                    ) : null}
+                                                </>
+                                            ) : (
+                                                <span className="status-badge status-badge--inactive">Static template</span>
+                                            )}
+                                        </div>
                                     </div>
+
+                                    {followUpEditorMode === 'ai' && followUpPreviewResult.researchBrief ? (
+                                        <div>
+                                            <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
+                                                Research brief
+                                            </div>
+                                            <pre className="follow-up-contract" style={{ color: 'var(--app-text-mid)' }}>
+                                                {formatBriefForFollowUpPrompt(followUpPreviewResult.researchBrief) || JSON.stringify(followUpPreviewResult.researchBrief, null, 2)}
+                                            </pre>
+                                        </div>
+                                    ) : null}
 
                                     <div>
                                         <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
-                                            Rendered HTML
+                                            {followUpEditorMode === 'ai' ? 'Generated copy' : 'Rendered body'}
                                         </div>
                                         <div style={{
                                             padding: '1rem',
@@ -11601,16 +11981,34 @@ export default function ClientPage() {
                                             border: '1px solid var(--app-border)',
                                             background: '#fff',
                                             color: '#111827',
-                                            minHeight: '160px'
+                                            minHeight: '160px',
+                                            whiteSpace: 'pre-wrap',
+                                            fontSize: '0.95rem',
+                                            lineHeight: 1.5
                                         }}>
-                                            <style>{`.followup-preview-render a { color: #2563eb; text-decoration: underline; }`}</style>
-                                            <div
-                                                className="followup-preview-render"
-                                                dangerouslySetInnerHTML={{ __html: followUpPreviewResult.renderedHtml }}
-                                            />
+                                            {followUpPreviewResult.renderedText || ''}
                                         </div>
                                     </div>
 
+                                    {followUpPreviewResult.renderedHtml ? (
+                                    <div>
+                                        <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
+                                            HTML
+                                        </div>
+                                        <div style={{
+                                            padding: '1rem',
+                                            borderRadius: '10px',
+                                            border: '1px solid var(--app-border)',
+                                            background: '#fff',
+                                            color: '#111827',
+                                            minHeight: '80px'
+                                        }}>
+                                        <div className="followup-preview-render" dangerouslySetInnerHTML={{ __html: followUpPreviewResult.renderedHtml }} />
+                                        </div>
+                                    </div>
+                                    ) : null}
+
+                                    {followUpPreviewResult.vars ? (
                                     <div>
                                         <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
                                             Variables
@@ -11628,6 +12026,7 @@ export default function ClientPage() {
                                             wordBreak: 'break-word'
                                         }}>{JSON.stringify(followUpPreviewResult.vars, null, 2)}</pre>
                                     </div>
+                                    ) : null}
                                 </div>
                             )}
                         </div>

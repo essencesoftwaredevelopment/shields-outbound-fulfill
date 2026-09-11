@@ -30,17 +30,25 @@ export const pool = new Pool({
     keepAliveInitialDelayMillis: 10_000
 });
 
-// Handle pool errors to prevent crashes
-pool.on('error', (err) => {
-    console.error('❌ [DB POOL ERROR]', {
-        code: err.code,
-        message: err.message,
-        stack: err.stack?.split('\n').slice(0, 3).join('\n')
+function logDbError(label, err) {
+    console.error(label, {
+        code: err?.code,
+        message: err?.message,
+        syscall: err?.syscall,
+        stack: err?.stack?.split('\n').slice(0, 3).join('\n')
     });
+}
+
+// Idle clients dropped by the pooler / TLS. Without this listener Node
+// treats it as unhandled and kills Express (EADDRNOTAVAIL / ECONNRESET).
+pool.on('error', (err) => {
+    logDbError('❌ [DB POOL ERROR]', err);
 });
 
-pool.on('connect', () => {
-    // console.log('✅ [DB] New connection established');
+pool.on('connect', (client) => {
+    client.on('error', (err) => {
+        logDbError('❌ [DB CLIENT ERROR]', err);
+    });
 });
 
 pool.on('acquire', () => {
