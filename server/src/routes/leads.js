@@ -44,6 +44,7 @@ import {
     sendLeadManualReply,
     uploadLeadReplyImage
 } from '../services/leadManualReply.js';
+import { getWarmFollowUpState, removeContactFromWarmFollowUps } from '../services/followUpSender.js';
 
 const uploadVerification = multer({
     storage: multer.memoryStorage(),
@@ -3776,6 +3777,93 @@ router.post('/leads/:contactId/instantly-reply', verifyFirebaseToken, async (req
         res.status(statusCode).json({
             error: error?.statusCode ? (error.message || 'Failed to send reply.') : 'Failed to send reply.'
         });
+    }
+});
+
+/** Contact row scoped to agency + client, or null. */
+async function resolveClientContact(agencyId, clientIdOrSlug, contactId) {
+    const clientRow = await queries.resolveClientRow(agencyId, clientIdOrSlug);
+    if (!clientRow) return { clientRow: null, contact: null };
+    const result = await pool.query(
+        `SELECT id, email FROM contacts WHERE id = $1 AND agency_id = $2 AND client_id = $3 LIMIT 1`,
+        [contactId, agencyId, clientRow.id]
+    );
+    return { clientRow, contact: result.rows[0] || null };
+}
+
+/**
+ * GET /leads/:contactId/warm-follow-up?clientId=
+ *
+ * Whether the lead is currently in the automated warm follow-up sequence,
+ * per enrolled campaign (anchor, first blocker after it, sends so far).
+ */
+router.get('/leads/:contactId/warm-follow-up', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        const clientIdOrSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        if (!clientIdOrSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+        const { clientRow, contact } = await resolveClientContact(agencyId, clientIdOrSlug, contactId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+        if (!contact) return res.status(404).json({ error: 'Lead not found.' });
+
+        res.json(await getWarmFollowUpState(pool, contactId));
+    } catch (error) {
+        console.error('Error fetching warm follow-up state:', error?.message || error);
+        res.status(500).json({ error: 'Failed to fetch warm follow-up state.' });
+    }
+});
+
+/**
+ * POST /leads/:contactId/warm-follow-up/remove
+ *
+ * Stop automated warm follow-ups for this lead. Writes a manual
+ * warm_follow_up_removed blocker event; the Instantly label is left as-is.
+ *
+ * Body: { clientId }
+ */
+router.post('/leads/:contactId/warm-follow-up/remove', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        const clientIdOrSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        if (!clientIdOrSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+        const { clientRow, contact } = await resolveClientContact(agencyId, clientIdOrSlug, contactId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+        if (!contact) return res.status(404).json({ error: 'Lead not found.' });
+
+        const removed = await removeContactFromWarmFollowUps(pool, {
+            agencyId,
+            clientId: clientRow.id,
+            contactId,
+            leadEmail: String(contact.email || '').trim().toLowerCase() || null,
+            removedBy: req.auth?.email || null
+        });
+        if (!removed) {
+            return res.status(409).json({ error: 'This lead is not in warm follow-ups.' });
+        }
+
+        res.json({
+            removed: true,
+            event: removed.event,
+            campaign: removed.campaign,
+            state: await getWarmFollowUpState(pool, contactId)
+        });
+    } catch (error) {
+        console.error('Error removing lead from warm follow-ups:', error?.message || error);
+        res.status(500).json({ error: 'Failed to remove lead from warm follow-ups.' });
     }
 });
 

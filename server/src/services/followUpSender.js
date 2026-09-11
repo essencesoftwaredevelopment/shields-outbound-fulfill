@@ -22,13 +22,20 @@ import crypto from 'crypto';
 export const WARM_FOLLOW_UP_EVENT = 'Warm Follow Up';
 
 /**
+ * Manual opt-out written from the lead modal. A blocker like any other: it
+ * stops the sequence until a fresh Warm Follow Up anchor (re-applied label
+ * or a new autoresponder send) lands after it.
+ */
+export const WARM_FOLLOW_UP_REMOVED_EVENT = 'warm_follow_up_removed';
+
+/**
  * Events that stop the follow-up sequence for a contact, provided they appear
  * AFTER the latest Warm Follow Up anchor for that campaign. Matched by
  * contact_id only (not campaign_id) so Calendly / cross-campaign blockers
  * with a null or different campaign_id still suppress follow-ups. email_sent
  * is intentionally absent — it must never block sequence progression.
  */
-const BLOCKER_EVENT_TYPES = [
+export const BLOCKER_EVENT_TYPES = [
     'reply_received',
     'email_bounced',
     'lead_unsubscribed',
@@ -38,6 +45,7 @@ const BLOCKER_EVENT_TYPES = [
     'lead_closed',
     'lead_wrong_person',
     'lead_no_show',
+    WARM_FOLLOW_UP_REMOVED_EVENT,
 ];
 
 const BATCH_SIZE_DEFAULT = parseInt(process.env.FOLLOWUP_BATCH_SIZE || '50', 10) || 50;
@@ -704,6 +712,136 @@ async function persistSentFollowUpActivity(db, {
             JSON.stringify(payload)
         ]
     );
+}
+
+/**
+ * Warm follow-up state for one contact, per enrolled campaign: the latest
+ * anchor, the first blocker after it (same contact-scoped rule as
+ * getEligibleProspects), and how many sends have gone out. `enrolled` is
+ * true when any campaign has an anchor with no blocker after it.
+ */
+export async function getWarmFollowUpState(db, contactId) {
+    const result = await db.query(
+        `WITH anchors AS (
+            SELECT e.campaign_id, MAX(e.event_timestamp) AS anchor_at
+            FROM contact_instantly_events e
+            WHERE e.contact_id = $1
+              AND e.event_type = $2
+              AND e.campaign_id IS NOT NULL
+            GROUP BY e.campaign_id
+        )
+        SELECT
+            a.campaign_id,
+            ic.instantly_campaign_id,
+            ic.name AS campaign_name,
+            a.anchor_at,
+            blocker.event_type AS blocked_by,
+            blocker.event_timestamp AS blocked_at,
+            blocker.source AS blocked_source,
+            (
+                SELECT COUNT(*)::int
+                FROM follow_up_sends fus
+                WHERE fus.contact_id = $1
+                  AND fus.campaign_id = a.campaign_id
+                  AND fus.status = 'sent'
+            ) AS sent_count
+        FROM anchors a
+        JOIN instantly_campaigns ic ON ic.id = a.campaign_id
+        LEFT JOIN LATERAL (
+            SELECT e.event_type, e.event_timestamp, e.source
+            FROM contact_instantly_events e
+            WHERE e.contact_id = $1
+              AND e.event_type = ANY($3::text[])
+              AND e.event_timestamp > a.anchor_at
+            ORDER BY e.event_timestamp ASC
+            LIMIT 1
+        ) blocker ON TRUE
+        ORDER BY a.anchor_at DESC`,
+        [contactId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES]
+    );
+
+    const campaigns = result.rows.map((row) => ({
+        campaign_id: row.campaign_id,
+        instantly_campaign_id: row.instantly_campaign_id,
+        campaign_name: row.campaign_name,
+        anchor_at: row.anchor_at,
+        sent_count: row.sent_count,
+        active: !row.blocked_by,
+        blocked_by: row.blocked_by || null,
+        blocked_at: row.blocked_at || null,
+        blocked_source: row.blocked_source || null
+    }));
+
+    return {
+        enrolled: campaigns.some((campaign) => campaign.active),
+        campaigns
+    };
+}
+
+/**
+ * Take a contact out of warm follow-ups by writing a manual blocker event.
+ * Returns null when nothing is active (nothing to stop). The event hangs off
+ * the most recently anchored active campaign, but blocks every campaign of
+ * the contact — same scope as the other blockers.
+ */
+export async function removeContactFromWarmFollowUps(db, {
+    agencyId,
+    clientId,
+    contactId,
+    leadEmail = null,
+    removedBy = null
+}) {
+    const state = await getWarmFollowUpState(db, contactId);
+    const target = state.campaigns.find((campaign) => campaign.active);
+    if (!target) return null;
+
+    const membership = await db.query(
+        `SELECT instantly_lead_id
+         FROM contact_instantly_campaigns
+         WHERE contact_id = $1 AND campaign_id = $2
+         LIMIT 1`,
+        [contactId, target.campaign_id]
+    );
+
+    const eventTimestamp = new Date().toISOString();
+    const fingerprint = crypto
+        .createHash('sha256')
+        .update([WARM_FOLLOW_UP_REMOVED_EVENT, String(contactId), String(target.campaign_id), eventTimestamp].join('|'))
+        .digest('hex');
+    const payload = {
+        event_type: WARM_FOLLOW_UP_REMOVED_EVENT,
+        source: 'manual',
+        removed_by: removedBy,
+        previous_anchor_at: target.anchor_at,
+        sent_count_at_removal: target.sent_count
+    };
+
+    const result = await db.query(
+        `INSERT INTO contact_instantly_events (
+            agency_id, client_id, contact_id, campaign_id, instantly_campaign_id, instantly_lead_id,
+            event_type, lead_email, message_text, event_timestamp, fingerprint, source, payload
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'manual', $12::jsonb)
+        ON CONFLICT (source, fingerprint) DO NOTHING
+        RETURNING id, event_type, campaign_id, instantly_campaign_id, lead_email,
+                  message_text, event_timestamp, source, payload, created_at`,
+        [
+            agencyId,
+            clientId,
+            contactId,
+            target.campaign_id,
+            target.instantly_campaign_id || null,
+            membership.rows[0]?.instantly_lead_id || null,
+            WARM_FOLLOW_UP_REMOVED_EVENT,
+            leadEmail || null,
+            'Removed from warm follow-ups',
+            eventTimestamp,
+            fingerprint,
+            JSON.stringify(payload)
+        ]
+    );
+
+    return { event: result.rows[0] || null, campaign: target };
 }
 
 /**

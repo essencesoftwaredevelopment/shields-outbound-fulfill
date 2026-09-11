@@ -46,17 +46,29 @@ cd "$REPO_ROOT"
 # ── Local phase: make origin/<branch> hold what we intend to deploy ──────────
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
-if [[ -n "$(git status --porcelain -- server lib app 2>/dev/null)" ]]; then
-    warn "You have uncommitted changes — they will NOT be deployed (deploy ships origin/$DEPLOY_BRANCH)."
+# Commit any local changes before deploy
+if [[ "$PUSH" -eq 1 ]] && [[ -n "$(git status --porcelain)" ]]; then
+    if [[ "$CURRENT_BRANCH" != "$DEPLOY_BRANCH" ]]; then
+        echo "[deploy] Refusing to auto-commit because current branch is '$CURRENT_BRANCH', expected '$DEPLOY_BRANCH'." >&2
+        exit 1
+    fi
+
+    log "Committing local changes..."
+    git add -A
+    git commit -m "chore: deploy $(date '+%Y-%m-%d %H:%M:%S')"
 fi
 
 if [[ "$PUSH" -eq 1 ]]; then
     if [[ "$CURRENT_BRANCH" != "$DEPLOY_BRANCH" ]]; then
-        warn "On branch '$CURRENT_BRANCH', not '$DEPLOY_BRANCH' — skipping push. origin/$DEPLOY_BRANCH deploys as-is."
-    else
-        log "Pushing $DEPLOY_BRANCH to origin…"
-        git push origin "$DEPLOY_BRANCH"
+        echo "[deploy] Must be on '$DEPLOY_BRANCH' to deploy. Current branch: '$CURRENT_BRANCH'." >&2
+        exit 1
     fi
+
+    log "Syncing $DEPLOY_BRANCH with origin..."
+    git pull --rebase origin "$DEPLOY_BRANCH"
+
+    log "Pushing $DEPLOY_BRANCH to origin..."
+    git push origin "$DEPLOY_BRANCH"
 fi
 
 TARGET_SHA="$(git ls-remote origin "refs/heads/$DEPLOY_BRANCH" | cut -f1)"
@@ -70,7 +82,7 @@ log "Deploying origin/$DEPLOY_BRANCH @ ${TARGET_SHA:0:9} to $DEPLOY_HOST:$DEPLOY
 # Heredoc pipes straight into ssh (no $(...) wrapper — macOS bash 3.2 chokes on
 # quotes inside command-substituted heredocs). Unescaped $VARS expand locally,
 # \$VARS expand on the droplet.
-ssh -o ConnectTimeout=10 "$DEPLOY_HOST" 'bash -s' <<EOF
+ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o ConnectTimeout=10 "$DEPLOY_HOST" 'bash -s' <<EOF
 set -euo pipefail
 cd "$DEPLOY_PATH"
 

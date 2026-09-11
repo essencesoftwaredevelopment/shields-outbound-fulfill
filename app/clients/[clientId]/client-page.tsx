@@ -188,6 +188,21 @@ type LeadReplyContext = {
 const LEAD_REPLY_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const LEAD_REPLY_MAX_IMAGES = 10;
 
+type LeadWarmFollowUpState = {
+    enrolled: boolean;
+    campaigns: Array<{
+        campaign_id: number;
+        instantly_campaign_id: string | null;
+        campaign_name: string | null;
+        anchor_at: string;
+        sent_count: number;
+        active: boolean;
+        blocked_by: string | null;
+        blocked_at: string | null;
+        blocked_source: string | null;
+    }>;
+};
+
 type LeadList = {
     id: number;
     name: string;
@@ -585,6 +600,7 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
     if (normalized === "reply received" || normalized === "reply" || normalized === "replied") return "Reply received";
     if (normalized === "interested reply sent") return "Autoresponder reply";
     if (normalized === "manual reply sent") return "Reply sent";
+    if (normalized === "warm follow up removed") return "Removed from warm follow-ups";
     if (normalized === "email sent") return "Email sent";
     if (normalized === "email opened") return "Email opened";
     if (normalized === "email link clicked") return "Link clicked";
@@ -640,6 +656,7 @@ function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | n
     if (normalized === "email sent") return "var(--app-event-email-sent)";
     if (normalized === "email opened") return "var(--app-event-email-opened)";
     if (normalized === "email link clicked") return "var(--app-event-link-clicked)";
+    if (normalized === "warm follow up removed") return "var(--app-event-warning)";
     if (normalized === "warm follow up" || displayTone === "manual") return "var(--app-event-warm-followup)";
     if (
         normalized === "reply received"
@@ -794,6 +811,7 @@ function getActivitySourceLogo(event: {
         || type === 'interest_status_set'
         || type === 'interested_reply_sent'
         || type === 'manual_reply_sent'
+        || type === 'warm_follow_up_removed'
         || type === 'warm_follow_up'
         || type === 'warm follow up'
         || type === 'warm_follow_up_label_skipped'
@@ -2485,6 +2503,9 @@ export default function ClientPage() {
     const [leadReplyContextLoading, setLeadReplyContextLoading] = useState(false);
     const leadReplyEditorRef = useRef<LeadReplyEditorHandle | null>(null);
     const leadReplyFileInputRef = useRef<HTMLInputElement | null>(null);
+    // Automated warm follow-up sequence state for the open lead (null until loaded).
+    const [leadWarmFollowUp, setLeadWarmFollowUp] = useState<LeadWarmFollowUpState | null>(null);
+    const [removingWarmFollowUp, setRemovingWarmFollowUp] = useState(false);
     const [expandedLeadActivityIds, setExpandedLeadActivityIds] = useState<string[]>([]);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsLoadingMore, setLeadsLoadingMore] = useState(false);
@@ -2582,6 +2603,30 @@ export default function ClientPage() {
         })();
         return () => { cancelled = true; };
     }, [selectedLead?.id, leadReplyEffectiveCampaignId, user, clientId]);
+
+    const fetchLeadWarmFollowUp = useCallback(async (contactId: string | number) => {
+        if (!user || !clientId) return null;
+        const idToken = await getAccessToken();
+        if (!idToken) return null;
+        const params = new URLSearchParams({ clientId });
+        const res = await fetchWithRetry(
+            `${getPipelineBaseUrl()}/api/leads/${contactId}/warm-follow-up?${params.toString()}`,
+            { headers: { Authorization: `Bearer ${idToken}` } }
+        );
+        if (!res.ok) throw new Error(`Failed to fetch warm follow-up state: ${res.statusText}`);
+        return (await res.json()) as LeadWarmFollowUpState;
+    }, [clientId, user]);
+
+    useEffect(() => {
+        const contactId = selectedLead?.id;
+        setLeadWarmFollowUp(null);
+        if (!contactId) return;
+        let cancelled = false;
+        fetchLeadWarmFollowUp(contactId)
+            .then((state) => { if (!cancelled && state) setLeadWarmFollowUp(state); })
+            .catch((err) => console.error('Failed to fetch warm follow-up state:', err));
+        return () => { cancelled = true; };
+    }, [selectedLead?.id, fetchLeadWarmFollowUp]);
 
     useEffect(() => {
         if (!selectedLead || !user || !selectedLead.id) {
@@ -6193,6 +6238,39 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setLeadReplySending(false);
+        }
+    };
+
+    const handleRemoveFromWarmFollowUps = async () => {
+        if (!user || !clientId || !selectedLead?.id) return;
+        const name = hasValidFounderName(selectedLead.founderName)
+            ? selectedLead.founderName
+            : (selectedLead.email || selectedLead.domain || 'this lead');
+        if (!confirm(`Stop automated warm follow-ups for ${name}? The Instantly label is left unchanged.`)) return;
+
+        setRemovingWarmFollowUp(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/${selectedLead.id}/warm-follow-up/remove`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ clientId })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to remove from warm follow-ups');
+            if (data.state) setLeadWarmFollowUp(data.state as LeadWarmFollowUpState);
+            await refreshLeadEvents(selectedLead.id);
+            setToastMessage('Removed from warm follow-ups.');
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to remove from warm follow-ups');
+            setToastVisible(true);
+        } finally {
+            setRemovingWarmFollowUp(false);
         }
     };
 
@@ -14976,6 +15054,71 @@ export default function ClientPage() {
                                     </div>
                                 </div>
                             )}
+
+                            {/* Warm follow-ups — automated sequence state, with a manual opt-out */}
+                            {leadWarmFollowUp && leadWarmFollowUp.campaigns.length > 0 && (() => {
+                                const active = leadWarmFollowUp.campaigns.find((campaign) => campaign.active) || null;
+                                const latest = active || leadWarmFollowUp.campaigns[0];
+                                const formatDate = (value: string | null) => (value
+                                    ? new Date(value).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                                    : null);
+                                const stoppedBy = latest.blocked_by
+                                    ? formatInstantlyActivityLabel(latest.blocked_by)
+                                    : null;
+                                return (
+                                    <div style={{
+                                        borderTop: '1px solid var(--app-border)',
+                                        paddingTop: '0.75rem',
+                                        marginBottom: '1rem',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '0.45rem'
+                                    }}>
+                                        <p style={{
+                                            margin: 0,
+                                            fontSize: '0.75rem',
+                                            fontWeight: 600,
+                                            textTransform: 'uppercase',
+                                            letterSpacing: '0.06em',
+                                            color: 'var(--app-text-ghost)'
+                                        }}>Warm follow-ups</p>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                                            <span style={{
+                                                display: 'inline-flex',
+                                                alignItems: 'center',
+                                                gap: '0.4rem',
+                                                fontSize: '0.82rem',
+                                                color: 'var(--app-text-high)'
+                                            }}>
+                                                <span aria-hidden="true" style={{
+                                                    width: 7,
+                                                    height: 7,
+                                                    borderRadius: '50%',
+                                                    background: active ? 'var(--app-event-warm-followup)' : 'var(--app-text-ghost)',
+                                                    flexShrink: 0
+                                                }} />
+                                                {active ? 'In sequence' : 'Stopped'}
+                                            </span>
+                                            <span style={{ fontSize: '0.76rem', color: 'var(--app-text-faint)', flex: '1 1 12rem', minWidth: 0 }}>
+                                                {active
+                                                    ? `${latest.campaign_name || 'Campaign'} · ${latest.sent_count} sent · since ${formatDate(latest.anchor_at)}`
+                                                    : `${stoppedBy || 'Stopped'}${latest.blocked_at ? ` on ${formatDate(latest.blocked_at)}` : ''} · ${latest.sent_count} sent`}
+                                            </span>
+                                            {active && (
+                                                <button
+                                                    type="button"
+                                                    className="secondary-button secondary-button--active"
+                                                    onClick={handleRemoveFromWarmFollowUps}
+                                                    disabled={removingWarmFollowUp}
+                                                    style={{ flex: '0 0 auto', height: 'auto', minHeight: 0, padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                >
+                                                    {removingWarmFollowUp ? 'Removing…' : 'Remove from warm follow-ups'}
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })()}
 
                             {/* Free-hand reply — goes out through Instantly on the lead's latest thread */}
                             {(selectedLead.campaignsData || []).length > 0 && (() => {

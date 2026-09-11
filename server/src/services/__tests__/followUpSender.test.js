@@ -20,7 +20,11 @@ import {
     htmlToPlainText,
     resolveThreadReplyAnchor,
     buildEssenceBookingUrl,
+    getWarmFollowUpState,
+    removeContactFromWarmFollowUps,
+    BLOCKER_EVENT_TYPES as ENGINE_BLOCKER_EVENT_TYPES,
     ESSENCE_BOOKING_URL,
+    WARM_FOLLOW_UP_REMOVED_EVENT,
 } from '../followUpSender.js';
 
 // ─── Template rendering ───────────────────────────────────────────────────────
@@ -242,17 +246,8 @@ test('htmlToPlainText returns empty string for empty input', () => {
 
 const WARM_FOLLOW_UP_EVENT = 'Warm Follow Up';
 
-const BLOCKER_EVENT_TYPES = new Set([
-    'reply_received',
-    'email_bounced',
-    'lead_unsubscribed',
-    'lead_not_interested',
-    'lead_meeting_booked',
-    'lead_meeting_completed',
-    'lead_closed',
-    'lead_wrong_person',
-    'lead_no_show',
-]);
+// The engine's own list, so these scenarios cannot drift from the SQL.
+const BLOCKER_EVENT_TYPES = new Set(ENGINE_BLOCKER_EVENT_TYPES);
 
 /**
  * Returns true if a contact+campaign should receive a follow-up given an
@@ -382,6 +377,24 @@ test('eligibility: not eligible when lead_wrong_person appears after anchor', ()
         { type: 'lead_wrong_person', ts: 2000 },
     ];
     assert.equal(isEligible(events), false);
+});
+
+test('eligibility: not eligible after a manual warm_follow_up_removed event', () => {
+    const events = [
+        { type: 'Warm Follow Up', ts: 1000 },
+        { type: 'email_sent', ts: 2000 },
+        { type: WARM_FOLLOW_UP_REMOVED_EVENT, ts: 3000 },
+    ];
+    assert.equal(isEligible(events), false);
+});
+
+test('eligibility: a fresh Warm Follow Up anchor after removal re-enrolls', () => {
+    const events = [
+        { type: 'Warm Follow Up', ts: 1000 },
+        { type: WARM_FOLLOW_UP_REMOVED_EVENT, ts: 3000 },
+        { type: 'Warm Follow Up', ts: 4000 },
+    ];
+    assert.equal(isEligible(events), true);
 });
 
 test('eligibility: eligible when blocker appears BEFORE anchor (restartability)', () => {
@@ -590,4 +603,73 @@ test('resolveThreadReplyAnchor ignores synthetic outbound follow-up events', () 
         reply_to_uuid: null,
         eaccount: null
     });
+});
+
+// ─── Warm follow-up state + manual removal (mock DB) ─────────────────────────
+
+function makeStateDb(stateRows, { membership = { instantly_lead_id: 'lead-1' } } = {}) {
+    const calls = [];
+    return {
+        calls,
+        query: async (sql, params) => {
+            calls.push({ sql, params });
+            if (/WITH anchors AS/.test(sql)) return { rows: stateRows };
+            if (/FROM contact_instantly_campaigns/.test(sql)) return { rows: membership ? [membership] : [] };
+            if (/INSERT INTO contact_instantly_events/.test(sql)) {
+                return { rows: [{ id: 99, event_type: params[6], campaign_id: params[3], message_text: params[8], event_timestamp: params[9], source: 'manual' }] };
+            }
+            throw new Error(`unexpected query: ${sql.slice(0, 40)}`);
+        },
+    };
+}
+
+const ACTIVE_ROW = {
+    campaign_id: 7, instantly_campaign_id: 'ic-7', campaign_name: 'Spring', anchor_at: '2026-09-01T10:00:00Z',
+    blocked_by: null, blocked_at: null, blocked_source: null, sent_count: 2,
+};
+const BLOCKED_ROW = {
+    campaign_id: 8, instantly_campaign_id: 'ic-8', campaign_name: 'Autumn', anchor_at: '2026-08-01T10:00:00Z',
+    blocked_by: 'reply_received', blocked_at: '2026-08-02T10:00:00Z', blocked_source: 'webhook', sent_count: 1,
+};
+
+test('getWarmFollowUpState: enrolled when any campaign has an unblocked anchor', async () => {
+    const state = await getWarmFollowUpState(makeStateDb([ACTIVE_ROW, BLOCKED_ROW]), 42);
+    assert.equal(state.enrolled, true);
+    assert.deepEqual(state.campaigns.map((c) => [c.campaign_id, c.active, c.blocked_by]), [[7, true, null], [8, false, 'reply_received']]);
+});
+
+test('getWarmFollowUpState: passes the engine blocker list to SQL', async () => {
+    const db = makeStateDb([]);
+    const state = await getWarmFollowUpState(db, 42);
+    assert.equal(state.enrolled, false);
+    assert.deepEqual(db.calls[0].params, [42, 'Warm Follow Up', ENGINE_BLOCKER_EVENT_TYPES]);
+    assert.ok(ENGINE_BLOCKER_EVENT_TYPES.includes(WARM_FOLLOW_UP_REMOVED_EVENT));
+});
+
+test('removeContactFromWarmFollowUps: returns null when nothing is active', async () => {
+    const db = makeStateDb([BLOCKED_ROW]);
+    const removed = await removeContactFromWarmFollowUps(db, { agencyId: 'a', clientId: 1, contactId: 42 });
+    assert.equal(removed, null);
+    assert.equal(db.calls.some((call) => /INSERT INTO contact_instantly_events/.test(call.sql)), false);
+});
+
+test('removeContactFromWarmFollowUps: writes a manual blocker on the active campaign', async () => {
+    const db = makeStateDb([BLOCKED_ROW, ACTIVE_ROW]);
+    const removed = await removeContactFromWarmFollowUps(db, {
+        agencyId: 'agency-1', clientId: 5, contactId: 42, leadEmail: 'bob@acme.com', removedBy: 'ops@shields.io',
+    });
+    assert.equal(removed.campaign.campaign_id, 7);
+    assert.equal(removed.event.event_type, WARM_FOLLOW_UP_REMOVED_EVENT);
+    assert.equal(removed.event.message_text, 'Removed from warm follow-ups');
+
+    const insert = db.calls.find((call) => /INSERT INTO contact_instantly_events/.test(call.sql));
+    const [agencyId, clientId, contactId, campaignId, instantlyCampaignId, instantlyLeadId, eventType, leadEmail] = insert.params;
+    assert.deepEqual([agencyId, clientId, contactId, campaignId, instantlyCampaignId, instantlyLeadId, eventType, leadEmail],
+        ['agency-1', 5, 42, 7, 'ic-7', 'lead-1', WARM_FOLLOW_UP_REMOVED_EVENT, 'bob@acme.com']);
+    const payload = JSON.parse(insert.params[11]);
+    assert.equal(payload.removed_by, 'ops@shields.io');
+    assert.equal(payload.previous_anchor_at, ACTIVE_ROW.anchor_at);
+    assert.equal(payload.sent_count_at_removal, 2);
+    // The manual event must never carry a reply_to_uuid (it is not a thread anchor).
+    assert.doesNotMatch(insert.sql, /reply_to_uuid/);
 });
