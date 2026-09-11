@@ -2832,7 +2832,8 @@ select.lead-activity-chip {
   .settings-field input,
   .settings-field select,
   .modal textarea,
-  .pipeline-panel textarea {
+  .pipeline-panel textarea,
+  .lead-reply-editor {
     font-size: 16px;
   }
 
@@ -2982,6 +2983,7 @@ select.lead-activity-chip {
   --app-text-muted: rgba(0, 0, 0, 0.62);
   --app-text-faint: rgba(0, 0, 0, 0.5);
   --app-text-ghost: rgba(0, 0, 0, 0.42);
+  --app-link: #2563eb;
 
   /* Overlays */
   --app-bg-overlay-soft: rgba(0, 0, 0, 0.2);
@@ -3078,6 +3080,7 @@ select.lead-activity-chip {
   --app-text-muted: rgba(255, 255, 255, 0.6);
   --app-text-faint: rgba(255, 255, 255, 0.45);
   --app-text-ghost: rgba(255, 255, 255, 0.4);
+  --app-link: #60a5fa;
   --app-bg-overlay-soft: rgba(0, 0, 0, 0.3);
   --app-event-default:       rgba(255, 255, 255, 0.3);
   --app-evtrow-default-pill:   rgba(255, 255, 255, 0.07);
@@ -3172,6 +3175,7 @@ select.lead-activity-chip {
     --app-text-muted: rgba(255, 255, 255, 0.6);
     --app-text-faint: rgba(255, 255, 255, 0.45);
     --app-text-ghost: rgba(255, 255, 255, 0.4);
+    --app-link: #60a5fa;
     --app-bg-overlay-soft: rgba(0, 0, 0, 0.3);
     --app-event-default:       rgba(255, 255, 255, 0.3);
     --app-evtrow-default-pill:   rgba(255, 255, 255, 0.07);
@@ -3469,6 +3473,73 @@ select.lead-activity-chip {
 }
 .df-iconbtn:hover:not(:disabled) { background: var(--app-surface-hover); color: var(--app-text); }
 .df-iconbtn:disabled { opacity: 0.35; cursor: default; }
+
+/* Lead modal free-hand reply composer (contentEditable, renders as the email will) */
+.lead-reply-editor {
+  min-height: 7.5rem;
+  padding: 0.7rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--app-border-strong);
+  background: var(--app-surface-1);
+  color: var(--app-text-high);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  outline: none;
+  overflow-wrap: anywhere;
+  cursor: text;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.lead-reply-editor:focus,
+.lead-reply-editor--dragging {
+  border-color: var(--app-border-accent);
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.25);
+}
+.lead-reply-editor[aria-disabled="true"] { opacity: 0.6; cursor: default; }
+.lead-reply-editor:empty::before {
+  content: attr(data-placeholder);
+  color: var(--app-text-ghost);
+  pointer-events: none;
+}
+.lead-reply-editor p,
+.lead-reply-editor div { margin: 0 0 0.8em; }
+.lead-reply-editor p:last-child,
+.lead-reply-editor div:last-child { margin-bottom: 0; }
+.lead-reply-editor a { color: var(--app-link); text-decoration: underline; cursor: pointer; }
+.lead-reply-editor img {
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+  border-radius: 6px;
+}
+.lead-reply-editor img:hover { outline: 2px solid rgba(96, 165, 250, 0.5); outline-offset: 1px; }
+.lead-reply-editor img[data-selected] { outline: 2px solid #60a5fa; outline-offset: 1px; }
+.lead-reply-editor img[data-uploading] { opacity: 0.45; filter: grayscale(0.4); }
+.lead-reply-editor-frame { position: relative; }
+.lead-reply-editor__resize {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  border-radius: 4px;
+  border: 2px solid #fff;
+  background: #60a5fa;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.lead-reply-editor__size {
+  position: absolute;
+  transform: translate(calc(-100% - 10px), calc(-100% - 6px));
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  z-index: 2;
+}
 
 .df-hint { font-size: 0.78rem; color: var(--app-text-muted); }
 .df-error { font-size: 0.85rem; color: var(--app-error-text, var(--df-red)); }

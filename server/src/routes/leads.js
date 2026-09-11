@@ -36,6 +36,14 @@ import {
     mapInterestStatusToEventType,
     updateInstantlyLeadInterestStatus
 } from '../services/instantlyState.js';
+import {
+    LEAD_REPLY_IMAGE_MAX_BYTES,
+    LEAD_REPLY_IMAGE_MIME_TYPES,
+    resolveLeadCampaignMembership,
+    resolveLeadReplyThread,
+    sendLeadManualReply,
+    uploadLeadReplyImage
+} from '../services/leadManualReply.js';
 
 const uploadVerification = multer({
     storage: multer.memoryStorage(),
@@ -45,6 +53,18 @@ const uploadVerification = multer({
             cb(null, true);
         } else {
             cb(new Error('Only CSV files are allowed'));
+        }
+    }
+});
+
+const uploadReplyImage = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: LEAD_REPLY_IMAGE_MAX_BYTES, files: 1 },
+    fileFilter: (_req, file, cb) => {
+        if (LEAD_REPLY_IMAGE_MIME_TYPES.has(String(file.mimetype || '').toLowerCase())) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PNG, JPEG, GIF or WebP images can be attached'));
         }
     }
 });
@@ -3585,6 +3605,176 @@ router.post('/leads/:contactId/instantly-interest-status', verifyFirebaseToken, 
             error: error?.statusCode
                 ? (error.message || 'Failed to update Instantly interest status.')
                 : 'Failed to update Instantly interest status.'
+        });
+    }
+});
+
+/**
+ * POST /leads/:contactId/reply-images
+ *
+ * Host one image for a free-hand reply (multipart field `file`). Stored in the
+ * public `lead-reply-images` bucket so the returned URL can be embedded in the
+ * outbound email HTML.
+ */
+router.post('/leads/:contactId/reply-images', verifyFirebaseToken, (req, res, next) => {
+    uploadReplyImage.single('file')(req, res, (error) => {
+        if (!error) return next();
+        const tooLarge = error?.code === 'LIMIT_FILE_SIZE';
+        return res.status(400).json({
+            error: tooLarge ? 'Image must be 10MB or smaller.' : (error.message || 'Invalid image upload.')
+        });
+    });
+}, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        if (!req.file) {
+            return res.status(400).json({ error: 'Image file is required.' });
+        }
+
+        const contactResult = await pool.query(
+            `SELECT id FROM contacts WHERE id = $1 AND agency_id = $2 LIMIT 1`,
+            [contactId, agencyId]
+        );
+        if (!contactResult.rows.length) {
+            return res.status(404).json({ error: 'Lead not found.' });
+        }
+
+        const image = await uploadLeadReplyImage({ agencyId, contactId, file: req.file });
+        res.json({ image });
+    } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        console.error('Error uploading lead reply image:', error?.message || error);
+        res.status(statusCode).json({
+            error: error?.statusCode ? (error.message || 'Failed to upload image.') : 'Failed to upload image.'
+        });
+    }
+});
+
+/**
+ * GET /leads/:contactId/instantly-reply-context?clientId=&campaignId=
+ *
+ * Which Instantly thread a free-hand reply would attach to (sender account,
+ * subject, anchor message). Lets the composer show where the reply goes and
+ * disable send when there is no thread yet.
+ */
+router.get('/leads/:contactId/instantly-reply-context', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        const clientIdOrSlug = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : '';
+        const instantlyCampaignId = typeof req.query.campaignId === 'string' ? req.query.campaignId.trim() : '';
+
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        if (!clientIdOrSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+
+        const clientRow = await queries.resolveClientRow(agencyId, clientIdOrSlug);
+        if (!clientRow) {
+            return res.status(404).json({ error: 'Client not found.' });
+        }
+        const instantlyKey = String(clientRow.instantly_key || '').trim();
+        if (!instantlyKey) {
+            return res.json({ available: false, reason: 'missing_instantly_key' });
+        }
+
+        const membership = await resolveLeadCampaignMembership({
+            agencyId,
+            clientId: clientRow.id,
+            contactId,
+            instantlyCampaignId: instantlyCampaignId || null
+        });
+        const thread = await resolveLeadReplyThread({
+            contactId,
+            campaignId: membership.campaign_id,
+            instantlyCampaignId: membership.instantly_campaign_id,
+            leadEmail: membership.lead_email,
+            apiKey: instantlyKey
+        });
+
+        if (!thread) {
+            return res.json({
+                available: false,
+                reason: 'no_thread',
+                campaign_id: membership.instantly_campaign_id,
+                campaign_name: membership.campaign_name
+            });
+        }
+        res.json({
+            available: true,
+            reply_to_uuid: thread.reply_to_uuid,
+            eaccount: thread.eaccount,
+            subject: thread.thread_subject,
+            anchor_source: thread.anchor_source,
+            campaign_id: membership.instantly_campaign_id,
+            campaign_name: membership.campaign_name
+        });
+    } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        console.error('Error resolving Instantly reply context:', error?.message || error);
+        res.status(statusCode).json({
+            error: error?.statusCode ? (error.message || 'Failed to resolve reply thread.') : 'Failed to resolve reply thread.'
+        });
+    }
+});
+
+/**
+ * POST /leads/:contactId/instantly-reply
+ *
+ * Send a free-hand reply to the lead through Instantly, anchored on the
+ * latest thread message. `html` is the composer's WYSIWYG output — sanitized
+ * server-side, with every <img src> required to be one of our hosted images.
+ * Mirrors the send to the timeline as a manual_reply_sent event.
+ *
+ * Body: { clientId, campaignId? (Instantly UUID), html }
+ */
+router.post('/leads/:contactId/instantly-reply', verifyFirebaseToken, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = req.agencyId;
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        const clientIdOrSlug = typeof req.body?.clientId === 'string' ? req.body.clientId.trim() : '';
+        const instantlyCampaignId = typeof req.body?.campaignId === 'string'
+            ? req.body.campaignId.trim()
+            : String(req.body?.campaignId || '').trim();
+
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        if (!clientIdOrSlug) {
+            return res.status(400).json({ error: 'clientId is required.' });
+        }
+        if (typeof req.body?.html !== 'string') {
+            return res.status(400).json({ error: 'html must be a string.' });
+        }
+
+        const clientRow = await queries.resolveClientRow(agencyId, clientIdOrSlug);
+        if (!clientRow) {
+            return res.status(404).json({ error: 'Client not found.' });
+        }
+
+        const result = await sendLeadManualReply({
+            agencyId,
+            clientRow,
+            contactId,
+            instantlyCampaignId: instantlyCampaignId || null,
+            html: req.body.html,
+            sentBy: req.auth?.email || null
+        });
+        res.json(result);
+    } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        console.error('Error sending manual Instantly reply:', error?.message || error);
+        res.status(statusCode).json({
+            error: error?.statusCode ? (error.message || 'Failed to send reply.') : 'Failed to send reply.'
         });
     }
 });

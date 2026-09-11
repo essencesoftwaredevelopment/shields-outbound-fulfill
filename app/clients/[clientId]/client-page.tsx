@@ -21,6 +21,7 @@ import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import { WarmFollowUpProgress } from "@/components/warm-follow-up-progress";
+import { LeadReplyEditor, type LeadReplyEditorHandle, type LeadReplyEditorState } from "@/components/lead-reply-editor";
 import { FOLLOW_UP_CODE_CONTRACT, FOLLOW_UP_MAX_CHARS, formatBriefForFollowUpPrompt } from "@server/services/warmFollowUpGeneration/prompt.js";
 
 // Loaded lazily so dnd-kit and recharts stay out of this route's initial chunk;
@@ -173,6 +174,19 @@ type Lead = {
     };
     lists?: Array<{ id: number; name: string }>;
 };
+
+type LeadReplyContext = {
+    available: boolean;
+    reason?: string | null;
+    eaccount?: string | null;
+    subject?: string | null;
+    anchor_source?: string | null;
+    campaign_id?: string | null;
+    campaign_name?: string | null;
+};
+
+const LEAD_REPLY_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const LEAD_REPLY_MAX_IMAGES = 10;
 
 type LeadList = {
     id: number;
@@ -570,6 +584,7 @@ function formatInstantlyActivityLabel(eventType: string, fallbackLabel?: string 
     const normalized = String(fallbackLabel || eventType || "unknown").toLowerCase().replace(/[_ ]+/g, " ").trim();
     if (normalized === "reply received" || normalized === "reply" || normalized === "replied") return "Reply received";
     if (normalized === "interested reply sent") return "Autoresponder reply";
+    if (normalized === "manual reply sent") return "Reply sent";
     if (normalized === "email sent") return "Email sent";
     if (normalized === "email opened") return "Email opened";
     if (normalized === "email link clicked") return "Link clicked";
@@ -621,7 +636,7 @@ function getInstantlyActivityColor(eventType: string, fallbackLabel?: string | n
     const displayLabel = formatInstantlyActivityLabel(eventType, fallbackLabel);
     const formattedTone = getActivityDisplayTone(displayLabel);
     const displayTone = formattedTone !== "default" ? formattedTone : getActivityDisplayTone(fallbackLabel);
-    if (normalized === "interested reply sent") return "var(--app-event-auto-reply)";
+    if (normalized === "interested reply sent" || normalized === "manual reply sent") return "var(--app-event-auto-reply)";
     if (normalized === "email sent") return "var(--app-event-email-sent)";
     if (normalized === "email opened") return "var(--app-event-email-opened)";
     if (normalized === "email link clicked") return "var(--app-event-link-clicked)";
@@ -778,6 +793,7 @@ function getActivitySourceLogo(event: {
         || type === 'email_not_found'
         || type === 'interest_status_set'
         || type === 'interested_reply_sent'
+        || type === 'manual_reply_sent'
         || type === 'warm_follow_up'
         || type === 'warm follow up'
         || type === 'warm_follow_up_label_skipped'
@@ -2454,11 +2470,21 @@ export default function ClientPage() {
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [emailCopied, setEmailCopied] = useState(false);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
-    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string; source?: string; unibox_url?: string | null; instantly_lead_id?: string | null }>>([]);
+    const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string; source?: string; unibox_url?: string | null; instantly_lead_id?: string | null; payload?: Record<string, unknown> | null }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
     const [leadStatusCampaignId, setLeadStatusCampaignId] = useState<string>('');
     const [leadStatusInterestValue, setLeadStatusInterestValue] = useState<string>('');
     const [savingLeadInstantlyStatus, setSavingLeadInstantlyStatus] = useState(false);
+    // Free-hand reply composer (lead modal). The editor owns its HTML; images
+    // are uploaded to Supabase Storage as they are placed and the send only
+    // references their public URLs.
+    const [leadReplyCampaignId, setLeadReplyCampaignId] = useState<string>('');
+    const [leadReplyEditorState, setLeadReplyEditorState] = useState<LeadReplyEditorState>({ isEmpty: true, uploading: 0, imageCount: 0 });
+    const [leadReplySending, setLeadReplySending] = useState(false);
+    const [leadReplyContext, setLeadReplyContext] = useState<LeadReplyContext | null>(null);
+    const [leadReplyContextLoading, setLeadReplyContextLoading] = useState(false);
+    const leadReplyEditorRef = useRef<LeadReplyEditorHandle | null>(null);
+    const leadReplyFileInputRef = useRef<HTMLInputElement | null>(null);
     const [expandedLeadActivityIds, setExpandedLeadActivityIds] = useState<string[]>([]);
     const [leadsLoading, setLeadsLoading] = useState(false);
     const [leadsLoadingMore, setLeadsLoadingMore] = useState(false);
@@ -2503,7 +2529,59 @@ export default function ClientPage() {
         const campaigns = selectedLead?.campaignsData || [];
         setLeadStatusCampaignId(campaigns[0]?.campaignId || '');
         setLeadStatusInterestValue('');
+        setLeadReplyCampaignId(campaigns[0]?.campaignId || '');
+        leadReplyEditorRef.current?.clear();
+        setLeadReplyContext(null);
     }, [selectedLead?.id]);
+
+    // The reply campaign, guarded against a stale pick from the previous lead
+    // (the reset effect above lands one render later than the lead switch).
+    const leadReplyCampaignKey = (selectedLead?.campaignsData || []).map((campaign) => campaign.campaignId).join(',');
+    const leadReplyEffectiveCampaignId = useMemo(() => {
+        const ids = leadReplyCampaignKey ? leadReplyCampaignKey.split(',') : [];
+        if (leadReplyCampaignId && ids.includes(leadReplyCampaignId)) return leadReplyCampaignId;
+        return ids[0] || '';
+    }, [leadReplyCampaignKey, leadReplyCampaignId]);
+
+    // Where a free-hand reply would land (sender account + thread subject).
+    useEffect(() => {
+        const contactId = selectedLead?.id;
+        const campaignId = leadReplyEffectiveCampaignId;
+        if (!contactId || !user || !clientId || !campaignId) {
+            setLeadReplyContext(null);
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            setLeadReplyContextLoading(true);
+            try {
+                const idToken = await getAccessToken();
+                if (!idToken) return;
+                const params = new URLSearchParams({ clientId, campaignId });
+                const res = await fetchWithRetry(
+                    `${getPipelineBaseUrl()}/api/leads/${contactId}/instantly-reply-context?${params.toString()}`,
+                    { headers: { Authorization: `Bearer ${idToken}` } }
+                );
+                const data = await res.json().catch(() => ({}));
+                if (cancelled) return;
+                if (!res.ok) {
+                    setLeadReplyContext({ available: false, reason: data.error || 'Failed to resolve reply thread.' });
+                    return;
+                }
+                setLeadReplyContext(data as LeadReplyContext);
+            } catch (err) {
+                if (!cancelled) {
+                    setLeadReplyContext({
+                        available: false,
+                        reason: err instanceof Error ? err.message : 'Failed to resolve reply thread.'
+                    });
+                }
+            } finally {
+                if (!cancelled) setLeadReplyContextLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [selectedLead?.id, leadReplyEffectiveCampaignId, user, clientId]);
 
     useEffect(() => {
         if (!selectedLead || !user || !selectedLead.id) {
@@ -6038,6 +6116,83 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setSavingLeadInstantlyStatus(false);
+        }
+    };
+
+    const uploadLeadReplyImage = useCallback(async (file: File): Promise<{ url: string } | null> => {
+        const contactId = selectedLead?.id;
+        if (!user || !contactId) return null;
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) throw new Error('Not signed in');
+            const form = new FormData();
+            form.append('file', file, file.name || 'image');
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/${contactId}/reply-images`,
+                { method: 'POST', headers: { Authorization: `Bearer ${idToken}` }, body: form }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.image?.url) {
+                throw new Error(data.error || 'Failed to upload image');
+            }
+            return { url: data.image.url };
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to upload image');
+            setToastVisible(true);
+            return null;
+        }
+    }, [selectedLead?.id, user]);
+
+    const showLeadReplyNotice = useCallback((message: string) => {
+        setToastMessage(message);
+        setToastVisible(true);
+    }, []);
+
+    const handleSendLeadReply = async () => {
+        if (!user || !clientId || !selectedLead?.id) return;
+        const campaignId = leadReplyEffectiveCampaignId;
+        if (!campaignId) {
+            setToastMessage('This lead has no Instantly campaign to reply in.');
+            setToastVisible(true);
+            return;
+        }
+        if (leadReplyEditorState.uploading > 0) {
+            setToastMessage('Wait for the images to finish uploading.');
+            setToastVisible(true);
+            return;
+        }
+        const html = leadReplyEditorRef.current?.getHtml() || '';
+        if (leadReplyEditorState.isEmpty || !html.trim()) {
+            setToastMessage('Write a message or attach an image first.');
+            setToastVisible(true);
+            return;
+        }
+
+        setLeadReplySending(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/leads/${selectedLead.id}/instantly-reply`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ clientId, campaignId, html })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to send reply');
+
+            leadReplyEditorRef.current?.clear();
+            await refreshLeadEvents(selectedLead.id);
+            const via = data.thread?.eaccount ? ` from ${data.thread.eaccount}` : '';
+            setToastMessage(`Reply sent via Instantly${via}.`);
+            setToastVisible(true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to send reply');
+            setToastVisible(true);
+        } finally {
+            setLeadReplySending(false);
         }
     };
 
@@ -14822,6 +14977,117 @@ export default function ClientPage() {
                                 </div>
                             )}
 
+                            {/* Free-hand reply — goes out through Instantly on the lead's latest thread */}
+                            {(selectedLead.campaignsData || []).length > 0 && (() => {
+                                const replyCampaigns = selectedLead.campaignsData || [];
+                                const uploadingCount = leadReplyEditorState.uploading;
+                                const hasContent = !leadReplyEditorState.isEmpty;
+                                const threadReady = Boolean(leadReplyContext?.available);
+                                const canSend = hasContent && threadReady && !leadReplySending && uploadingCount === 0;
+                                const threadHint = (() => {
+                                    if (leadReplyContextLoading && !leadReplyContext) return 'Finding the Instantly thread…';
+                                    if (!leadReplyContext) return null;
+                                    if (leadReplyContext.available) {
+                                        const subject = leadReplyContext.subject?.trim();
+                                        return `Sends from ${leadReplyContext.eaccount || 'the campaign account'}${subject ? ` · “${subject}”` : ''}`;
+                                    }
+                                    if (leadReplyContext.reason === 'no_thread') return 'No Instantly thread for this lead yet — nothing to reply to.';
+                                    if (leadReplyContext.reason === 'missing_instantly_key') return 'Add the client\'s Instantly API key to reply from here.';
+                                    return leadReplyContext.reason || 'Could not resolve the Instantly thread.';
+                                })();
+                                return (
+                                    <div style={{
+                                        borderTop: '1px solid var(--app-border)',
+                                        paddingTop: '0.75rem',
+                                        marginBottom: '1rem',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '0.5rem'
+                                    }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                            <p style={{
+                                                margin: 0,
+                                                fontSize: '0.75rem',
+                                                fontWeight: 600,
+                                                textTransform: 'uppercase',
+                                                letterSpacing: '0.06em',
+                                                color: 'var(--app-text-ghost)'
+                                            }}>Reply</p>
+                                            {replyCampaigns.length > 1 && (
+                                                <AppSelect
+                                                    value={leadReplyEffectiveCampaignId}
+                                                    disabled={leadReplySending}
+                                                    triggerClassName="min-w-[8.75rem] flex-[0_1_220px]"
+                                                    options={replyCampaigns.map((campaign) => ({
+                                                        value: campaign.campaignId,
+                                                        label: campaign.campaignName || campaign.campaignId
+                                                    }))}
+                                                    onChange={setLeadReplyCampaignId}
+                                                />
+                                            )}
+                                        </div>
+                                        <LeadReplyEditor
+                                            ref={leadReplyEditorRef}
+                                            disabled={leadReplySending}
+                                            placeholder="Write a reply… links turn blue as you type; paste, drop or attach images anywhere in the message."
+                                            maxImages={LEAD_REPLY_MAX_IMAGES}
+                                            acceptedMimeTypes={LEAD_REPLY_IMAGE_MIME_TYPES}
+                                            uploadImage={uploadLeadReplyImage}
+                                            onChange={setLeadReplyEditorState}
+                                            onNotice={showLeadReplyNotice}
+                                            onSubmit={handleSendLeadReply}
+                                        />
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                            <input
+                                                ref={leadReplyFileInputRef}
+                                                type="file"
+                                                accept="image/png,image/jpeg,image/gif,image/webp"
+                                                multiple
+                                                hidden
+                                                onChange={(event) => {
+                                                    const files = Array.from(event.target.files || []);
+                                                    event.target.value = '';
+                                                    if (files.length) leadReplyEditorRef.current?.insertImages(files);
+                                                }}
+                                            />
+                                            <button
+                                                type="button"
+                                                className="secondary-button secondary-button--active"
+                                                onClick={() => leadReplyFileInputRef.current?.click()}
+                                                disabled={leadReplySending || leadReplyEditorState.imageCount >= LEAD_REPLY_MAX_IMAGES}
+                                                style={{ flex: '0 0 auto', height: 'auto', minHeight: 0, padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                            >
+                                                Attach image
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className="primary-button"
+                                                onClick={handleSendLeadReply}
+                                                disabled={!canSend}
+                                                title="⌘/Ctrl + Enter"
+                                                style={{ flex: '0 0 auto', height: 'auto', minHeight: 0, padding: '0.4rem 0.9rem', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
+                                            >
+                                                <SendHorizontal size={13} aria-hidden="true" />
+                                                {leadReplySending ? 'Sending…' : uploadingCount > 0 ? 'Uploading…' : 'Send reply'}
+                                            </button>
+                                            {threadHint && (
+                                                <span style={{
+                                                    flex: '1 1 12rem',
+                                                    minWidth: 0,
+                                                    fontSize: '0.72rem',
+                                                    color: threadReady ? 'var(--app-text-ghost)' : 'var(--app-event-warning)',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap'
+                                                }} title={threadHint}>
+                                                    {threadHint}
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })()}
+
                             {/* Events Timeline */}
                             <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: '0.75rem', marginBottom: '0.75rem' }}>
                                 <p style={{
@@ -14847,6 +15113,7 @@ export default function ClientPage() {
                                             subtitle?: string | null;
                                             source?: string | null;
                                             synthetic?: boolean;
+                                            images?: Array<{ url: string; name?: string | null }>;
                                         };
 
                                         const syntheticEvents: TimelineItem[] = [];
@@ -14935,11 +15202,13 @@ export default function ClientPage() {
                                             event_type: evt.event_type || 'unknown',
                                             displayLabel: evt.event_type === 'email_sent' && evt.step != null
                                                 ? `email ${evt.step} sent`
-                                                : evt.event_type === 'interest_status_set' && evt.message_text
-                                                    ? evt.message_text
-                                                    : evt.source === 'manual' && evt.message_text
+                                                : evt.event_type === 'manual_reply_sent'
+                                                    ? 'Reply sent'
+                                                    : evt.event_type === 'interest_status_set' && evt.message_text
                                                         ? evt.message_text
-                                                        : (evt.event_type || 'unknown').replace(/_/g, ' '),
+                                                        : evt.source === 'manual' && evt.message_text
+                                                            ? evt.message_text
+                                                            : (evt.event_type || 'unknown').replace(/_/g, ' '),
                                             event_timestamp: evt.event_timestamp,
                                             campaign_name: evt.campaign_name || null,
                                             lead_email: evt.lead_email || selectedLead.email || null,
@@ -14947,6 +15216,11 @@ export default function ClientPage() {
                                             reply_text_snippet: evt.reply_text_snippet || null,
                                             reply_category: evt.reply_category || null,
                                             source: evt.source || null,
+                                            images: Array.isArray(evt.payload?.images)
+                                                ? (evt.payload.images as Array<{ url?: unknown; name?: unknown }>)
+                                                    .filter((image) => typeof image?.url === 'string' && image.url)
+                                                    .map((image) => ({ url: String(image.url), name: typeof image.name === 'string' ? image.name : null }))
+                                                : undefined,
                                         }));
 
                                         const allEvents = buildCollatedActivityEvents([...realEvents, ...syntheticEvents]);
@@ -14999,7 +15273,7 @@ export default function ClientPage() {
                                                         ? fullContent
                                                         : fullContent.replace(/\n/g, '<br>');
                                                     const preview = snippet || evt.campaign_name || evt.subtitle || (evt.secondaryLabel ? `Includes ${evt.secondaryLabel.toLowerCase()}` : '');
-                                                    const hasDetails = Boolean(fullContent || evt.campaign_name || evt.reply_category || evt.secondaryLabel);
+                                                    const hasDetails = Boolean(fullContent || evt.campaign_name || evt.reply_category || evt.secondaryLabel || evt.images?.length);
                                                     const isExpanded = expandedLeadActivityIds.includes(evt.id);
                                                     const toggleExpanded = () => {
                                                         if (!hasDetails) return;
@@ -15153,6 +15427,36 @@ export default function ClientPage() {
                                                                                 ? <div dangerouslySetInnerHTML={{ __html: htmlToRender }} />
                                                                                 : fullContent
                                                                             }
+                                                                        </div>
+                                                                    )}
+                                                                    {evt.images && evt.images.length > 0 && (
+                                                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                                                                            {evt.images.map((image, imageIdx) => (
+                                                                                <a
+                                                                                    key={`${evt.id}-img-${imageIdx}`}
+                                                                                    href={image.url}
+                                                                                    target="_blank"
+                                                                                    rel="noopener noreferrer"
+                                                                                    title={image.name || 'Attached image'}
+                                                                                    style={{
+                                                                                        width: 72,
+                                                                                        height: 72,
+                                                                                        borderRadius: 8,
+                                                                                        overflow: 'hidden',
+                                                                                        border: '1px solid var(--app-border)',
+                                                                                        background: 'var(--app-surface-3)',
+                                                                                        display: 'block',
+                                                                                        flexShrink: 0
+                                                                                    }}
+                                                                                >
+                                                                                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                                                                                    <img
+                                                                                        src={image.url}
+                                                                                        alt={image.name || 'Attached image'}
+                                                                                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                                                                                    />
+                                                                                </a>
+                                                                            ))}
                                                                         </div>
                                                                     )}
                                                                     {evt.reply_category && (

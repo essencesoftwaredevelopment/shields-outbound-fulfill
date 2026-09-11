@@ -825,7 +825,7 @@ async function resolvePreviousLeadMessageForDraft(db, {
     return fetchRecentThreadMessages(db, contactId, campaignId);
 }
 
-async function fetchLatestThreadMetadata(db, contactId, campaignId) {
+export async function fetchLatestThreadMetadata(db, contactId, campaignId) {
     const [subjectResult, threadReply] = await Promise.all([
         db.query(
             `SELECT COALESCE(
@@ -1128,7 +1128,7 @@ export function resolveInstantlyReplySubject(threadSubject) {
     return asTrimmedText(threadSubject) || 'Re:';
 }
 
-async function fetchInstantlyEmailSubject(apiKey, emailId) {
+export async function fetchInstantlyEmailSubject(apiKey, emailId) {
     const id = asTrimmedText(emailId);
     if (!apiKey || !id) return null;
 
