@@ -13,7 +13,11 @@ import {
     cancelInterestedAutoResponderDraftByToken,
     regenerateInterestedAutoResponderDraftByToken,
     cancelStalePendingReviewDraftsForClient,
+    retryFailedInterestedAutoResponderDraft,
+    dismissFailedInterestedAutoResponderDraft,
+    classifyDraftFailure,
     applyActiveFungiStoryUrlToTemplateVars,
+    FAILED_DRAFT_STATUSES,
     INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES,
     resolveReplyPreviewBehavior,
     withAuditUrlVars
@@ -543,10 +547,101 @@ router.get('/clients/:clientId/interested-autoresponder/drafts/pending-review', 
              LIMIT 50`,
             [clientRow.id, INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES]
         );
-        res.json({ drafts: result.rows });
+
+        // Failed drafts have no review link and nothing retries them — surface the
+        // latest non-cancelled draft per thread while the lead is still interested.
+        const failedResult = await pool.query(
+            `SELECT d.id, d.lead_email, d.eaccount, d.thread_subject, d.status, d.blocked_reason,
+                    d.created_at, d.updated_at,
+                    ic.name AS campaign_name,
+                    cic.interest_status,
+                    cic.interest_status_label,
+                    cic.last_event_type
+             FROM interested_autoresponder_drafts d
+             LEFT JOIN instantly_campaigns ic ON ic.id = d.campaign_id
+             INNER JOIN contact_instantly_campaigns cic
+                 ON cic.contact_id = d.contact_id
+                 AND cic.campaign_id = d.campaign_id
+                 AND cic.active = TRUE
+             WHERE d.client_id = $1
+               AND d.status = ANY($3::text[])
+               AND d.created_at > NOW() - INTERVAL '14 days'
+               AND cic.interest_status = 1
+               AND (
+                   COALESCE(cic.last_event_type, '') = ''
+                   OR LOWER(cic.last_event_type) = ANY($2::text[])
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM interested_autoresponder_drafts later
+                   WHERE later.contact_id = d.contact_id
+                     AND later.campaign_id = d.campaign_id
+                     AND later.id > d.id
+                     AND later.status <> 'cancelled'
+               )
+             ORDER BY d.created_at DESC
+             LIMIT 50`,
+            [clientRow.id, INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES, FAILED_DRAFT_STATUSES]
+        );
+
+        const failedDrafts = failedResult.rows.map((row) => ({
+            ...row,
+            failure: classifyDraftFailure({ status: row.status, reason: row.blocked_reason })
+        }));
+
+        res.json({ drafts: result.rows, failedDrafts });
     } catch (error) {
         console.error('GET pending-review drafts error:', error);
         res.status(500).json({ error: 'Failed to fetch pending review drafts.' });
+    }
+});
+
+router.post('/clients/:clientId/interested-autoresponder/drafts/:draftId/retry', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+
+        const draftId = Number(req.params.draftId);
+        if (!Number.isInteger(draftId) || draftId <= 0) {
+            return res.status(400).json({ error: 'Invalid draft id.' });
+        }
+
+        const result = await retryFailedInterestedAutoResponderDraft({
+            agencyId: req.agencyId,
+            clientRow,
+            draftId,
+            logger: (message) => console.log(message)
+        });
+        res.json(result);
+    } catch (error) {
+        const statusCode = Number(error?.statusCode) || 500;
+        console.error('POST retry failed draft error:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to retry draft.' });
+    }
+});
+
+router.post('/clients/:clientId/interested-autoresponder/drafts/:draftId/dismiss', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+
+        const draftId = Number(req.params.draftId);
+        if (!Number.isInteger(draftId) || draftId <= 0) {
+            return res.status(400).json({ error: 'Invalid draft id.' });
+        }
+
+        const result = await dismissFailedInterestedAutoResponderDraft({
+            agencyId: req.agencyId,
+            clientRow,
+            draftId
+        });
+        res.json(result);
+    } catch (error) {
+        const statusCode = Number(error?.statusCode) || 500;
+        console.error('POST dismiss failed draft error:', error);
+        res.status(statusCode).json({ error: error?.message || 'Failed to dismiss draft.' });
     }
 });
 

@@ -1923,6 +1923,14 @@ export default function ClientPage() {
         review_token: string | null;
         status?: string | null;
         research_step?: string | null;
+        blocked_reason?: string | null;
+        failure?: {
+            service: string | null;
+            kind: string;
+            headline: string;
+            hint: string;
+            raw: string;
+        } | null;
         campaign_name: string | null;
         interest_status?: number | null;
         interest_status_label?: string | null;
@@ -1932,6 +1940,13 @@ export default function ClientPage() {
     };
     const [pendingReviewDrafts, setPendingReviewDrafts] = useState<PendingReviewDraft[]>([]);
     const [pendingReviewDraftsLoading, setPendingReviewDraftsLoading] = useState(false);
+    // Drafts the autoresponder could not produce (no OpenAI credits, missing thread, …):
+    // no review link exists, so they need a manual retry from here.
+    const [failedDrafts, setFailedDrafts] = useState<PendingReviewDraft[]>([]);
+    const [expandedFailedDraftId, setExpandedFailedDraftId] = useState<number | null>(null);
+    const [retryingDraftId, setRetryingDraftId] = useState<number | null>(null);
+    const [dismissingDraftId, setDismissingDraftId] = useState<number | null>(null);
+    const [retryDraftError, setRetryDraftError] = useState<{ id: number; message: string } | null>(null);
     const [expandedDraftId, setExpandedDraftId] = useState<number | null>(null);
     const [animatedPendingDraftIds, setAnimatedPendingDraftIds] = useState<Set<number>>(new Set());
     const previousPendingDraftIdsRef = useRef<Set<number> | null>(null);
@@ -5012,6 +5027,11 @@ export default function ClientPage() {
             const draftRows: PendingReviewDraft[] = (data.drafts || []).filter(
                 (draft: PendingReviewDraft) => isPendingReviewDraftCurrentlyInterested(draft)
             );
+            setFailedDrafts(
+                ((data.failedDrafts || []) as PendingReviewDraft[]).filter(
+                    (draft) => isPendingReviewDraftCurrentlyInterested(draft)
+                )
+            );
             const draftIds = draftRows.map((draft) => draft.id);
             const previousDraftIds = previousPendingDraftIdsRef.current;
 
@@ -5047,6 +5067,52 @@ export default function ClientPage() {
             }
         }
     }, [user, clientId]);
+
+    const retryFailedDraft = useCallback(async (draftId: number) => {
+        if (!user || !clientId || retryingDraftId !== null) return;
+        setRetryingDraftId(draftId);
+        setRetryDraftError(null);
+        try {
+            const token = await getAccessToken();
+            if (!token) return;
+            // Plain fetch: a network-level retry here would re-run generation (OpenAI + audit).
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/drafts/${draftId}/retry`,
+                { method: "POST", headers: { Authorization: `Bearer ${token}` } }
+            );
+            const data = await response.json();
+            if (!response.ok) throw new Error(data?.error || `Retry failed (${response.status})`);
+            if (!data?.created) {
+                setRetryDraftError({ id: draftId, message: `Still failing: ${data?.reason || "unknown"}` });
+            }
+        } catch (error) {
+            setRetryDraftError({ id: draftId, message: error instanceof Error ? error.message : "Retry failed" });
+        } finally {
+            setRetryingDraftId(null);
+            fetchPendingReviewDrafts(false);
+        }
+    }, [user, clientId, retryingDraftId, fetchPendingReviewDrafts]);
+
+    const dismissFailedDraft = useCallback(async (draftId: number) => {
+        if (!user || !clientId || dismissingDraftId !== null) return;
+        setDismissingDraftId(draftId);
+        setRetryDraftError(null);
+        try {
+            const token = await getAccessToken();
+            if (!token) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/drafts/${draftId}/dismiss`,
+                { method: "POST", headers: { Authorization: `Bearer ${token}` } }
+            );
+            const data = await response.json();
+            if (!response.ok) throw new Error(data?.error || `Dismiss failed (${response.status})`);
+            setFailedDrafts((prev) => prev.filter((draft) => draft.id !== draftId));
+        } catch (error) {
+            setRetryDraftError({ id: draftId, message: error instanceof Error ? error.message : "Dismiss failed" });
+        } finally {
+            setDismissingDraftId(null);
+        }
+    }, [user, clientId, dismissingDraftId]);
 
     useEffect(() => {
         if (jobState) {
@@ -9661,20 +9727,159 @@ export default function ClientPage() {
                             }}>
                                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingBottom: "15px" }}>
                                     <p className="eyebrow eyebrow--muted" style={{ margin: 0 }}>Pending Review</p>
-                                    {pendingReviewDrafts.length > 0 && (
-                                        <span style={{
-                                            fontSize: "0.7rem",
-                                            fontWeight: 600,
-                                            color: "var(--app-evtpill-purple)",
-                                            background: "rgba(139,92,246,0.12)",
-                                            border: "1px solid rgba(139,92,246,0.25)",
-                                            borderRadius: "999px",
-                                            padding: "0.1rem 0.5rem",
-                                        }}>
-                                            {pendingReviewDrafts.length}
-                                        </span>
-                                    )}
+                                    <div style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
+                                        {failedDrafts.length > 0 && (
+                                            <span title={`${failedDrafts.length} draft${failedDrafts.length === 1 ? "" : "s"} failed to generate`} style={{
+                                                fontSize: "0.7rem",
+                                                fontWeight: 600,
+                                                color: "var(--app-evtpill-red)",
+                                                background: "rgba(239,68,68,0.12)",
+                                                border: "1px solid rgba(239,68,68,0.25)",
+                                                borderRadius: "999px",
+                                                padding: "0.1rem 0.5rem",
+                                            }}>
+                                                {failedDrafts.length} failed
+                                            </span>
+                                        )}
+                                        {pendingReviewDrafts.length > 0 && (
+                                            <span style={{
+                                                fontSize: "0.7rem",
+                                                fontWeight: 600,
+                                                color: "var(--app-evtpill-purple)",
+                                                background: "rgba(139,92,246,0.12)",
+                                                border: "1px solid rgba(139,92,246,0.25)",
+                                                borderRadius: "999px",
+                                                padding: "0.1rem 0.5rem",
+                                            }}>
+                                                {pendingReviewDrafts.length}
+                                            </span>
+                                        )}
+                                    </div>
                                 </div>
+                                {failedDrafts.length > 0 && (
+                                    <div style={{
+                                        marginBottom: "0.9rem",
+                                        padding: "0.6rem 0.75rem",
+                                        borderRadius: "12px",
+                                        background: "rgba(239,68,68,0.06)",
+                                        border: "1px solid rgba(239,68,68,0.25)",
+                                    }}>
+                                        <p style={{ margin: "0 0 0.45rem", fontSize: "0.72rem", fontWeight: 600, color: "var(--app-evtpill-red)", letterSpacing: "0.02em" }}>
+                                            Needs attention — no reply was drafted
+                                        </p>
+                                        <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+                                            {failedDrafts.map((draft, idx) => {
+                                                const isExpanded = expandedFailedDraftId === draft.id;
+                                                const isRetrying = retryingDraftId === draft.id;
+                                                const isDismissing = dismissingDraftId === draft.id;
+                                                const actionsBusy = retryingDraftId !== null || dismissingDraftId !== null;
+                                                const draftDate = new Date(draft.created_at);
+                                                const timeStr = Number.isNaN(draftDate.getTime()) ? "" : draftDate.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                                                const dateStr = Number.isNaN(draftDate.getTime()) ? "" : draftDate.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+                                                const failureHeadline = draft.failure?.headline
+                                                    || (draft.status === "blocked_missing_thread" ? "Instantly thread metadata missing" : "Draft generation failed");
+                                                const failureHint = draft.failure?.hint || null;
+                                                const failureDetail = draft.failure?.raw || draft.blocked_reason || null;
+                                                const retryError = retryDraftError?.id === draft.id ? retryDraftError.message : null;
+
+                                                return (
+                                                    <div
+                                                        key={draft.id}
+                                                        style={{
+                                                            borderTop: idx > 0 ? "1px solid rgba(239,68,68,0.18)" : "none",
+                                                            padding: "0.5rem 0",
+                                                            display: "flex",
+                                                            flexDirection: "column",
+                                                            gap: "0.2rem",
+                                                            cursor: "pointer",
+                                                        }}
+                                                        onClick={() => setExpandedFailedDraftId(isExpanded ? null : draft.id)}
+                                                    >
+                                                        <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                                                            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#ef4444", flexShrink: 0 }} />
+                                                            <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "var(--app-text-high)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                                                {draft.lead_email}
+                                                            </span>
+                                                            <span style={{ fontSize: "0.7rem", color: "var(--app-text-ghost)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>
+                                                                {dateStr} {timeStr}
+                                                            </span>
+                                                        </div>
+                                                        {draft.campaign_name && (
+                                                            <p style={{ margin: 0, fontSize: "0.72rem", color: "var(--app-text-ghost)", paddingLeft: "16px" }}>
+                                                                {draft.campaign_name}
+                                                            </p>
+                                                        )}
+                                                        <p style={{ margin: 0, fontSize: "0.76rem", fontWeight: 600, color: "var(--app-error-text)", lineHeight: 1.4, paddingLeft: "16px" }}>
+                                                            {failureHeadline}
+                                                        </p>
+                                                        {failureHint && (
+                                                            <p style={{
+                                                                margin: 0,
+                                                                fontSize: "0.72rem",
+                                                                color: "var(--app-text-faint)",
+                                                                lineHeight: 1.45,
+                                                                paddingLeft: "16px",
+                                                                wordBreak: "break-word",
+                                                                ...(isExpanded ? {} : { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const, overflow: "hidden" }),
+                                                            }}>
+                                                                {failureHint}
+                                                            </p>
+                                                        )}
+                                                        {isExpanded && failureDetail && (
+                                                            <p style={{ margin: "0.15rem 0 0", fontSize: "0.7rem", color: "var(--app-text-ghost)", lineHeight: 1.45, paddingLeft: "16px", wordBreak: "break-word", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                                                                {failureDetail}
+                                                            </p>
+                                                        )}
+                                                        {retryError && (
+                                                            <p style={{ margin: 0, fontSize: "0.72rem", color: "var(--app-error-text)", paddingLeft: "16px" }}>
+                                                                {retryError}
+                                                            </p>
+                                                        )}
+                                                        <div style={{ paddingLeft: "16px", marginTop: "0.3rem", display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                                                            <button
+                                                                type="button"
+                                                                disabled={actionsBusy}
+                                                                onClick={(e) => { e.stopPropagation(); retryFailedDraft(draft.id); }}
+                                                                style={{
+                                                                    fontSize: "0.75rem",
+                                                                    fontWeight: 600,
+                                                                    color: "var(--app-evtpill-red)",
+                                                                    background: "transparent",
+                                                                    border: "1px solid rgba(239,68,68,0.35)",
+                                                                    borderRadius: "999px",
+                                                                    padding: "0.15rem 0.6rem",
+                                                                    cursor: actionsBusy ? "not-allowed" : "pointer",
+                                                                    opacity: actionsBusy && !isRetrying ? 0.5 : 1,
+                                                                }}
+                                                            >
+                                                                {isRetrying ? "Retrying…" : "Retry draft"}
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                disabled={actionsBusy}
+                                                                title="Hide this failure without retrying"
+                                                                onClick={(e) => { e.stopPropagation(); dismissFailedDraft(draft.id); }}
+                                                                style={{
+                                                                    fontSize: "0.75rem",
+                                                                    fontWeight: 500,
+                                                                    color: "var(--app-text-faint)",
+                                                                    background: "transparent",
+                                                                    border: "1px solid transparent",
+                                                                    borderRadius: "999px",
+                                                                    padding: "0.15rem 0.5rem",
+                                                                    cursor: actionsBusy ? "not-allowed" : "pointer",
+                                                                    opacity: actionsBusy && !isDismissing ? 0.5 : 1,
+                                                                }}
+                                                            >
+                                                                {isDismissing ? "Dismissing…" : "Dismiss"}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                )}
                                 {pendingReviewDraftsLoading && pendingReviewDrafts.length === 0 ? (
                                     <div className="pipeline-panel__empty">
                                         <svg className="spinner" style={{ width: "24px", height: "24px", color: "#8b5cf6" }} viewBox="0 0 24 24" fill="none">

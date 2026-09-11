@@ -19,7 +19,9 @@ import { getAgencySettings, apiKeysFromSettings } from '../db/agencySettings.js'
 import { resolveTemplateVars, renderTemplate } from '../followUpSender.js';
 import {
     applyActiveFungiStoryUrlToTemplateVars,
+    buildClientAutoresponderUrl,
     buildReviewUrl,
+    classifyDraftFailure,
     domainFromLeadEmail,
     fetchAgencyAndClientSettings,
     fetchPromptConfig,
@@ -30,6 +32,7 @@ import {
     humanizeDomainAsCompanyName,
     normalizeAuditDomain,
     resolveContactSignalContext,
+    sendNtfyDraftFailureNotification,
     sendNtfyNotification,
     withAuditUrlVars
 } from '../interestedAutoResponder.js';
@@ -657,5 +660,36 @@ export async function handleResearchFailure({ draftId, agencyId }, errorInfo) {
     console.error(
         `[interested-research] run failed draft=${draftId} marked=${result.rowCount > 0}: ${message}`
     );
+    if (result.rowCount > 0) {
+        await notifyResearchDraftFailure(draftId, message);
+    }
     return { marked: result.rowCount > 0 };
+}
+
+/** Same client ntfy channel as the review push; best-effort so the failure handler never throws. */
+async function notifyResearchDraftFailure(draftId, reason) {
+    try {
+        const lookup = await pool.query(
+            `SELECT d.lead_email, d.client_id, c.ntfy_topic, ic.name AS campaign_name
+             FROM interested_autoresponder_drafts d
+             JOIN clients c ON c.id = d.client_id
+             LEFT JOIN instantly_campaigns ic ON ic.id = d.campaign_id
+             WHERE d.id = $1
+             LIMIT 1`,
+            [draftId]
+        );
+        const row = lookup.rows[0];
+        const topic = String(row?.ntfy_topic || '').trim();
+        if (!row || !topic) return;
+        await sendNtfyDraftFailureNotification(topic, {
+            leadEmail: row.lead_email,
+            campaignName: row.campaign_name,
+            failure: classifyDraftFailure({ status: 'generation_failed', reason }),
+            clientUrl: buildClientAutoresponderUrl(row.client_id)
+        });
+    } catch (error) {
+        console.error(
+            `[interested-research] ntfy failure alert failed draft=${draftId}: ${error?.message || error}`
+        );
+    }
 }

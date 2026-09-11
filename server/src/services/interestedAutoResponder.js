@@ -535,6 +535,14 @@ export function buildReviewUrl(token) {
     return `${getPublicAppBaseUrl()}/interested-autoresponder/${encodeURIComponent(token)}`;
 }
 
+/** Client analytics tab — where failed drafts surface with a Retry action. */
+export function buildClientAutoresponderUrl(clientId) {
+    return `${getPublicAppBaseUrl()}/clients/${encodeURIComponent(String(clientId))}?tab=analytics`;
+}
+
+/** Statuses a human must act on: no review link exists and nothing retries them automatically. */
+export const FAILED_DRAFT_STATUSES = ['generation_failed', 'blocked_missing_thread'];
+
 /**
  * Vulcan campaign prompts use a bare `AUDIT_URL` token (and sometimes `[AUDIT_URL]`)
  * as the audit href. If generation didn't receive a real URL, the model copies the
@@ -1149,6 +1157,173 @@ export async function sendNtfyNotification(topic, { leadEmail, campaignName, rev
     return { notified: true };
 }
 
+const OPENAI_BILLING_URL = 'https://platform.openai.com/settings/organization/billing';
+
+/**
+ * Turn a raw draft failure into "which service, what's wrong, how to fix it" for the
+ * UI and ntfy. Works from the stored `blocked_reason` text alone (historical rows) and
+ * uses the SDK error object when one is available. Popup/audit helpers never throw, so
+ * a generation error is OpenAI or the database unless proven otherwise.
+ */
+export function classifyDraftFailure({ status = null, reason = null, error = null } = {}) {
+    const text = String(reason || error?.message || '').trim();
+    const lower = text.toLowerCase();
+    const raw = text || 'Unknown error';
+    const code = String(error?.code || error?.error?.code || '').toLowerCase();
+    const httpStatus = Number(error?.status) || Number((/^(\d{3})\b/.exec(text) || [])[1]) || null;
+
+    if (status === 'blocked_missing_thread' || lower === 'missing_thread_metadata') {
+        return {
+            service: 'Instantly',
+            kind: 'missing_thread',
+            headline: 'Instantly thread metadata missing',
+            hint: 'The reply-to id / sending mailbox for this thread has not synced yet. Retry after the next Instantly sync.',
+            raw
+        };
+    }
+    if (lower.includes('no openai api key')) {
+        return {
+            service: 'OpenAI',
+            kind: 'missing_key',
+            headline: 'OpenAI API key not configured',
+            hint: 'Add an OpenAI API key in agency settings, then retry.',
+            raw
+        };
+    }
+
+    const isOpenAiSdkError = typeof OpenAI?.APIError === 'function' && error instanceof OpenAI.APIError;
+    const openAiPhrases = [
+        'no credits remaining', 'exceeded your current quota', 'insufficient_quota',
+        'incorrect api key', 'invalid api key', 'invalid_api_key',
+        'rate limit reached', 'model_not_found', 'does not exist or you do not have access'
+    ];
+    const isOpenAi = isOpenAiSdkError
+        || lower.includes('openai')
+        || openAiPhrases.some((phrase) => lower.includes(phrase));
+
+    if (isOpenAi) {
+        if (
+            code === 'insufficient_quota'
+            || lower.includes('no credits remaining')
+            || lower.includes('exceeded your current quota')
+            || lower.includes('insufficient_quota')
+        ) {
+            return {
+                service: 'OpenAI',
+                kind: 'out_of_credits',
+                headline: 'OpenAI is out of credits',
+                hint: `Add credits to the agency's OpenAI organisation (${OPENAI_BILLING_URL}), then retry.`,
+                raw
+            };
+        }
+        if (httpStatus === 401 || code === 'invalid_api_key' || lower.includes('incorrect api key') || lower.includes('invalid api key')) {
+            return {
+                service: 'OpenAI',
+                kind: 'invalid_key',
+                headline: 'OpenAI API key rejected',
+                hint: 'The agency OpenAI key is invalid or revoked. Update it in agency settings, then retry.',
+                raw
+            };
+        }
+        if (httpStatus === 429 || code === 'rate_limit_exceeded' || lower.includes('rate limit')) {
+            return {
+                service: 'OpenAI',
+                kind: 'rate_limited',
+                headline: 'OpenAI rate limit hit',
+                hint: 'Temporary — retry in a few minutes.',
+                raw
+            };
+        }
+        if (httpStatus === 404 || code === 'model_not_found' || lower.includes('does not exist')) {
+            return {
+                service: 'OpenAI',
+                kind: 'model_unavailable',
+                headline: 'OpenAI model unavailable',
+                hint: 'The configured model is not available to this key. Check the model setting and key access.',
+                raw
+            };
+        }
+        if (httpStatus && httpStatus >= 500) {
+            return {
+                service: 'OpenAI',
+                kind: 'upstream_error',
+                headline: 'OpenAI service error',
+                hint: 'Temporary OpenAI outage — retry shortly.',
+                raw
+            };
+        }
+        return {
+            service: 'OpenAI',
+            kind: 'error',
+            headline: 'OpenAI request failed',
+            hint: 'Retry; if it keeps failing, check the agency OpenAI key and model.',
+            raw
+        };
+    }
+
+    return {
+        service: null,
+        kind: 'error',
+        headline: 'Draft generation failed',
+        hint: 'Retry; if it keeps failing, check the server logs for this draft.',
+        raw
+    };
+}
+
+/**
+ * Same client channel as the review push, so an out-of-credits key or a broken
+ * prompt is caught on the first interested lead instead of silently piling up.
+ * Leads with the cause ("OpenAI is out of credits") so it reads at a glance.
+ */
+export async function sendNtfyDraftFailureNotification(topic, { leadEmail, campaignName, failure = null, reason = null, clientUrl }) {
+    if (!topic) return { notified: false, reason: 'missing_topic' };
+
+    const classified = failure || classifyDraftFailure({ reason });
+    // HTTP header values must be Latin-1; the body is UTF-8 and can carry anything.
+    const title = `${classified.headline} - no reply drafted for ${leadEmail}`.replace(/[^\x20-\xFF]/g, '?');
+
+    const response = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Title': title,
+            'Tags': 'warning,robot_face',
+            'Priority': 'high',
+            ...(clientUrl ? { 'Click': clientUrl } : {})
+        },
+        body: [
+            `Cause: ${classified.headline}`,
+            `Fix: ${classified.hint}`,
+            `Lead: ${leadEmail}`,
+            `Campaign: ${campaignName || 'Unknown campaign'}`,
+            `Detail: ${String(classified.raw || 'unknown').slice(0, 300)}`,
+            clientUrl ? `Retry / dismiss on the client page: ${clientUrl}` : null
+        ].filter(Boolean).join('\n')
+    });
+
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`ntfy failure notification failed (${response.status}): ${text || response.statusText}`);
+    }
+
+    return { notified: true };
+}
+
+/** Best-effort: a notification error must never mask the original draft failure. */
+async function notifyDraftGenerationFailure({ ntfyTopic, clientId, leadEmail, campaignName, reason, error = null, draftId, logger = () => {} }) {
+    if (!ntfyTopic) return;
+    try {
+        await sendNtfyDraftFailureNotification(ntfyTopic, {
+            leadEmail,
+            campaignName,
+            failure: classifyDraftFailure({ status: 'generation_failed', reason, error }),
+            clientUrl: buildClientAutoresponderUrl(clientId)
+        });
+    } catch (notifyError) {
+        logger(`[interested-autoresponder] ntfy failure alert failed for draft=${draftId}: ${notifyError.message}`);
+    }
+}
+
 /** Instantly POST /emails/reply requires `subject`; use thread subject or a minimal fallback. */
 export function resolveInstantlyReplySubject(threadSubject) {
     return asTrimmedText(threadSubject) || 'Re:';
@@ -1558,6 +1733,15 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 model: DEFAULT_MODEL,
                 rendered_text: null
             });
+            await notifyDraftGenerationFailure({
+                ntfyTopic: settings.ntfyTopic,
+                clientId,
+                leadEmail: normalizedLeadEmail,
+                campaignName: promptConfig.campaign_name,
+                reason: 'No OpenAI API key configured for this agency',
+                draftId: failedDraft?.id,
+                logger
+            });
             return { created: false, reason: 'missing_openai_key', draftId: failedDraft?.id || null };
         }
 
@@ -1703,6 +1887,17 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 model: DEFAULT_MODEL,
                 rendered_text: null
             });
+            logger(`[interested-autoresponder] generation failed draft=${failedDraft?.id} contact=${contactId}: ${error.message}`);
+            await notifyDraftGenerationFailure({
+                ntfyTopic: settings.ntfyTopic,
+                clientId,
+                leadEmail: normalizedLeadEmail,
+                campaignName: promptConfig.campaign_name,
+                reason: error.message || 'generation_failed',
+                error,
+                draftId: failedDraft?.id,
+                logger
+            });
             return { created: false, reason: 'generation_failed', draftId: failedDraft?.id || null };
         }
 
@@ -1751,6 +1946,80 @@ export async function createInterestedAutoResponderDraftFromEvent({
     } finally {
         client.release();
     }
+}
+
+/**
+ * Re-run drafting for a failed draft from its original source event (same path the
+ * webhook takes). The failed row is cancelled only once a replacement row exists, so a
+ * retry that fails again leaves exactly one visible failure per thread.
+ */
+export async function retryFailedInterestedAutoResponderDraft({ agencyId, clientRow, draftId, logger = () => {} }) {
+    const draftResult = await pool.query(
+        `SELECT id, campaign_id, contact_id, instantly_lead_id, source_event_id, lead_email, status
+         FROM interested_autoresponder_drafts
+         WHERE id = $1
+           AND agency_id = $2
+           AND client_id = $3
+           AND status = ANY($4::text[])
+         LIMIT 1`,
+        [draftId, agencyId, clientRow.id, FAILED_DRAFT_STATUSES]
+    );
+    const failedDraft = draftResult.rows[0];
+    if (!failedDraft) {
+        const error = new Error('Failed draft not found.');
+        error.statusCode = 404;
+        throw error;
+    }
+
+    const result = await createInterestedAutoResponderDraftFromEvent({
+        agencyId,
+        clientSlug: clientRow.slug,
+        clientId: clientRow.id,
+        campaignId: failedDraft.campaign_id,
+        contactId: failedDraft.contact_id,
+        instantlyLeadId: failedDraft.instantly_lead_id,
+        sourceEventId: failedDraft.source_event_id,
+        leadEmail: failedDraft.lead_email,
+        logger
+    });
+
+    // blocked_missing_thread is an open status and is already superseded inside the
+    // create call; generation_failed is terminal and needs explicit retirement.
+    if (result.draftId && result.draftId !== failedDraft.id) {
+        await pool.query(
+            `UPDATE interested_autoresponder_drafts
+             SET status = 'cancelled',
+                 blocked_reason = 'retried',
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = ANY($2::text[])`,
+            [failedDraft.id, FAILED_DRAFT_STATUSES]
+        );
+    }
+
+    return { retriedDraftId: failedDraft.id, ...result };
+}
+
+/** Hide a failed draft from the review list without retrying (e.g. lead handled manually in Instantly). */
+export async function dismissFailedInterestedAutoResponderDraft({ agencyId, clientRow, draftId }) {
+    const result = await pool.query(
+        `UPDATE interested_autoresponder_drafts
+         SET status = 'cancelled',
+             blocked_reason = 'dismissed',
+             updated_at = NOW()
+         WHERE id = $1
+           AND agency_id = $2
+           AND client_id = $3
+           AND status = ANY($4::text[])
+         RETURNING id`,
+        [draftId, agencyId, clientRow.id, FAILED_DRAFT_STATUSES]
+    );
+    if (!result.rowCount) {
+        const error = new Error('Failed draft not found.');
+        error.statusCode = 404;
+        throw error;
+    }
+    return { dismissed: true, draftId: result.rows[0].id };
 }
 
 async function loadDraftByReviewToken(token) {
