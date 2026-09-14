@@ -1442,7 +1442,7 @@ function asNullableInt(value) {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
-async function hasOpenInterestedAutoresponderDraft(db, contactId, campaignId) {
+export async function hasOpenInterestedAutoresponderDraft(db, contactId, campaignId) {
     const result = await db.query(
         `SELECT 1
          FROM interested_autoresponder_drafts
@@ -1667,6 +1667,14 @@ export async function createInterestedAutoResponderDraftFromEvent({
         ]);
 
         if (!promptConfig) {
+            // No draft row is written here on purpose — campaigns without a prompt
+            // are not meant to autorespond, so failure rows would be pure noise.
+            // Log it, otherwise an interested lead on a campaign that *should* have
+            // a prompt is dropped without a trace anywhere.
+            logger(
+                `[interested-autoresponder] no active prompt — skipped draft for`
+                + ` contact=${contactId} campaign=${campaignId} event=${sourceEventId}`
+            );
             return { created: false, reason: 'missing_active_prompt' };
         }
 

@@ -45,6 +45,10 @@ import {
     uploadLeadReplyImage
 } from '../services/leadManualReply.js';
 import { getWarmFollowUpState, removeContactFromWarmFollowUps } from '../services/followUpSender.js';
+import {
+    createInterestedAutoResponderDraftFromEvent,
+    hasOpenInterestedAutoresponderDraft
+} from '../services/interestedAutoResponder.js';
 
 const uploadVerification = multer({
     storage: multer.memoryStorage(),
@@ -3592,12 +3596,61 @@ router.post('/leads/:contactId/instantly-interest-status', verifyFirebaseToken, 
         );
 
         const eventRow = insertEventResult.rows[0] || null;
+
+        // Marking a lead Interested by hand carries the same intent as Instantly's
+        // lead_interested webhook, so draft a reply here too. Without this, a lead
+        // the team flags manually — because Instantly never fired the webhook, or
+        // fired it before the campaign had an active prompt — silently never gets
+        // a draft, and nothing shows up in the failed list either.
+        let autoresponder = null;
+        if (eventRow?.id && eventType === 'lead_interested') {
+            try {
+                if (await hasOpenInterestedAutoresponderDraft(pool, contactId, membership.campaign_id)) {
+                    autoresponder = { created: false, reason: 'open_draft_exists' };
+                } else {
+                    // Anchor the lead's message on their actual reply: the event we
+                    // just wrote carries the status label as its text, not the email.
+                    const replyEvent = await pool.query(
+                        `SELECT id FROM contact_instantly_events
+                         WHERE contact_id = $1
+                           AND campaign_id = $2
+                           AND event_type = 'reply_received'
+                         ORDER BY event_timestamp DESC NULLS LAST, created_at DESC NULLS LAST
+                         LIMIT 1`,
+                        [contactId, membership.campaign_id]
+                    );
+                    const result = await createInterestedAutoResponderDraftFromEvent({
+                        agencyId,
+                        clientSlug: clientRow.slug,
+                        clientId: clientRow.id,
+                        campaignId: membership.campaign_id,
+                        contactId,
+                        instantlyLeadId: membership.instantly_lead_id,
+                        sourceEventId: eventRow.id,
+                        replySourceEventId: replyEvent.rows[0]?.id || null,
+                        leadEmail,
+                        logger: (message) => console.log(message)
+                    });
+                    autoresponder = {
+                        created: Boolean(result.created),
+                        researching: Boolean(result.researching),
+                        reason: result.reason || null
+                    };
+                }
+            } catch (draftError) {
+                // Never fail the status update because drafting failed.
+                console.error('Manual interest autoresponder draft failed:', draftError?.message || draftError);
+                autoresponder = { created: false, reason: 'draft_error' };
+            }
+        }
+
         res.json({
             interest_status: interestValue,
             interest_status_label: interestStatusLabel,
             label,
             campaign_id: membership.instantly_campaign_id,
-            event: eventRow
+            event: eventRow,
+            autoresponder
         });
     } catch (error) {
         const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
