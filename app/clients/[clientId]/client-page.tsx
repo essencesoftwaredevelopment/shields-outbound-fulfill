@@ -2516,6 +2516,9 @@ export default function ClientPage() {
     const [leadReplySending, setLeadReplySending] = useState(false);
     const [leadReplyContext, setLeadReplyContext] = useState<LeadReplyContext | null>(null);
     const [leadReplyContextLoading, setLeadReplyContextLoading] = useState(false);
+    // Forced autoresponder draft for the open lead (independent of the interested webhook).
+    const [generatingLeadDraft, setGeneratingLeadDraft] = useState(false);
+    const [leadDraftResult, setLeadDraftResult] = useState<{ ok: boolean; message: string; reviewUrl?: string | null } | null>(null);
     const leadReplyEditorRef = useRef<LeadReplyEditorHandle | null>(null);
     const leadReplyFileInputRef = useRef<HTMLInputElement | null>(null);
     // Automated warm follow-up sequence state for the open lead (null until loaded).
@@ -2568,6 +2571,7 @@ export default function ClientPage() {
         setLeadReplyCampaignId(campaigns[0]?.campaignId || '');
         leadReplyEditorRef.current?.clear();
         setLeadReplyContext(null);
+        setLeadDraftResult(null);
     }, [selectedLead?.id]);
 
     // The reply campaign, guarded against a stale pick from the previous lead
@@ -2742,6 +2746,8 @@ export default function ClientPage() {
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
     const [instantlyCampaigns, setInstantlyCampaigns] = useState<Array<{ id: string; name: string }>>([]);
     const [instantlyCampaignsLoading, setInstantlyCampaignsLoading] = useState(false);
+    const [refreshingCampaigns, setRefreshingCampaigns] = useState(false);
+    const [campaignRefreshMessage, setCampaignRefreshMessage] = useState("");
 
     // Segments state
     const [segments, setSegments] = useState<Segment[]>([]);
@@ -3640,6 +3646,41 @@ export default function ClientPage() {
             stopInstantlySyncPolling();
         };
     }, [user?.id, clientId, agencyId, stopInstantlySyncPolling]);
+
+    // Pull the latest campaigns from Instantly, then reload the local list
+    const handleRefreshCampaigns = useCallback(async () => {
+        if (!clientId || !agencyId || refreshingCampaigns) return;
+        setRefreshingCampaigns(true);
+        setCampaignRefreshMessage("");
+        try {
+            const resp = await apiFetch(`/api/clients/${encodeURIComponent(clientId)}/campaigns`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
+            });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data.error || `Sync failed (${resp.status})`);
+            }
+
+            const campaignsPayload = await apiFetch(
+                `/api/clients/${encodeURIComponent(clientId)}/campaigns/list?agencyId=${encodeURIComponent(agencyId)}`
+            ).then((r) => r.json());
+            const campaignRows = (campaignsPayload.campaigns || []).map((row: { id: string | number; name: string; status?: number }) => ({
+                id: String(row.id),
+                name: row.name || String(row.id),
+                status: Number(row.status ?? 0),
+                createdAt: "",
+                totalLeads: 0,
+            })) as Campaign[];
+            setCampaigns(campaignRows);
+            setCampaignRefreshMessage(`Synced ${campaignRows.length} campaign${campaignRows.length === 1 ? "" : "s"}.`);
+        } catch (err) {
+            setCampaignRefreshMessage(err instanceof Error ? err.message : "Failed to refresh campaigns");
+        } finally {
+            setRefreshingCampaigns(false);
+        }
+    }, [clientId, agencyId, refreshingCampaigns]);
 
     useEffect(() => {
         setClientTotalLeads(0);
@@ -5092,6 +5133,45 @@ export default function ClientPage() {
             fetchPendingReviewDrafts(false);
         }
     }, [user, clientId, retryingDraftId, fetchPendingReviewDrafts]);
+
+    /**
+     * Draft an autoresponder reply for the open lead on demand, from its
+     * Instantly thread — the webhook only drafts for leads Instantly flagged
+     * interested. Supersedes any open draft on the same thread.
+     */
+    const handleForceGenerateLeadDraft = useCallback(async (contactId: string | number, campaignId: string) => {
+        if (!user || !clientId || generatingLeadDraft) return;
+        setGeneratingLeadDraft(true);
+        setLeadDraftResult(null);
+        try {
+            const token = await getAccessToken();
+            if (!token) return;
+            // Plain fetch: a network-level retry here would re-run generation (OpenAI + audit).
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/interested-autoresponder/leads/${encodeURIComponent(String(contactId))}/generate`,
+                {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ campaignId })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.error || `Draft failed (${response.status})`);
+            setLeadDraftResult({
+                ok: true,
+                message: data?.researching ? 'Researching the lead — the draft appears once it finishes.' : 'Draft ready for review.',
+                reviewUrl: data?.reviewUrl || null
+            });
+        } catch (error) {
+            setLeadDraftResult({
+                ok: false,
+                message: error instanceof Error ? error.message : 'Failed to generate a draft.'
+            });
+        } finally {
+            setGeneratingLeadDraft(false);
+            fetchPendingReviewDrafts(false);
+        }
+    }, [user, clientId, generatingLeadDraft, fetchPendingReviewDrafts]);
 
     const dismissFailedDraft = useCallback(async (draftId: number) => {
         if (!user || !clientId || dismissingDraftId !== null) return;
@@ -10029,6 +10109,20 @@ export default function ClientPage() {
                                     >
                                         📤 Upload Leads
                                     </button>
+                                    <button
+                                        type="button"
+                                        className="secondary-button secondary-button--active"
+                                        onClick={handleRefreshCampaigns}
+                                        disabled={refreshingCampaigns || !agencyId}
+                                        title="Pull the latest campaigns from Instantly"
+                                    >
+                                        {refreshingCampaigns ? "Refreshing…" : "🔄 Refresh Campaigns"}
+                                    </button>
+                                    {campaignRefreshMessage && (
+                                        <span className="eyebrow eyebrow--muted" aria-live="polite">
+                                            {campaignRefreshMessage}
+                                        </span>
+                                    )}
                                 </div>
                             </div>
 
@@ -15361,19 +15455,53 @@ export default function ClientPage() {
                                                 letterSpacing: '0.06em',
                                                 color: 'var(--app-text-ghost)'
                                             }}>Reply</p>
-                                            {replyCampaigns.length > 1 && (
-                                                <AppSelect
-                                                    value={leadReplyEffectiveCampaignId}
-                                                    disabled={leadReplySending}
-                                                    triggerClassName="min-w-[8.75rem] flex-[0_1_220px]"
-                                                    options={replyCampaigns.map((campaign) => ({
-                                                        value: campaign.campaignId,
-                                                        label: campaign.campaignName || campaign.campaignId
-                                                    }))}
-                                                    onChange={setLeadReplyCampaignId}
-                                                />
-                                            )}
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                                <button
+                                                    type="button"
+                                                    className="secondary-button secondary-button--active"
+                                                    onClick={() => handleForceGenerateLeadDraft(selectedLead.id, leadReplyEffectiveCampaignId)}
+                                                    disabled={generatingLeadDraft || leadReplySending || !leadReplyEffectiveCampaignId}
+                                                    title="Draft an autoresponder reply from this thread, even if the lead was never marked interested"
+                                                    style={{ flex: '0 0 auto', height: 'auto', minHeight: 0, padding: '0.25rem 0.6rem', fontSize: '0.72rem' }}
+                                                >
+                                                    {generatingLeadDraft ? 'Drafting…' : '✨ Generate draft'}
+                                                </button>
+                                                {replyCampaigns.length > 1 && (
+                                                    <AppSelect
+                                                        value={leadReplyEffectiveCampaignId}
+                                                        disabled={leadReplySending || generatingLeadDraft}
+                                                        triggerClassName="min-w-[8.75rem] flex-[0_1_220px]"
+                                                        options={replyCampaigns.map((campaign) => ({
+                                                            value: campaign.campaignId,
+                                                            label: campaign.campaignName || campaign.campaignId
+                                                        }))}
+                                                        onChange={setLeadReplyCampaignId}
+                                                    />
+                                                )}
+                                            </div>
                                         </div>
+                                        {leadDraftResult && (
+                                            <div style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: '0.4rem',
+                                                flexWrap: 'wrap',
+                                                fontSize: '0.72rem',
+                                                color: leadDraftResult.ok ? 'var(--app-text-ghost)' : 'var(--app-event-warning)'
+                                            }} aria-live="polite">
+                                                <span>{leadDraftResult.message}</span>
+                                                {leadDraftResult.ok && leadDraftResult.reviewUrl && (
+                                                    <a
+                                                        href={leadDraftResult.reviewUrl}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        style={{ color: 'var(--app-link, #3b82f6)', textDecoration: 'underline' }}
+                                                    >
+                                                        Open review
+                                                    </a>
+                                                )}
+                                            </div>
+                                        )}
                                         <LeadReplyEditor
                                             ref={leadReplyEditorRef}
                                             disabled={leadReplySending}

@@ -13,6 +13,8 @@ import {
     cancelInterestedAutoResponderDraftByToken,
     regenerateInterestedAutoResponderDraftByToken,
     cancelStalePendingReviewDraftsForClient,
+    createInterestedAutoResponderDraftFromEvent,
+    fetchPromptConfig,
     retryFailedInterestedAutoResponderDraft,
     dismissFailedInterestedAutoResponderDraft,
     classifyDraftFailure,
@@ -23,6 +25,7 @@ import {
     withAuditUrlVars
 } from '../services/interestedAutoResponder.js';
 import { resolveTemplateVars, renderTemplate } from '../services/followUpSender.js';
+import { resolveLeadCampaignMembership, resolveLeadReplyThread } from '../services/leadManualReply.js';
 
 const router = express.Router();
 
@@ -642,6 +645,157 @@ router.post('/clients/:clientId/interested-autoresponder/drafts/:draftId/dismiss
         const statusCode = Number(error?.statusCode) || 500;
         console.error('POST dismiss failed draft error:', error);
         res.status(statusCode).json({ error: error?.message || 'Failed to dismiss draft.' });
+    }
+});
+
+/**
+ * Pick the thread message a forced draft should answer. Prefers the lead's own
+ * inbound message (that is what the prompt replies to), then whatever carries
+ * text, then recency. Rows we sent ourselves are excluded so a forced draft
+ * never anchors on an earlier autoresponder/follow-up reply.
+ */
+async function pickThreadSourceEvent(contactId, campaignId) {
+    const result = await pool.query(
+        `SELECT id, lead_email, event_type, reply_to_uuid, email_account
+         FROM contact_instantly_events
+         WHERE contact_id = $1
+           AND campaign_id = $2
+           AND COALESCE(source, '') NOT IN ('server_follow_up', 'interested_autoresponder', 'manual')
+           AND event_type NOT IN ('interested_reply_sent', 'manual_reply_sent')
+         ORDER BY
+            (event_type IN ('reply_received', 'lead_interested')) DESC,
+            (message_text IS NOT NULL OR reply_text_snippet IS NOT NULL) DESC,
+            event_timestamp DESC NULLS LAST,
+            created_at DESC NULLS LAST
+         LIMIT 1`,
+        [contactId, campaignId]
+    );
+    return result.rows[0] || null;
+}
+
+/**
+ * Why a create call came back without a draft, in words a user can act on.
+ * 4xx where the fix is in our own config, 502 where an upstream call failed.
+ */
+const FORCE_DRAFT_FAILURES = {
+    missing_required_context: [400, 'Not enough thread context to draft a reply.'],
+    missing_active_prompt: [400, 'No active autoresponder prompt for this campaign.'],
+    missing_openai_key: [400, 'No OpenAI API key configured for this agency.'],
+    blocked_missing_thread: [502, 'Instantly has not synced the reply-to id / sending mailbox for this thread yet.'],
+    generation_failed: [502, 'The model could not generate a reply — see the failed drafts list for details.']
+};
+
+/**
+ * POST /clients/:clientId/interested-autoresponder/leads/:contactId/generate
+ *
+ * Force an autoresponder draft for a lead from the lead modal, built from the
+ * lead's existing Instantly thread. The webhook path only drafts for leads
+ * Instantly flagged interested; this one skips that gate so a draft can be
+ * produced on demand (missed webhook, lead replied outside the interested
+ * flow, prompt changed since the original draft). Any open draft on the same
+ * thread is superseded by the create call, so pressing this twice does not
+ * leave two drafts behind.
+ *
+ * Body: { campaignId? } — the Instantly campaign id, required when the lead
+ * sits in more than one campaign.
+ */
+router.post('/clients/:clientId/interested-autoresponder/leads/:contactId/generate', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientRow = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!clientRow) return res.status(404).json({ error: 'Client not found.' });
+
+        const contactId = Number.parseInt(req.params.contactId, 10);
+        if (!Number.isInteger(contactId) || contactId <= 0) {
+            return res.status(400).json({ error: 'Valid contactId is required.' });
+        }
+        const instantlyCampaignId = String(req.body?.campaignId || '').trim() || null;
+
+        const membership = await resolveLeadCampaignMembership({
+            agencyId: req.agencyId,
+            clientId: clientRow.id,
+            contactId,
+            instantlyCampaignId
+        });
+
+        // Fail before drafting rather than writing a missing_active_prompt row.
+        const promptConfig = await fetchPromptConfig(pool, clientRow.id, membership.campaign_id);
+        if (!promptConfig) {
+            return res.status(400).json({
+                error: `No active autoresponder prompt for campaign “${membership.campaign_name}”.`,
+                reason: 'missing_active_prompt'
+            });
+        }
+
+        const sourceEvent = await pickThreadSourceEvent(contactId, membership.campaign_id);
+        if (!sourceEvent) {
+            return res.status(400).json({
+                error: 'No Instantly thread activity stored for this lead yet — nothing to draft from.',
+                reason: 'no_thread_events'
+            });
+        }
+
+        // Our events may carry no usable reply anchor (webhook missed, lead
+        // replied before the sync). Look it up live and write it back onto the
+        // source event, otherwise the draft lands as blocked_missing_thread.
+        const thread = await resolveLeadReplyThread({
+            contactId,
+            campaignId: membership.campaign_id,
+            instantlyCampaignId: membership.instantly_campaign_id,
+            leadEmail: membership.lead_email,
+            apiKey: String(clientRow.instantly_key || '').trim()
+        });
+        if (!thread) {
+            return res.status(400).json({
+                error: 'No Instantly thread for this lead yet — nothing to reply to.',
+                reason: 'no_thread'
+            });
+        }
+        if (thread.anchor_source === 'instantly') {
+            await pool.query(
+                `UPDATE contact_instantly_events
+                 SET reply_to_uuid = COALESCE(reply_to_uuid, $2),
+                     email_account = COALESCE(email_account, $3)
+                 WHERE id = $1`,
+                [sourceEvent.id, thread.reply_to_uuid, thread.eaccount]
+            );
+        }
+
+        const result = await createInterestedAutoResponderDraftFromEvent({
+            agencyId: req.agencyId,
+            clientSlug: clientRow.slug,
+            clientId: clientRow.id,
+            campaignId: membership.campaign_id,
+            contactId,
+            instantlyLeadId: membership.instantly_lead_id,
+            sourceEventId: sourceEvent.id,
+            leadEmail: membership.lead_email,
+            logger: (message) => console.log(message)
+        });
+
+        if (!result.created) {
+            const [status, message] = FORCE_DRAFT_FAILURES[result.reason] || [502, 'Failed to generate a draft.'];
+            return res.status(status).json({
+                error: message,
+                reason: result.reason || 'unknown',
+                draftId: result.draftId || null
+            });
+        }
+
+        res.json({
+            created: true,
+            researching: Boolean(result.researching),
+            draftId: result.draftId,
+            reviewUrl: result.reviewUrl || null,
+            campaignId: membership.instantly_campaign_id,
+            campaignName: membership.campaign_name
+        });
+    } catch (error) {
+        const statusCode = Number(error?.statusCode) || 500;
+        console.error('POST force generate autoresponder draft error:', error);
+        res.status(statusCode).json({
+            error: error?.statusCode ? (error.message || 'Failed to generate a draft.') : 'Failed to generate a draft.'
+        });
     }
 });
 
