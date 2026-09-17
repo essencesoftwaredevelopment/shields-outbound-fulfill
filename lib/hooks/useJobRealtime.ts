@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { supabase } from "@/lib/supabase/client";
+import { rowToJobState, type JobRealtimeRow, type JobRealtimeState } from "@/lib/pipeline/realtimeRow";
 
 export function debounceFn<T extends (...args: never[]) => void>(fn: T, ms: number) {
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -14,57 +15,7 @@ export function debounceFn<T extends (...args: never[]) => void>(fn: T, ms: numb
     };
 }
 
-export type JobRealtimeRow = {
-    id: string;
-    status: string;
-    paused: boolean;
-    cancelled: boolean;
-    stages: Record<string, unknown>;
-    options?: Record<string, unknown>;
-    error?: string | null;
-    cost?: number;
-    file_name?: string;
-    dedupe_stats?: Record<string, unknown> | null;
-    upload_status?: string | null;
-    updated_at?: string;
-};
-
-export function rowToJobState(row: JobRealtimeRow) {
-    const options = row.options || {};
-    const stages = row.stages || {};
-    // Prefer explicit options.pipelineMode. Do not infer shopping_audit from stage
-    // shells — get_job_stage_counts / normalizeStages can leave empty keys that
-    // would falsely flip a standard DNS+verify job into the shopping-audit layout.
-    const pipelineMode =
-        options.pipelineMode === "shopping_audit"
-        || options.nicheId === "shopping_audit"
-        || options.industry === "shopping_audit"
-            ? "shopping_audit"
-            : "standard";
-    return {
-        id: row.id,
-        status: row.status,
-        paused: row.paused,
-        cancelled: row.cancelled,
-        stages,
-        pipelineMode,
-        skipFounderFinder: options.skipFounderFinder === true,
-        skipEmailFinder: options.skipEmailFinder === true,
-        skipVerification: options.skipVerification === true,
-        skipDomainCheck: options.skipDomainCheck === true,
-        personalizeFirstLine: options.personalizeFirstLine === true,
-        activityMessage: typeof options.activityMessage === 'string' ? options.activityMessage : null,
-        activityUpdatedAt: typeof options.activityUpdatedAt === 'string' ? options.activityUpdatedAt : null,
-        error: row.error ?? null,
-        cost: row.cost,
-        fileName: row.file_name || row.id,
-        dedupeStats: row.dedupe_stats ?? null,
-        createdAt: row.updated_at || new Date().toISOString(),
-        completedAt: null as string | null,
-    };
-}
-
-export type JobRealtimeState = ReturnType<typeof rowToJobState>;
+export { rowToJobState, type JobRealtimeRow, type JobRealtimeState };
 
 export function useJobRealtime(
     jobId: string | null,
