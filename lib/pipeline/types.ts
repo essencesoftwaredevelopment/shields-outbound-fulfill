@@ -101,6 +101,9 @@ export interface PipelineJob {
     skipEmailFinder?: boolean;
     skipVerification?: boolean;
     personalizeFirstLine?: boolean;
+    /** Upload column mapping; a mapped founder/email/emailStatus column means that
+     *  skipped stage imports from the CSV instead of not running at all. */
+    columnMapping?: JobColumnMapping | null;
     cost?: number;
     clientId?: string;
     pipelineMode?: PipelineMode;
@@ -155,8 +158,43 @@ const LEGACY_SHOPPING_AUDIT_STAGE_ORDER: PipelineStageKey[] = [
     "personalization",
 ];
 
+export interface JobColumnMapping {
+    domain?: string;
+    founder?: string;
+    email?: string;
+    emailStatus?: string;
+}
+
+function stageOrderForJob(job?: Pick<PipelineJob, "pipelineMode" | "stages"> | null): PipelineStageKey[] {
+    return isShoppingAuditPipelineJob(job)
+        ? isLegacyShoppingAuditJob(job)
+            ? LEGACY_SHOPPING_AUDIT_STAGE_ORDER
+            : SHOPPING_AUDIT_STAGE_ORDER
+        : STANDARD_STAGE_ORDER;
+}
+
 /**
- * Stage cards to show for a job — only selected / applicable enrichment steps.
+ * Stage cards to render for a job: the whole pipeline in order, so the overview
+ * (domains → founders → emails → verification → personalization) reads the same
+ * on every job and a skipped / CSV-imported stage shows as such instead of
+ * vanishing. Shopping-audit jobs keep their audit cards and only show
+ * personalization when it is enabled — the signal hooks are that pipeline's
+ * personalization, so a permanently "Skipped" card there would just be noise.
+ * Progress / ETA / cost math uses resolveVisibleStageKeys (active stages only).
+ */
+export function resolveDisplayStageKeys(
+    job?: Pick<PipelineJob, "pipelineMode" | "stages" | "personalizeFirstLine"> | null
+): PipelineStageKey[] {
+    const order = stageOrderForJob(job);
+    if (isShoppingAuditPipelineJob(job) && job?.personalizeFirstLine !== true) {
+        return order.filter((key) => key !== "personalization");
+    }
+    return order;
+}
+
+/**
+ * Stages that actually run for a job — only selected / applicable enrichment
+ * steps. Drives progress percent, ETAs and cost sums (not the card grid).
  */
 export function resolveVisibleStageKeys(
     job?: Pick<
@@ -169,11 +207,7 @@ export function resolveVisibleStageKeys(
         | "personalizeFirstLine"
     > | null
 ): PipelineStageKey[] {
-    const order = isShoppingAuditPipelineJob(job)
-        ? isLegacyShoppingAuditJob(job)
-            ? LEGACY_SHOPPING_AUDIT_STAGE_ORDER
-            : SHOPPING_AUDIT_STAGE_ORDER
-        : STANDARD_STAGE_ORDER;
+    const order = stageOrderForJob(job);
 
     return order.filter((key) => {
         switch (key) {

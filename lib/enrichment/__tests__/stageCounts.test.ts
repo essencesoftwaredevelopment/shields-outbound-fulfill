@@ -105,12 +105,61 @@ const SKIP_JOB = {
 };
 
 describe('stageCountsToStages (skip-flag jobs)', () => {
-  it('marks skipped stages completed so the status line never announces "Preparing Email Discovery…"', () => {
-    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: SKIP_JOB });
+  it('marks stages that never run completed so the status line never announces "Preparing Email Discovery…"', () => {
+    // Skipped with nothing mapped from the upload → not a CSV import → instant completed.
+    const notRun = { ...SKIP_JOB, columnMapping: { domain: 'domain', founder: '', email: '', emailStatus: '' } };
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: notRun });
     assert.equal(stages.emailDiscovery?.status, 'completed');
     assert.equal((stages.emailDiscovery?.summary as Record<string, unknown>)?.skipped, true);
+    assert.equal((stages.emailDiscovery?.summary as Record<string, unknown>)?.imported, undefined);
     assert.equal(stages.founders?.status, 'completed');
     assert.equal((stages.founders?.summary as Record<string, unknown>)?.skipped, true);
+  });
+
+  it('a skipped stage with a mapped upload column is a CSV import: real status from its counts, `imported` on the summary', () => {
+    const csvJob = { ...SKIP_JOB, columnMapping: { domain: 'domain', founder: 'First Name', email: 'Email', emailStatus: '' } };
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: csvJob });
+    // founders: 1,200 of 5,923 imported so far → running, not "completed at t=0".
+    assert.equal(stages.founders?.status, 'running');
+    assert.deepEqual(
+      [(stages.founders?.summary as Record<string, unknown>)?.skipped, (stages.founders?.summary as Record<string, unknown>)?.imported],
+      [true, 1200]
+    );
+    // emails: nothing stamped yet → pending, and the pre-existing-email fallback
+    // (1,200 leftovers from earlier runs) must not read as "1,200 imported".
+    assert.equal(stages.emailDiscovery?.status, 'pending');
+    assert.equal((stages.emailDiscovery?.summary as Record<string, unknown>)?.imported, 0);
+    assert.equal((stages.emailDiscovery?.summary as Record<string, unknown>)?.found, 0);
+  });
+
+  it('a CSV-import stage still reads completed once the job is completed', () => {
+    const csvJob = { ...SKIP_JOB, columnMapping: { domain: 'domain', founder: 'First Name', email: 'Email', emailStatus: '' } };
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobCompleted: true, job: csvJob });
+    assert.equal(stages.founders?.status, 'completed');
+    assert.equal(stages.emailDiscovery?.status, 'completed');
+    // Completed job: the fallback count is what those legacy leads carry.
+    assert.equal((stages.emailDiscovery?.summary as Record<string, unknown>)?.imported, 1200);
+  });
+
+  it('skipped verification with a mapped email-status column reports imported statuses', () => {
+    const statusJob = {
+      ...SKIP_JOB,
+      skipVerification: true,
+      columnMapping: { domain: 'domain', founder: 'First Name', email: 'Email', emailStatus: 'email_status' },
+    };
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: statusJob });
+    assert.equal(stages.verification?.status, 'running'); // 1,200 of 5,923 stamped
+    assert.equal((stages.verification?.summary as Record<string, unknown>)?.imported, 1200);
+    const noStatus = { ...statusJob, columnMapping: { ...statusJob.columnMapping, emailStatus: '' } };
+    const plain = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: noStatus });
+    assert.equal(plain.verification?.status, 'completed');
+    assert.equal((plain.verification?.summary as Record<string, unknown>)?.imported, undefined);
+  });
+
+  it('without a column mapping, falls back to "imported" whenever the counts move', () => {
+    const stages = stageCountsToStages(skipFlagsCounts(), null, { jobRunning: true, job: SKIP_JOB });
+    assert.equal((stages.founders?.summary as Record<string, unknown>)?.imported, 1200);
+    assert.equal(stages.founders?.status, 'running');
   });
 
   it('verification uses the cohort denominator on skipEmailFinder jobs — never lockstep emailFound', () => {

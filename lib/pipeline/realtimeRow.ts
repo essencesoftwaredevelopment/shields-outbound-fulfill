@@ -2,6 +2,7 @@
  * Realtime `jobs` row → page job state. Pure so it can be unit-tested away from
  * the Supabase client (the hook in lib/hooks/useJobRealtime.ts re-exports it).
  */
+import type { JobColumnMapping } from "./types";
 
 export type JobRealtimeRow = {
     id: string;
@@ -22,6 +23,20 @@ export type JobRealtimeRow = {
     updated_at?: string;
 };
 
+/** Upload column mapping from job options (founder / email / emailStatus → CSV header). */
+export function columnMappingFromOptions(options: Record<string, unknown>): JobColumnMapping | null {
+    const raw = options.columnMapping;
+    if (!raw || typeof raw !== "object") return null;
+    const mapping = raw as Record<string, unknown>;
+    const pick = (key: string) => (typeof mapping[key] === "string" ? (mapping[key] as string).trim() : "");
+    return {
+        domain: pick("domain"),
+        founder: pick("founder"),
+        email: pick("email"),
+        emailStatus: pick("emailStatus"),
+    };
+}
+
 /** Option-derived job fields; only emitted when the payload actually carried `options`. */
 function optionsToJobState(options: Record<string, unknown>) {
     // Prefer explicit options.pipelineMode. Do not infer shopping_audit from stage
@@ -40,6 +55,7 @@ function optionsToJobState(options: Record<string, unknown>) {
         skipVerification: options.skipVerification === true,
         skipDomainCheck: options.skipDomainCheck === true,
         personalizeFirstLine: options.personalizeFirstLine === true,
+        columnMapping: columnMappingFromOptions(options),
         activityMessage: typeof options.activityMessage === 'string' ? options.activityMessage : null,
         activityUpdatedAt: typeof options.activityUpdatedAt === 'string' ? options.activityUpdatedAt : null,
     };

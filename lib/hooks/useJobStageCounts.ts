@@ -38,7 +38,7 @@ export function useJobStageCounts(
         /** Job skip options — lets the mapper mark skipped stages and pick real denominators. */
         job?: Pick<
             PipelineJob,
-            "skipFounderFinder" | "skipEmailFinder" | "skipVerification" | "personalizeFirstLine"
+            "skipFounderFinder" | "skipEmailFinder" | "skipVerification" | "personalizeFirstLine" | "columnMapping"
         > | null;
         onUpdate: (update: JobStageCountsUpdate) => void;
     }

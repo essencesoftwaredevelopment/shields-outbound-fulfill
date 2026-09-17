@@ -93,6 +93,9 @@ export function stageCountsToStages(
             skipEmailFinder?: boolean;
             skipVerification?: boolean;
             personalizeFirstLine?: boolean;
+            /** Mapped upload columns: a skipped stage with a mapped column imports
+             *  from the CSV (real, countable progress) instead of not running. */
+            columnMapping?: { founder?: string; email?: string; emailStatus?: string } | null;
         } | null;
     } = {}
 ): Partial<Record<PipelineStageKey, PipelineStageState>> {
@@ -105,6 +108,16 @@ export function stageCountsToStages(
     const skipVerify = opts.job?.skipVerification === true;
     // Only meaningful when job options are provided at all.
     const skipPersonalize = opts.job ? opts.job.personalizeFirstLine !== true : false;
+    // "Skipped" splits into two: imported from the upload (the stage still runs as
+    // a CSV import and its counts move) vs. simply not run. Without a mapping we
+    // can't tell, so fall back to "imported" whenever the counts do move.
+    const mapping = opts.job?.columnMapping;
+    const foundersFromCsv = skipFounders && (mapping ? !!mapping.founder : num(counts.founders?.found) > 0);
+    const emailsFromCsv = skipEmails && (mapping ? !!mapping.email : num(counts.emailDiscovery?.found) > 0);
+    const statusFromCsv = skipVerify && (mapping ? !!mapping.emailStatus : num(counts.verification?.verified) > 0);
+    // A CSV-import stage derives status from its counts like any other stage; the
+    // `skipped` shortcut (instant "completed") is only for stages that never run.
+    const skippedOpt = (skipped: boolean, fromCsv: boolean) => ({ skipped: skipped && !fromCsv, jobRunning, jobCompleted });
     const totalDomains = num(counts.domainPrep?.total);
     // Domain-prep "processable" = input cohort after DNS (not post-waterfall leftovers).
     // RPC returns dns-aware processable; fall back to total when DNS was skipped.
@@ -221,10 +234,14 @@ export function stageCountsToStages(
     // Contact enrichment denominators: contacts on this job (CSV/import size), not
     // post-waterfall queue leftovers.
     const contactTotal = num(counts.contacts?.total) || processable || totalDomains;
+    // CSV imports create/stamp contacts as they go, so contacts.total can trail
+    // the import in lockstep; the stable denominator is the upload cohort.
+    const importTotal = processable || contactTotal;
 
     const foundersProcessed = num(counts.founders?.processed);
     const foundersFound = num(counts.founders?.found);
-    const foundersStatus = deriveStatus(foundersProcessed, contactTotal, { skipped: skipFounders, jobRunning, jobCompleted });
+    const foundersTotal = foundersFromCsv ? importTotal : contactTotal;
+    const foundersStatus = deriveStatus(foundersProcessed, foundersTotal, skippedOpt(skipFounders, foundersFromCsv));
     out.founders = {
         status: foundersStatus,
         startedAt: prior?.founders?.startedAt ?? null,
@@ -235,22 +252,30 @@ export function stageCountsToStages(
             Found: foundersFound,
             found: foundersFound,
             ...(skipFounders ? { skipped: true } : {}),
+            ...(foundersFromCsv ? { imported: foundersFound } : {}),
             ...costSummary("founders", costs),
         },
         progress: {
             stage: "founders",
             processed: foundersProcessed,
-            total: contactTotal,
+            total: foundersTotal,
             found: foundersFound,
             stats: { Found: foundersFound, Processed: foundersProcessed },
         },
     };
 
     const emailProcessed = num(counts.emailDiscovery?.processed);
-    const emailFound = num(counts.emailDiscovery?.found);
+    // The RPC falls back to "any email on the contact" for skip-finder jobs
+    // before anything is stamped (legacy jobs never stamped). A running job
+    // stamps every CSV import, so before the import starts those are leftovers
+    // from earlier runs, not this job's imports — show 0 until the counts move.
+    const emailFound = emailsFromCsv && jobRunning && emailProcessed === 0
+        ? 0
+        : num(counts.emailDiscovery?.found);
     const emailNotFound = num(counts.emailDiscovery?.notFound);
     const emailErrors = num(counts.emailDiscovery?.errors);
-    const emailStatus = deriveStatus(emailProcessed, contactTotal, { skipped: skipEmails, jobRunning, jobCompleted });
+    const emailTotal = emailsFromCsv ? importTotal : contactTotal;
+    const emailStatus = deriveStatus(emailProcessed, emailTotal, skippedOpt(skipEmails, emailsFromCsv));
     out.emailDiscovery = {
         status: emailStatus,
         startedAt: prior?.emailDiscovery?.startedAt ?? null,
@@ -264,12 +289,13 @@ export function stageCountsToStages(
             notFound: emailNotFound,
             errors: emailErrors,
             ...(skipEmails ? { skipped: true } : {}),
+            ...(emailsFromCsv ? { imported: emailFound } : {}),
             ...costSummary("emailDiscovery", costs),
         },
         progress: {
             stage: "emailDiscovery",
             processed: emailProcessed,
-            total: contactTotal,
+            total: emailTotal,
             found: emailFound,
             notFound: emailNotFound,
             stats: {
@@ -287,7 +313,7 @@ export function stageCountsToStages(
     const verifyTotal = skipEmails
         ? (processable || contactTotal)
         : (emailFound || contactTotal);
-    const verifyStatus = deriveStatus(verified, verifyTotal, { skipped: skipVerify, jobRunning, jobCompleted });
+    const verifyStatus = deriveStatus(verified, verifyTotal, skippedOpt(skipVerify, statusFromCsv));
     out.verification = {
         status: verifyStatus,
         startedAt: prior?.verification?.startedAt ?? null,
@@ -306,7 +332,8 @@ export function stageCountsToStages(
             "Valid-Risky": num(counts.verification?.validRisky),
             processed: verified,
             // Stage skipped but rows carry a stamped status: the upload's email-status column.
-            ...(skipVerify ? { skipped: true, ...(verified > 0 ? { imported: verified } : {}) } : {}),
+            ...(skipVerify ? { skipped: true } : {}),
+            ...(statusFromCsv ? { imported: verified } : {}),
             ...costSummary("verification", costs),
         },
         progress: {

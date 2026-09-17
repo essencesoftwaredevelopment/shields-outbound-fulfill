@@ -10,6 +10,7 @@ import {
     type JobRealtimeState,
 } from "@/lib/hooks/useJobRealtime";
 import { useJobStageCounts } from "@/lib/hooks/useJobStageCounts";
+import { columnMappingFromOptions } from "@/lib/pipeline/realtimeRow";
 import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAnalyticsRealtime } from "@/lib/hooks/useAnalyticsRealtime";
 import { useAuth } from "@/hooks/use-auth";
@@ -39,6 +40,7 @@ import {
     ALL_PIPELINE_STAGE_KEYS,
     isShoppingAuditPipelineJob,
     resolveVisibleStageKeys,
+    resolveDisplayStageKeys,
     PipelineJob,
     PipelineStageKey,
     PipelineStageState,
@@ -1242,6 +1244,32 @@ const JOB_STATUS_COLORS: Record<JobStatus, string> = {
 };
 
 const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
+
+/**
+ * Was this stage skipped because its data came from the upload (vs. not run at
+ * all)? The live-count mapper only sets `imported` for CSV-mapped stages; the
+ * server reconcile writes `imported: 0` for any skipped stage, so a completed
+ * stage with nothing imported still reads as plain "Skipped".
+ */
+const stageImportedFromCsv = (
+    summary: Record<string, unknown> | null | undefined,
+    status?: StageStatus | null,
+) =>
+    summary?.skipped === true
+    && typeof summary?.imported === "number"
+    && ((summary.imported as number) > 0 || (status !== undefined && status !== null && status !== "completed"));
+
+/** Chip text for a stage card: skipped stages say so instead of "Completed". */
+const formatStageChip = (stage?: PipelineStageState | null) => {
+    const summary = stage?.summary as Record<string, unknown> | null | undefined;
+    if (summary?.skipped === true && stage?.status !== "error") {
+        if (stageImportedFromCsv(summary, stage?.status)) {
+            return stage?.status === "running" ? "Importing CSV" : stage?.status === "completed" ? "From CSV" : "Pending";
+        }
+        return "Skipped";
+    }
+    return formatStageStatus(stage?.status);
+};
 
 const humanizeKey = (value: string) =>
     value
@@ -3985,6 +4013,7 @@ export default function ClientPage() {
             skipVerification: data.skipVerification === true,
             skipDomainCheck: data.skipDomainCheck === true,
             personalizeFirstLine: data.personalizeFirstLine === true,
+            columnMapping: columnMappingFromOptions(data),
             cost: typeof data.cost === "number" ? data.cost : undefined,
             activityMessage: typeof data.activityMessage === 'string' ? data.activityMessage : null,
             activityUpdatedAt: typeof data.activityUpdatedAt === 'string' ? data.activityUpdatedAt : null,
@@ -10615,7 +10644,7 @@ export default function ClientPage() {
                                         )}
                                         
                                         <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
-                                        {[...resolveStageOrder(jobState)].map((stageKey) => {
+                                        {resolveDisplayStageKeys(jobState).map((stageKey) => {
                                             const stage = jobState.stages[stageKey];
                                             const meta = STAGE_METADATA[stageKey];
                                             const dedupedTotal = deriveDedupedDomainBaseline(jobState);
@@ -10695,29 +10724,36 @@ export default function ClientPage() {
                                                 const processedRaw = total ?? dedupedTotal ?? 0;
                                                 const processed = processedRaw > 0 ? Math.min(processedRaw, dedupedTotal ?? processedRaw) : (dedupedTotal ?? 0);
                                                 const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
-                                                const importedFromCsv =
-                                                    !extractNumberFrom(summary, ["Found", "found"])
-                                                    && (extractNumberFrom(summary, ["processed", "imported"]) ?? found) > 0;
+                                                const skippedStage = summary?.skipped === true;
+                                                const importedFromCsv = stageImportedFromCsv(summary, stage?.status)
+                                                    || (!skippedStage
+                                                        && !extractNumberFrom(summary, ["Found", "found"])
+                                                        && (extractNumberFrom(summary, ["processed", "imported"]) ?? found) > 0);
                                                 const cost = stageCostFromStage(stage);
                                                 heroNumber = found;
-                                                heroLabel = importedFromCsv ? "Imported" : "Found";
-                                                subtext = processed > 0
-                                                    ? importedFromCsv
+                                                heroLabel = importedFromCsv ? "Imported" : skippedStage ? "Skipped" : "Found";
+                                                subtext = importedFromCsv
+                                                    ? found > 0
                                                         ? `${found.toLocaleString()} imported from CSV`
-                                                        : `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield`
-                                                    : "Awaiting...";
+                                                        : "Importing founder names from CSV…"
+                                                    : skippedStage
+                                                        ? "Not run for this job"
+                                                        : processed > 0
+                                                            ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield`
+                                                            : "Awaiting...";
                                                 if (cost !== null && cost > 0) costFooter = `Cost $${cost.toFixed(2)}`;
                                             } else if (stageKey === "emailDiscovery") {
-                                                const skippedImport = summary?.skipped === true;
-                                                const imported = skippedImport
-                                                    ? (dedupedTotal ?? throughputNum ?? 0)
-                                                    : (extractNumberFrom(stats, ["imported", "Found", "found"])
+                                                const skippedStage = summary?.skipped === true;
+                                                const skippedImport = stageImportedFromCsv(summary, stage?.status);
+                                                // Imports are stamped like finder results now, so the counts are real —
+                                                // no need to assume the whole domain baseline was imported.
+                                                const imported = extractNumberFrom(stats, ["imported", "Found", "found"])
                                                     ?? (typeof stage?.progress?.found === "number"
                                                         ? stage.progress.found
                                                         : null)
-                                                    ?? extractNumberFrom(summary, ["Found", "found", "imported"])
+                                                    ?? extractNumberFrom(summary, ["imported", "Found", "found"])
                                                     ?? throughputNum
-                                                    ?? 0);
+                                                    ?? 0;
                                                 const found = imported;
                                                 // Attempted finds = emailDone (`processed`), not `found` alone.
                                                 // Outcome split (Found / Not Found / errors) is preferred when
@@ -10746,14 +10782,18 @@ export default function ClientPage() {
                                                 heroNumber = found;
                                                 heroLabel = skippedImport || (found > 0 && outcomeChecked === 0 && attempted > 0 && processedCount === 0)
                                                     ? "Emails Imported"
-                                                    : "Emails Found";
-                                                subtext = skippedImport && found > 0
-                                                    ? `${found.toLocaleString()} imported from CSV`
-                                                    : attempted > 0 && !skippedImport
-                                                    ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
-                                                    : attempted > 0
-                                                    ? `${attempted.toLocaleString()} imported from CSV`
-                                                    : "Awaiting...";
+                                                    : skippedStage
+                                                        ? "Skipped"
+                                                        : "Emails Found";
+                                                subtext = skippedImport
+                                                    ? found > 0
+                                                        ? `${found.toLocaleString()} imported from CSV${notFound > 0 ? ` • ${notFound.toLocaleString()} already on another contact` : ""}`
+                                                        : "Importing emails from CSV…"
+                                                    : skippedStage
+                                                        ? "Not run for this job"
+                                                        : attempted > 0
+                                                            ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
+                                                            : "Awaiting...";
                                                 const emailCost = stageCostFromStage(stage);
                                                 if (emailCost !== null && emailCost > 0) {
                                                     costFooter = `Cost $${emailCost.toFixed(2)}`;
@@ -10782,14 +10822,21 @@ export default function ClientPage() {
                                                 const importedStatuses = summary?.skipped === true
                                                     ? (extractNumberFrom(summary, ["imported", "verified", "Verified"]) ?? 0)
                                                     : 0;
+                                                if (summary?.skipped === true && !stageImportedFromCsv(summary, stage?.status)) {
+                                                    heroLabel = "Skipped";
+                                                }
                                                 subtext =
                                                     importedStatuses > 0
                                                         ? `${safe.toLocaleString()} safe • ${importedStatuses.toLocaleString()} from CSV${riskyText}`
-                                                        : summary?.skipped === true && stage?.status === "completed"
-                                                            ? "Skipped"
-                                                            : checked > 0
-                                                                ? `${safe.toLocaleString()} safe • ${checked.toLocaleString()} checked${riskyText}`
-                                                                : "Awaiting...";
+                                                        : stageImportedFromCsv(summary, stage?.status)
+                                                            ? "Importing email statuses from CSV…"
+                                                            : summary?.skipped === true
+                                                                ? "Not run for this job — emails carry no status"
+                                                                : checked > 0
+                                                                    ? `${safe.toLocaleString()} safe • ${checked.toLocaleString()} checked${riskyText}`
+                                                                    : stage?.status === "completed"
+                                                                        ? "No emails to verify"
+                                                                        : "Awaiting...";
                                                 const verifyCost = stageCostFromStage(stage);
                                                 if (verifyCost !== null && verifyCost > 0) {
                                                     costFooter = `Cost $${verifyCost.toFixed(2)}`;
@@ -10822,7 +10869,10 @@ export default function ClientPage() {
                                                 const shopifyStores = (summary?.shopifyStores as number) ?? (summary?.["Shopify Stores"] as number) ?? 0;
                                                 heroNumber = personalized;
                                                 heroLabel = "Ready";
-                                                if (stage?.status === "completed" && skipped) {
+                                                if (skipped && jobState.personalizeFirstLine !== true) {
+                                                    heroLabel = "Skipped";
+                                                    subtext = "Not enabled for this job";
+                                                } else if (stage?.status === "completed" && skipped) {
                                                     subtext =
                                                         shopifyStores > 0
                                                             ? `Skipped — ${shopifyStores.toLocaleString()} Shopify, 0 personalized`
@@ -10849,13 +10899,13 @@ export default function ClientPage() {
                                             return (
                                                 <article
                                                     key={stageKey}
-                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""}`}
+                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""} ${summary?.skipped === true && !stageImportedFromCsv(summary, stage?.status) ? "stage-card--skipped" : ""}`}
                                                 >
                                                     <div className="stage-card__head">
                                                         <div>
                                                             <p className="stage-card__label">{meta.title}</p>
                                                         </div>
-                                                        <span className="stage-card__status">{formatStageStatus(stage?.status)}</span>
+                                                        <span className="stage-card__status">{formatStageChip(stage)}</span>
                                                     </div>
                                                     
                                                     {isCreditExhaustionText(stage?.error) ? (
