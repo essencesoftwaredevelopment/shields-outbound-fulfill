@@ -76,8 +76,28 @@ function summaryFromStats(stageKey, stats, priorSummary = {}, denominators = {})
 
     if (stageKey === 'verification') {
         const s = stats.verification;
-        if (s.skipped) {
+        if (s.skipped && !s.imported) {
             return { ...withCost, skipped: true, processed: 0 };
+        }
+        if (s.skipped) {
+            // Statuses imported from the upload's email-status column.
+            return {
+                ...withCost,
+                skipped: true,
+                imported: s.verified,
+                Verified: s.verified,
+                verified: s.verified,
+                processed: s.verified,
+                Valid: s.valid,
+                valid: s.valid,
+                Invalid: s.invalid,
+                invalid: s.invalid,
+                Unknown: s.unknown,
+                unknown: s.unknown,
+                'Valid-Risky': s.validRisky,
+                'valid-risky': s.validRisky,
+                eligible: denominators.verification?.total ?? s.verified
+            };
         }
         return {
             ...withCost,
@@ -282,6 +302,11 @@ async function countStatsForJob(ctx, runStartedAt = null) {
         skipFounderFinder: options.skipFounderFinder,
         skipEmailFinder: options.skipEmailFinder,
         skipVerification: options.skipVerification,
+        csvEmailStatus: !!(
+            options.skipVerification
+            && options.skipEmailFinder
+            && String(options.columnMapping?.emailStatus || '').trim()
+        ),
         personalizeFirstLine: options.personalizeFirstLine,
         domainCheckSkipped: options.skipDomainCheck === true,
         // Scope email/verify/personalization counts to this run (jobs.created_at),

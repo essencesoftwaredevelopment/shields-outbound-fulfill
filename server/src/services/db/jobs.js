@@ -534,18 +534,28 @@ export async function markJobDomainFounderExcluded(jobId, domainNormalized) {
     await markJobDomainsFounderExcluded(jobId, [domainNormalized]);
 }
 
-export async function listJobDomainsForJob(jobId, { emailCohortOnly = false, excludeSkipped = false } = {}) {
+export async function listJobDomainsForJob(
+    jobId,
+    { emailCohortOnly = false, excludeSkipped = false, domains = null } = {}
+) {
     const cohortFilter = emailCohortOnly
         ? `AND COALESCE(raw_row->'_enrichment'->>'inEmailCohort', 'true') = 'true'
            AND COALESCE(raw_row->'_enrichment'->>'founderExcluded', 'false') <> 'true'`
         : '';
     const skippedFilter = excludeSkipped ? `AND status <> 'skipped'` : '';
+    const params = [jobId];
+    let domainsFilter = '';
+    if (Array.isArray(domains)) {
+        if (!domains.length) return [];
+        params.push(domains.map((d) => String(d).toLowerCase()));
+        domainsFilter = `AND LOWER(domain_normalized) = ANY($${params.length}::text[])`;
+    }
     const result = await pool.query(
         `SELECT domain_normalized, raw_row, status
          FROM job_domains
-         WHERE job_id = $1 ${cohortFilter} ${skippedFilter}
+         WHERE job_id = $1 ${cohortFilter} ${skippedFilter} ${domainsFilter}
          ORDER BY sort_order ASC`,
-        [jobId]
+        params
     );
     return result.rows;
 }
@@ -932,6 +942,9 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
         skipFounderFinder = false,
         skipEmailFinder = false,
         skipVerification = false,
+        // Verification skipped but statuses came from the upload (emailStatus column):
+        // still count them so the stage shows valid/risky/invalid instead of zeros.
+        csvEmailStatus = false,
         personalizeFirstLine = false,
         domainCheckSkipped = false,
         // Count only completions stamped at/after this run started, so reprocess runs
@@ -1006,7 +1019,8 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
         skipEmailFinder ? [agencyId, clientId, jobId] : [agencyId, clientId, jobId, runStartedAt]
     );
 
-    const verificationSql = skipVerification
+    const countVerification = !skipVerification || csvEmailStatus;
+    const verificationSql = !countVerification
         ? `SELECT 0::int AS verified, 0::int AS valid, 0::int AS invalid, 0::int AS unknown, 0::int AS valid_risky`
         : `SELECT
             COUNT(DISTINCT c.id) FILTER (
@@ -1043,7 +1057,7 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
              ${COHORT_ELIGIBLE_SQL}
              ${skippedJobDomainSql()}`;
 
-    const verificationResult = skipVerification
+    const verificationResult = !countVerification
         ? { rows: [{ verified: 0, valid: 0, invalid: 0, unknown: 0, valid_risky: 0 }] }
         : await pool.query(verificationSql, [agencyId, clientId, jobId, runStartedAt]);
 
@@ -1109,7 +1123,8 @@ export async function countJobStageStats(agencyId, clientId, jobId, options = {}
             invalid: Number(verifyRow.invalid ?? 0),
             unknown: Number(verifyRow.unknown ?? 0),
             validRisky: Number(verifyRow.valid_risky ?? 0),
-            skipped: !!skipVerification
+            skipped: !!skipVerification,
+            imported: !!(skipVerification && csvEmailStatus)
         },
         personalization: {
             processed: Number(personalizeRow.processed ?? 0),

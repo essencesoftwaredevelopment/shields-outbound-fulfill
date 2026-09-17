@@ -598,7 +598,9 @@ router.post('/jobs', uploadFields, async (req, res) => {
                     columnMapping: {
                         domain: (req.body.domainColumn || 'domain').toString().trim(),
                         founder: (req.body.founderColumn || '').toString().trim(),
-                        email: (req.body.emailColumn || '').toString().trim()
+                        email: (req.body.emailColumn || '').toString().trim(),
+                        // Uploaded verification status; only imported when verification is skipped.
+                        emailStatus: (req.body.emailStatusColumn || '').toString().trim()
                     }
                 })
         });

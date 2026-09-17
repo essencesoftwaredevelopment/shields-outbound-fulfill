@@ -151,6 +151,55 @@ export async function upsertFounderSearchBatch({
 }
 
 /**
+ * Persist "upload included email" rows: the email itself, plus the uploaded
+ * verification status when `importStatus` is set (verification skipped). The
+ * status goes through the `verification` upsert so it is stamped like a
+ * verifier result and the stage counts / export gates pick it up.
+ *
+ * @returns {Promise<{ emailRows: number, statusRows: number }>}
+ */
+export async function upsertCsvEmailRowsBatch({
+    agencyId,
+    clientId,
+    jobId,
+    rows,
+    mergeMode = 'preserve',
+    importStatus = false,
+    onTiming = null,
+    reconcileAfterWrite = true
+}) {
+    if (!Array.isArray(rows) || rows.length === 0) return { emailRows: 0, statusRows: 0 };
+
+    await upsertLeadRowsBatch({
+        agencyId,
+        clientId,
+        rows,
+        type: 'emails',
+        jobId,
+        mergeMode,
+        onTiming,
+        reconcileAfterWrite
+    });
+
+    const statusRows = importStatus
+        ? rows.filter((r) => r.email_status && String(r.email_status).trim())
+        : [];
+    if (statusRows.length) {
+        await upsertLeadRowsBatch({
+            agencyId,
+            clientId,
+            rows: statusRows,
+            type: 'verification',
+            jobId,
+            mergeMode,
+            onTiming,
+            reconcileAfterWrite
+        });
+    }
+    return { emailRows: rows.length, statusRows: statusRows.length };
+}
+
+/**
  * Upsert an in-memory batch of lead rows (no CSV needed)
  */
 export async function upsertLeadRowsBatch({

@@ -55,3 +55,42 @@ export function readEnrichmentMeta(rawRow) {
         founderExcluded: meta.founderExcluded === true
     };
 }
+
+const CSV_EMAIL_STATUS_ALIASES = {
+    valid: 'valid',
+    verified: 'valid',
+    deliverable: 'valid',
+    ok: 'valid',
+    safe: 'valid',
+    good: 'valid',
+    risky: 'risky',
+    'valid-risky': 'risky',
+    'valid_risky': 'risky',
+    'catch-all': 'risky',
+    'catch_all': 'risky',
+    catchall: 'risky',
+    'accept-all': 'risky',
+    'accept_all': 'risky',
+    acceptall: 'risky',
+    invalid: 'invalid',
+    undeliverable: 'invalid',
+    bounced: 'invalid',
+    bounce: 'invalid',
+    bad: 'invalid',
+    unknown: 'unknown',
+    unverified: 'unknown',
+    unverifiable: 'unknown'
+};
+
+/**
+ * Map an uploaded email-status cell onto contacts.email_status. Accepts the
+ * labels common providers/exports use (Instantly, TryKitt, MillionVerifier…).
+ * Empty cells return null (leave the column alone); anything unrecognised is
+ * 'unknown' so a mapped column never silently drops a lead into "unverified".
+ * Provider results still go through normalizeEmailStatus in services/leads.js.
+ */
+export function normalizeCsvEmailStatus(value) {
+    const normalized = String(value ?? '').trim().toLowerCase();
+    if (!normalized) return null;
+    return CSV_EMAIL_STATUS_ALIASES[normalized] || 'unknown';
+}

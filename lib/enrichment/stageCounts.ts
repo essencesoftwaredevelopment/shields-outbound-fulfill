@@ -305,7 +305,8 @@ export function stageCountsToStages(
             "valid-risky": num(counts.verification?.validRisky),
             "Valid-Risky": num(counts.verification?.validRisky),
             processed: verified,
-            ...(skipVerify ? { skipped: true } : {}),
+            // Stage skipped but rows carry a stamped status: the upload's email-status column.
+            ...(skipVerify ? { skipped: true, ...(verified > 0 ? { imported: verified } : {}) } : {}),
             ...costSummary("verification", costs),
         },
         progress: {

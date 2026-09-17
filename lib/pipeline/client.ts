@@ -75,6 +75,8 @@ export interface CreatePipelineJobOptions {
     domainColumn?: string;
     founderColumn?: string;
     emailColumn?: string;
+    /** CSV column holding a verification status; imported when verification is skipped. */
+    emailStatusColumn?: string;
     signal?: AbortSignal;
 }
 
@@ -201,6 +203,7 @@ export async function createPipelineJob({
     domainColumn,
     founderColumn,
     emailColumn,
+    emailStatusColumn,
     dedupeStrategy,
     pipelineMode,
     signal,
@@ -259,6 +262,9 @@ export async function createPipelineJob({
     }
     if (emailColumn) {
         formData.append("emailColumn", emailColumn);
+    }
+    if (emailStatusColumn) {
+        formData.append("emailStatusColumn", emailStatusColumn);
     }
     if (typeof dedupeStrategy === 'string') {
         formData.append("dedupeStrategy", dedupeStrategy);

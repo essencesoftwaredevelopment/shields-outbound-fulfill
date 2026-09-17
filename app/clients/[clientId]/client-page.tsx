@@ -1816,6 +1816,8 @@ export default function ClientPage() {
     const [domainColumn, setDomainColumn] = useState<string>("");
     const [founderColumn, setFounderColumn] = useState<string>("");
     const [emailColumn, setEmailColumn] = useState<string>("");
+    // Optional verification status already in the CSV — skips the verify stage.
+    const [emailStatusColumn, setEmailStatusColumn] = useState<string>("");
 
     // Step 2: Processing options
     const [dedupeStrategy, setDedupeStrategy] = useState<'skip' | 'include'>('skip');
@@ -5442,6 +5444,7 @@ export default function ClientPage() {
         setDomainColumn("");
         setFounderColumn("");
         setEmailColumn("");
+        setEmailStatusColumn("");
 
         if (!file) return;
 
@@ -5459,7 +5462,15 @@ export default function ClientPage() {
 
             const detectedDomain = guessColumn(columns, ["domain", "website", "url", "company"]);
             const detectedFounder = guessColumn(columns, ["founder_name", "founder", "owner", "ceo", "name"]);
-            const detectedEmail = guessColumn(columns, ["email", "email_address", "contact_email", "mail"]);
+            // "email_status" contains "email" — keep status-like columns out of the email guess.
+            const isStatusLike = (col: string) => /status|verif/i.test(col);
+            const detectedEmail = guessColumn(columns.filter((col) => !isStatusLike(col)), ["email", "email_address", "contact_email", "mail"]);
+            const detectedEmailStatus = detectedEmail
+                ? guessColumn(
+                    columns.filter((col) => col !== detectedEmail && isStatusLike(col)),
+                    ["email_status", "email_verification", "verification_status", "verification", "lookup_status", "status"]
+                )
+                : "";
             
             if (detectedDomain) {
                 setDomainColumn(detectedDomain);
@@ -5524,6 +5535,9 @@ export default function ClientPage() {
             }
             if (detectedEmail) {
                 setEmailColumn(detectedEmail);
+            }
+            if (detectedEmailStatus) {
+                setEmailStatusColumn(detectedEmailStatus);
             }
         } catch (error) {
             console.error("Failed to read CSV header", error);
@@ -5821,6 +5835,7 @@ export default function ClientPage() {
                 domainColumn,
                 founderColumn,
                 emailColumn,
+                emailStatusColumn: verifyEmail ? undefined : emailStatusColumn,
             });
 
             const freshJob = response.job;
@@ -5912,8 +5927,20 @@ export default function ClientPage() {
         } else {
             setSkipEmailFinder(false);
             setFindEmail(true);
+            // A status column only means something next to an email column.
+            setEmailStatusColumn("");
         }
     }, [emailColumn]);
+
+    // A mapped email-status column replaces the verify stage; clearing it re-enables verification.
+    useEffect(() => {
+        if (emailStatusColumn.trim().length > 0) {
+            setVerifyEmail(false);
+        } else {
+            setVerifyEmail(emailProvider !== 'self_hosted');
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [emailStatusColumn]);
 
     // Keep downstream steps coherent when founder finding is disabled
     useEffect(() => {
@@ -7957,6 +7984,7 @@ export default function ClientPage() {
         setDomainColumn("");
         setFounderColumn("");
         setEmailColumn("");
+        setEmailStatusColumn("");
         setDedupeStrategy('include');
         // These domains already live in the DB; DNS-checking them again is usually wasted time.
         setRunDomainCheck(false);
@@ -10750,10 +10778,18 @@ export default function ClientPage() {
                                                 heroNumber = safe + risky;
                                                 heroLabel = "Verified";
                                                 const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
+                                                // Statuses imported from the upload's email-status column (stage skipped).
+                                                const importedStatuses = summary?.skipped === true
+                                                    ? (extractNumberFrom(summary, ["imported", "verified", "Verified"]) ?? 0)
+                                                    : 0;
                                                 subtext =
-                                                    checked > 0
-                                                        ? `${safe.toLocaleString()} safe • ${checked.toLocaleString()} checked${riskyText}`
-                                                        : "Awaiting...";
+                                                    importedStatuses > 0
+                                                        ? `${safe.toLocaleString()} safe • ${importedStatuses.toLocaleString()} from CSV${riskyText}`
+                                                        : summary?.skipped === true && stage?.status === "completed"
+                                                            ? "Skipped"
+                                                            : checked > 0
+                                                                ? `${safe.toLocaleString()} safe • ${checked.toLocaleString()} checked${riskyText}`
+                                                                : "Awaiting...";
                                                 const verifyCost = stageCostFromStage(stage);
                                                 if (verifyCost !== null && verifyCost > 0) {
                                                     costFooter = `Cost $${verifyCost.toFixed(2)}`;
@@ -12971,6 +13007,26 @@ export default function ClientPage() {
                                                 : 'Auto-detects columns like email, email_address. Leave blank to run email discovery.'}
                                         </span>
                                     </label>
+
+                                    <label className="settings-field" style={{ opacity: emailColumn ? 1 : 0.6 }}>
+                                        <span className="settings-field__label">Email status column (optional)</span>
+                                        <AppSelect
+                                            value={emailStatusColumn}
+                                            emptyLabel="Select column (or none)"
+                                            disabled={!csvColumns.length || !emailColumn}
+                                            options={csvColumns
+                                                .filter((col) => col !== emailColumn)
+                                                .map((col) => ({ value: col, label: col }))}
+                                            onChange={setEmailStatusColumn}
+                                        />
+                                        <span className="settings-field__hint">
+                                            {!emailColumn
+                                                ? 'Map an email column first.'
+                                                : emailStatusColumn
+                                                    ? `Using "${emailStatusColumn}" for verification status (valid / risky / catch-all / invalid). Email verification will be skipped.`
+                                                    : 'Auto-detects columns like email_status, verification_status. Leave blank to verify the CSV emails with TryKitt.'}
+                                        </span>
+                                    </label>
                                 </div>
                             )}
 
@@ -13187,14 +13243,14 @@ export default function ClientPage() {
                                             display: 'flex',
                                             alignItems: 'center',
                                             gap: '0.75rem',
-                                            cursor: (findFounder || skipFounderFinder) ? 'pointer' : 'not-allowed',
+                                            cursor: (findFounder || skipFounderFinder) && !emailColumn ? 'pointer' : 'not-allowed',
                                             padding: '0.5rem',
-                                            opacity: (findFounder || skipFounderFinder) ? 1 : 0.5
+                                            opacity: !(findFounder || skipFounderFinder) ? 0.5 : emailColumn ? 0.6 : 1
                                         }}>
                                             <input
                                                 type="checkbox"
                                                 checked={findEmail}
-                                                disabled={!(findFounder || skipFounderFinder)}
+                                                disabled={!(findFounder || skipFounderFinder) || !!emailColumn}
                                                 onChange={(e) => {
                                                     const checked = e.target.checked;
                                                     setFindEmail(checked);
@@ -13241,8 +13297,8 @@ export default function ClientPage() {
                                                     Find Email
                                                 </div>
                                                 <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
-                                                    {skipEmailFinder 
-                                                        ? 'Skipped - using emails from your CSV' 
+                                                    {skipEmailFinder
+                                                        ? `Skipped - using emails from your CSV ("${emailColumn}")`
                                                         : `Discover email addresses with ${emailProvider === 'self_hosted' ? 'self-hosted verifier' : 'TryKitt'}`}
                                                 </div>
                                             </div>
@@ -13298,12 +13354,24 @@ export default function ClientPage() {
                                                 <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
                                                     Verify Email
                                                 </div>
-                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
+                                                <div style={{
+                                                    fontSize: '0.875rem',
+                                                    marginTop: '0.125rem',
+                                                    color: skipEmailFinder && !verifyEmail && !emailStatusColumn && emailProvider !== 'self_hosted'
+                                                        ? '#f59e0b'
+                                                        : 'var(--app-text-muted)'
+                                                }}>
                                                     {emailProvider === 'self_hosted'
                                                         ? 'Automatically skipped - self-hosted finding already verifies emails'
-                                                        : skipEmailFinder 
-                                                            ? 'Validate emails from your CSV with TryKitt'
-                                                            : 'Validate discovered email addresses with TryKitt'}
+                                                        : emailStatusColumn && !verifyEmail
+                                                            ? `Skipped - using email status from your CSV ("${emailStatusColumn}")`
+                                                            : emailStatusColumn && verifyEmail
+                                                                ? `Re-verify CSV emails with TryKitt (ignores "${emailStatusColumn}")`
+                                                                : skipEmailFinder && !verifyEmail
+                                                                    ? 'Skipped - CSV emails get no status, so they won\'t count as ready for export or Instantly. Map an email status column in Step 2 or keep verification on.'
+                                                                    : skipEmailFinder
+                                                                        ? 'Validate emails from your CSV with TryKitt'
+                                                                        : 'Validate discovered email addresses with TryKitt'}
                                                 </div>
                                             </div>
                                         </label>

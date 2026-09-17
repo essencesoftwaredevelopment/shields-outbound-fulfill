@@ -5,8 +5,9 @@ import { promises as dns } from 'dns';
 import { env } from '../config/env.js';
 import { logTimestamp } from '../utils/logTimestamp.js';
 import { DEFAULT_PRICING, loadPricing, computeJobCost, normalizeStageSummary } from '../utils/pricing.js';
-import { filterJobDomainsForDedupe, upsertLeadRowsBatch, upsertFounderSearchBatch } from './leads.js';
+import { filterJobDomainsForDedupe, upsertLeadRowsBatch, upsertFounderSearchBatch, upsertCsvEmailRowsBatch } from './leads.js';
 import { isNotFoundValue } from './enrichmentCohort.js';
+import { buildCsvEmailRows } from '../enrichment/stages/emailsBatch.js';
 import { runFounderFinder } from './founderFinder.js';
 import { runEmailFinder } from './emailFinder.js';
 import { runEmailVerifier } from './emailVerifier.js';
@@ -950,7 +951,6 @@ async function processJob(job) {
 
         if (job.skipEmailFinder) {
             await runStageIfNeeded(job, 'emailDiscovery', async () => {
-                const emailCol = job.columnMapping?.email || 'email';
                 const excludeSkipped = !isReprocessExistingDomains(job);
                 const loadStart = Date.now();
                 const jobDomains = await listJobDomainsForJob(job.id, {
@@ -966,63 +966,42 @@ async function processJob(job) {
                 );
                 setActivity(job, `Importing emails from CSV… 0 / ${total.toLocaleString()}`);
 
-                const pendingBatch = [];
+                // Same row mapping + status rule as the workflow runner (emailsBatch.js).
+                const rows = buildCsvEmailRows(jobDomains, job.columnMapping);
+                const importStatus = !!job.skipVerification;
                 let imported = 0;
+                let statusImported = 0;
                 const BATCH_SIZE = 50;
-                const progressEvery = 50;
 
-                const flushEmailBatch = async () => {
-                    if (!pendingBatch.length) return;
-                    const batch = pendingBatch.splice(0, pendingBatch.length);
-                    await upsertLeadRowsBatch({
+                for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+                    await gate.checkpoint();
+                    const batch = rows.slice(i, i + BATCH_SIZE);
+                    const written = await upsertCsvEmailRowsBatch({
                         agencyId: job.uid,
                         clientId: job.sqlClientId,
                         rows: batch,
-                        type: 'emails',
                         jobId: job.id,
                         mergeMode: enrichmentMergeMode(job),
+                        importStatus,
                         onTiming: makeUpsertTiming(job, 'emailDiscovery')
                     });
                     imported += batch.length;
-                };
-
-                for (let i = 0; i < jobDomains.length; i += 1) {
-                    if (i % 100 === 0) await gate.checkpoint();
-                    const jd = jobDomains[i];
-                    const raw = jd.raw_row || {};
-                    const email = String(raw[emailCol] || raw.email || '').trim();
-                    if (!isNotFoundValue(email)) {
-                        pendingBatch.push({
-                            domain: jd.domain_normalized,
-                            founder_name:
-                                String(raw[job.columnMapping?.founder || 'founder_name'] || raw.founder_name || '').trim()
-                                || null,
-                            email,
-                            lookup_status: 'found'
-                        });
-                    }
-                    if (pendingBatch.length >= BATCH_SIZE) {
-                        await flushEmailBatch();
-                    }
-                    const processed = i + 1;
-                    if (processed % progressEvery === 0 || processed === total) {
-                        log(job, `Email from CSV: ${processed.toLocaleString()} / ${total.toLocaleString()}`, {
-                            progress: {
-                                stage: 'emailDiscovery',
-                                processed,
-                                total,
-                                found: imported,
-                                stats: { Found: imported, imported }
-                            }
-                        });
-                        setActivity(
-                            job,
-                            `Importing emails from CSV… ${processed.toLocaleString()} / ${total.toLocaleString()}`
-                        );
-                    }
+                    statusImported += written.statusRows;
+                    log(job, `Email from CSV: ${imported.toLocaleString()} / ${rows.length.toLocaleString()}`, {
+                        progress: {
+                            stage: 'emailDiscovery',
+                            processed: imported,
+                            total,
+                            found: imported,
+                            stats: { Found: imported, imported }
+                        }
+                    });
+                    setActivity(
+                        job,
+                        `Importing emails from CSV… ${imported.toLocaleString()} / ${rows.length.toLocaleString()}`
+                    );
                 }
-                await flushEmailBatch();
-                return { processed: total, found: imported, Found: imported, cost: 0 };
+                return { processed: total, found: imported, Found: imported, statusImported, cost: 0 };
             });
             log(job, `Email discovery skipped (upload included email). Processed ${job.stages.emailDiscovery?.summary?.processed ?? 0} rows.`);
         } else {
