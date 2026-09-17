@@ -1781,6 +1781,97 @@ router.post('/jobs/check-domains/new.csv', async (req, res) => {
     }
 });
 
+// POST /api/jobs/check-domains/existing.csv — existing domains with their enriched data.
+// `scope` selects which subset to export; the predicates mirror the counts returned by
+// POST /jobs/check-domains so the row count matches the number shown in the modal.
+const EXISTING_DOMAIN_EXPORT_SCOPES = {
+    founders: {
+        predicate: `c.full_name IS NOT NULL AND c.full_name != ''`,
+        headers: ['domain', 'founder_name', 'first_name', 'last_name']
+    },
+    emails: {
+        predicate: `c.email IS NOT NULL AND c.email != ''`,
+        headers: ['domain', 'founder_name', 'first_name', 'last_name', 'email', 'email_status']
+    },
+    personalization: {
+        predicate: `c.personalization_first_line IS NOT NULL AND c.personalization_first_line != ''`,
+        headers: ['domain', 'founder_name', 'first_name', 'last_name', 'email', 'email_status', 'personalization']
+    }
+};
+
+router.post('/jobs/check-domains/existing.csv', async (req, res) => {
+    try {
+        const { domains, clientId: clientSlug, scope } = req.body;
+
+        if (!Array.isArray(domains) || domains.length === 0) {
+            return res.status(400).json({ error: 'domains must be a non-empty array.' });
+        }
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'Missing clientId.' });
+        }
+
+        const exportScope = EXISTING_DOMAIN_EXPORT_SCOPES[String(scope || '')];
+        if (!exportScope) {
+            return res.status(400).json({
+                error: `scope must be one of: ${Object.keys(EXISTING_DOMAIN_EXPORT_SCOPES).join(', ')}.`
+            });
+        }
+
+        const agencyId = await agencyFromRequest(req);
+        const uniqueDomains = Array.from(new Set(domains.map((d) => normalizeDomain(d)).filter(Boolean)));
+
+        const clientRow = await resolveClientRow(agencyId, String(clientSlug).trim());
+        if (!clientRow?.id) {
+            return res.status(404).json({ error: 'Client not found.' });
+        }
+
+        // One row per domain. Only 'founder' contacts are written in practice, but prefer
+        // them explicitly so the row count stays aligned with the distinct-domain stats.
+        const result = await pool.query(
+            `SELECT DISTINCT ON (co.domain_normalized)
+                co.domain_normalized AS domain,
+                c.full_name AS founder_name,
+                c.email,
+                c.email_status,
+                c.personalization_first_line AS personalization
+             FROM companies co
+             JOIN contacts c ON c.company_id = co.id
+             WHERE co.client_id = $1
+             AND co.domain_normalized = ANY($2::text[])
+             AND c.job_id IS NOT NULL
+             AND ${exportScope.predicate}
+             ORDER BY co.domain_normalized ASC, (c.role_type = 'founder') DESC, c.updated_at DESC`,
+            [clientRow.id, uniqueDomains]
+        );
+
+        const { headers } = exportScope;
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="existing_${scope}.csv"`);
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.write(`${headers.join(',')}\n`);
+        for (const row of result.rows) {
+            const parts = String(row.founder_name || '').trim().split(/\s+/);
+            res.write(`${formatUnifiedCsvLine(headers, {
+                domain: row.domain,
+                founder_name: row.founder_name || '',
+                first_name: parts[0] || '',
+                last_name: parts.length > 1 ? parts.slice(1).join(' ') : '',
+                email: row.email || '',
+                email_status: row.email_status || '',
+                personalization: row.personalization || ''
+            })}\n`);
+        }
+        res.end();
+    } catch (error) {
+        console.error('Error exporting existing domains:', error);
+        if (res.headersSent) {
+            return res.end();
+        }
+        res.status(500).json({ error: 'Failed to export existing domains.' });
+    }
+});
+
 // Personalizer endpoint - simplified pipeline for Shopify personalization
 const personalizerFields = upload.fields([
     { name: 'file', maxCount: 1 },

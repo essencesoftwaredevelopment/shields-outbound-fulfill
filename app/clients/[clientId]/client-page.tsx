@@ -1643,6 +1643,58 @@ const calculateJobProgress = (job: PipelineJob): { processed: number; total: num
     return { processed, total, percent };
 };
 
+type DomainStatDownloadButtonProps = {
+    /** RGB triplet, e.g. "16, 185, 129" — used to derive the border/background tints. */
+    rgb: string;
+    busy: boolean;
+    label: string;
+    onClick: () => void;
+};
+
+function DomainStatDownloadButton({ rgb, busy, label, onClick }: DomainStatDownloadButtonProps) {
+    const color = `rgb(${rgb})`;
+    return (
+        <button
+            type="button"
+            onClick={onClick}
+            disabled={busy}
+            title={busy ? 'Preparing CSV…' : label}
+            aria-label={busy ? 'Preparing CSV' : label}
+            style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '22px',
+                height: '22px',
+                padding: 0,
+                border: `1px solid rgba(${rgb}, 0.4)`,
+                borderRadius: '5px',
+                background: `rgba(${rgb}, 0.12)`,
+                color,
+                cursor: busy ? 'wait' : 'pointer',
+                opacity: busy ? 0.7 : 1,
+            }}
+        >
+            {busy ? (
+                <span
+                    style={{
+                        width: '11px',
+                        height: '11px',
+                        border: `2px solid rgba(${rgb}, 0.3)`,
+                        borderTopColor: color,
+                        borderRadius: '50%',
+                        animation: 'spin 0.8s linear infinite'
+                    }}
+                />
+            ) : (
+                <Download size={13} strokeWidth={2} />
+            )}
+        </button>
+    );
+}
+
+type ExistingDomainExportScope = 'founders' | 'emails' | 'personalization';
+
 const CLIENT_TABS = ["analytics", "info", "campaigns", "leads", "follow-ups", "deal-flow"] as const;
 type ClientTab = typeof CLIENT_TABS[number];
 
@@ -1785,6 +1837,7 @@ export default function ClientPage() {
     } | null>(null);
     const [checkingDomains, setCheckingDomains] = useState(false);
     const [downloadingNewDomains, setDownloadingNewDomains] = useState(false);
+    const [downloadingExistingScope, setDownloadingExistingScope] = useState<ExistingDomainExportScope | null>(null);
     const uploadedCsvDomainsRef = useRef<string[]>([]);
 
     // Step 3: Personalization options
@@ -5545,6 +5598,84 @@ export default function ClientPage() {
             setToastVisible(true);
         } finally {
             setDownloadingNewDomains(false);
+        }
+    };
+
+    const handleDownloadExistingDomainsCsv = async (scope: ExistingDomainExportScope) => {
+        if (downloadingExistingScope) return;
+        const scopeMeta: Record<ExistingDomainExportScope, { count: number; noun: string }> = {
+            founders: { count: domainCheckStats?.withFounders ?? 0, noun: 'founder' },
+            emails: { count: domainCheckStats?.withEmails ?? 0, noun: 'email' },
+            personalization: { count: domainCheckStats?.withPersonalization ?? 0, noun: 'personalization row' },
+        };
+        const { count, noun } = scopeMeta[scope];
+        if (!count) {
+            setToastMessage(`No existing ${noun}s to download.`);
+            setToastVisible(true);
+            return;
+        }
+        if (!user || !clientId) {
+            setToastMessage('You must be signed in to download existing leads.');
+            setToastVisible(true);
+            return;
+        }
+
+        const domains = uploadedCsvDomainsRef.current;
+        if (!domains.length) {
+            setToastMessage('Re-upload the CSV to download existing leads.');
+            setToastVisible(true);
+            return;
+        }
+
+        setDownloadingExistingScope(scope);
+        try {
+            const token = await getAccessToken();
+            if (!token) {
+                setToastMessage('Session expired. Sign in again and retry.');
+                setToastVisible(true);
+                return;
+            }
+
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/jobs/check-domains/existing.csv`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        domains,
+                        clientId,
+                        scope,
+                    })
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(`Failed to export existing ${noun}s.`);
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            const sourceName = selectedFile?.name?.replace(/\.csv$/i, '') || 'upload';
+            link.href = url;
+            link.download = `${sourceName}_existing_${scope}.csv`;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            setToastMessage(`Downloaded ${count.toLocaleString()} ${noun}${count === 1 ? '' : 's'}`);
+            setToastVisible(true);
+        } catch (error) {
+            console.error(`Error downloading existing ${scope}:`, error);
+            setToastMessage(error instanceof Error ? error.message : `Failed to download existing ${noun}s`);
+            setToastVisible(true);
+        } finally {
+            setDownloadingExistingScope(null);
         }
     };
 
@@ -12713,42 +12844,12 @@ export default function ClientPage() {
                                                                 <strong style={{ color: '#10b981' }}>{domainCheckStats.new.toLocaleString()}</strong> new
                                                             </span>
                                                             {domainCheckStats.new > 0 && (
-                                                                <button
-                                                                    type="button"
+                                                                <DomainStatDownloadButton
+                                                                    rgb="16, 185, 129"
+                                                                    busy={downloadingNewDomains}
+                                                                    label="Download CSV of new domains"
                                                                     onClick={handleDownloadNewDomainsCsv}
-                                                                    disabled={downloadingNewDomains}
-                                                                    title={downloadingNewDomains ? 'Preparing CSV…' : 'Download CSV of new domains'}
-                                                                    aria-label={downloadingNewDomains ? 'Preparing CSV' : 'Download CSV of new domains'}
-                                                                    style={{
-                                                                        display: 'inline-flex',
-                                                                        alignItems: 'center',
-                                                                        justifyContent: 'center',
-                                                                        width: '22px',
-                                                                        height: '22px',
-                                                                        padding: 0,
-                                                                        border: '1px solid rgba(16, 185, 129, 0.4)',
-                                                                        borderRadius: '5px',
-                                                                        background: 'rgba(16, 185, 129, 0.12)',
-                                                                        color: '#10b981',
-                                                                        cursor: downloadingNewDomains ? 'wait' : 'pointer',
-                                                                        opacity: downloadingNewDomains ? 0.7 : 1,
-                                                                    }}
-                                                                >
-                                                                    {downloadingNewDomains ? (
-                                                                        <span
-                                                                            style={{
-                                                                                width: '11px',
-                                                                                height: '11px',
-                                                                                border: '2px solid rgba(16, 185, 129, 0.3)',
-                                                                                borderTopColor: '#10b981',
-                                                                                borderRadius: '50%',
-                                                                                animation: 'spin 0.8s linear infinite'
-                                                                            }}
-                                                                        />
-                                                                    ) : (
-                                                                        <Download size={13} strokeWidth={2} />
-                                                                    )}
-                                                                </button>
+                                                                />
                                                             )}
                                                         </span>
                                                     </div>
@@ -12765,14 +12866,44 @@ export default function ClientPage() {
 
                                                     {/* Row 3: Data enrichment */}
                                                     <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)' }}>
-                                                        <span>
-                                                            <strong style={{ color: '#8b5cf6' }}>{domainCheckStats.withFounders.toLocaleString()}</strong> w/ founders
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: '#8b5cf6' }}>{domainCheckStats.withFounders.toLocaleString()}</strong> w/ founders
+                                                            </span>
+                                                            {domainCheckStats.withFounders > 0 && (
+                                                                <DomainStatDownloadButton
+                                                                    rgb="139, 92, 246"
+                                                                    busy={downloadingExistingScope === 'founders'}
+                                                                    label="Download CSV of existing founders (domain + name)"
+                                                                    onClick={() => handleDownloadExistingDomainsCsv('founders')}
+                                                                />
+                                                            )}
                                                         </span>
-                                                        <span>
-                                                            <strong style={{ color: '#ec4899' }}>{domainCheckStats.withEmails.toLocaleString()}</strong> w/ emails
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: '#ec4899' }}>{domainCheckStats.withEmails.toLocaleString()}</strong> w/ emails
+                                                            </span>
+                                                            {domainCheckStats.withEmails > 0 && (
+                                                                <DomainStatDownloadButton
+                                                                    rgb="236, 72, 153"
+                                                                    busy={downloadingExistingScope === 'emails'}
+                                                                    label="Download CSV of existing emails (domain + name + email)"
+                                                                    onClick={() => handleDownloadExistingDomainsCsv('emails')}
+                                                                />
+                                                            )}
                                                         </span>
-                                                        <span>
-                                                            <strong style={{ color: '#06b6d4' }}>{domainCheckStats.withPersonalization.toLocaleString()}</strong> w/ personalization
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: '#06b6d4' }}>{domainCheckStats.withPersonalization.toLocaleString()}</strong> w/ personalization
+                                                            </span>
+                                                            {domainCheckStats.withPersonalization > 0 && (
+                                                                <DomainStatDownloadButton
+                                                                    rgb="6, 182, 212"
+                                                                    busy={downloadingExistingScope === 'personalization'}
+                                                                    label="Download CSV of existing personalization (domain + name + email + personalization)"
+                                                                    onClick={() => handleDownloadExistingDomainsCsv('personalization')}
+                                                                />
+                                                            )}
                                                         </span>
                                                     </div>
                                                 </div>
