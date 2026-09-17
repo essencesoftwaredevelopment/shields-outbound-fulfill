@@ -615,6 +615,7 @@ const LEAD_FILTER_FIELDS = [
             { key: 'eq', label: 'Equals' },
             { key: 'neq', label: 'Does Not Equal' },
             { key: 'starts_with', label: 'Starts With' },
+            { key: 'ends_with', label: 'Ends With' },
             { key: 'is_empty', label: 'Is Empty' },
             { key: 'not_empty', label: 'Is Not Empty' }
         ]
@@ -1895,6 +1896,11 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
                 clauses.push(`co.domain_normalized <> ${ref}`);
             } else if (operatorKey === 'starts_with') {
                 const ref = bindParam(`${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`co.domain_normalized IS NOT NULL AND co.domain_normalized LIKE ${ref}`);
+            } else if (operatorKey === 'ends_with') {
+                // TLD / suffix filters (".co.uk", "shopify.com"); leading-wildcard LIKE
+                // is served by the trigram index like `contains`.
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}`);
                 clauses.push(`co.domain_normalized IS NOT NULL AND co.domain_normalized LIKE ${ref}`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`(co.domain_normalized IS NULL OR BTRIM(co.domain_normalized) = '')`);
