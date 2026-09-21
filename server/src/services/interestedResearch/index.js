@@ -16,7 +16,7 @@
 import OpenAI from 'openai';
 import { pool } from '../../config/db.js';
 import { getAgencySettings, apiKeysFromSettings } from '../db/agencySettings.js';
-import { resolveTemplateVars, renderTemplate } from '../followUpSender.js';
+import { resolveTemplateVars, renderTemplate, buildEssenceBookingUrl, buildEssenceOfferUrl } from '../followUpSender.js';
 import {
     applyActiveFungiStoryUrlToTemplateVars,
     buildClientAutoresponderUrl,
@@ -47,6 +47,14 @@ import {
     RESEARCH_INDUSTRIES
 } from './briefUtils.js';
 import { attachWorkflowRunId, stampResearchStep } from './progress.js';
+import { runOpenAiStoreSizeResearch } from './sizeAgent.js';
+import {
+    buildForcedBookingCtaInstructions,
+    buildForcedOfferCtaInstructions,
+    mergeSizeEstimateIntoBrief,
+    shouldOfferBuildCta,
+    sizeEstimateFromContactInsights
+} from './sizeEstimate.js';
 
 export { attachWorkflowRunId, stampResearchStep };
 
@@ -435,6 +443,90 @@ export async function persistResearchBrief({ draftId, agencyId, brief = null }) 
 }
 
 /**
+ * Step 3c — OpenAI web_search size agent (or contact_insights short-circuit).
+ * Merges sizeEstimate onto the draft's research_brief. Best-effort: failure
+ * leaves the brief unchanged and the CTA defaults to Calendly.
+ *
+ * @param {{ draftId: number, agencyId: string }} args
+ * @returns {Promise<object | null>} updated brief (or prior brief / null)
+ */
+export async function estimateStoreSize({ draftId, agencyId }) {
+    const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    await stampResearchStep(draftId, agencyId, 'size');
+    const { domain, companyName } = await resolveDraftResearchTarget(pool, draft);
+
+    let sizeEstimate = null;
+    try {
+        const insightsRow = await pool.query(
+            `SELECT annual_revenue_min, annual_revenue_max, annual_revenue_text
+             FROM contact_insights
+             WHERE contact_id = $1
+             LIMIT 1`,
+            [draft.contact_id]
+        );
+        sizeEstimate = sizeEstimateFromContactInsights(insightsRow.rows[0] || null);
+    } catch (err) {
+        console.warn(
+            `[interested-research] insights size lookup failed draft=${draftId}: ${err?.message || err}`
+        );
+    }
+
+    if (!sizeEstimate) {
+        const settings = await fetchAgencyAndClientSettings(agencyId, draft.client_id);
+        if (!settings.openaiKey) {
+            console.warn(`[interested-research] missing OpenAI key for size agent agency=${agencyId}`);
+        } else {
+            try {
+                sizeEstimate = await runOpenAiStoreSizeResearch({
+                    openaiKey: settings.openaiKey,
+                    companyName,
+                    domain,
+                    leadEmail: draft.lead_email
+                });
+            } catch (err) {
+                console.warn(
+                    `[interested-research] size agent failed draft=${draftId}: ${err?.message || err}`
+                );
+                sizeEstimate = null;
+            }
+        }
+    }
+
+    if (!sizeEstimate) {
+        console.log(`[interested-research] no sizeEstimate for draft=${draftId} — Calendly path`);
+        return draft.research_brief && typeof draft.research_brief === 'object'
+            ? draft.research_brief
+            : null;
+    }
+
+    const prior = draft.research_brief && typeof draft.research_brief === 'object'
+        ? draft.research_brief
+        : null;
+    const merged = mergeSizeEstimateIntoBrief(prior, sizeEstimate, { company: companyName, domain });
+    if (!merged) return prior;
+
+    const result = await pool.query(
+        `UPDATE interested_autoresponder_drafts
+         SET research_brief = $2::jsonb,
+             updated_at = NOW()
+         WHERE id = $1 AND status = 'researching'
+         RETURNING research_brief`,
+        [draftId, JSON.stringify(merged)]
+    );
+    if (!result.rowCount) {
+        throw new ResearchDraftSupersededError(
+            `Draft ${draftId} is no longer researching — superseded or cancelled`
+        );
+    }
+
+    console.log(
+        `[interested-research] sizeEstimate draft=${draftId} sevenFigure=${sizeEstimate.isSevenFigureLikely}`
+        + ` confidence=${sizeEstimate.confidence} offerCta=${shouldOfferBuildCta(sizeEstimate)}`
+    );
+    return result.rows[0]?.research_brief || merged;
+}
+
+/**
  * Step 4 — external popup / lead-magnet URL, exactly as the inline path does it:
  * Vulcan audit for shopping-audit reply agencies, Essence popup only when the
  * campaign prompt uses it, skipped otherwise. Popup generation stays external.
@@ -556,6 +648,23 @@ export async function finalizeResearchDraft({
         : withAuditUrlVars(resolvedTemplateVars, auditPreviewUrl);
     const renderedSystemPrompt = renderTemplate(promptConfig.system_prompt, templateVars);
 
+    const sizeEstimate = draft.research_brief?.sizeEstimate || null;
+    const offerBuildCta = !useActiveFungiStoryUrl
+        && !preview.useShoppingAuditReply
+        && shouldOfferBuildCta(sizeEstimate);
+    const bookingUrl = buildEssenceBookingUrl(templateVars);
+    const offerUrl = buildEssenceOfferUrl(templateVars, {
+        utmSource: 'interested_reply',
+        utmCampaign: 'acq_build_offer'
+    });
+    const forcedCtaInstructions = offerBuildCta
+        ? buildForcedOfferCtaInstructions(offerUrl)
+        : (preview.systemPromptOwnsCta
+            ? ''
+            : buildForcedBookingCtaInstructions(bookingUrl));
+    // When we force the VSL, the campaign prompt must not also own a Calendly CTA.
+    const systemPromptOwnsCta = offerBuildCta ? false : preview.systemPromptOwnsCta;
+
     const generation = await generateDraftReply({
         openaiKey: settings.openaiKey,
         systemPrompt: renderedSystemPrompt,
@@ -565,9 +674,11 @@ export async function finalizeResearchDraft({
         previousLeadMessage: draft.previous_lead_message,
         auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
         researchBrief: draft.research_brief || null,
-        systemPromptOwnsCta: preview.systemPromptOwnsCta,
+        systemPromptOwnsCta,
         additionalInstructions,
-        essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
+        forcedCtaInstructions: forcedCtaInstructions || null,
+        forcedCtaUrl: offerBuildCta ? offerUrl : null,
+        essenceStorePreviewTool: offerBuildCta ? false : preview.canGenerateEssenceStorePreview,
         previewDomain: domain
     });
 

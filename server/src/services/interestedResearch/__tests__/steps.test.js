@@ -6,12 +6,13 @@ import {
     resolveResearchProgress
 } from '../steps.js';
 
-test('step catalog is a stable 6-step horizontal sequence', () => {
+test('step catalog is a stable 7-step horizontal sequence', () => {
     assert.deepEqual(
         INTERESTED_RESEARCH_STEPS.map((step) => step.id),
-        ['hydrate', 'research', 'synthesize', 'persist', 'popup', 'finalize']
+        ['hydrate', 'research', 'synthesize', 'persist', 'size', 'popup', 'finalize']
     );
     assert.equal(isInterestedResearchStepId('synthesize'), true);
+    assert.equal(isInterestedResearchStepId('size'), true);
     assert.equal(isInterestedResearchStepId('serper'), false);
 });
 

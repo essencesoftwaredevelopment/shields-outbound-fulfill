@@ -318,6 +318,23 @@ test('extractReviewCountFromSerper does not see dropped Titan-glove hits after f
     assert.equal(extractReviewCountFromSerper(filtered), null);
 });
 
+test('normalizeResearchBrief preserves a sizeEstimate from the size agent', () => {
+    const brief = normalizeResearchBrief({
+        company: 'Brand',
+        domain: 'brand.com',
+        summary: 'Sells premium widgets DTC.',
+        sizeEstimate: {
+            isSevenFigureLikely: true,
+            confidence: 'high',
+            rationale: 'Strong review volume and funding',
+            signals: ['reviews'],
+            sources: []
+        }
+    });
+    assert.equal(brief.sizeEstimate.isSevenFigureLikely, true);
+    assert.equal(brief.sizeEstimate.confidence, 'high');
+});
+
 test('serializeResearchBriefForReview keeps a stored brief intact and drops empty ones', () => {
     const stored = {
         company: 'Wild Orchard',

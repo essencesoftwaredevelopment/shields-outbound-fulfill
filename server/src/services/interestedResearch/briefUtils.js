@@ -3,6 +3,8 @@
  * everything here is unit-testable and safe to import from anywhere.
  */
 
+import { normalizeSizeEstimate } from './sizeEstimate.js';
+
 export const RESEARCH_HOMEPAGE_TEXT_LIMIT = 8_000;
 
 /**
@@ -296,7 +298,7 @@ export function compactSerperResults(responses = [], { limitPerQuery = RESEARCH_
 /**
  * Validate/normalize the LLM's brief JSON into the canonical shape:
  * { company, domain, industry, summary, talkingPoints, risks, sources,
- *   reviewCount, estimatedVisitors }.
+ *   reviewCount, estimatedVisitors, sizeEstimate? }.
  * Returns null when there is no usable summary (thin research → no brief).
  *
  * @param {object|null} raw
@@ -332,7 +334,7 @@ export function normalizeResearchBrief(raw, { company = '', domain = '', fallbac
     const reviewCount = normalizeReviewCount(fallbackReviewCount);
     const estimatedVisitors = estimateVisitorsFromReviewCount(reviewCount);
 
-    return {
+    const brief = {
         company: asText(raw.company) || asText(company),
         domain: asText(raw.domain) || asText(domain),
         industry: normalizeResearchIndustry(raw.industry),
@@ -343,6 +345,14 @@ export function normalizeResearchBrief(raw, { company = '', domain = '', fallbac
         reviewCount,
         estimatedVisitors
     };
+
+    // sizeEstimate is produced by the OpenAI web_search size agent (or insights
+    // short-circuit). Preserve when present — do not invent here.
+    const sizeEstimate = normalizeSizeEstimate(raw.sizeEstimate);
+    if (sizeEstimate) {
+        brief.sizeEstimate = sizeEstimate;
+    }
+    return brief;
 }
 
 /**
@@ -352,7 +362,13 @@ export function normalizeResearchBrief(raw, { company = '', domain = '', fallbac
  */
 export function serializeResearchBriefForReview(raw) {
     if (!raw || typeof raw !== 'object') return null;
-    return normalizeResearchBrief(raw, { fallbackReviewCount: raw.reviewCount });
+    const normalized = normalizeResearchBrief(raw, { fallbackReviewCount: raw.reviewCount });
+    if (!normalized) return null;
+    // Re-attach sizeEstimate after normalize (normalizer already copies when present).
+    if (raw.sizeEstimate && typeof raw.sizeEstimate === 'object' && !normalized.sizeEstimate) {
+        normalized.sizeEstimate = raw.sizeEstimate;
+    }
+    return normalized;
 }
 
 /** Render the brief as a compact block for the reply-draft prompt. */
@@ -391,6 +407,16 @@ export function formatResearchBriefForPrompt(brief) {
     }
     if (estimatedVisitors !== null) {
         lines.push(`Estimated site visitors (reviews × ${VISITORS_PER_REVIEW}): ${estimatedVisitors}`);
+    }
+    const size = brief.sizeEstimate && typeof brief.sizeEstimate === 'object'
+        ? brief.sizeEstimate
+        : null;
+    if (size) {
+        const confidence = asText(size.confidence) || 'unknown';
+        const likely = size.isSevenFigureLikely === true ? 'yes' : 'no';
+        lines.push(`Store-size estimate (≥$1M/year likely): ${likely} (confidence: ${confidence})`);
+        const rationale = asText(size.rationale);
+        if (rationale) lines.push(`Size rationale: ${rationale.slice(0, 500)}`);
     }
     return lines.join('\n');
 }

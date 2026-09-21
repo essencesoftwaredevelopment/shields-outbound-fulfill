@@ -109,15 +109,21 @@ signal context → template vars → render the campaign prompt → `generateDra
 Vercel Workflows runtime, one durable run per draft:
 
 ```
-hydrate ──┬── homepage ──┬── synthesizeBrief ── persistBrief ── popup ── finalize
-          └── serper   ──┘        (Promise.all)
+hydrate ──┬── homepage ──┬── synthesizeBrief ── persistBrief ── sizeEstimate ── popup ── finalize
+          └── serper   ──┘        (Promise.all)                  (OpenAI web_search)
 ```
+
+`sizeEstimate` uses OpenAI Responses + hosted `web_search` (not Serper) to decide
+whether the brand is likely ≥$1M/year. High-confidence yes → finalize forces the
+[acq-build-offer VSL](https://essenceretention.com/acq-build-offer) CTA; otherwise
+Calendly. Drafts still promote to `pending_review`. Warm follow-ups reuse
+`research_brief.sizeEstimate` with no human approval.
 
 Every step re-reads the draft (`SELECT d.*, ic.name FROM interested_autoresponder_drafts d
 JOIN instantly_campaigns ic … WHERE d.id=$1 AND d.agency_id=$2`), stops with a
 `{ status: 'superseded' }` sentinel unless `status='researching'`, and writes
 `research_step` for the stepper (`hydrate` · `research` · `synthesize` · `persist` ·
-`popup` · `finalize`; the two parallel steps share `research`).
+`size` · `popup` · `finalize`; the two parallel steps share `research`).
 
 ### 3.1 hydrate — `maxRetries 0`
 

@@ -960,7 +960,7 @@ export async function generateDraftReply({
     auditPreviewUrl = null,
     essenceAiPreviewUrl = null,
     // Structured research brief ({ company, domain, industry, summary, talkingPoints,
-    // risks, sources, reviewCount, estimatedVisitors })
+    // risks, sources, reviewCount, estimatedVisitors, sizeEstimate? })
     // produced by the interested-research workflow. Optional — inline drafts pass nothing.
     researchBrief = null,
     // When true, the campaign system prompt already owns the CTA (Active Fungi
@@ -968,6 +968,9 @@ export async function generateDraftReply({
     // Skip shopping-audit / Essence-AI-demo CTA instructions so they don't fight it.
     systemPromptOwnsCta = false,
     additionalInstructions = null,
+    // Size-gated VSL / booking override — prepended above the campaign prompt.
+    forcedCtaInstructions = null,
+    forcedCtaUrl = null,
     // Essence AI Email Generation: offer generate_store_preview instead of
     // building the popup up front. The model calls it only when the campaign
     // prompt says the preview is the right CTA.
@@ -978,21 +981,32 @@ export async function generateDraftReply({
     const enablePreviewTool = Boolean(essenceStorePreviewTool) && !previewUrl;
     const client = new OpenAI({ apiKey: openaiKey });
     let ctaBlock = '';
-    if (!systemPromptOwnsCta) {
+    if (!systemPromptOwnsCta && !asTrimmedText(forcedCtaInstructions)) {
         ctaBlock = previewUrl
             ? `CTA instruction: A personalized shopping ad audit has already been generated for this prospect's store. Use the Shopping audit URL above as the sole CTA link — link text should be "See what we built for your store". Do NOT include the Calendly booking link.`
             : `CTA instruction: Use the Calendly booking link as the CTA: https://calendly.com/essencesoftwaredevelopment/essence-ai-demo`;
     }
     const briefBlock = formatResearchBriefForPrompt(researchBrief);
+    const priorityBlock = [
+        asTrimmedText(forcedCtaInstructions),
+        asTrimmedText(additionalInstructions)
+    ].filter(Boolean).join('\n\n');
     const effectiveSystemPrompt = applyReplyLinkPlaceholders(
-        prependPriorityInstructions(systemPrompt, additionalInstructions),
+        prependPriorityInstructions(systemPrompt, priorityBlock || null),
         { auditUrl: previewUrl }
     );
+    const forcedUrl = asTrimmedText(forcedCtaUrl);
     const userContent = [
         `Campaign: ${campaignName || 'Unknown campaign'}`,
         `Lead email: ${leadEmail || 'Unknown lead'}`,
         `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
-        previewUrl && !systemPromptOwnsCta
+        forcedUrl
+            ? [
+                `Forced CTA URL (use this exact href as the sole CTA): ${forcedUrl}`,
+                'Never invent a different offer or booking URL.'
+            ].join('\n')
+            : '',
+        previewUrl && !systemPromptOwnsCta && !forcedUrl
             ? [
                 `Shopping audit URL: ${previewUrl}`,
                 'Use that exact URL as the audit href. Never output AUDIT_URL, [AUDIT_URL], or any other placeholder in an <a> tag.'

@@ -296,6 +296,7 @@ export function htmlToPlainText(html) {
 // ─── Essence Retention booking URL ────────────────────────────────────────────
 
 export const ESSENCE_BOOKING_URL = 'https://essenceretention.com/booking';
+export const ESSENCE_BUILD_OFFER_URL = 'https://essenceretention.com/acq-build-offer';
 
 /**
  * Query-param names the /booking page accepts, in preference order.
@@ -331,6 +332,28 @@ export function buildEssenceBookingUrl(vars = {}) {
         parts.push(`${encodeURIComponent(param)}=${encodeURIComponent(value)}`);
     }
     return parts.length ? `${ESSENCE_BOOKING_URL}?${parts.join('&')}` : ESSENCE_BOOKING_URL;
+}
+
+/**
+ * Build the free popup/welcome-flow VSL URL with optional UTM + website context.
+ * Prefill is lighter than /booking — the page qualifies; we only attribute traffic.
+ *
+ * @param {Record<string, unknown>} [vars]
+ * @param {{ utmSource?: string, utmMedium?: string, utmCampaign?: string }} [opts]
+ */
+export function buildEssenceOfferUrl(vars = {}, opts = {}) {
+    const parts = [];
+    const website = firstNonEmptyVar(vars, ['company_domain', 'website', 'url', 'site', 'domain']);
+    if (website) {
+        parts.push(`website=${encodeURIComponent(website)}`);
+    }
+    const utmSource = String(opts.utmSource || 'outbound').trim();
+    const utmMedium = String(opts.utmMedium || 'email').trim();
+    const utmCampaign = String(opts.utmCampaign || 'acq_build_offer').trim();
+    if (utmSource) parts.push(`utm_source=${encodeURIComponent(utmSource)}`);
+    if (utmMedium) parts.push(`utm_medium=${encodeURIComponent(utmMedium)}`);
+    if (utmCampaign) parts.push(`utm_campaign=${encodeURIComponent(utmCampaign)}`);
+    return parts.length ? `${ESSENCE_BUILD_OFFER_URL}?${parts.join('&')}` : ESSENCE_BUILD_OFFER_URL;
 }
 
 // ─── Template variable resolution ────────────────────────────────────────────
@@ -402,7 +425,8 @@ export async function resolveTemplateVars(db, contactId, campaignId, options = {
 
     return {
         ...vars,
-        booking_url: buildEssenceBookingUrl(vars)
+        booking_url: buildEssenceBookingUrl(vars),
+        offer_url: buildEssenceOfferUrl(vars, { utmCampaign: 'acq_build_offer' })
     };
 }
 

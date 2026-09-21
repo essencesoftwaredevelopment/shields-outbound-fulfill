@@ -20,10 +20,12 @@ import {
     htmlToPlainText,
     resolveThreadReplyAnchor,
     buildEssenceBookingUrl,
+    buildEssenceOfferUrl,
     getWarmFollowUpState,
     removeContactFromWarmFollowUps,
     BLOCKER_EVENT_TYPES as ENGINE_BLOCKER_EVENT_TYPES,
     ESSENCE_BOOKING_URL,
+    ESSENCE_BUILD_OFFER_URL,
     WARM_FOLLOW_UP_REMOVED_EVENT,
 } from '../followUpSender.js';
 
@@ -135,6 +137,17 @@ test('renderTemplate substitutes booking_url', () => {
         booking_url: bookingUrl
     });
     assert.equal(result, `<a href="${bookingUrl}">Grab a time here</a>`);
+});
+
+test('buildEssenceOfferUrl defaults to the VSL with attribution params', () => {
+    assert.equal(
+        buildEssenceOfferUrl(),
+        `${ESSENCE_BUILD_OFFER_URL}?utm_source=outbound&utm_medium=email&utm_campaign=acq_build_offer`
+    );
+    assert.equal(
+        buildEssenceOfferUrl({ company_domain: 'store.com' }, { utmSource: 'interested_reply' }),
+        `${ESSENCE_BUILD_OFFER_URL}?website=store.com&utm_source=interested_reply&utm_medium=email&utm_campaign=acq_build_offer`
+    );
 });
 
 // ─── HTML sanitization ────────────────────────────────────────────────────────

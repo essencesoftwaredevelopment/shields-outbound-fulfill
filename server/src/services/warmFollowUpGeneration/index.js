@@ -9,6 +9,8 @@ import OpenAI from 'openai';
 import { pool } from '../../config/db.js';
 import { fetchAgencyAndClientSettings } from '../interestedAutoResponder.js';
 import {
+    buildEssenceBookingUrl,
+    buildEssenceOfferUrl,
     htmlToPlainText,
     renderTemplate,
     resolveTemplateVars,
@@ -16,6 +18,7 @@ import {
     sendRenderedFollowUp,
     fetchThreadReplyMetadata
 } from '../followUpSender.js';
+import { shouldOfferBuildCta } from '../interestedResearch/sizeEstimate.js';
 import {
     assembleFollowUpMessages,
     FOLLOW_UP_MAX_CHARS,
@@ -197,9 +200,10 @@ export async function loadResearchBriefForRun({ runId, agencyId }) {
         [run.contact_id, run.campaign_id]
     );
     const brief = result.rows[0]?.research_brief || null;
-    const usable = brief && typeof brief === 'object' && String(brief.summary || '').trim()
-        ? brief
-        : null;
+    const hasSummary = brief && typeof brief === 'object' && String(brief.summary || '').trim();
+    const hasSize = brief && typeof brief === 'object' && brief.sizeEstimate
+        && typeof brief.sizeEstimate === 'object';
+    const usable = hasSummary || hasSize ? brief : null;
 
     await pool.query(
         `UPDATE follow_up_generation_runs
@@ -327,9 +331,29 @@ export async function generateFollowUpCopy({ runId, agencyId, researchBrief = nu
         clientId: ctx.clientId,
         emailAccount: threadMeta.eaccount
     });
-    const renderedSystemPrompt = renderTemplate(ctx.systemPrompt || '', vars);
-    const thread = await loadThreadContext(ctx.contactId, ctx.campaignId);
     const brief = researchBrief && typeof researchBrief === 'object' ? researchBrief : null;
+    const offerBuildCta = shouldOfferBuildCta(brief?.sizeEstimate);
+    const forcedCtaMode = offerBuildCta ? 'offer' : 'booking';
+    const forcedCtaUrl = offerBuildCta
+        ? buildEssenceOfferUrl(vars, {
+            utmSource: 'warm_follow_up',
+            utmCampaign: 'acq_build_offer'
+        })
+        : (vars.booking_url || buildEssenceBookingUrl(vars));
+    const offerAwareSystemPrompt = offerBuildCta
+        ? [
+            ctx.systemPrompt || '',
+            '',
+            'When following up on the free build offer: bump the VSL link, do not push a call booking.',
+            'Soft eligibility only. One CTA — the offer URL injected by the system.'
+        ].join('\n')
+        : (ctx.systemPrompt || '');
+    const renderedSystemPrompt = renderTemplate(offerAwareSystemPrompt, {
+        ...vars,
+        offer_url: forcedCtaUrl,
+        booking_url: vars.booking_url || buildEssenceBookingUrl(vars)
+    });
+    const thread = await loadThreadContext(ctx.contactId, ctx.campaignId);
 
     let generatedText = '';
     let usedTemplateFallback = false;
@@ -344,7 +368,9 @@ export async function generateFollowUpCopy({ runId, agencyId, researchBrief = nu
             firstName: vars.first_name || '',
             previousLeadMessage: thread.previousLeadMessage,
             previousOutbound: thread.previousOutbound,
-            previousOutbounds: thread.previousOutbounds
+            previousOutbounds: thread.previousOutbounds,
+            forcedCtaUrl,
+            forcedCtaMode
         });
         try {
             const first = await callFollowUpModel({ openaiKey: settings.openaiKey, messages });
@@ -360,7 +386,9 @@ export async function generateFollowUpCopy({ runId, agencyId, researchBrief = nu
                     previousLeadMessage: thread.previousLeadMessage,
                     previousOutbound: thread.previousOutbound,
                     previousOutbounds: thread.previousOutbounds,
-                    retryShorter: true
+                    retryShorter: true,
+                    forcedCtaUrl,
+                    forcedCtaMode
                 });
                 const retry = await callFollowUpModel({ openaiKey: settings.openaiKey, messages: retryMessages });
                 if (retry.text) generatedText = retry.text;
