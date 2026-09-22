@@ -14,6 +14,7 @@ describe('lead filter field groups', () => {
         assert.equal(getLeadFilterFieldGroup('email_find_state'), LEAD_FILTER_GROUP_ACTIVITY);
         assert.equal(getLeadFilterFieldGroup('email_find_completed_at'), LEAD_FILTER_GROUP_ACTIVITY);
         assert.equal(getLeadFilterFieldGroup('email_verify_completed_at'), LEAD_FILTER_GROUP_ACTIVITY);
+        assert.equal(getLeadFilterFieldGroup('enrow_verify_attempted_at'), LEAD_FILTER_GROUP_ACTIVITY);
         assert.equal(getLeadFilterFieldGroup('shopping_audit_state'), LEAD_FILTER_GROUP_ACTIVITY);
         assert.equal(getLeadFilterFieldGroup('lead_activity'), LEAD_FILTER_GROUP_ACTIVITY);
         assert.equal(getLeadFilterFieldGroup('discovery_call_held'), LEAD_FILTER_GROUP_ACTIVITY);

@@ -36,6 +36,13 @@ import { TMP_ROOT } from '../config/paths.js';
 import { resolveJobPaths } from '../services/jobPipeline.js';
 import { attachCampaignToLeads, incrementCampaignLeadCount } from '../services/leads.js';
 import { createJobRecord, jobs, logJob, markCancelled, markPaused, markResumed, serializeJob } from '../services/jobPipeline.js';
+import {
+    INSTANTLY_UPLOAD_BATCH_SIZE,
+    buildInstantlyLead,
+    addLeadsToInstantlyCampaign,
+    getSqlCampaignId,
+    trackContactsInCampaign
+} from '../services/instantlyUpload.js';
 import { getOrCreateClient, getClientRowBySlug, resolveClientRow } from '../services/db/queries.js';
 import { pool } from '../config/db.js';
 import { runPersonalizerPipeline } from '../services/personalizerPipeline.js';
@@ -493,6 +500,58 @@ function sanitizeLeadFilterInput(rawLeadFilter) {
     };
 }
 
+/**
+ * Mid-run Instantly auto-add settings from the enrichment wizard. Arrives as a
+ * JSON string on multipart CSV uploads and as an object on filtered jobs.
+ * Returns null when absent or unusable (no campaign / no email mapping).
+ */
+function sanitizeAutoInstantlyInput(raw) {
+    let value = raw;
+    if (typeof value === 'string') {
+        try {
+            value = JSON.parse(value);
+        } catch {
+            return null;
+        }
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const campaignId = typeof value.campaignId === 'string' ? value.campaignId.trim() : '';
+    if (!campaignId) return null;
+
+    const columnMapping = {};
+    for (const [field, mapping] of Object.entries(value.columnMapping || {})) {
+        const column = typeof mapping?.column === 'string' ? mapping.column.trim() : '';
+        if (column && !mapping?.isCustom) columnMapping[field] = { column, isCustom: false };
+    }
+    if (!columnMapping.email) return null;
+
+    const customVariables = (Array.isArray(value.customVariables) ? value.customVariables : [])
+        .map((cv) => ({
+            name: typeof cv?.name === 'string' ? cv.name.trim() : '',
+            column: typeof cv?.column === 'string' ? cv.column.trim() : ''
+        }))
+        .filter((cv) => cv.name && cv.column);
+
+    const includeValid = value.includeValid !== false;
+    const includeRisky = value.includeRisky === true;
+    if (!includeValid && !includeRisky) return null;
+
+    return {
+        campaignId,
+        campaignName: typeof value.campaignName === 'string' ? value.campaignName.trim().slice(0, 200) : '',
+        columnMapping,
+        customVariables,
+        skipOptions: {
+            skip_if_in_workspace: !!value.skipOptions?.skip_if_in_workspace,
+            skip_if_in_campaign: !!value.skipOptions?.skip_if_in_campaign,
+            skip_if_in_list: !!value.skipOptions?.skip_if_in_list
+        },
+        includeValid,
+        includeRisky,
+        requireFirstLine: value.requireFirstLine !== false
+    };
+}
+
 router.post('/jobs', uploadFields, async (req, res) => {
     try {
         const hasFile = Boolean(req.files?.file && req.files.file[0]);
@@ -576,7 +635,13 @@ router.post('/jobs', uploadFields, async (req, res) => {
             jobFileName = `Filtered leads (${seedEntries.length.toLocaleString('en-US')} domains)`;
         }
 
+        const autoInstantly = sanitizeAutoInstantlyInput(req.body?.autoInstantly);
+        if (req.body?.autoInstantly && !autoInstantly) {
+            return res.status(400).json({ error: 'Instantly auto-add needs a campaign, an Email mapping and at least one email status.' });
+        }
+
         const job = await createJobRecord(file?.buffer || null, jobFileName, apiKeys, uid, clientSlug, dedupeStrategy, {
+            autoInstantly,
             skipFounderFinder,
             skipEmailFinder,
             skipVerification,
@@ -1126,66 +1191,12 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
         }
 
         // Upload to Instantly in batches
-        const batchSize = 100;
+        const batchSize = INSTANTLY_UPLOAD_BATCH_SIZE;
         let uploaded = 0;
-
-        const customVarsArray = Array.isArray(customVariables) ? customVariables : [];
-
-        const skipPayload = {
-            skip_if_in_workspace: !!skipOptions?.skip_if_in_workspace,
-            skip_if_in_campaign: !!skipOptions?.skip_if_in_campaign,
-            skip_if_in_list: !!skipOptions?.skip_if_in_list
-        };
 
         for (let i = 0; i < verified.length; i += batchSize) {
             const batch = verified.slice(i, i + batchSize);
-            const leads = batch.map(row => {
-                const lead = {};
-
-                // Map standard Instantly fields
-                Object.entries(columnMapping).forEach(([field, mapping]) => {
-                    if (!mapping.column) return;
-
-                    const value = row[mapping.column] || '';
-
-                    if (field === 'email') {
-                        lead.email = value;
-                    } else if (field === 'firstName') {
-                        lead.first_name = value;
-                    } else if (field === 'lastName') {
-                        lead.last_name = value;
-                    } else if (field === 'companyName') {
-                        lead.company_name = value;
-                    } else if (field === 'website') {
-                        lead.website = value;
-                    } else if (field === 'personalization') {
-                        lead.personalization = value;
-                    } else if (field.startsWith('custom_')) {
-                        // Custom variables
-                        const customFieldName = field.replace('custom_', '');
-                        lead[customFieldName] = value;
-                    }
-                });
-                // Defaults
-                if (!lead.website) {
-                    lead.website = row.domain || '';
-                }
-
-                // Custom variables (exact user-provided keys)
-                if (customVarsArray.length > 0) {
-                    const cvPayload = {};
-                    customVarsArray.forEach((cv) => {
-                        if (!cv?.name || !cv?.column) return;
-                        const val = row[cv.column] || '';
-                        cvPayload[cv.name] = val;
-                    });
-                    if (Object.keys(cvPayload).length > 0) {
-                        lead.custom_variables = cvPayload;
-                    }
-                }
-
-                return lead;
-            });
+            const leads = batch.map((row) => buildInstantlyLead(row, columnMapping, customVariables));
 
             // Debug: Log first lead in batch to verify personalization
             if (leads.length > 0) {
@@ -1193,36 +1204,15 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
             }
 
             try {
-                // Instantly v2 with Bearer auth only
-                const response = await fetch('https://api.instantly.ai/api/v2/leads/add', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${instantlyKey}`
-                    },
-                    body: JSON.stringify({
-                        campaign_id: campaignId,
-                        leads,
-                        ...skipPayload
-                    })
-                });
-
-                if (!response.ok) {
-                    const status = response.status;
-                    const errorText = await response.text().catch(() => '');
-                    console.error(`Instantly v2 upload failed for batch ${i / batchSize + 1}: (${status}) ${errorText}`);
-                    if (status === 401) {
-                        await recordUploadFailure('Instantly v2 authentication failed. Check API key and permissions.');
-                        return res.status(401).json({ error: 'ERR_AUTH_FAILED', message: 'Instantly v2 authentication failed. Check API key and permissions.' });
-                    }
-                    throw new Error(`Instantly v2 API error: ${status}`);
-                }
-
-                // Successfully uploaded this batch
+                await addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions });
                 uploaded += leads.length;
                 console.log(`Successfully uploaded batch ${i / batchSize + 1}: ${leads.length} leads (total: ${uploaded}/${verified.length})`);
             } catch (error) {
-                console.error('Error uploading batch to Instantly v2:', error);
+                console.error(`Instantly v2 upload failed for batch ${i / batchSize + 1}:`, error?.message || error);
+                if (error?.code === 'INSTANTLY_UNAUTHORIZED') {
+                    await recordUploadFailure('Instantly v2 authentication failed. Check API key and permissions.');
+                    return res.status(401).json({ error: 'ERR_AUTH_FAILED', message: 'Instantly v2 authentication failed. Check API key and permissions.' });
+                }
                 // Continue with other batches on non-auth errors
             }
         }
@@ -1250,14 +1240,9 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
                 if (clientResult.rows.length > 0) {
                     const sqlClientId = clientResult.rows[0].id;
                     
-                    // Get campaign SQL ID
-                    const campaignResult = await pool.query(
-                        'SELECT id FROM instantly_campaigns WHERE agency_id = $1 AND instantly_campaign_id = $2',
-                        [uid, campaignId]
-                    );
-                    
-                    if (campaignResult.rows.length > 0) {
-                        const sqlCampaignId = campaignResult.rows[0].id;
+                    const sqlCampaignId = await getSqlCampaignId(uid, campaignId);
+
+                    if (sqlCampaignId) {
                         
                         // Get contact IDs for uploaded leads (only valid/risky emails)
                         const emails = verified.slice(0, uploaded).map(row => row.email).filter(Boolean);
@@ -1270,30 +1255,13 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
                             );
                             
                             if (contactsResult.rows.length > 0) {
-                                // Bulk insert into contact_instantly_campaigns
-                                const values = contactsResult.rows.map((_, idx) => {
-                                    const offset = idx * 4;
-                                    return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`;
-                                }).join(', ');
-                                
-                                const params = contactsResult.rows.flatMap(contact => [
-                                    contact.id,
+                                await trackContactsInCampaign({
+                                    contactIds: contactsResult.rows.map((contact) => contact.id),
                                     sqlCampaignId,
                                     jobId,
-                                    'pipeline'
-                                ]);
-                                
-                                await pool.query(
-                                    `INSERT INTO contact_instantly_campaigns 
-                                        (contact_id, campaign_id, job_id, upload_source)
-                                     VALUES ${values}
-                                     ON CONFLICT (contact_id, campaign_id) 
-                                     DO UPDATE SET 
-                                        job_id = COALESCE(contact_instantly_campaigns.job_id, EXCLUDED.job_id),
-                                        added_at = now()`,
-                                    params
-                                );
-                                
+                                    uploadSource: 'pipeline'
+                                });
+
                                 console.log(`[SQL] Tracked ${contactsResult.rows.length} contacts in campaign ${sqlCampaignId}`);
                             }
                         }

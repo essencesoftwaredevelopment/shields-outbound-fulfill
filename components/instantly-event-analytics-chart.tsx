@@ -67,10 +67,22 @@ function formatAxisTick(value: number) {
     return value.toLocaleString();
 }
 
-function buildChartData(rows: ChartRow[]): ChartDataPoint[] {
+// Hourly buckets arrive as UTC ISO keys (e.g. "2026-09-22T21:00:00Z") with a
+// UTC "21:00" label; re-label them in the viewer's own time zone and locale.
+// Day buckets keep the server label: they are whole UTC days, and shifting
+// midnight UTC into a negative-offset zone would show the previous date.
+const localHourFormat = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+
+function localBucketLabel(row: ChartRow, bucketUnit: "hour" | "day"): string {
+    if (bucketUnit !== "hour") return row.label;
+    const date = new Date(row.bucket);
+    return Number.isNaN(date.getTime()) ? row.label : localHourFormat.format(date);
+}
+
+function buildChartData(rows: ChartRow[], bucketUnit: "hour" | "day"): ChartDataPoint[] {
     return rows.map((row) => ({
         bucket: row.bucket,
-        label: row.label,
+        label: localBucketLabel(row, bucketUnit),
         count: row.count,
         emails_sent: row.emails_sent ?? 0,
         positive_replies: row.positive_replies ?? 0,
@@ -91,7 +103,7 @@ export default function InstantlyEventAnalyticsChart({
     const useOutreachView = showPositiveReplies || showMeetingsBooked;
     const primaryDataKey = useOutreachView ? "emails_sent" : "count";
     const chartConfig = useOutreachView ? outreachChartConfig : filteredChartConfig;
-    const chartData = useMemo(() => buildChartData(rows), [rows]);
+    const chartData = useMemo(() => buildChartData(rows, bucketUnit), [rows, bucketUnit]);
 
     const totalPrimaryCount = useMemo(
         () => chartData.reduce((sum, row) => sum + (useOutreachView ? row.emails_sent : row.count), 0),

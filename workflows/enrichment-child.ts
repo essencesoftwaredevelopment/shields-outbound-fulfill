@@ -96,9 +96,21 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
     }
     await emailsStep(input);
     await enrowFallback(input, 'find');
-    await verificationStep(input);
+    // A TryKitt throttle/timeout on a few emails used to end the batch here,
+    // skipping the Enrow re-check and personalization for the ~98 emails that
+    // DID verify (job 1790116521925-r8pj7j: 28 of 95 batches). Finish the
+    // batch first, then surface the failure so the job still ends resumable.
+    let deferredVerifyError: unknown = null;
+    try {
+      await verificationStep(input);
+    } catch (err) {
+      if (!isTryKittThrottledError(err)) throw err;
+      deferredVerifyError = err;
+    }
     await enrowFallback(input, 'verify');
     await personalizationStep(input);
+    await instantlyAutoAddStep(input);
+    if (deferredVerifyError) throw deferredVerifyError;
 
     return {
       batchIndex: input.batchIndex,
@@ -114,6 +126,15 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
     );
     throw err;
   }
+}
+
+/**
+ * Error codes may not survive the step boundary (it arrives as a FatalError
+ * wrapping the step's message), so match createTryKittThrottledError's text.
+ */
+function isTryKittThrottledError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return /TryKitt throttled or timed out/i.test(message);
 }
 
 async function serperShoppingStep(
@@ -208,6 +229,16 @@ async function personalizationStep(input: ChildBatchInput) {
   });
 }
 
+/** Push this batch's qualifying leads to Instantly (no-op unless set on the job). */
+async function instantlyAutoAddStep(input: ChildBatchInput) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.runInstantlyAutoAddBatch(ctx, input.batchDomains);
+}
+
 /**
  * Enrow fallback behind TryKitt (no-op unless the agency enabled it). Enrow is
  * async: submit one bulk request for the batch, then poll with durable sleeps
@@ -277,3 +308,6 @@ personalizationStep.maxRetries = 2;
 // collect is a free GET plus idempotent UPDATEs.
 enrowSubmitStep.maxRetries = 2;
 enrowCollectStep.maxRetries = 2;
+// Leads already in the campaign are excluded from the candidate query, so a
+// retry only sends what the failed attempt didn't record.
+instantlyAutoAddStep.maxRetries = 2;

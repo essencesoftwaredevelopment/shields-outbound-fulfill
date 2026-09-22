@@ -17,7 +17,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useAgencyId } from "@/lib/hooks/useAgencyId";
 import dynamic from "next/dynamic";
 import { apiFetch, apiJson } from "@/lib/api/http";
-import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { createFilteredPipelineJob, createPipelineJob, getJobResultUrl, getPipelineBaseUrl, type AutoInstantlyConfig } from "@/lib/pipeline/client";
 import AppShell from "@/components/app-shell";
 import { AnimatedNumber } from "@/components/animated-number";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
@@ -2475,6 +2475,12 @@ export default function ClientPage() {
     const [includeValidEmails, setIncludeValidEmails] = useState<boolean>(true);
     const [includeRiskyEmails, setIncludeRiskyEmails] = useState<boolean>(true);
     const [uploadEmailStatusCounts, setUploadEmailStatusCounts] = useState<{ valid: number; risky: number } | null>(null);
+    // The mapping modal doubles as the settings form for mid-run Instantly auto-add.
+    const [uploadModalMode, setUploadModalMode] = useState<'upload' | 'autoAdd'>('upload');
+    const [autoInstantlyEnabled, setAutoInstantlyEnabled] = useState(false);
+    const [autoInstantlyConfig, setAutoInstantlyConfig] = useState<AutoInstantlyConfig | null>(null);
+    const [autoInstantlyMappingDraft, setAutoInstantlyMappingDraft] = useState<Record<string, { column: string; isCustom: boolean; customName?: string }> | null>(null);
+    const [autoRequireFirstLine, setAutoRequireFirstLine] = useState(true);
 
     type JobPreviewLead = {
         domain: string;
@@ -5778,6 +5784,7 @@ export default function ClientPage() {
                 nicheLabel: activeNiche?.label,
                 pipelineMode: 'standard',
                 campaignId: selectedCampaignId || undefined,
+                autoInstantly: autoInstantlyEnabled && autoInstantlyConfig ? autoInstantlyConfig : undefined,
                 findFounder,
                 skipFounderFinder,
                 findEmail,
@@ -5816,6 +5823,10 @@ export default function ClientPage() {
             reportUploadError("You must be signed in to upload leads.");
             return;
         }
+        if (autoInstantlyEnabled && !autoInstantlyConfig) {
+            reportUploadError("Set up the Instantly campaign for auto-add, or turn auto-add off.");
+            return;
+        }
         if (enrichSource === 'filtered') {
             await handleStartFilteredEnrichment();
             return;
@@ -5845,6 +5856,7 @@ export default function ClientPage() {
             const response = await createPipelineJob({
                 file: selectedFile,
                 idToken,
+                autoInstantly: autoInstantlyEnabled && autoInstantlyConfig ? autoInstantlyConfig : undefined,
                 clientId: clientId,
                 nicheId: pipelineMode === 'shopping_audit' ? 'shopping_audit' : activeNiche?.id,
                 nicheLabel: pipelineMode === 'shopping_audit' ? 'Shopping Audit' : activeNiche?.label,
@@ -7489,6 +7501,7 @@ export default function ClientPage() {
             return;
         }
 
+        setUploadModalMode('upload');
         setIncludeValidEmails(true);
         setIncludeRiskyEmails(true);
 
@@ -7546,6 +7559,89 @@ export default function ClientPage() {
         } finally {
             setUploading(false);
         }
+    };
+
+    // Columns of a job's unified rows — mirrors STANDARD_UNIFIED_HEADERS /
+    // SHOPPING_AUDIT_UNIFIED_HEADERS in server/src/services/db/jobs.js.
+    const AUTO_INSTANTLY_STANDARD_HEADERS = ['domain', 'founder_name', 'email', 'email_status', 'first_name', 'last_name', 'personalization'];
+    const AUTO_INSTANTLY_SHOPPING_AUDIT_HEADERS = [
+        'domain', 'founder_name', 'email', 'email_status', 'first_name', 'last_name', 'shopify_store', 'ad_matched',
+        'hero_product', 'shopping_ad_link', 'signal', 'issue', 'product_short', 'ad_price', 'page_price', 'other_signals',
+        'personalization'
+    ];
+
+    const openAutoInstantlySettings = () => {
+        setUploadModalMode('autoAdd');
+        setCsvHeaders(enrichSource === 'csv' && useShoppingAuditPipeline
+            ? AUTO_INSTANTLY_SHOPPING_AUDIT_HEADERS
+            : AUTO_INSTANTLY_STANDARD_HEADERS);
+        setCsvPreviewRows([]);
+        setUploadEmailStatusCounts(null);
+        if (autoInstantlyConfig && autoInstantlyMappingDraft) {
+            setSelectedCampaignId(autoInstantlyConfig.campaignId);
+            setColumnMapping(autoInstantlyMappingDraft);
+            setIncludeValidEmails(autoInstantlyConfig.includeValid);
+            setIncludeRiskyEmails(autoInstantlyConfig.includeRisky);
+            setAutoRequireFirstLine(autoInstantlyConfig.requireFirstLine);
+            setSkipWorkspaceDupes(autoInstantlyConfig.skipOptions.skip_if_in_workspace);
+            setSkipCampaignDupes(autoInstantlyConfig.skipOptions.skip_if_in_campaign);
+            setSkipListDupes(autoInstantlyConfig.skipOptions.skip_if_in_list);
+        } else {
+            setColumnMapping({
+                email: { column: 'email', isCustom: false },
+                firstName: { column: 'first_name', isCustom: false },
+                lastName: { column: 'last_name', isCustom: false },
+                website: { column: 'domain', isCustom: false },
+                personalization: { column: 'personalization', isCustom: false }
+            });
+            setIncludeValidEmails(true);
+            setIncludeRiskyEmails(false);
+            setAutoRequireFirstLine(true);
+        }
+        setUploadModalOpen(true);
+    };
+
+    const closeUploadModal = () => {
+        setUploadModalOpen(false);
+        if (uploadModalMode === 'autoAdd') {
+            // Cancelled before the first save: nothing to auto-add with.
+            if (!autoInstantlyConfig) setAutoInstantlyEnabled(false);
+            setUploadModalMode('upload');
+        }
+    };
+
+    const handleSaveAutoInstantly = () => {
+        const emailMapping = columnMapping.email;
+        if (!selectedCampaignId || !emailMapping?.column || emailMapping.isCustom) return;
+        if (!includeValidEmails && !includeRiskyEmails) return;
+        const customVariables = Object.values(columnMapping)
+            .filter((v) => v?.isCustom && v.customName && v.column)
+            .map((v) => ({ name: v.customName!.trim(), column: v.column }));
+        const standardMapping = Object.entries(columnMapping).reduce((acc, [key, val]) => {
+            if (!val || val.isCustom || !val.column) return acc;
+            acc[key] = { column: val.column, isCustom: false };
+            return acc;
+        }, {} as Record<string, { column: string; isCustom: false }>);
+        const campaignName = (instantlyCampaigns.length ? instantlyCampaigns : campaigns)
+            .find((c) => c.id === selectedCampaignId)?.name || '';
+        setAutoInstantlyConfig({
+            campaignId: selectedCampaignId,
+            campaignName,
+            columnMapping: standardMapping,
+            customVariables,
+            skipOptions: {
+                skip_if_in_workspace: skipWorkspaceDupes,
+                skip_if_in_campaign: skipCampaignDupes,
+                skip_if_in_list: skipListDupes
+            },
+            includeValid: includeValidEmails,
+            includeRisky: includeRiskyEmails,
+            requireFirstLine: autoRequireFirstLine
+        });
+        setAutoInstantlyMappingDraft(columnMapping);
+        setAutoInstantlyEnabled(true);
+        setUploadModalOpen(false);
+        setUploadModalMode('upload');
     };
 
     const handleConfirmUpload = async () => {
@@ -8030,6 +8126,7 @@ export default function ClientPage() {
         setPersonalizeFirstLine(false);
         setUseShoppingAuditPipeline(false);
         setSelectedCampaignId("");
+        setAutoInstantlyEnabled(false);
         setWizardStep(3);
         setModalOpen(true);
 
@@ -10286,6 +10383,7 @@ export default function ClientPage() {
                                         onClick={() => {
                                             setEnrichSource('csv');
                                             setModalOpen(true);
+                                            setAutoInstantlyEnabled(false);
                                             setWizardStep(1);
                                             setSelectedFile(null);
                                             setDedupeStrategy('skip');
@@ -13727,7 +13825,60 @@ export default function ClientPage() {
                                         )}
                                     </div>
 
-                                    {/* Campaign selection removed; will be chosen after job completes in the upload modal */}
+                                    <div style={{
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '0.5rem',
+                                        padding: '1rem',
+                                        background: 'var(--app-surface-3)',
+                                        borderRadius: '8px',
+                                        border: '1px solid var(--app-border)'
+                                    }}>
+                                        <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem', cursor: 'pointer', padding: '0.5rem' }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={autoInstantlyEnabled}
+                                                onChange={(e) => {
+                                                    const checked = e.target.checked;
+                                                    setAutoInstantlyEnabled(checked);
+                                                    if (checked && !autoInstantlyConfig) openAutoInstantlySettings();
+                                                }}
+                                                style={{ width: '18px', height: '18px', cursor: 'pointer', marginTop: '0.15rem' }}
+                                            />
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
+                                                    Auto-add to Instantly during the run
+                                                </div>
+                                                <div style={{ fontSize: '0.875rem', color: 'var(--app-text-muted)', marginTop: '0.125rem' }}>
+                                                    After each batch is personalized, leads that pass the checklist are added to the campaign straight away.
+                                                </div>
+                                                {autoInstantlyEnabled && autoInstantlyConfig && (
+                                                    <div style={{ marginTop: '0.625rem', fontSize: '0.875rem', color: 'var(--app-text)', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                                                        <span>Campaign: <strong>{autoInstantlyConfig.campaignName || autoInstantlyConfig.campaignId}</strong></span>
+                                                        <span>
+                                                            Emails: {[autoInstantlyConfig.includeValid ? 'valid' : null, autoInstantlyConfig.includeRisky ? 'risky' : null].filter(Boolean).join(' + ')}
+                                                            {autoInstantlyConfig.requireFirstLine ? ' · must have a first line' : ''}
+                                                        </span>
+                                                        {autoInstantlyConfig.requireFirstLine && !personalizeFirstLine && (
+                                                            <span style={{ color: '#f59e0b' }}>
+                                                                Personalization is off, so only leads that already have a first line will be added.
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </label>
+                                        {autoInstantlyEnabled && (
+                                            <button
+                                                type="button"
+                                                className="secondary-button"
+                                                style={{ alignSelf: 'flex-start', marginLeft: '2.25rem' }}
+                                                onClick={openAutoInstantlySettings}
+                                            >
+                                                {autoInstantlyConfig ? 'Edit campaign & mapping' : 'Set up campaign & mapping'}
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
                             )}
 
@@ -13789,14 +13940,16 @@ export default function ClientPage() {
                     className="modal-overlay"
                     role="dialog"
                     aria-modal="true"
-                    onClick={() => setUploadModalOpen(false)}
+                    onClick={closeUploadModal}
                 >
                     <div className="modal" onClick={(event) => event.stopPropagation()} style={{ maxWidth: '900px' }}>
                         <div className="modal__header">
                             <div>
-                                <h2 className="modal__title">Map Columns to Instantly</h2>
+                                <h2 className="modal__title">{uploadModalMode === 'autoAdd' ? 'Auto-add to Instantly' : 'Map Columns to Instantly'}</h2>
                                 <p className="modal__description">
-                                    Map your CSV columns to Instantly variables. Preview shows first 3 rows.
+                                    {uploadModalMode === 'autoAdd'
+                                        ? 'Choose the campaign, how lead fields map to Instantly variables, and which leads qualify. Applied to every batch after personalization.'
+                                        : 'Map your CSV columns to Instantly variables. Preview shows first 3 rows.'}
                                 </p>
                             </div>
                         </div>
@@ -13901,7 +14054,9 @@ export default function ClientPage() {
                             <div style={{ marginBottom: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--app-border)' }}>
                                 <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'var(--app-text)' }}>Email verification status</div>
                                 <p style={{ margin: '0 0 0.75rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
-                                    Choose which verified emails to include in this upload.
+                                    {uploadModalMode === 'autoAdd'
+                                        ? 'Only leads with these statuses are added.'
+                                        : 'Choose which verified emails to include in this upload.'}
                                 </p>
                                 <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
                                     <input
@@ -13925,7 +14080,19 @@ export default function ClientPage() {
                                         {uploadEmailStatusCounts ? ` (${uploadEmailStatusCounts.risky.toLocaleString()})` : ''}
                                     </span>
                                 </label>
-                                {uploadLeadCount !== null && (
+                                {uploadModalMode === 'autoAdd' && (
+                                    <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={autoRequireFirstLine}
+                                            onChange={(e) => setAutoRequireFirstLine(e.target.checked)}
+                                        />
+                                        <span className="settings-field__label" style={{ margin: 0 }}>
+                                            Must have a first line
+                                        </span>
+                                    </label>
+                                )}
+                                {uploadModalMode === 'upload' && uploadLeadCount !== null && (
                                     <div style={{ marginTop: '0.75rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
                                         {uploadLeadCount > 0
                                             ? `${uploadLeadCount.toLocaleString()} lead${uploadLeadCount === 1 ? '' : 's'} will be uploaded`
@@ -13966,20 +14133,25 @@ export default function ClientPage() {
                         </div>
 
                         <div className="modal__actions">
-                            <button type="button" className="secondary-button secondary-button--active" onClick={() => setUploadModalOpen(false)}>Cancel</button>
+                            <button type="button" className="secondary-button secondary-button--active" onClick={closeUploadModal}>Cancel</button>
                             <button
                                 type="button"
                                 className="primary-button"
                                 disabled={
-                                    uploading
-                                    || !columnMapping.email?.column
-                                    || !selectedCampaignId
-                                    || (!includeValidEmails && !includeRiskyEmails)
-                                    || (uploadLeadCount ?? 0) === 0
+                                    uploadModalMode === 'autoAdd'
+                                        ? (!columnMapping.email?.column
+                                            || !!columnMapping.email?.isCustom
+                                            || !selectedCampaignId
+                                            || (!includeValidEmails && !includeRiskyEmails))
+                                        : (uploading
+                                            || !columnMapping.email?.column
+                                            || !selectedCampaignId
+                                            || (!includeValidEmails && !includeRiskyEmails)
+                                            || (uploadLeadCount ?? 0) === 0)
                                 }
-                                onClick={handleConfirmUpload}
+                                onClick={uploadModalMode === 'autoAdd' ? handleSaveAutoInstantly : handleConfirmUpload}
                             >
-                                {uploading ? 'Uploading...' : 'Upload to Instantly'}
+                                {uploadModalMode === 'autoAdd' ? 'Save auto-add settings' : uploading ? 'Uploading...' : 'Upload to Instantly'}
                             </button>
                         </div>
                     </div>

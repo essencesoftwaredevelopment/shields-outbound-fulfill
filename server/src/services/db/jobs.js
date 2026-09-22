@@ -1398,6 +1398,63 @@ export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {
     return result.rows.map((row) => mapUnifiedContactRow(row, shoppingAudit));
 }
 
+/**
+ * Leads of this job that qualify for the mid-run Instantly auto-add: email
+ * status in the chosen set, optionally a first line, and not already in the
+ * target campaign (contact_instantly_campaigns), which makes step retries and
+ * resumes idempotent. Same row shape as the manual upload (mapUnifiedContactRow)
+ * plus `contact_id`.
+ *
+ * @param {string} jobId
+ * @param {{ domains?: string[] | null, includeValid?: boolean, includeRisky?: boolean,
+ *           requireFirstLine?: boolean, sqlCampaignId?: number | null }} [opts]
+ */
+export async function listAutoInstantlyCandidates(jobId, {
+    domains = null,
+    includeValid = true,
+    includeRisky = false,
+    requireFirstLine = true,
+    sqlCampaignId = null
+} = {}) {
+    if (Array.isArray(domains) && !domains.length) return [];
+    const shoppingAudit = await resolveShoppingAuditFlag(jobId, {});
+    const { select, from } = buildUnifiedQueryParts(shoppingAudit);
+    const params = [jobId];
+    let extra = `
+         AND c.email IS NOT NULL AND BTRIM(c.email) <> ''`;
+    if (requireFirstLine) {
+        extra += `
+         AND c.personalization_first_line IS NOT NULL AND BTRIM(c.personalization_first_line) <> ''
+         AND LOWER(BTRIM(c.personalization_first_line)) <> 'invalid'`;
+    }
+    if (Array.isArray(domains)) {
+        params.push(domains);
+        extra += `
+         AND co.domain_normalized = ANY($${params.length}::text[])`;
+    }
+    if (sqlCampaignId) {
+        params.push(sqlCampaignId);
+        extra += `
+         AND NOT EXISTS (
+             SELECT 1 FROM contact_instantly_campaigns cic
+             WHERE cic.contact_id = c.id AND cic.campaign_id = $${params.length}
+         )`;
+    }
+    const result = await pool.query(
+        `${select},
+         c.id AS contact_id
+         ${from}
+         ${buildUploadEmailStatusFilter({ includeValid, includeRisky })}
+         ${extra}
+         ORDER BY co.domain_normalized ASC`,
+        params
+    );
+    return result.rows.map((row) => ({
+        ...mapUnifiedContactRow(row, shoppingAudit),
+        contact_id: String(row.contact_id)
+    }));
+}
+
 export async function listUnifiedRowsFromDb(jobId, {
     scope = 'all',
     limit = 100,

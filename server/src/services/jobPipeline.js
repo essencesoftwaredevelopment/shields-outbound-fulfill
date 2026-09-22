@@ -20,6 +20,7 @@ import {
 } from './shoppingAudit/index.js';
 import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature, rateLimitsFromSettings, enrowOptionsFromSettings } from './db/agencySettings.js';
 import { runEnrowInline } from '../enrichment/stages/enrowBatch.js';
+import { runInstantlyAutoAddBatch } from '../enrichment/stages/instantlyBatch.js';
 import { createRateLimitHooks } from '../enrichment/rateLimit.js';
 import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
 import { normalizeDomain } from '../utils/domain.js';
@@ -404,6 +405,8 @@ async function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId,
         // entries themselves — 100k domains do not belong in options JSONB).
         ...(options.jobSource ? { jobSource: options.jobSource } : {}),
         ...(options.leadFilter ? { leadFilter: options.leadFilter } : {}),
+        // Mid-run Instantly auto-add (enrichment/stages/instantlyBatch.js).
+        ...(options.autoInstantly ? { autoInstantly: options.autoInstantly } : {}),
         initialStages: stages
     };
 
@@ -540,7 +543,7 @@ function isReprocessExistingDomains(job) {
     return String(job.dedupeStrategy || 'skip').toLowerCase() === 'include';
 }
 
-/** Minimal EnrichmentContext for the Enrow stage helpers on the PM2 path. */
+/** Minimal EnrichmentContext for the Enrow / Instantly stage helpers on the PM2 path. */
 function enrowContextForJob(job) {
     return {
         jobId: job.id,
@@ -1287,6 +1290,9 @@ async function processJob(job) {
 
         await syncJobControl(job);
         if (job.cancelled) return await markCancelled(job);
+
+        // Auto-add qualifying leads to Instantly (no-op unless set on the job).
+        await runInstantlyAutoAddBatch(enrowContextForJob(job), null);
 
         setActivity(job, 'Finalizing job results…');
         const finishedCount = await timeJobOp(

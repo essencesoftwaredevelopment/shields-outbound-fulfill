@@ -29,6 +29,7 @@ export const LEAD_FILTER_ACTIVITY_FIELD_KEYS = [
     'email_find_state',
     'email_find_completed_at',
     'email_verify_completed_at',
+    'enrow_verify_attempted_at',
     'last_contacted_at',
     'added_to_campaign_at',
     'last_reply_at',

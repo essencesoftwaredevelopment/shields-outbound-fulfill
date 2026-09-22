@@ -5,6 +5,8 @@ import {
     getPersonalizeQueue,
     getJobById
 } from '../services/db/jobs.js';
+import { getEnrowFindQueue, getEnrowVerifyQueue } from '../services/db/enrow.js';
+import { isEnrowEnabled } from './stages/enrowBatch.js';
 
 /** Above the 50k-domain design point — resume planning must see every domain. */
 const RESUME_PLAN_DOMAIN_LIMIT = 100000;
@@ -87,6 +89,17 @@ export async function listResumeStageDomainNames(ctx) {
             ...opts,
             requireValidEmail: reprocessInclude
         }));
+    }
+    // Enrow fallback work left behind by a batch that stopped early (e.g. a
+    // TryKitt verify failure skipped its Enrow re-check). Resume planning only:
+    // jobHasRemainingPipelineWork deliberately ignores Enrow, so a job whose
+    // Enrow requests keep failing (no credits) can still finalize.
+    const enrowOpts = { reprocessInclude, jobStartedAt, limit: RESUME_PLAN_DOMAIN_LIMIT };
+    if (isEnrowEnabled(ctx, 'find')) {
+        queues.push(getEnrowFindQueue(ctx.agencyId, ctx.clientId, ctx.jobId, enrowOpts));
+    }
+    if (isEnrowEnabled(ctx, 'verify')) {
+        queues.push(getEnrowVerifyQueue(ctx.agencyId, ctx.clientId, ctx.jobId, enrowOpts));
     }
     if (!queues.length) return [];
 

@@ -257,6 +257,29 @@ export async function upsertLeadRowsBatch({
             contactsMs = Date.now() - contactsStart;
         }
 
+        // A verification written here (TryKitt, self-hosted or a CSV status)
+        // replaces whatever verdict the contact had, so it also clears the
+        // 'enrow' provenance label. Otherwise a lead Enrow once verified keeps
+        // saying "verified by Enrow" after TryKitt re-verifies it, and the Enrow
+        // risky re-check queue skips it. Enrow's own writes go through
+        // services/db/enrow.js and set the label afterwards.
+        if (type === 'verification') {
+            const verifiedDomains = payloads.filter((p) => p.emailStatus).map((p) => p.domain);
+            if (verifiedDomains.length) {
+                await client.query(
+                    `UPDATE contacts c
+                     SET email_verify_source = NULL
+                     FROM companies co
+                     WHERE c.company_id = co.id
+                       AND co.agency_id = $1 AND co.client_id = $2
+                       AND co.domain_normalized = ANY($3::text[])
+                       AND c.role_type = 'founder'
+                       AND c.email_verify_source IS NOT NULL`,
+                    [agencyId, clientId, verifiedDomains]
+                );
+            }
+        }
+
         if (type === 'personalization') {
             const signalStart = Date.now();
             for (const p of payloads) {

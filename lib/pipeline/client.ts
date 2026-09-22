@@ -53,6 +53,23 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 2): P
     throw new Error('Max retries exceeded');
 }
 
+/** Mid-run Instantly auto-add, run per batch after personalization. */
+export interface AutoInstantlyConfig {
+    campaignId: string;
+    campaignName?: string;
+    /** Standard Instantly fields (email, firstName, …) → unified row column. */
+    columnMapping: Record<string, { column: string; isCustom: false }>;
+    customVariables: Array<{ name: string; column: string }>;
+    skipOptions: {
+        skip_if_in_workspace: boolean;
+        skip_if_in_campaign: boolean;
+        skip_if_in_list: boolean;
+    };
+    includeValid: boolean;
+    includeRisky: boolean;
+    requireFirstLine: boolean;
+}
+
 export interface CreatePipelineJobOptions {
     file: File;
     idToken: string;
@@ -62,6 +79,7 @@ export interface CreatePipelineJobOptions {
     pipelineMode?: PipelineMode;
     dedupeStrategy?: 'skip' | 'include';
     campaignId?: string;
+    autoInstantly?: AutoInstantlyConfig;
     findFounder?: boolean;
     skipFounderFinder?: boolean;
     findEmail?: boolean;
@@ -96,6 +114,7 @@ export interface CreateFilteredPipelineJobOptions {
     nicheLabel?: string;
     pipelineMode?: PipelineMode;
     campaignId?: string;
+    autoInstantly?: AutoInstantlyConfig;
     findFounder?: boolean;
     skipFounderFinder?: boolean;
     findEmail?: boolean;
@@ -122,6 +141,7 @@ export async function createFilteredPipelineJob({
     nicheLabel,
     pipelineMode,
     campaignId,
+    autoInstantly,
     findFounder,
     skipFounderFinder,
     findEmail,
@@ -142,6 +162,7 @@ export async function createFilteredPipelineJob({
     if (nicheLabel) payload.nicheLabel = nicheLabel;
     if (pipelineMode) payload.pipelineMode = pipelineMode;
     if (campaignId) payload.campaignId = campaignId;
+    if (autoInstantly) payload.autoInstantly = autoInstantly;
     if (typeof findFounder === 'boolean') payload.findFounder = String(findFounder);
     if (typeof skipFounderFinder === 'boolean') payload.skipFounderFinder = String(skipFounderFinder);
     if (typeof findEmail === 'boolean') payload.findEmail = String(findEmail);
@@ -190,6 +211,7 @@ export async function createPipelineJob({
     nicheId,
     nicheLabel,
     campaignId,
+    autoInstantly,
     findFounder,
     skipFounderFinder,
     findEmail,
@@ -222,6 +244,9 @@ export async function createPipelineJob({
     }
     if (campaignId) {
         formData.append("campaignId", campaignId);
+    }
+    if (autoInstantly) {
+        formData.append("autoInstantly", JSON.stringify(autoInstantly));
     }
     // Processing options
     if (typeof findFounder === 'boolean') {
