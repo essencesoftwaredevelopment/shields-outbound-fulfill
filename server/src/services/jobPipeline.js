@@ -18,7 +18,8 @@ import {
     isShoppingAuditJob,
     runShoppingAuditPipeline
 } from './shoppingAudit/index.js';
-import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature, rateLimitsFromSettings } from './db/agencySettings.js';
+import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature, rateLimitsFromSettings, enrowOptionsFromSettings } from './db/agencySettings.js';
+import { runEnrowInline } from '../enrichment/stages/enrowBatch.js';
 import { createRateLimitHooks } from '../enrichment/rateLimit.js';
 import { withTx, batchUpsertCompanies, batchUpsertContacts } from '../lib/db.js';
 import { normalizeDomain } from '../utils/domain.js';
@@ -539,6 +540,23 @@ function isReprocessExistingDomains(job) {
     return String(job.dedupeStrategy || 'skip').toLowerCase() === 'include';
 }
 
+/** Minimal EnrichmentContext for the Enrow stage helpers on the PM2 path. */
+function enrowContextForJob(job) {
+    return {
+        jobId: job.id,
+        agencyId: job.uid,
+        clientId: job.sqlClientId,
+        apiKeys: job.apiKeys || {},
+        options: {
+            dedupeStrategy: job.dedupeStrategy || 'skip',
+            skipEmailFinder: !!job.skipEmailFinder,
+            skipVerification: !!job.skipVerification,
+            executionRunner: 'pm2',
+            enrow: job.enrow || {}
+        }
+    };
+}
+
 function enrichmentMergeMode(job) {
     return isReprocessExistingDomains(job) ? 'enrichment_b' : 'preserve';
 }
@@ -641,6 +659,7 @@ async function processJob(job) {
             job.auditFeatures = agencyFeaturesFromSettings(agencySettings);
         });
         job.rateLimits = rateLimitsFromSettings(agencySettings);
+        job.enrow = enrowOptionsFromSettings(agencySettings, job.sqlClientId);
         if (isShoppingAuditJob(job) && !hasShoppingAuditFeature(agencySettings)) {
             throw new Error('Shopping audit pipeline is not enabled for this agency.');
         }
@@ -1080,6 +1099,8 @@ async function processJob(job) {
                 });
             });
         }
+        // Enrow fallback for TryKitt misses (no-op unless enabled for the agency).
+        await runEnrowInline(enrowContextForJob(job), 'find', { checkpoint: () => gate.checkpoint() });
         computeJobCost(job);
 
         await syncJobControl(job);
@@ -1148,6 +1169,8 @@ async function processJob(job) {
                 })
             );
         }
+        // Enrow re-check of TryKitt risky/unknown verdicts (no-op unless enabled).
+        await runEnrowInline(enrowContextForJob(job), 'verify', { checkpoint: () => gate.checkpoint() });
         computeJobCost(job);
 
         await syncJobControl(job);

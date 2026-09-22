@@ -6,8 +6,9 @@
  * status='researching'. Single linear run per draft — no fan-out:
  *
  *   hydrate → homepage + Serper research → synthesize brief (GPT only) →
- *   persist brief → OpenAI web_search size estimate → external popup URL →
- *   generate reply with the brief → promote to pending_review + ntfy.
+ *   persist brief on the draft → external popup URL (Essence/Vulcan, stays
+ *   external by design) → generate reply with the brief → promote to
+ *   pending_review + ntfy.
  *
  * This is deliberately NOT part of the enrichment parent/child pipeline: the
  * reply path is per-event, reply-aware, and human-gated, while enrichment is
@@ -74,11 +75,6 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
       return { status: 'superseded' as const, draftId: input.draftId };
     }
 
-    const sized = await sizeEstimateStep(input);
-    if (isResearchSupersededResult(sized)) {
-      return { status: 'superseded' as const, draftId: input.draftId };
-    }
-
     const popup = await popupStep(input);
     if (isResearchSupersededResult(popup)) {
       return { status: 'superseded' as const, draftId: input.draftId };
@@ -93,7 +89,7 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
       status: 'promoted' as const,
       draftId: ctx.draftId,
       reviewUrl: result.reviewUrl,
-      hadBrief: persisted !== null || sized !== null,
+      hadBrief: persisted !== null,
     };
   } catch (err) {
     const errorInfo = toResearchErrorInfo(err);
@@ -182,20 +178,6 @@ async function persistBriefStep(
   }
 }
 
-async function sizeEstimateStep(input: InterestedResearchInput) {
-  'use step';
-
-  const research = await loadResearch();
-  try {
-    return await research.estimateStoreSize(input);
-  } catch (err) {
-    if (isResearchSupersededError(err)) return researchSupersededResult();
-    // Size gate is best-effort — missing estimate → Calendly path at finalize.
-    console.warn('[interested-research] size estimate failed:', toResearchErrorInfo(err).message);
-    return null;
-  }
-}
-
 async function popupStep(input: InterestedResearchInput) {
   'use step';
 
@@ -253,8 +235,6 @@ serperStep.maxRetries = 1;
 synthesizeBriefStep.maxRetries = 0;
 // DB write only — safe to retry; never re-runs GPT.
 persistBriefStep.maxRetries = 1;
-// Long OpenAI web_search run — do not auto-retry (re-bills a multi-minute call).
-sizeEstimateStep.maxRetries = 0;
 // Popup generation has its own internal retry/backoff (mirrors the inline path).
 popupStep.maxRetries = 0;
 // Finalize is guarded by status='researching', so a retry after a mid-step crash

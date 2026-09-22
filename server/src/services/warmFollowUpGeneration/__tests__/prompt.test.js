@@ -36,18 +36,6 @@ test('assembleFollowUpMessages puts the code contract above the client prompt', 
     assert.ok(user.content.includes('do not repeat'));
 });
 
-test('assembleFollowUpMessages injects a forced offer CTA above the client prompt', () => {
-    const [system] = assembleFollowUpMessages({
-        systemPrompt: 'Voice: casual. CTA: book a call.',
-        stepInstruction: 'Bump the offer.',
-        forcedCtaUrl: 'https://essenceretention.com/acq-build-offer',
-        forcedCtaMode: 'offer'
-    });
-    assert.ok(system.content.includes('Forced CTA:'));
-    assert.ok(system.content.includes('https://essenceretention.com/acq-build-offer'));
-    assert.ok(system.content.includes('free build offer'));
-});
-
 test('assembleFollowUpMessages includes the full outbound thread, not only the last send', () => {
     const [, user] = assembleFollowUpMessages({
         systemPrompt: 'Be short.',

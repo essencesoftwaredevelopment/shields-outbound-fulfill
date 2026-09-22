@@ -61,6 +61,32 @@ export const FEATURE_FLAGS = [
         description: 'Off = the agency\'s TryKitt key is on the free tier: verification is capped at 20 requests/min and 2 concurrent calls, and pauses with TRYKITT_THROTTLED instead of failing.'
     },
     {
+        key: 'enrowFallback',
+        group: 'pipeline',
+        type: 'boolean',
+        default: false,
+        label: 'Enrow email-finder fallback',
+        description: 'Founders TryKitt finds no email for are retried with Enrow (1 credit per email found, misses are free). Enrow hits count as verified. Needs an Enrow key in the API Vault.'
+    },
+    {
+        key: 'enrowVerifyRisky',
+        group: 'pipeline',
+        type: 'boolean',
+        default: false,
+        label: 'Enrow re-check of risky emails',
+        description: 'Emails TryKitt verifies as risky / unknown (catch-all) are re-checked with Enrow\'s verifier and become valid or invalid (0.25 credits each). Needs an Enrow key in the API Vault.'
+    },
+    {
+        key: 'enrowClients',
+        group: 'pipeline',
+        type: 'object',
+        label: 'Enrow clients',
+        description: 'Limit both Enrow options to these client IDs (comma-separated). Leave blank to use Enrow for every client of this agency.',
+        fields: [
+            { key: 'ids', type: 'string', label: 'Client IDs', placeholder: 'all clients' }
+        ]
+    },
+    {
         key: 'enrichmentRunner',
         group: 'pipeline',
         type: 'enum',

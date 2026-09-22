@@ -6,6 +6,7 @@
  * becomes an independent run with its own event log, and completion is reported
  * back through the parent's completion hook instead of a thrown error.
  */
+import { sleep } from 'workflow';
 import { resumeHook } from 'workflow/api';
 import type { ChildBatchInput, ShoppingAuditBatchState } from '@/lib/enrichment/types';
 import {
@@ -94,7 +95,9 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       await foundersStep(input);
     }
     await emailsStep(input);
+    await enrowFallback(input, 'find');
     await verificationStep(input);
+    await enrowFallback(input, 'verify');
     await personalizationStep(input);
 
     return {
@@ -205,6 +208,53 @@ async function personalizationStep(input: ChildBatchInput) {
   });
 }
 
+/**
+ * Enrow fallback behind TryKitt (no-op unless the agency enabled it). Enrow is
+ * async: submit one bulk request for the batch, then poll with durable sleeps
+ * so the wait costs no function time. After ENROW_MAX_POLLS the batch moves on
+ * — the request stays in flight in enrow_requests and a resume collects it.
+ */
+const ENROW_POLL_INTERVAL = '30s';
+const ENROW_MAX_POLLS = 20;
+
+async function enrowFallback(input: ChildBatchInput, kind: 'find' | 'verify') {
+  const submitted = await enrowSubmitStep(input, kind);
+  if (!submitted) return;
+  for (let poll = 0; poll < ENROW_MAX_POLLS; poll += 1) {
+    await sleep(ENROW_POLL_INTERVAL);
+    const result = await enrowCollectStep(input, kind, submitted.requestId);
+    if (result.done) return;
+  }
+}
+
+async function enrowSubmitStep(input: ChildBatchInput, kind: 'find' | 'verify') {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  if (!enrichment.isEnrowEnabled(ctx, kind)) return null;
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.submitEnrowBatch(ctx, kind, input.batchDomains, {
+    batchKey: input.batchIndex,
+  });
+}
+
+async function enrowCollectStep(
+  input: ChildBatchInput,
+  kind: 'find' | 'verify',
+  requestId: string
+) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  const result = await enrichment.collectEnrowBatch(ctx, kind, requestId);
+  // Results are written before the pause check, so a pause mid-wait never
+  // drops a finished Enrow batch.
+  if (!result.done) await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return result;
+}
+
 // Shopping-audit steps are per-domain idempotent since Phase 2: serper skips
 // domains with existing ad_observations (and hits the per-job response cache
 // for anything fetched before a crash), the waterfall skips domains with
@@ -219,3 +269,7 @@ foundersStep.maxRetries = 2;
 emailsStep.maxRetries = 2;
 verificationStep.maxRetries = 2;
 personalizationStep.maxRetries = 2;
+// Submit reuses the in-flight enrow_requests row, so a retry never double-pays;
+// collect is a free GET plus idempotent UPDATEs.
+enrowSubmitStep.maxRetries = 2;
+enrowCollectStep.maxRetries = 2;

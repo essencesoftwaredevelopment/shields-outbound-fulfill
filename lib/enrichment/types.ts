@@ -8,7 +8,7 @@ export type EnrichmentContext = {
   clientId: number;
   clientSlug: string;
   pipelineMode: PipelineMode;
-  apiKeys: { openai: string; serper: string; trykitt?: string };
+  apiKeys: { openai: string; serper: string; trykitt?: string; enrow?: string };
   options: Record<string, unknown>;
   auditFeatures?: Record<string, unknown>;
   stages?: Record<string, unknown>;

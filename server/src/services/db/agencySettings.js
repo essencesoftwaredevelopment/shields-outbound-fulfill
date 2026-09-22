@@ -21,13 +21,14 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
     await pool.query(
         `INSERT INTO agency_settings (
             agency_id, openai_key, serper_key, trykitt_key, openai_founder_model,
-            email_verification_provider, pricing_overrides, features, vault_updated_at, updated_at
+            email_verification_provider, pricing_overrides, features, enrow_key, vault_updated_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb,
-            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), NOW(), NOW())
+            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), $10, NOW(), NOW())
         ON CONFLICT (agency_id) DO UPDATE SET
             openai_key = COALESCE(EXCLUDED.openai_key, agency_settings.openai_key),
             serper_key = COALESCE(EXCLUDED.serper_key, agency_settings.serper_key),
             trykitt_key = COALESCE(EXCLUDED.trykitt_key, agency_settings.trykitt_key),
+            enrow_key = COALESCE(EXCLUDED.enrow_key, agency_settings.enrow_key),
             openai_founder_model = COALESCE(EXCLUDED.openai_founder_model, agency_settings.openai_founder_model),
             email_verification_provider = COALESCE(EXCLUDED.email_verification_provider, agency_settings.email_verification_provider),
             pricing_overrides = COALESCE(EXCLUDED.pricing_overrides, agency_settings.pricing_overrides),
@@ -48,7 +49,8 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             patch.email_verification_provider ?? null,
             JSON.stringify(patch.pricing_overrides ?? {}),
             featuresJson,
-            featuresPatchJson
+            featuresPatchJson,
+            patch.enrow_key ?? null
         ]
     );
 }
@@ -72,11 +74,12 @@ export async function mergeAgencyFeatures(agencyId, patch) {
 }
 
 export function apiKeysFromSettings(settings) {
-    if (!settings) return { openai: '', serper: '', trykitt: '' };
+    if (!settings) return { openai: '', serper: '', trykitt: '', enrow: '' };
     return {
         openai: settings.openai_key || '',
         serper: settings.serper_key || '',
-        trykitt: settings.trykitt_key || ''
+        trykitt: settings.trykitt_key || '',
+        enrow: settings.enrow_key || ''
     };
 }
 
@@ -161,6 +164,35 @@ export function rateLimitsFromSettings(settings) {
         if (Number.isFinite(parsed) && parsed > 0) out[key] = parsed;
     }
     return out;
+}
+
+/**
+ * Enrow as a secondary provider behind TryKitt. Per-agency opt-in only, and only
+ * with the agency's OWN key (agency_settings.enrow_key): flags are editable by
+ * any agency user, so there is deliberately no host-env key fallback that a
+ * tenant could spend.
+ *   find   — TryKitt email-finder misses are retried with Enrow's finder
+ *   verify — TryKitt risky/unknown verdicts are re-checked with Enrow's verifier
+ * `features.enrowClients.ids` (comma-separated client ids) limits both to those
+ * clients; blank = every client of the agency.
+ *
+ * @param {object | null} settings
+ * @param {number | string | null} [clientId]
+ * @returns {{ find: boolean, verify: boolean }}
+ */
+export function enrowOptionsFromSettings(settings, clientId = null) {
+    const hasKey = !!String(settings?.enrow_key || '').trim();
+    const features = agencyFeaturesFromSettings(settings);
+    const allowed = String(features.enrowClients?.ids ?? '')
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
+    const clientAllowed = !allowed.length
+        || (clientId != null && allowed.includes(String(clientId)));
+    return {
+        find: hasKey && clientAllowed && features.enrowFallback === true,
+        verify: hasKey && clientAllowed && features.enrowVerifyRisky === true
+    };
 }
 
 export function hasVercelEnrichmentRunner(settings) {

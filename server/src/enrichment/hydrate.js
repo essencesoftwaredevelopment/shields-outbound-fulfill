@@ -4,7 +4,8 @@ import {
     apiKeysFromSettings,
     agencyFeaturesFromSettings,
     hasShoppingAuditFeature,
-    rateLimitsFromSettings
+    rateLimitsFromSettings,
+    enrowOptionsFromSettings
 } from '../services/db/agencySettings.js';
 import { DEFAULT_PRICING } from '../utils/pricing.js';
 import { getPricingDefaults } from '../services/db/agencySettings.js';
@@ -72,7 +73,10 @@ export async function hydrateJobContext(jobId, agencyId) {
             executionRunner: options.executionRunner || 'pm2',
             workflowRunId: options.workflowRunId || null,
             // Agency plan limits first, explicit per-job overrides win.
-            rateLimits: { ...rateLimitsFromSettings(settings), ...(options.rateLimits || {}) }
+            rateLimits: { ...rateLimitsFromSettings(settings), ...(options.rateLimits || {}) },
+            // Read per step from agency settings (like the keys), so toggling the
+            // flag takes effect on the next batch of a running job.
+            enrow: enrowOptionsFromSettings(settings, row.client_id)
         },
         auditFeatures: agencyFeaturesFromSettings(settings),
         stages: row.stages || {},

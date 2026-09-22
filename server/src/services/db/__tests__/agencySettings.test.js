@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     isTryKittPaidAccount,
     rateLimitsFromSettings,
+    enrowOptionsFromSettings,
     TRYKITT_FREE_TIER_LIMITS
 } from '../agencySettings.js';
 
@@ -71,5 +72,39 @@ describe('rateLimitsFromSettings', () => {
         );
         assert.equal(result.trykittConcurrency, 9);
         assert.equal(TRYKITT_FREE_TIER_LIMITS.trykittConcurrency, 2);
+    });
+});
+
+describe('enrowOptionsFromSettings', () => {
+    it('is off by default', () => {
+        assert.deepEqual(enrowOptionsFromSettings(null), { find: false, verify: false });
+        assert.deepEqual(enrowOptionsFromSettings({ enrow_key: 'k', features: {} }), { find: false, verify: false });
+    });
+
+    it('needs both the flag and the agency\'s own key', () => {
+        const features = { enrowFallback: true, enrowVerifyRisky: true };
+        assert.deepEqual(enrowOptionsFromSettings({ features }), { find: false, verify: false });
+        assert.deepEqual(enrowOptionsFromSettings({ enrow_key: '  ', features }), { find: false, verify: false });
+        assert.deepEqual(enrowOptionsFromSettings({ enrow_key: 'k', features }), { find: true, verify: true });
+        assert.deepEqual(
+            enrowOptionsFromSettings({ enrow_key: 'k', features: { enrowFallback: true } }),
+            { find: true, verify: false }
+        );
+    });
+});
+
+describe('enrowOptionsFromSettings client scope', () => {
+    const base = { enrow_key: 'k', features: { enrowFallback: true, enrowVerifyRisky: true, enrowClients: { ids: '2, 7' } } };
+
+    it('only enables listed clients', () => {
+        assert.deepEqual(enrowOptionsFromSettings(base, 2), { find: true, verify: true });
+        assert.deepEqual(enrowOptionsFromSettings(base, '7'), { find: true, verify: true });
+        assert.deepEqual(enrowOptionsFromSettings(base, 24), { find: false, verify: false });
+        assert.deepEqual(enrowOptionsFromSettings(base, null), { find: false, verify: false });
+    });
+
+    it('blank list means every client', () => {
+        const all = { ...base, features: { ...base.features, enrowClients: { ids: ' ' } } };
+        assert.deepEqual(enrowOptionsFromSettings(all, 24), { find: true, verify: true });
     });
 });

@@ -46,17 +46,19 @@ type Niche = {
   hint: string;
 };
 
-const API_KEY_FIELDS = ["openai", "serper", "kitt"] as const;
+const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow"] as const;
 type ApiKeyName = (typeof API_KEY_FIELDS)[number];
 const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   openai: "openai_key",
   serper: "serper_key",
   kitt: "trykitt_key",
+  enrow: "enrow_key",
 };
 const API_KEY_LABELS: Record<ApiKeyName, string> = {
   openai: "OpenAI",
   serper: "Serper",
   kitt: "TryKitt",
+  enrow: "Enrow",
 };
 type ApiKeyState = Record<ApiKeyName, string>;
 
@@ -70,6 +72,7 @@ const createEmptyKeys = (): ApiKeyState => ({
   openai: "",
   serper: "",
   kitt: "",
+  enrow: "",
 });
 
 async function hashKeyValue(value: string) {
@@ -106,6 +109,7 @@ type AgencySettingsPayload = {
   openai_key?: string;
   serper_key?: string;
   trykitt_key?: string;
+  enrow_key?: string;
   trykitt_paid_account?: boolean;
 };
 
@@ -115,6 +119,7 @@ const readKeysFromAgencySettings = (
   openai: data?.openai_key || "",
   serper: data?.serper_key || "",
   kitt: data?.trykitt_key || "",
+  enrow: data?.enrow_key || "",
 });
 
 // Absent flag = paid, matching the server's isTryKittPaidAccount default.
@@ -379,6 +384,7 @@ function HomeContent() {
           openai_key: sanitizedKeys.openai,
           serper_key: sanitizedKeys.serper,
           trykitt_key: sanitizedKeys.kitt,
+          enrow_key: sanitizedKeys.enrow,
           trykitt_paid_account: kittPaidAccount,
         }),
       });
@@ -655,6 +661,19 @@ function HomeContent() {
                 {!kittPaidAccount
                   ? " Free-tier keys are throttled to 2 concurrent requests at 20/min."
                   : ""}
+              </p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="enrow-key">Enrow API Key (optional)</Label>
+              <Input
+                id="enrow-key"
+                type="text"
+                placeholder="Enrow key"
+                value={apiKeys.enrow}
+                onChange={(event) => handleKeyChange(event, "enrow")}
+              />
+              <p className="text-xs text-muted-foreground">
+                Backup email finder for leads TryKitt misses. Turn it on in Account → Pipeline &amp; rate limits.
               </p>
             </div>
             {showVaultStatus && (

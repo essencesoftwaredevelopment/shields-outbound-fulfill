@@ -166,26 +166,18 @@ function formatList(items, prefix) {
 export function formatBriefForFollowUpPrompt(brief) {
     if (!brief || typeof brief !== 'object') return '';
     const summary = asTrimmedText(brief.summary);
-    const size = brief.sizeEstimate && typeof brief.sizeEstimate === 'object'
-        ? brief.sizeEstimate
-        : null;
-    if (!summary && !size) return '';
+    if (!summary) return '';
     const lines = [];
     const company = asTrimmedText(brief.company);
     const domain = asTrimmedText(brief.domain);
     if (company || domain) {
         lines.push(`Company: ${[company, domain && `(${domain})`].filter(Boolean).join(' ')}`);
     }
-    if (summary) lines.push(`Summary: ${summary}`);
+    lines.push(`Summary: ${summary}`);
     const talking = formatList(brief.talkingPoints, 'Talking points:');
     if (talking) lines.push(talking);
     const risks = formatList(brief.risks, 'Avoid / be careful with:');
     if (risks) lines.push(risks);
-    if (size) {
-        const confidence = asTrimmedText(size.confidence) || 'unknown';
-        const likely = size.isSevenFigureLikely === true ? 'yes' : 'no';
-        lines.push(`Store-size estimate (≥$1M/year likely): ${likely} (confidence: ${confidence})`);
-    }
     return lines.join('\n');
 }
 
@@ -199,9 +191,7 @@ export function assembleFollowUpMessages({
     previousLeadMessage = '',
     previousOutbound = '',
     previousOutbounds = null,
-    retryShorter = false,
-    forcedCtaUrl = '',
-    forcedCtaMode = null
+    retryShorter = false
 } = {}) {
     const clientPrompt = asTrimmedText(systemPrompt);
     const step = asTrimmedText(stepInstruction);
@@ -216,19 +206,8 @@ export function assembleFollowUpMessages({
             : (existingOutbound
                 ? formatOutboundThreadHistory([{ label: 'Previous outbound', text: previousOutbound }])
                 : ''));
-    const ctaUrl = asTrimmedText(forcedCtaUrl);
-    const ctaMode = asTrimmedText(forcedCtaMode).toLowerCase();
-    const ctaRules = ctaUrl
-        ? [
-            ctaMode === 'offer'
-                ? 'CTA path: free build offer (VSL). Soft eligibility only — do not promise approval or invent revenue.'
-                : 'CTA path: Calendly booking. Do not mention the free build offer.',
-            `Use exactly this URL as the sole CTA (raw https, no markdown): ${ctaUrl}`
-        ].join('\n')
-        : '';
     const system = [
         FOLLOW_UP_CODE_CONTRACT,
-        ctaRules ? `\nForced CTA:\n${ctaRules}` : '',
         clientPrompt ? `\nClient prompt (voice, CTA, brand):\n${clientPrompt}` : ''
     ].filter(Boolean).join('\n');
 

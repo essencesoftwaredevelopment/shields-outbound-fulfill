@@ -9,7 +9,6 @@ export const INTERESTED_RESEARCH_STEPS = Object.freeze([
     Object.freeze({ id: 'research', label: 'Research' }),
     Object.freeze({ id: 'synthesize', label: 'Brief' }),
     Object.freeze({ id: 'persist', label: 'Save' }),
-    Object.freeze({ id: 'size', label: 'Size' }),
     Object.freeze({ id: 'popup', label: 'Preview' }),
     Object.freeze({ id: 'finalize', label: 'Draft' })
 ]);

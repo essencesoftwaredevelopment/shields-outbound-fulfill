@@ -12,7 +12,7 @@
  * @property {number} clientId
  * @property {string} clientSlug
  * @property {'shopping_audit' | 'standard'} pipelineMode
- * @property {{ openai: string, serper: string, trykitt?: string }} apiKeys
+ * @property {{ openai: string, serper: string, trykitt?: string, enrow?: string }} apiKeys
  * @property {Object} options
  * @property {Object} [auditFeatures]
  * @property {Object} [stages]
