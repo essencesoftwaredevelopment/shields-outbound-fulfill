@@ -23,7 +23,8 @@ const CSV_EMAIL_UPSERT_CHUNK = 50;
 /**
  * Map job_domains rows to `emails` upsert rows from the upload's column mapping.
  * Rows whose email cell is empty / "Not Found" are dropped. An unmapped column
- * falls back to a literal `email` / `founder_name` key (lead_filter seeds).
+ * falls back to a literal `email` / `founder_name` key (lead_filter seeds carry
+ * `email` only, so their contacts keep whatever name they hold).
  * A mapped emailStatus column adds a normalized `email_status` (null when the
  * cell is empty); the caller decides whether to persist it.
  *

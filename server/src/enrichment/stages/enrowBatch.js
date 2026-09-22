@@ -221,7 +221,7 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {'find' | 'verify'} kind
  * @param {{ pollMs?: number, maxPolls?: number, checkpoint?: () => Promise<void> }} [opts]
  */
-export async function runEnrowInline(ctx, kind, { pollMs = 30_000, maxPolls = 20, checkpoint = null } = {}) {
+export async function runEnrowInline(ctx, kind, { pollMs = 15_000, maxPolls = 40, checkpoint = null } = {}) {
     if (!isEnrowEnabled(ctx, kind)) return;
     // Each applied chunk stamps its rows, so the queue shrinks until empty.
     for (let chunk = 0; chunk < 100; chunk += 1) {

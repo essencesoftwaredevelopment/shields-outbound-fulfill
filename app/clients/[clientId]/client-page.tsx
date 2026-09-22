@@ -5935,8 +5935,10 @@ export default function ClientPage() {
         }
     }, [emailProvider]);
 
-    // Adjust founder-related options based on mapped columns
+    // Adjust founder-related options based on mapped columns (CSV uploads only —
+    // filtered jobs choose "use existing" / "find again" per stage in the modal).
     useEffect(() => {
+        if (enrichSource === 'filtered') return;
         const hasFounderColumn = founderColumn.trim().length > 0;
         if (hasFounderColumn) {
             setSkipFounderFinder(true);
@@ -5945,10 +5947,11 @@ export default function ClientPage() {
             setSkipFounderFinder(false);
             setFindFounder(true);
         }
-    }, [founderColumn]);
+    }, [founderColumn, enrichSource]);
 
-    // Adjust email-related options based on mapped columns
+    // Adjust email-related options based on mapped columns (CSV uploads only).
     useEffect(() => {
+        if (enrichSource === 'filtered') return;
         const hasEmailColumn = emailColumn.trim().length > 0;
         if (hasEmailColumn) {
             setSkipEmailFinder(true);
@@ -5959,7 +5962,7 @@ export default function ClientPage() {
             // A status column only means something next to an email column.
             setEmailStatusColumn("");
         }
-    }, [emailColumn]);
+    }, [emailColumn, enrichSource]);
 
     // A mapped email-status column replaces the verify stage; clearing it re-enables verification.
     useEffect(() => {
@@ -8017,11 +8020,13 @@ export default function ClientPage() {
         setDedupeStrategy('include');
         // These domains already live in the DB; DNS-checking them again is usually wasted time.
         setRunDomainCheck(false);
-        setFindFounder(true);
-        setFindEmail(true);
+        // Filtered leads already carry names + emails: default to reusing them and
+        // re-running verification only. Each stage can be switched to "find again".
+        setFindFounder(false);
+        setSkipFounderFinder(true);
+        setFindEmail(false);
+        setSkipEmailFinder(true);
         setVerifyEmail(emailProvider !== 'self_hosted');
-        setSkipFounderFinder(false);
-        setSkipEmailFinder(false);
         setPersonalizeFirstLine(false);
         setUseShoppingAuditPipeline(false);
         setSelectedCampaignId("");
@@ -13223,6 +13228,76 @@ export default function ClientPage() {
                                             </div>
                                         </label>
 
+                                        {enrichSource === 'filtered' && (
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', padding: '0.5rem' }}>
+                                                <label className="settings-field">
+                                                    <span className="settings-field__label">Founder names</span>
+                                                    <AppSelect
+                                                        value={skipFounderFinder ? 'existing' : 'find'}
+                                                        options={[
+                                                            { value: 'existing', label: 'Use existing names' },
+                                                            { value: 'find', label: 'Find again (Serper + OpenAI)' }
+                                                        ]}
+                                                        onChange={(value) => {
+                                                            const useExisting = value === 'existing';
+                                                            setSkipFounderFinder(useExisting);
+                                                            setFindFounder(!useExisting);
+                                                        }}
+                                                    />
+                                                    <span className="settings-field__hint">
+                                                        {skipFounderFinder
+                                                            ? `Keeps the names on file${filteredEnrichPreview ? ` (${filteredEnrichPreview.withFounderName.toLocaleString()} leads have one)` : ''}. Leads without a name skip the later stages.`
+                                                            : 'Re-runs the founder search for every selected lead. A new name replaces the old one; a miss keeps it.'}
+                                                    </span>
+                                                </label>
+                                                <label className="settings-field">
+                                                    <span className="settings-field__label">Emails</span>
+                                                    <AppSelect
+                                                        value={skipEmailFinder ? 'existing' : 'find'}
+                                                        options={[
+                                                            { value: 'existing', label: 'Use existing emails' },
+                                                            { value: 'find', label: `Find again (${emailProvider === 'self_hosted' ? 'self-hosted' : 'TryKitt'})` }
+                                                        ]}
+                                                        onChange={(value) => {
+                                                            const useExisting = value === 'existing';
+                                                            setSkipEmailFinder(useExisting);
+                                                            setFindEmail(!useExisting);
+                                                        }}
+                                                    />
+                                                    <span className="settings-field__hint">
+                                                        {skipEmailFinder
+                                                            ? `Keeps the emails on file${filteredEnrichPreview ? ` (${filteredEnrichPreview.withEmail.toLocaleString()} leads have one)` : ''}. Leads without an email skip the later stages.`
+                                                            : 'Looks up an email for every selected lead with a founder name. A found email replaces the old one; a miss keeps it.'}
+                                                    </span>
+                                                </label>
+                                                <label className="settings-field">
+                                                    <span className="settings-field__label">Verification</span>
+                                                    <AppSelect
+                                                        value={verifyEmail && emailProvider !== 'self_hosted' ? 'reverify' : 'keep'}
+                                                        disabled={emailProvider === 'self_hosted'}
+                                                        options={[
+                                                            { value: 'reverify', label: 'Re-verify with TryKitt' },
+                                                            { value: 'keep', label: 'Keep current status' }
+                                                        ]}
+                                                        onChange={(value) => setVerifyEmail(value === 'reverify')}
+                                                    />
+                                                    <span className="settings-field__hint">
+                                                        {emailProvider === 'self_hosted'
+                                                            ? 'Automatically skipped - self-hosted finding already verifies emails'
+                                                            : verifyEmail
+                                                                ? 'Every selected email is checked again, including ones already verified.'
+                                                                : !skipEmailFinder
+                                                                    ? 'Newly found emails get no status, so they won\'t count as ready for export or Instantly.'
+                                                                    : 'Statuses stay as they are.'}
+                                                    </span>
+                                                </label>
+                                                <span className="settings-field__hint">
+                                                    Personalization is chosen on the next step.
+                                                </span>
+                                            </div>
+                                        )}
+
+                                        {enrichSource !== 'filtered' && (<>
                                         <label style={{
                                             display: 'flex',
                                             alignItems: 'center',
@@ -13425,6 +13500,7 @@ export default function ClientPage() {
                                                 </div>
                                             </div>
                                         </label>
+                                        </>)}
                                     </div>
                                 </div>
                             )}

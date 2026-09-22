@@ -561,11 +561,15 @@ router.post('/jobs', uploadFields, async (req, res) => {
             // out-of-cohort (see computeCohortMeta), which would silently drop
             // every lead missing that value. Stage toggles + 'include' queues
             // already scope re-runs correctly.
+            // The existing name is kept under its own key, NOT `founder_name`: the
+            // "use existing emails" import falls back to raw.founder_name, and that
+            // would overwrite a name the founder stage just found with the old one.
+            // The contact already holds its name, so the import leaves it alone.
             seedEntries = seedRows.map((row) => ({
                 domain: row.domain,
                 raw: {
                     domain: row.domain,
-                    founder_name: row.full_name || '',
+                    existing_founder_name: row.full_name || '',
                     email: row.email || ''
                 }
             }));

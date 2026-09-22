@@ -211,17 +211,21 @@ async function personalizationStep(input: ChildBatchInput) {
 /**
  * Enrow fallback behind TryKitt (no-op unless the agency enabled it). Enrow is
  * async: submit one bulk request for the batch, then poll with durable sleeps
- * so the wait costs no function time. After ENROW_MAX_POLLS the batch moves on
- * — the request stays in flight in enrow_requests and a resume collects it.
+ * so the wait costs no function time. After ENROW_MAX_POLLS (~10 min) the batch
+ * moves on — the request stays in flight in enrow_requests and a resume
+ * collects it. First check is early: in prod a 21-email verify batch finished
+ * inside 30s and a 100-name find batch inside 60s, so a flat 30s interval
+ * mostly waited on work that was already done.
  */
-const ENROW_POLL_INTERVAL = '30s';
-const ENROW_MAX_POLLS = 20;
+const ENROW_FIRST_POLL = '10s';
+const ENROW_POLL_INTERVAL = '15s';
+const ENROW_MAX_POLLS = 40;
 
 async function enrowFallback(input: ChildBatchInput, kind: 'find' | 'verify') {
   const submitted = await enrowSubmitStep(input, kind);
   if (!submitted) return;
   for (let poll = 0; poll < ENROW_MAX_POLLS; poll += 1) {
-    await sleep(ENROW_POLL_INTERVAL);
+    await sleep(poll === 0 ? ENROW_FIRST_POLL : ENROW_POLL_INTERVAL);
     const result = await enrowCollectStep(input, kind, submitted.requestId);
     if (result.done) return;
   }
