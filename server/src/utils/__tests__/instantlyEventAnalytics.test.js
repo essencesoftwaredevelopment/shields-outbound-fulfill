@@ -15,7 +15,8 @@ import {
     parseAnalyticsCampaignId,
     generateBucketSeries,
     mergeAnalyticsBuckets,
-    mergeCoreAndDetailsAnalytics
+    mergeCoreAndDetailsAnalytics,
+    loadInstantlyEventAnalyticsDetails
 } from '../instantlyEventAnalytics.js';
 
 const PERIOD_CONFIG_7D = {
@@ -55,14 +56,65 @@ test('summary query scans the base table directly without analytics CTE bundle',
     );
 });
 
-test('bucket and event-type queries use direct grouped scans', () => {
+test('bucket counts query uses a direct grouped scan', () => {
     const bucketSql = buildInstantlyEventBucketCountsQuery(PERIOD_CONFIG_7D, PERIOD_FILTER, '');
-    const eventTypeSql = buildInstantlyEventTypesQuery(PERIOD_FILTER, '');
 
     assert.doesNotMatch(bucketSql, /WITH period_events AS/);
     assert.match(bucketSql, /GROUP BY 1/);
-    assert.doesNotMatch(eventTypeSql, /SELECT DISTINCT/);
-    assert.match(eventTypeSql, /GROUP BY 1/);
+});
+
+test('event-type query skip-scans distinct types and checks the window per type', () => {
+    const sql = buildInstantlyEventTypesQuery(PERIOD_CONFIG_7D.eventFloorSql, ' AND cie.campaign_id = $3');
+
+    assert.match(sql, /WITH RECURSIVE client_event_types/);
+    assert.match(sql, /cie\.event_type > cet\.event_type/);
+    assert.match(sql, /cie\.event_timestamp >= NOW\(\) - INTERVAL '7 days' AND cie\.campaign_id = \$3/);
+    assert.doesNotMatch(sql, /GROUP BY/);
+});
+
+test('details in all mode skips the full-window summary and bucket scans', async () => {
+    const queries = [];
+    const pool = {
+        query: async (sql) => {
+            queries.push(sql);
+            return { rows: [] };
+        }
+    };
+
+    const details = await loadInstantlyEventAnalyticsDetails({
+        pool,
+        agencyId: 'agency',
+        sqlClientId: 1,
+        periodConfig: PERIOD_CONFIG_7D,
+        eventTypeFilter: { clause: '', params: [], normalized: 'all' },
+        skipCache: true
+    });
+
+    assert.equal(queries.length, 3);
+    assert.ok(queries.every((sql) => !/COUNT\(DISTINCT/.test(sql)));
+    assert.deepEqual(details.summary, {});
+    assert.equal(details.byHour.length, 7);
+});
+
+test('details for a single event type still runs the summary and bucket scans', async () => {
+    const queries = [];
+    const pool = {
+        query: async (sql) => {
+            queries.push(sql);
+            return { rows: [] };
+        }
+    };
+
+    await loadInstantlyEventAnalyticsDetails({
+        pool,
+        agencyId: 'agency',
+        sqlClientId: 1,
+        periodConfig: PERIOD_CONFIG_7D,
+        eventTypeFilter: { clause: " AND LOWER(COALESCE(cie.event_type, '')) = $3", params: ['email_opened'], normalized: 'email_opened' },
+        skipCache: true
+    });
+
+    assert.equal(queries.length, 5);
 });
 
 test('typed period filter leads with agency_id, client_id, then event_type', () => {
@@ -140,6 +192,8 @@ test('recent events query keeps client_id-first filter and limit', () => {
     assert.match(sql, /cie\.client_id = \$2/);
     assert.match(sql, /LIMIT 25/);
     assert.doesNotMatch(sql, /WITH period_events AS/);
+    // NULLS LAST on event_timestamp would defeat the index and sort the whole window.
+    assert.match(sql, /ORDER BY cie\.event_timestamp DESC,/);
 });
 
 test('generateBucketSeries returns expected bucket counts', () => {
