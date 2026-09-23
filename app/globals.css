@@ -925,7 +925,7 @@ body {
 .stage-card__progress-percentage {
   font-size: 0.9rem;
   font-weight: 600;
-  color: #008728;
+  color: var(--app-success-text);
 }
 
 .stage-card--running {
@@ -980,7 +980,7 @@ body {
 
 .stage-card__error {
   margin: 0;
-  color: #f87171;
+  color: var(--app-danger-text);
   font-size: 0.85rem;
 }
 
@@ -1638,7 +1638,7 @@ body {
 
 .form-error {
   margin: 0.5rem 0 0;
-  color: #f87171;
+  color: var(--app-danger-text);
   font-size: 0.85rem;
 }
 
@@ -1896,11 +1896,11 @@ body {
 }
 
 .metric-card__value--success {
-  color: #34d399;
+  color: var(--app-success-text);
 }
 
 .metric-card__value--warning {
-  color: #f6c362;
+  color: var(--app-warn-text);
 }
 
 .metric-card__hint {
@@ -2118,11 +2118,11 @@ body {
 }
 
 .vault-status--success {
-  color: #34d399;
+  color: var(--app-success-text);
 }
 
 .vault-status--error {
-  color: #f87171;
+  color: var(--app-danger-text);
 }
 
 .modal__actions--end {
@@ -2181,7 +2181,21 @@ body {
   flex-wrap: wrap;
 }
 
-.primary-button {
+/* ── Buttons ─────────────────────────────────────────────────────
+   primary     — the one main action in a group (filled, inverted).
+   secondary   — every other action. `--active` is a legacy alias.
+                 Use aria-pressed="true" for a selected option in a set.
+   destructive — deletes, removes or discards data, or stops work that
+                 can't be resumed. Tinted at rest, solid red on hover;
+                 always confirmed with useConfirm (components/confirm-dialog)
+                 unless the action can be undone. `--solid` is the confirm
+                 button inside that dialog.
+   All three share size, shape, disabled and focus behaviour.
+──────────────────────────────────────────────────────────────── */
+.primary-button,
+.secondary-button,
+.secondary-button--active,
+.destructive-button {
   border-radius: 22px;
   padding: 0 1.25rem;
   height: 44px;
@@ -2189,95 +2203,190 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.9rem;
+  gap: 0.5rem;
+  font-size: 0.875rem;
   font-weight: 600;
+  line-height: 1.2;
   cursor: pointer;
-  border: none;
-  transition: opacity 0.2s ease, border-color 0.2s ease;
   flex: 1 1 0;
+  border: 1px solid transparent;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.primary-button {
   background: var(--app-primary-btn-bg);
   color: var(--app-primary-btn-text);
 }
 
-.primary-button:hover {
+.primary-button:hover:not(:disabled):not([aria-disabled="true"]) {
   opacity: 0.85;
 }
 
-.primary-button:disabled,
-.primary-button[aria-disabled="true"] {
-  opacity: 1;
-  background: var(--app-surface-1);
-  color: var(--app-text-faint);
-  border: 1px dashed var(--app-border-highlight);
-  cursor: not-allowed;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
-}
-
-.secondary-button {
-  border-radius: 20px;
-  padding: 0 1.25rem;
-  height: 44px;
-  min-height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.85rem;
-  border: 1px dashed var(--app-border-highlight);
-  background: transparent;
-  color: var(--app-text-high);
-  cursor: not-allowed;
-  flex: 1 1 0;
-}
-
+.secondary-button,
 .secondary-button--active {
-  border-radius: 20px;
-  padding: 0 1.25rem;
-  height: 44px;
-  min-height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.85rem;
-  border: 1px dashed var(--app-border-highlight);
-  background: transparent;
-  color: var(--app-text-high);
-  cursor: pointer;
-  box-shadow: var(--app-shadow-button);
-  flex: 1 1 0;
+  background: var(--app-surface-2);
+  border-color: var(--app-border-strong);
+  color: var(--app-text);
+  font-weight: 500;
+}
+
+.secondary-button:hover:not(:disabled):not([aria-disabled="true"]),
+.secondary-button--active:hover:not(:disabled):not([aria-disabled="true"]) {
+  background: var(--app-surface-hover);
+  border-color: var(--app-border-highlight);
+}
+
+.secondary-button[aria-pressed="true"] {
+  background: var(--app-surface-hover);
+  border-color: var(--app-text);
+  font-weight: 600;
 }
 
 .destructive-button {
-  border-radius: 20px;
-  padding: 0 1.25rem;
-  height: 44px;
-  min-height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.85rem;
-  font-weight: 600;
-  border: 1px solid rgba(239, 68, 68, 0.5);
-  background: rgba(239, 68, 68, 0.15);
-  color: #f87171;
-  cursor: pointer;
-  box-shadow: var(--app-shadow-button);
-  flex: 1 1 0;
-  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, opacity 0.2s ease;
+  background: var(--app-danger-bg);
+  border-color: var(--app-danger-border);
+  color: var(--app-danger-text);
 }
 
-.destructive-button:hover {
-  background: rgba(239, 68, 68, 0.25);
-  border-color: rgba(239, 68, 68, 0.8);
-  color: #fecaca;
+.destructive-button:hover:not(:disabled):not([aria-disabled="true"]),
+.destructive-button--solid {
+  background: var(--app-danger-solid);
+  border-color: var(--app-danger-solid);
+  color: var(--app-on-solid);
 }
 
+.destructive-button--solid:hover:not(:disabled):not([aria-disabled="true"]) {
+  background: var(--app-danger-solid-hover);
+  border-color: var(--app-danger-solid-hover);
+}
+
+.primary-button:disabled,
+.primary-button[aria-disabled="true"],
+.secondary-button:disabled,
+.secondary-button[aria-disabled="true"],
+.secondary-button--active:disabled,
+.secondary-button--active[aria-disabled="true"],
 .destructive-button:disabled,
 .destructive-button[aria-disabled="true"] {
-  opacity: 0.7;
+  opacity: 0.45;
   cursor: not-allowed;
-  background: rgba(239, 68, 68, 0.08);
-  color: rgba(248, 113, 113, 0.6);
-  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.primary-button:focus-visible,
+.secondary-button:focus-visible,
+.secondary-button--active:focus-visible,
+.destructive-button:focus-visible,
+.action-button:focus-visible {
+  outline: 2px solid var(--app-text);
+  outline-offset: 2px;
+}
+
+/* Compact size for buttons inside rows, cards and toolbars. */
+.primary-button--compact,
+.secondary-button--compact,
+.destructive-button--compact {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 0.85rem;
+  border-radius: 16px;
+  font-size: 0.8125rem;
+  flex: 0 0 auto;
+}
+
+@media (pointer: coarse) {
+  .primary-button--compact,
+  .secondary-button--compact,
+  .destructive-button--compact {
+    height: 44px;
+    min-height: 44px;
+  }
+}
+
+/* Destructive actions that remove a whole record sit apart from Save. */
+.danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 0.5rem;
+  padding: 1rem 1.1rem;
+  border-radius: 12px;
+  border: 1px solid var(--app-danger-border);
+}
+
+.danger-zone > .destructive-button {
+  flex: 0 0 auto;
+}
+
+.danger-zone__title {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--app-text);
+}
+
+.danger-zone__text {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+}
+
+/* ── Confirm dialog (components/confirm-dialog.tsx) ── */
+.confirm-dialog__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--app-bg-overlay);
+  animation: modalOverlayFade 150ms ease-out;
+}
+
+.confirm-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 61;
+  width: min(440px, calc(100vw - 2rem));
+  transform: translate(-50%, -50%);
+  padding: 1.5rem;
+  border-radius: 20px;
+  border: 1px solid var(--app-border-subtle);
+  background: var(--app-bg-modal);
+  box-shadow: var(--app-shadow-modal);
+  color: var(--app-text);
+  outline: none;
+}
+
+.confirm-dialog__title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.confirm-dialog__message {
+  margin: 0.5rem 0 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--app-text-muted);
+}
+
+.confirm-dialog__actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+@media (max-width: 600px) {
+  .confirm-dialog {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    transform: none;
+    border-radius: 22px 22px 0 0;
+    padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
+  }
 }
 
 .pipeline-status-row {
@@ -2330,7 +2439,7 @@ body {
 
 .toast-notification p {
   margin: 0;
-  color: #34d399;
+  color: var(--app-success-text);
   font-size: 0.9rem;
   font-weight: 500;
   line-height: 1.5;
@@ -2345,7 +2454,7 @@ body {
   border-radius: 50%;
   border: 1px solid rgba(15, 111, 255, 0.3);
   background: #0f6fff30;
-  color: #0f6fff;
+  color: var(--app-info-text);
   font-size: 1rem;
   display: flex;
   align-items: center;
@@ -2358,7 +2467,7 @@ body {
 .card-big-data {
   font-size: 2rem;
   font-weight: 700;
-  color: #8ac480;
+  color: var(--app-success-text);
 }
 
 .card-big-data--loading {
@@ -2934,10 +3043,10 @@ select.lead-activity-chip {
   --app-warning-detail: #7f1d1d;
 
   /* Lead chip colors — readable on light backgrounds */
-  --chip-valid-text: #15803d;
+  --chip-valid-text: #166534;
   --chip-valid-bg: rgba(22, 163, 74, 0.12);
   --chip-valid-border: rgba(22, 163, 74, 0.35);
-  --chip-valid-risky-text: #a16207;
+  --chip-valid-risky-text: #854d0e;
   --chip-valid-risky-bg: rgba(202, 138, 4, 0.12);
   --chip-valid-risky-border: rgba(202, 138, 4, 0.35);
   --chip-invalid-text: #be123c;
@@ -2955,7 +3064,7 @@ select.lead-activity-chip {
   --chip-default-text: #374151;
   --chip-default-bg: rgba(55, 65, 81, 0.08);
   --chip-default-border: rgba(55, 65, 81, 0.25);
-  --chip-campaign-text: #047857;
+  --chip-campaign-text: #065f46;
   --chip-campaign-bg: rgba(4, 120, 87, 0.1);
   --chip-campaign-border: rgba(4, 120, 87, 0.3);
   --chip-campaign-more-text: #4b5563;
@@ -2963,15 +3072,15 @@ select.lead-activity-chip {
   --chip-campaign-more-border: rgba(75, 85, 99, 0.25);
 
   /* Job pill colors — readable on light backgrounds */
-  --job-pill-queued: #a16207;
-  --job-pill-running: #2563eb;
-  --job-pill-completed: #059669;
-  --job-pill-error: #dc2626;
-  --job-pill-live: #ea580c;
-  --job-pill-paused: #6b7280;
+  --job-pill-queued: #92400e;
+  --job-pill-running: #1d4ed8;
+  --job-pill-completed: #166534;
+  --job-pill-error: #b91c1c;
+  --job-pill-live: #9a3412;
+  --job-pill-paused: #4b5563;
 
   /* Send-day picker */
-  --send-day-active-text: #a16207;
+  --send-day-active-text: #854d0e;
   --send-day-active-bg: rgba(202, 138, 4, 0.12);
   --send-day-active-border: rgba(202, 138, 4, 0.45);
 
@@ -2988,8 +3097,8 @@ select.lead-activity-chip {
   --app-text-high:  rgba(0, 0, 0, 0.85);
   --app-text-mid:   rgba(0, 0, 0, 0.75);
   --app-text-muted: rgba(0, 0, 0, 0.62);
-  --app-text-faint: rgba(0, 0, 0, 0.5);
-  --app-text-ghost: rgba(0, 0, 0, 0.42);
+  --app-text-faint: rgba(0, 0, 0, 0.58);
+  --app-text-ghost: rgba(0, 0, 0, 0.56);
   --app-link: #2563eb;
 
   /* Overlays */
@@ -2998,8 +3107,8 @@ select.lead-activity-chip {
   /* Status indicator colors (semantic — same in both themes) */
   --app-status-active:   #16a34a;
   --app-status-paused:   #2563eb;
-  --app-status-inactive: #a1a1aa;
-  --app-status-other:    #f59e0b;
+  --app-status-inactive: #71717a;
+  --app-status-other:    #d97706;
 
   /* Activity event dot colors (semantic — same in both themes) */
   --app-event-auto-reply:    #8b5cf6;
@@ -3018,14 +3127,47 @@ select.lead-activity-chip {
   --app-evtrow-default-text:   rgba(0, 0, 0, 0.55);
   --app-evtrow-default-border: rgba(0, 0, 0, 0.12);
   /* Event pill text — darker in light mode for contrast */
-  --app-evtpill-purple: #7c3aed;
-  --app-evtpill-blue:   #2563eb;
-  --app-evtpill-green:  #16a34a;
-  --app-evtpill-red:    #dc2626;
+  --app-evtpill-purple: #6d28d9;
+  --app-evtpill-blue:   #1d4ed8;
+  --app-evtpill-green:  #166534;
+  --app-evtpill-red:    #b91c1c;
   /* Hover + inverted button */
   --app-surface-hover:    rgba(0, 0, 0, 0.1);
   --app-primary-btn-bg:   #0a0a0a;
   --app-primary-btn-text: #fff;
+
+  /* Status families. -text passes 4.5:1 on its own -bg and on every surface
+     in both themes; -solid is for dots, fills and bars (never for text). */
+  --app-success-text:   #166534;
+  --app-success-bg:     rgba(22, 163, 74, 0.1);
+  --app-success-border: rgba(22, 163, 74, 0.35);
+  --app-success-solid:  #16a34a;
+  --app-danger-text:    #b91c1c;
+  --app-danger-bg:      rgba(220, 38, 38, 0.08);
+  --app-danger-border:  rgba(220, 38, 38, 0.35);
+  --app-danger-solid:   #dc2626;
+  --app-danger-solid-hover: #b91c1c;
+  --app-warn-text:      #92400e;
+  --app-warn-bg:        rgba(217, 119, 6, 0.1);
+  --app-warn-border:    rgba(217, 119, 6, 0.35);
+  --app-warn-solid:     #d97706;
+  --app-info-text:      #1d4ed8;
+  --app-info-bg:        rgba(37, 99, 235, 0.08);
+  --app-info-border:    rgba(37, 99, 235, 0.35);
+  --app-info-solid:     #2563eb;
+  --app-violet-text:    #6d28d9;
+  --app-violet-bg:      rgba(124, 58, 237, 0.08);
+  --app-violet-border:  rgba(124, 58, 237, 0.3);
+  --app-violet-solid:   #7c3aed;
+  --app-teal-text:      #0f766e;
+  --app-teal-solid:     #0d9488;
+  /* Text on any -solid fill (white passes 4.5:1 on every solid above except success) */
+  --app-on-solid: #fff;
+  /* Selected row / option (tint reads in both themes, text stays --app-text) */
+  --app-selected-bg:     rgba(59, 130, 246, 0.12);
+  --app-selected-border: rgba(59, 130, 246, 0.6);
+  /* Read-only code / prompt blocks */
+  --app-code-bg: rgba(0, 0, 0, 0.04);
 }
 
 .dark {
@@ -3085,8 +3227,8 @@ select.lead-activity-chip {
   --app-text-high:  rgba(255, 255, 255, 0.85);
   --app-text-mid:   rgba(255, 255, 255, 0.75);
   --app-text-muted: rgba(255, 255, 255, 0.6);
-  --app-text-faint: rgba(255, 255, 255, 0.45);
-  --app-text-ghost: rgba(255, 255, 255, 0.4);
+  --app-text-faint: rgba(255, 255, 255, 0.55);
+  --app-text-ghost: rgba(255, 255, 255, 0.52);
   --app-link: #60a5fa;
   --app-bg-overlay-soft: rgba(0, 0, 0, 0.3);
   --app-event-default:       rgba(255, 255, 255, 0.3);
@@ -3100,6 +3242,30 @@ select.lead-activity-chip {
   --app-surface-hover:    rgba(255, 255, 255, 0.16);
   --app-primary-btn-bg:   #fff;
   --app-primary-btn-text: #000;
+  --app-status-inactive: #a1a1aa;
+  --app-status-other:    #f59e0b;
+  --app-success-text:   #4ade80;
+  --app-success-bg:     rgba(74, 222, 128, 0.12);
+  --app-success-border: rgba(74, 222, 128, 0.35);
+  --app-success-solid:  #22c55e;
+  --app-danger-text:    #f87171;
+  --app-danger-bg:      rgba(248, 113, 113, 0.12);
+  --app-danger-border:  rgba(248, 113, 113, 0.4);
+  --app-warn-text:      #fcd34d;
+  --app-warn-bg:        rgba(252, 211, 77, 0.1);
+  --app-warn-border:    rgba(252, 211, 77, 0.35);
+  --app-warn-solid:     #f59e0b;
+  --app-info-text:      #93c5fd;
+  --app-info-bg:        rgba(147, 197, 253, 0.12);
+  --app-info-border:    rgba(147, 197, 253, 0.4);
+  --app-info-solid:     #3b82f6;
+  --app-violet-text:    #c4b5fd;
+  --app-violet-bg:      rgba(196, 181, 253, 0.12);
+  --app-violet-border:  rgba(196, 181, 253, 0.35);
+  --app-violet-solid:   #8b5cf6;
+  --app-teal-text:      #5eead4;
+  --app-teal-solid:     #2dd4bf;
+  --app-code-bg: rgba(0, 0, 0, 0.35);
 
   /* Shadows — depth in dark mode */
   --app-shadow-panel: 0 25px 80px rgba(0, 0, 0, 0.45);
@@ -3180,8 +3346,8 @@ select.lead-activity-chip {
     --app-text-high:  rgba(255, 255, 255, 0.85);
     --app-text-mid:   rgba(255, 255, 255, 0.75);
     --app-text-muted: rgba(255, 255, 255, 0.6);
-    --app-text-faint: rgba(255, 255, 255, 0.45);
-    --app-text-ghost: rgba(255, 255, 255, 0.4);
+    --app-text-faint: rgba(255, 255, 255, 0.55);
+    --app-text-ghost: rgba(255, 255, 255, 0.52);
     --app-link: #60a5fa;
     --app-bg-overlay-soft: rgba(0, 0, 0, 0.3);
     --app-event-default:       rgba(255, 255, 255, 0.3);
@@ -3195,6 +3361,30 @@ select.lead-activity-chip {
     --app-surface-hover:    rgba(255, 255, 255, 0.16);
     --app-primary-btn-bg:   #fff;
     --app-primary-btn-text: #000;
+    --app-status-inactive: #a1a1aa;
+    --app-status-other:    #f59e0b;
+    --app-success-text:   #4ade80;
+    --app-success-bg:     rgba(74, 222, 128, 0.12);
+    --app-success-border: rgba(74, 222, 128, 0.35);
+    --app-success-solid:  #22c55e;
+    --app-danger-text:    #f87171;
+    --app-danger-bg:      rgba(248, 113, 113, 0.12);
+    --app-danger-border:  rgba(248, 113, 113, 0.4);
+    --app-warn-text:      #fcd34d;
+    --app-warn-bg:        rgba(252, 211, 77, 0.1);
+    --app-warn-border:    rgba(252, 211, 77, 0.35);
+    --app-warn-solid:     #f59e0b;
+    --app-info-text:      #93c5fd;
+    --app-info-bg:        rgba(147, 197, 253, 0.12);
+    --app-info-border:    rgba(147, 197, 253, 0.4);
+    --app-info-solid:     #3b82f6;
+    --app-violet-text:    #c4b5fd;
+    --app-violet-bg:      rgba(196, 181, 253, 0.12);
+    --app-violet-border:  rgba(196, 181, 253, 0.35);
+    --app-violet-solid:   #8b5cf6;
+    --app-teal-text:      #5eead4;
+    --app-teal-solid:     #2dd4bf;
+    --app-code-bg: rgba(0, 0, 0, 0.35);
 
     --app-shadow-panel: 0 25px 80px rgba(0, 0, 0, 0.45);
     --app-shadow-button: 0 10px 30px rgba(0, 0, 0, 0.35);
@@ -3387,16 +3577,28 @@ select.lead-activity-chip {
   cursor: not-allowed;
 }
 
+.action-button--danger {
+  background: var(--app-danger-bg);
+  border-color: var(--app-danger-border);
+  color: var(--app-danger-text);
+}
+
+.action-button--danger:hover:not(:disabled) {
+  background: var(--app-danger-solid);
+  border-color: var(--app-danger-solid);
+  color: var(--app-on-solid);
+}
+
 /* ========================================================================
    Deal Flow board (components/deal-flow)
    ======================================================================== */
 :root {
   --df-violet: #6d4acb; --df-violet-bg: #eee9fa;
-  --df-sky: #1c6fb0;    --df-sky-bg: #e3eef8;
-  --df-teal: #0f7b6c;   --df-teal-bg: #dff2ee;
-  --df-green: #2e7d32;  --df-green-bg: #e3f1e4;
+  --df-sky: #185f98;    --df-sky-bg: #e3eef8;
+  --df-teal: #0b6b5e;   --df-teal-bg: #dff2ee;
+  --df-green: #276b2b;  --df-green-bg: #e3f1e4;
   --df-red: #b43a2e;    --df-red-bg: #f8e4e1;
-  --df-amber: #b4550a;  --df-amber-bg: #fbebdd;
+  --df-amber: #9a4708;  --df-amber-bg: #fbebdd;
   --df-slate: #5c6572;  --df-slate-bg: #e8ebee;
 }
 .dark {
@@ -3473,7 +3675,8 @@ select.lead-activity-chip {
 .df-btn--primary:hover:not(:disabled) { background: var(--app-primary-btn-bg); filter: brightness(1.08); }
 .df-btn--ghost { background: transparent; border-color: transparent; color: var(--app-text-muted); }
 .df-btn--ghost:hover:not(:disabled) { color: var(--app-text); }
-.df-btn--danger { background: var(--df-red); color: #fff; border-color: transparent; }
+.df-btn--danger { background: var(--app-danger-solid); color: var(--app-on-solid); border-color: transparent; }
+.df-btn--danger:hover:not(:disabled) { background: var(--app-danger-solid-hover); }
 .df-iconbtn {
   background: transparent; border: 1px solid transparent; border-radius: 6px;
   color: var(--app-text-muted); width: 26px; height: 26px; cursor: pointer; font-size: 0.9rem; line-height: 1;
@@ -3903,7 +4106,7 @@ select.lead-activity-chip {
 }
 
 .ar-save-state--saved {
-  color: #34d399;
+  color: var(--app-success-text);
 }
 
 /* Editor is its own panel: same behaviour as the lead-modal composer, with
@@ -4452,7 +4655,7 @@ select.lead-activity-chip {
 .ar-link-popup__btn--remove {
   background: rgba(239, 68, 68, 0.15);
   border: 1px solid rgba(239, 68, 68, 0.5);
-  color: #f87171;
+  color: var(--app-danger-text);
 }
 
 /* Regenerate-instructions textarea, matching .settings-field inputs */
