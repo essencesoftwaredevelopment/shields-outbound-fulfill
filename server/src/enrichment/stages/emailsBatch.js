@@ -98,7 +98,10 @@ async function importCsvEmailsBatch(ctx, batchDomains, { batchIndex, stageLog })
             jobId: ctx.jobId,
             mergeMode,
             importStatus,
-            reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
+            reconcileAfterWrite: shouldScheduleChildReconcile(ctx),
+            // Lead-filter jobs map no email column: they re-supply existing emails
+            // and must not relabel an Enrow/TryKitt find as a CSV import.
+            source: String(ctx.options.columnMapping?.email || '').trim() ? 'csv' : null
         });
         imported += chunk.length;
         statusImported += written.statusRows;
@@ -183,7 +186,8 @@ export async function runEmailsBatch(ctx, batchDomains, batchOpts = {}) {
                 type: 'emails',
                 jobId: ctx.jobId,
                 mergeMode: enrichmentMergeMode(ctx),
-                reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
+                reconcileAfterWrite: shouldScheduleChildReconcile(ctx),
+                source: 'trykitt'
             });
         }
     });

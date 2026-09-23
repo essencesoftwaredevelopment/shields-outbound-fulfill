@@ -166,7 +166,9 @@ export async function upsertCsvEmailRowsBatch({
     mergeMode = 'preserve',
     importStatus = false,
     onTiming = null,
-    reconcileAfterWrite = true
+    reconcileAfterWrite = true,
+    /** 'csv' for real uploads; null for lead-filter seeds, which only re-supply existing emails. */
+    source = 'csv'
 }) {
     if (!Array.isArray(rows) || rows.length === 0) return { emailRows: 0, statusRows: 0 };
 
@@ -178,7 +180,8 @@ export async function upsertCsvEmailRowsBatch({
         jobId,
         mergeMode,
         onTiming,
-        reconcileAfterWrite
+        reconcileAfterWrite,
+        source
     });
 
     const statusRows = importStatus
@@ -193,7 +196,8 @@ export async function upsertCsvEmailRowsBatch({
             jobId,
             mergeMode,
             onTiming,
-            reconcileAfterWrite
+            reconcileAfterWrite,
+            source
         });
     }
     return { emailRows: rows.length, statusRows: statusRows.length };
@@ -210,7 +214,13 @@ export async function upsertLeadRowsBatch({
     jobId = null,
     mergeMode = 'preserve',
     onTiming = null,
-    reconcileAfterWrite = true
+    reconcileAfterWrite = true,
+    /**
+     * Provenance label for this write ('trykitt' | 'self_hosted' | 'csv').
+     * 'emails': stamped on email_source where the stored email is the one this
+     * write supplied. 'verification': stamped on email_verify_source (null clears).
+     */
+    source = null
 }) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     if (!agencyId || !clientId) return;
@@ -258,24 +268,44 @@ export async function upsertLeadRowsBatch({
         }
 
         // A verification written here (TryKitt, self-hosted or a CSV status)
-        // replaces whatever verdict the contact had, so it also clears the
-        // 'enrow' provenance label. Otherwise a lead Enrow once verified keeps
-        // saying "verified by Enrow" after TryKitt re-verifies it, and the Enrow
-        // risky re-check queue skips it. Enrow's own writes go through
-        // services/db/enrow.js and set the label afterwards.
+        // replaces whatever verdict the contact had, so it also replaces the
+        // provenance label. Otherwise a lead Enrow once verified keeps saying
+        // "verified by Enrow" after TryKitt re-verifies it, and the Enrow risky
+        // re-check queue skips it. Enrow's own writes go through
+        // services/db/enrow.js and set 'enrow' afterwards.
         if (type === 'verification') {
             const verifiedDomains = payloads.filter((p) => p.emailStatus).map((p) => p.domain);
             if (verifiedDomains.length) {
                 await client.query(
                     `UPDATE contacts c
-                     SET email_verify_source = NULL
+                     SET email_verify_source = $4::text
                      FROM companies co
                      WHERE c.company_id = co.id
                        AND co.agency_id = $1 AND co.client_id = $2
                        AND co.domain_normalized = ANY($3::text[])
                        AND c.role_type = 'founder'
-                       AND c.email_verify_source IS NOT NULL`,
-                    [agencyId, clientId, verifiedDomains]
+                       AND c.email_verify_source IS DISTINCT FROM $4::text`,
+                    [agencyId, clientId, verifiedDomains, source]
+                );
+            }
+        }
+
+        // Who found the email. Only where the stored email is the one supplied:
+        // in 'preserve' merges an existing address wins and keeps its source.
+        if (type === 'emails' && source) {
+            const found = payloads.filter((p) => p.email);
+            if (found.length) {
+                await client.query(
+                    `UPDATE contacts c
+                     SET email_source = $5::text
+                     FROM companies co, unnest($3::text[], $4::text[]) AS f(domain, email)
+                     WHERE c.company_id = co.id
+                       AND co.agency_id = $1 AND co.client_id = $2
+                       AND co.domain_normalized = f.domain
+                       AND c.role_type = 'founder'
+                       AND LOWER(c.email) = LOWER(f.email)
+                       AND c.email_source IS DISTINCT FROM $5::text`,
+                    [agencyId, clientId, found.map((p) => p.domain), found.map((p) => p.email), source]
                 );
             }
         }

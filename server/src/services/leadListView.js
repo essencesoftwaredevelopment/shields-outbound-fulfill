@@ -74,6 +74,11 @@ export function mapLeadListRow(row, { tableView = false } = {}) {
         lastContactedAt: row.last_contacted_at,
         firstLine: row.personalization_first_line,
         jobId: row.job_id,
+        // Provenance (lead lookup only): 'trykitt' | 'enrow' | 'csv' | 'self_hosted' | null (legacy / unknown).
+        emailSource: row.email_source ?? null,
+        emailVerifySource: row.email_verify_source ?? null,
+        enrowFindAttemptedAt: row.enrow_find_attempted_at ?? null,
+        enrowVerifyAttemptedAt: row.enrow_verify_attempted_at ?? null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         campaignCountAllTime: row.campaign_count_all_time,

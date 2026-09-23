@@ -68,7 +68,8 @@ async function handOffStuckEmailsToEnrow(ctx, { err, verify, batchSize, queueOpt
             type: 'verification',
             jobId: ctx.jobId,
             mergeMode: enrichmentMergeMode(ctx),
-            reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
+            reconcileAfterWrite: shouldScheduleChildReconcile(ctx),
+            source: 'trykitt'
         });
         stageLog(`Verify: TryKitt timed out twice on ${stillStuck.length} email(s) — marked unknown and passed to Enrow.`);
     }
@@ -140,7 +141,8 @@ export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
                 type: 'verification',
                 jobId: ctx.jobId,
                 mergeMode: enrichmentMergeMode(ctx),
-                reconcileAfterWrite: shouldScheduleChildReconcile(ctx)
+                reconcileAfterWrite: shouldScheduleChildReconcile(ctx),
+                source: ctx.options.emailVerificationProvider || 'trykitt'
             });
         }
     });

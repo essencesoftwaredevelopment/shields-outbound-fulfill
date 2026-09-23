@@ -135,6 +135,11 @@ type Lead = {
     emailFindCompletedAt?: string;
     emailVerifyCompletedAt?: string;
     founderFindCompletedAt?: string;
+    /** Who found / verified the email: 'trykitt' | 'enrow' | 'csv' | 'self_hosted'; empty = legacy / unknown. */
+    emailSource?: string;
+    emailVerifySource?: string;
+    enrowFindAttemptedAt?: string;
+    enrowVerifyAttemptedAt?: string;
     lastContactedAt?: string;
     jobId?: string;
     campaignCountAllTime?: number | null;
@@ -539,6 +544,46 @@ function isPendingReviewDraftCurrentlyInterested(draft: {
     const lastEventType = String(draft.last_event_type || "").trim().toLowerCase();
     if (!lastEventType) return true;
     return INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES.has(lastEventType);
+}
+
+const EMAIL_PROVIDER_LABELS: Record<string, string> = {
+    trykitt: 'TryKitt',
+    enrow: 'Enrow',
+    csv: 'CSV import',
+    self_hosted: 'Self-hosted'
+};
+
+/**
+ * Provider for the lead's "Email discovered / not found" activity entry.
+ * Enrow only searches after a TryKitt miss, so an Enrow find always means both
+ * ran. Empty source on older leads = unknown (recorded from 2026-09-23).
+ */
+function getEmailFindSource(lead: { email?: string; emailSource?: string; enrowFindAttemptedAt?: string }): { label: string; detail: string | null } | null {
+    if (!lead.email) {
+        return lead.enrowFindAttemptedAt
+            ? { label: 'TryKitt + Enrow', detail: 'Neither TryKitt nor Enrow found an email' }
+            : null;
+    }
+    if (lead.emailSource === 'enrow') {
+        return { label: 'Enrow', detail: 'TryKitt found none, Enrow found it' };
+    }
+    const label = lead.emailSource ? EMAIL_PROVIDER_LABELS[lead.emailSource] || lead.emailSource : null;
+    return label ? { label, detail: null } : null;
+}
+
+/** Provider for the "Email verified" activity entry. */
+function getEmailVerifySource(lead: { emailSource?: string; emailVerifySource?: string; enrowVerifyAttemptedAt?: string }): { label: string; detail: string | null } | null {
+    if (lead.emailVerifySource === 'enrow') {
+        if (lead.enrowVerifyAttemptedAt) {
+            return { label: 'TryKitt → Enrow', detail: 'TryKitt was inconclusive (risky / unknown), Enrow re-checked it' };
+        }
+        if (lead.emailSource === 'enrow') {
+            return { label: 'Enrow', detail: 'Verified by Enrow when it found the email' };
+        }
+        return { label: 'Enrow', detail: null };
+    }
+    const label = lead.emailVerifySource ? EMAIL_PROVIDER_LABELS[lead.emailVerifySource] || lead.emailVerifySource : null;
+    return label ? { label, detail: null } : null;
 }
 
 const ACTIVE_INSTANTLY_SYNC_STATUSES = new Set(['queued', 'running', 'cancelling']);
@@ -4142,6 +4187,10 @@ export default function ClientPage() {
         emailFindCompletedAt: row.emailFindCompletedAt || "",
         emailVerifyCompletedAt: row.emailVerifyCompletedAt || "",
         founderFindCompletedAt: row.founderFindCompletedAt || "",
+        emailSource: row.emailSource || "",
+        emailVerifySource: row.emailVerifySource || "",
+        enrowFindAttemptedAt: row.enrowFindAttemptedAt || "",
+        enrowVerifyAttemptedAt: row.enrowVerifyAttemptedAt || "",
         lastContactedAt: row.lastContactedAt || "",
         jobId: row.jobId || "",
         campaignCountAllTime: typeof row.campaignCountAllTime === "number" ? row.campaignCountAllTime : null,
@@ -16093,19 +16142,25 @@ export default function ClientPage() {
                                         const enrichmentJobId = (selectedLead.jobId || '').trim();
                                         const enrichmentJobSubtitle = enrichmentJobId ? `Job ${enrichmentJobId}` : null;
 
+                                        const joinSubtitle = (...parts: Array<string | null | undefined>) => parts.filter(Boolean).join(' · ') || null;
+
                                         // Email find event
                                         if (selectedLead.emailFindCompletedAt) {
+                                            const findSource = getEmailFindSource(selectedLead);
+                                            const findLabel = selectedLead.email ? 'Email discovered' : 'Email not found';
                                             syntheticEvents.push({
                                                 id: 'syn-email-find',
                                                 event_type: selectedLead.email ? 'email_found' : 'email_not_found',
-                                                displayLabel: selectedLead.email ? 'Email discovered' : 'Email not found',
+                                                displayLabel: findSource ? `${findLabel} · ${findSource.label}` : findLabel,
                                                 event_timestamp: selectedLead.emailFindCompletedAt,
                                                 campaign_name: null,
                                                 lead_email: selectedLead.email || null,
                                                 message_text: null,
                                                 reply_text_snippet: null,
                                                 reply_category: null,
-                                                subtitle: selectedLead.email ? enrichmentJobSubtitle : null,
+                                                subtitle: selectedLead.email
+                                                    ? joinSubtitle(findSource?.detail, enrichmentJobSubtitle)
+                                                    : findSource?.detail || null,
                                                 source: 'shields',
                                                 synthetic: true,
                                             });
@@ -16119,17 +16174,20 @@ export default function ClientPage() {
                                                 selectedLead.emailVerifyCompletedAt,
                                                 selectedLead.emailFindCompletedAt
                                             );
+                                            const verifySource = getEmailVerifySource(selectedLead);
                                             syntheticEvents.push({
                                                 id: 'syn-email-verify',
                                                 event_type: 'email_verified',
-                                                displayLabel: `Email verified — ${verifyDisplay.label}`,
+                                                displayLabel: verifySource
+                                                    ? `Email verified — ${verifyDisplay.label} · ${verifySource.label}`
+                                                    : `Email verified — ${verifyDisplay.label}`,
                                                 event_timestamp: selectedLead.emailVerifyCompletedAt,
                                                 campaign_name: null,
                                                 lead_email: selectedLead.email || null,
                                                 message_text: null,
                                                 reply_text_snippet: null,
                                                 reply_category: null,
-                                                subtitle: enrichmentJobSubtitle,
+                                                subtitle: joinSubtitle(verifySource?.detail, enrichmentJobSubtitle),
                                                 source: 'shields',
                                                 synthetic: true,
                                             });

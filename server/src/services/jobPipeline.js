@@ -1005,7 +1005,8 @@ async function processJob(job) {
                         jobId: job.id,
                         mergeMode: enrichmentMergeMode(job),
                         importStatus,
-                        onTiming: makeUpsertTiming(job, 'emailDiscovery')
+                        onTiming: makeUpsertTiming(job, 'emailDiscovery'),
+                        source: String(job.columnMapping?.email || '').trim() ? 'csv' : null
                     });
                     imported += batch.length;
                     statusImported += written.statusRows;
@@ -1096,7 +1097,8 @@ async function processJob(job) {
                             type: 'emails',
                             jobId: job.id,
                             mergeMode: enrichmentMergeMode(job),
-                            onTiming: makeUpsertTiming(job, 'emailDiscovery')
+                            onTiming: makeUpsertTiming(job, 'emailDiscovery'),
+                            source: job.emailVerificationProvider === 'self_hosted' ? 'self_hosted' : 'trykitt'
                         });
                     }
                 });
@@ -1166,7 +1168,8 @@ async function processJob(job) {
                             type: 'verification',
                             jobId: job.id,
                             mergeMode: enrichmentMergeMode(job),
-                            onTiming: makeUpsertTiming(job, 'verification')
+                            onTiming: makeUpsertTiming(job, 'verification'),
+                            source: job.emailVerificationProvider || 'trykitt'
                         });
                     }
                 })

@@ -298,6 +298,17 @@ function contactUpdateClauseForStrategy(strategy) {
                     THEN EXCLUDED.email_verify_completed_at
                 ELSE COALESCE(EXCLUDED.email_verify_completed_at, contacts.email_verify_completed_at)
             END,
+            email_source = CASE
+                WHEN EXCLUDED.email IS NOT NULL AND (contacts.email IS NULL OR LOWER(contacts.email) <> LOWER(EXCLUDED.email))
+                    THEN EXCLUDED.email_source
+                ELSE contacts.email_source
+            END,
+            email_verify_source = CASE
+                WHEN EXCLUDED.email IS NOT NULL AND (contacts.email IS NULL OR LOWER(contacts.email) <> LOWER(EXCLUDED.email))
+                    THEN EXCLUDED.email_verify_source
+                WHEN EXCLUDED.email_status IS NOT NULL THEN EXCLUDED.email_verify_source
+                ELSE contacts.email_verify_source
+            END,
             import_batch_id = EXCLUDED.import_batch_id,
             updated_at = NOW()`;
     }
@@ -322,6 +333,16 @@ function contactUpdateClauseForStrategy(strategy) {
             WHEN (contacts.email IS NULL OR BTRIM(contacts.email) = '') AND EXCLUDED.email IS NOT NULL
                 THEN EXCLUDED.email_verify_completed_at
             ELSE contacts.email_verify_completed_at
+        END,
+        email_source = CASE
+            WHEN (contacts.email IS NULL OR BTRIM(contacts.email) = '') AND EXCLUDED.email IS NOT NULL
+                THEN EXCLUDED.email_source
+            ELSE contacts.email_source
+        END,
+        email_verify_source = CASE
+            WHEN (contacts.email IS NULL OR BTRIM(contacts.email) = '') AND EXCLUDED.email IS NOT NULL
+                THEN EXCLUDED.email_verify_source
+            ELSE contacts.email_verify_source
         END,
         import_batch_id = EXCLUDED.import_batch_id,
         updated_at = NOW()`;
@@ -355,13 +376,15 @@ async function upsertImportContactsChunk(txClient, {
         entry.emailStatus,
         entry.emailStatus ? verifiedAt : null,
         agencyId,
-        batchId
+        batchId,
+        entry.email ? 'csv' : null,
+        entry.emailStatus ? 'csv' : null
     ];
 
     const insertSql = (valuesSql) => `
         INSERT INTO contacts (
             client_id, company_id, role_type, full_name, email, email_status,
-            email_verify_completed_at, agency_id, import_batch_id
+            email_verify_completed_at, agency_id, import_batch_id, email_source, email_verify_source
         )
         VALUES ${valuesSql}
         ON CONFLICT (company_id, role_type)
