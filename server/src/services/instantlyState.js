@@ -635,14 +635,31 @@ function filterCampaignsForSync(campaigns, instantlyCampaignId) {
     return campaigns.filter((campaign) => resolveInstantlyCampaignIdFromPayload(campaign) === targetId);
 }
 
-async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {}) {
-    const payload = await instantlyRequest({
-        apiKey,
-        path: '/api/v2/campaigns',
-        method: 'GET',
-        syncRunId
-    });
-    return extractItems(payload);
+/**
+ * Every campaign on the workspace. /api/v2/campaigns is paginated (10 per page
+ * when no limit is sent), so a single call silently dropped campaigns past the
+ * first page and a targeted sync failed with "Instantly campaign not found"
+ * (Essence Retention: 21 campaigns, "Email Conversion System" on page 2).
+ */
+export async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {}) {
+    const rows = [];
+    let startingAfter = null;
+    for (let page = 0; page < 100; page += 1) {
+        const params = new URLSearchParams();
+        params.set('limit', '100');
+        if (startingAfter) params.set('starting_after', startingAfter);
+        const payload = await instantlyRequest({
+            apiKey,
+            path: `/api/v2/campaigns?${params.toString()}`,
+            method: 'GET',
+            syncRunId
+        });
+        rows.push(...extractItems(payload));
+        const next = nextStartingAfter(payload);
+        if (!next || next === startingAfter) break;
+        startingAfter = next;
+    }
+    return rows;
 }
 
 async function fetchInstantlyAccounts(apiKey, { syncRunId = null } = {}) {

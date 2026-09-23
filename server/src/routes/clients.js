@@ -30,7 +30,8 @@ import {
     requestStopInstantlySyncRun,
     registerInstantlyWebhook
     ,
-    syncClientEmailAccounts
+    syncClientEmailAccounts,
+    fetchInstantlyCampaigns
 } from '../services/instantlyState.js';
 import { mergeLeadLabelsWithDefaults, normalizeLeadLabels } from '../services/warmFollowUpStatus.js';
 import {
@@ -415,36 +416,8 @@ router.post('/clients/:id/campaigns', async (req, res) => {
         const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
         console.log('[campaigns] window', { days, since: since.toISOString() });
         let campaigns = [];
-        async function fetchInstantlyCampaignsV2(key) {
-            console.log('[campaigns] calling Instantly v2');
-            const resp = await fetch('https://api.instantly.ai/api/v2/campaigns', {
-                method: 'GET',
-                headers: {
-                    // v2 expects Authorization Bearer
-                    'Authorization': `Bearer ${key}`,
-                    'Accept': 'application/json'
-                }
-            });
-            console.log('[campaigns] v2 response', { status: resp.status });
-            if (!resp.ok) {
-                const msg = await resp.text().catch(() => '');
-                throw new Error(`Instantly v2 error (${resp.status}): ${msg}`);
-            }
-            const data = await resp.json();
-            // v2 returns { items: [...] } (observed), but support other shapes defensively
-            const items = Array.isArray(data?.items)
-                ? data.items
-                : (Array.isArray(data?.data)
-                    ? data.data
-                    : (Array.isArray(data?.campaigns)
-                        ? data.campaigns
-                        : (Array.isArray(data) ? data : [])));
-            if (Array.isArray(items) && items.length > 0) {
-                const sample = items[0];
-                console.log('[campaigns] v2 sample keys', Object.keys(sample || {}));
-            }
-            return items;
-        }
+        // Paged: a bare /api/v2/campaigns call only returns the first 10 campaigns.
+        const fetchInstantlyCampaignsV2 = (key) => fetchInstantlyCampaigns(key);
         try {
             let items = [];
             try {
@@ -991,22 +964,14 @@ router.post('/clients/:clientId/instantly-import/merge', upload.single('file'), 
         }
 
         // Fetch campaigns from Instantly API (live) and resolve duplicate names deterministically
-        const instantlyResp = await fetch('https://api.instantly.ai/api/v2/campaigns', {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${instantlyKey}`,
-                'Accept': 'application/json'
-            }
-        });
-
-        if (!instantlyResp.ok) {
-            const message = await instantlyResp.text().catch(() => '');
-            console.error('[instantly-import/merge] Instantly campaigns fetch failed:', instantlyResp.status, message);
+        // Paged: a bare /api/v2/campaigns call only returns the first 10 campaigns.
+        let instantlyItems;
+        try {
+            instantlyItems = await fetchInstantlyCampaigns(instantlyKey);
+        } catch (err) {
+            console.error('[instantly-import/merge] Instantly campaigns fetch failed:', err?.message || err);
             return res.status(502).json({ error: 'Failed to fetch campaigns from Instantly API.' });
         }
-
-        const instantlyPayload = await instantlyResp.json();
-        const instantlyItems = extractCampaignApiItems(instantlyPayload);
         const parsedCampaigns = instantlyItems
             .map((item) => {
                 const instantlyCampaignId = String(item?.id || item?.campaignId || item?.uuid || item?._id || '').trim();
