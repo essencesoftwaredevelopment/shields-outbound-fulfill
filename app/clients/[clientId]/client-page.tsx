@@ -11259,7 +11259,8 @@ export default function ClientPage() {
                                         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '1rem' }}>
                                             {jobHistory.map((job) => {
                                                 const isSelected = job.id === selectedJobId;
-                                                const statusColor = JOB_STATUS_COLORS[job.status];
+                                                // The server also writes cancelled / discarded / paused / pending-upload, which have no entry.
+                                                const statusColor = JOB_STATUS_COLORS[job.status] ?? JOB_STATUS_COLORS.queued;
                                                 const isExpanded = expandedErrorJobId === job.id;
                                                 
                                                 // Calculate metrics
