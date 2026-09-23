@@ -422,6 +422,7 @@ type InstantlyEventAnalyticsPayload = {
     summary: InstantlyEventAnalyticsSummary;
     byHour: InstantlyEventAnalyticsByHourRow[];
     recentEvents: InstantlyEventAnalyticsRecentEvent[];
+    computedAt?: string;
 };
 
 function analyticsCampaignKey(payload: InstantlyEventAnalyticsPayload | null) {
@@ -459,6 +460,7 @@ function mergeAnalyticsPayloads(
         scope: "full",
         clientSqlId: core.clientSqlId ?? details.clientSqlId,
         realtimeConfig: core.realtimeConfig || details.realtimeConfig,
+        computedAt: core.computedAt,
         summary: {
             ...details.summary,
             emails_sent: core.summary.emails_sent,
@@ -497,6 +499,16 @@ type CollatedActivityEvent = CollatableActivityEvent & {
     secondaryLabel?: string | null;
     combined?: boolean;
 };
+
+// Server refreshes the core snapshot every ~10 min; poll at half that.
+const ANALYTICS_CORE_REFRESH_MS = 5 * 60_000;
+
+function formatAnalyticsUpdatedAgo(computedAt: string | undefined, now: number) {
+    if (!computedAt) return null;
+    const minutes = Math.max(0, Math.floor((now - new Date(computedAt).getTime()) / 60_000));
+    if (minutes < 1) return "Totals updated just now";
+    return `Totals updated ${minutes} min ago`;
+}
 
 const INSTANTLY_ANALYTICS_PERIOD_OPTIONS: Array<{ value: InstantlyEventAnalyticsPeriod; label: string }> = [
     { value: "24h", label: "Last 24 hours" },
@@ -2041,6 +2053,8 @@ export default function ClientPage() {
     const previousRecentEventIdsRef = useRef<Set<string> | null>(null);
     const recentEventAnimationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const analyticsRequestIdRef = useRef(0);
+    const analyticsDetailsRequestIdRef = useRef(0);
+    const [analyticsNow, setAnalyticsNow] = useState(() => Date.now());
 
     type PendingReviewDraft = {
         id: number;
@@ -5080,14 +5094,19 @@ export default function ClientPage() {
         }
     }, [user?.id, clientId, agencyId, jobHistoryIdsKey]);
 
-    const fetchInstantlyEventAnalytics = useCallback(async (showLoading = true) => {
+    // detailsOnly: refresh the recent-events feed without re-reading the core totals
+    // (served from a ~10 min snapshot, so per-webhook refetches add nothing).
+    const fetchInstantlyEventAnalytics = useCallback(async (showLoading = true, detailsOnly = false) => {
         if (!user || !clientId) return;
 
-        const requestId = ++analyticsRequestIdRef.current;
+        // Details-only refreshes keep the main request id so they never cancel an
+        // in-flight core load; details get their own id so the newest one wins.
+        const requestId = detailsOnly ? analyticsRequestIdRef.current : ++analyticsRequestIdRef.current;
+        const detailsRequestId = ++analyticsDetailsRequestIdRef.current;
         const period = instantlyEventAnalyticsPeriod;
         const eventType = instantlyEventAnalyticsEventType;
         const campaignId = instantlyEventAnalyticsCampaignId;
-        const loadCore = eventType === "all";
+        const loadCore = eventType === "all" && !detailsOnly;
 
         try {
             if (showLoading) {
@@ -5151,30 +5170,43 @@ export default function ClientPage() {
                 }
             };
 
-            if (loadCore) {
-                const corePayload = await fetchScope("core");
-                if (requestId !== analyticsRequestIdRef.current) return;
-                setInstantlyEventAnalytics((prev) => {
-                    if (analyticsFiltersMatch(prev, period, eventType, campaignId) && (prev?.scope === "details" || prev?.scope === "full")) {
-                        return mergeAnalyticsPayloads(corePayload, prev);
+            // Core and details load in parallel; each merges into whatever the other
+            // already put in state, so arrival order doesn't matter.
+            const corePromise = loadCore
+                ? fetchScope("core").then((corePayload) => {
+                    if (requestId !== analyticsRequestIdRef.current) return;
+                    setAnalyticsNow(Date.now());
+                    setInstantlyEventAnalytics((prev) => {
+                        if (analyticsFiltersMatch(prev, period, eventType, campaignId) && (prev?.scope === "details" || prev?.scope === "full")) {
+                            return mergeAnalyticsPayloads(corePayload, prev);
+                        }
+                        return mergeAnalyticsPayloads(corePayload, null);
+                    });
+                    if (showLoading) {
+                        setInstantlyEventAnalyticsCoreLoading(false);
+                        setInstantlyEventAnalyticsLoading(false);
                     }
-                    return mergeAnalyticsPayloads(corePayload, null);
+                })
+                : Promise.resolve();
+
+            const detailsPromise = fetchScope("details").then((detailsPayload) => {
+                if (requestId !== analyticsRequestIdRef.current) return;
+                if (detailsRequestId !== analyticsDetailsRequestIdRef.current) return;
+                applyRecentEventAnimation(detailsPayload);
+                setInstantlyEventAnalytics((prev) => {
+                    if (analyticsFiltersMatch(prev, period, eventType, campaignId) && (prev?.scope === "core" || prev?.scope === "full")) {
+                        return mergeAnalyticsPayloads(prev, detailsPayload);
+                    }
+                    return mergeAnalyticsPayloads(null, detailsPayload);
                 });
                 if (showLoading) {
-                    setInstantlyEventAnalyticsCoreLoading(false);
-                    setInstantlyEventAnalyticsLoading(false);
+                    setInstantlyEventAnalyticsDetailsLoading(false);
                 }
-            }
-
-            const detailsPayload = await fetchScope("details");
-            if (requestId !== analyticsRequestIdRef.current) return;
-            applyRecentEventAnimation(detailsPayload);
-            setInstantlyEventAnalytics((prev) => {
-                if (analyticsFiltersMatch(prev, period, eventType, campaignId) && (prev?.scope === "core" || prev?.scope === "full")) {
-                    return mergeAnalyticsPayloads(prev, detailsPayload);
-                }
-                return mergeAnalyticsPayloads(null, detailsPayload);
             });
+
+            const results = await Promise.allSettled([corePromise, detailsPromise]);
+            const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+            if (failure) throw failure.reason;
         } catch (error) {
             if (requestId !== analyticsRequestIdRef.current) return;
             console.error("Error fetching Instantly event analytics:", error);
@@ -5345,8 +5377,34 @@ export default function ClientPage() {
         }
 
         fetchInstantlyEventAnalytics(true);
+    }, [activeTab, user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod, fetchInstantlyEventAnalytics]);
+
+    useEffect(() => {
+        if (activeTab !== "analytics" || !user || !clientId) {
+            return;
+        }
+
         fetchPendingReviewDrafts();
-    }, [activeTab, user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod, fetchInstantlyEventAnalytics, fetchPendingReviewDrafts]);
+    }, [activeTab, user, clientId, fetchPendingReviewDrafts]);
+
+    // Core totals come from a server snapshot refreshed every ~10 min; pick up new
+    // snapshots while the tab stays open, and keep the "updated N min ago" label current.
+    useEffect(() => {
+        if (activeTab !== "analytics" || !user || !clientId) {
+            return;
+        }
+
+        const tick = setInterval(() => setAnalyticsNow(Date.now()), 60_000);
+        const refresh = setInterval(() => {
+            if (document.visibilityState === "visible") {
+                fetchInstantlyEventAnalytics(false);
+            }
+        }, ANALYTICS_CORE_REFRESH_MS);
+        return () => {
+            clearInterval(tick);
+            clearInterval(refresh);
+        };
+    }, [activeTab, user, clientId, fetchInstantlyEventAnalytics]);
 
     useEffect(() => {
         if (activeTab !== 'follow-ups' || !user || !clientId) return;
@@ -5448,7 +5506,7 @@ export default function ClientPage() {
     useAnalyticsRealtime({
         clientSqlId: instantlyEventAnalytics?.clientSqlId ?? null,
         enabled: activeTab === "analytics",
-        onEventsChange: () => { fetchInstantlyEventAnalytics(false); },
+        onEventsChange: () => { fetchInstantlyEventAnalytics(false, true); },
         onDraftsChange: () => { fetchPendingReviewDrafts(false); },
         onError: setInstantlyEventRealtimeError,
     });
@@ -9478,6 +9536,21 @@ export default function ClientPage() {
                                         <span style={{ width: "8px", height: "8px", borderRadius: "999px", background: "#22c55e" }} />
                                         Live
                                     </span>
+                                    {(() => {
+                                        const updatedAgo = analyticsFiltersMatch(
+                                            instantlyEventAnalytics,
+                                            instantlyEventAnalyticsPeriod,
+                                            instantlyEventAnalyticsEventType,
+                                            instantlyEventAnalyticsCampaignId
+                                        )
+                                            ? formatAnalyticsUpdatedAgo(instantlyEventAnalytics?.computedAt, analyticsNow)
+                                            : null;
+                                        return updatedAgo ? (
+                                            <span style={{ fontSize: "0.78rem", color: "var(--app-text-muted)" }}>
+                                                {updatedAgo}
+                                            </span>
+                                        ) : null;
+                                    })()}
                                     <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginLeft: "auto" }}>
                                         <label className="settings-field" style={{ minWidth: "220px" }}>
                                             <span className="settings-field__label">Campaign</span>

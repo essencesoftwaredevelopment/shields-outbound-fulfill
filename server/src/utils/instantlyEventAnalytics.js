@@ -223,12 +223,41 @@ export function buildInstantlyEventBucketCountsQuery(periodConfig, periodFilterS
     `;
 }
 
-export function buildInstantlyEventTypesQuery(periodFilterSql, eventTypeFilterClause) {
+/**
+ * Distinct event types seen in the window, via a loose index scan on
+ * (agency_id, client_id, event_type, event_timestamp): one probe per distinct
+ * type (~25) instead of grouping every event row in the window (7s → 20ms on
+ * 200k events).
+ */
+export function buildInstantlyEventTypesQuery(eventFloorSql, eventTypeFilterClause) {
     return `
-        SELECT LOWER(COALESCE(cie.event_type, 'unknown')) AS event_type
-        FROM contact_instantly_events cie
-        WHERE ${periodFilterSql}${eventTypeFilterClause}
-        GROUP BY 1
+        WITH RECURSIVE client_event_types AS (
+            SELECT MIN(cie.event_type) AS event_type
+            FROM contact_instantly_events cie
+            WHERE cie.agency_id = $1
+              AND cie.client_id = $2
+            UNION ALL
+            SELECT (
+                SELECT MIN(cie.event_type)
+                FROM contact_instantly_events cie
+                WHERE cie.agency_id = $1
+                  AND cie.client_id = $2
+                  AND cie.event_type > cet.event_type
+            )
+            FROM client_event_types cet
+            WHERE cet.event_type IS NOT NULL
+        )
+        SELECT DISTINCT LOWER(cet.event_type) AS event_type
+        FROM client_event_types cet
+        WHERE cet.event_type IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM contact_instantly_events cie
+              WHERE cie.agency_id = $1
+                AND cie.client_id = $2
+                AND cie.event_type = cet.event_type
+                AND cie.event_timestamp >= ${eventFloorSql}${eventTypeFilterClause}
+          )
         ORDER BY 1 ASC
     `;
 }
@@ -261,7 +290,9 @@ export function buildInstantlyRecentEventsQuery(eventFloorSql, eventTypeFilterCl
         FROM contact_instantly_events cie
         LEFT JOIN instantly_campaigns ic ON ic.id = cie.campaign_id
         WHERE ${periodFilterSql}${eventTypeFilterClause}
-        ORDER BY cie.event_timestamp DESC NULLS LAST, cie.created_at DESC NULLS LAST, cie.id DESC
+        -- Plain DESC (not NULLS LAST) matches the (client_id, event_timestamp) index so
+        -- this stops after 25 rows; the period floor already excludes NULL timestamps.
+        ORDER BY cie.event_timestamp DESC, cie.created_at DESC NULLS LAST, cie.id DESC
         LIMIT 25
     `;
 }
@@ -490,6 +521,12 @@ export async function loadInstantlyEventAnalyticsDetails({
     const followUpClause = buildCampaignIdFilterClause(campaignId, 'fus', '$2');
     const followUpParams = campaignId ? [sqlClientId, campaignId] : [sqlClientId];
 
+    // In "all" mode the cards and chart come from core; the all-event summary and
+    // bucket counts are only shown for a single event type, and they scan every
+    // event row in the window (14s at 90d on the largest client). Skip them.
+    const needsEventScans = eventTypeFilter.normalized !== 'all';
+    const emptyResult = { rows: [] };
+
     return withAnalyticsCache(cacheKey, skipCache, async () => {
         const [
             summaryResult,
@@ -498,20 +535,24 @@ export async function loadInstantlyEventAnalyticsDetails({
             recentEventsResult,
             followUpStatsResult
         ] = await Promise.all([
+            needsEventScans
+                ? pool.query(
+                    buildInstantlyEventSummaryQuery(periodFilterSql, extraClause),
+                    analyticsParams
+                )
+                : emptyResult,
+            needsEventScans
+                ? pool.query(
+                    buildInstantlyEventBucketCountsQuery(
+                        periodConfig,
+                        periodFilterSql,
+                        extraClause
+                    ),
+                    analyticsParams
+                )
+                : emptyResult,
             pool.query(
-                buildInstantlyEventSummaryQuery(periodFilterSql, extraClause),
-                analyticsParams
-            ),
-            pool.query(
-                buildInstantlyEventBucketCountsQuery(
-                    periodConfig,
-                    periodFilterSql,
-                    extraClause
-                ),
-                analyticsParams
-            ),
-            pool.query(
-                buildInstantlyEventTypesQuery(periodFilterSql, extraClause),
+                buildInstantlyEventTypesQuery(periodConfig.eventFloorSql, extraClause),
                 analyticsParams
             ),
             pool.query(

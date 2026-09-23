@@ -32,6 +32,7 @@ import calendlyRouter from './routes/calendly.js';
 import resendWebhookRouter from './routes/resendWebhook.js';
 import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobPipeline.js';
 import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/jobRunner.js';
+import { startAnalyticsSnapshotSweep } from './services/analyticsSnapshots.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
@@ -122,6 +123,8 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', pipelineExecution: 'queue' });
 });
 
+let stopAnalyticsSnapshotSweep = () => {};
+
 const server = app.listen(PORT, async () => {
     if (env.DB_WRITE_FREEZE) {
         console.warn('⚠️  DB_WRITE_FREEZE=true: write endpoints are currently blocked');
@@ -133,6 +136,7 @@ const server = app.listen(PORT, async () => {
     } catch (err) {
         console.error('Database connectivity check failed:', err.message);
     }
+    stopAnalyticsSnapshotSweep = startAnalyticsSnapshotSweep(pool);
 });
 
 server.on('error', (err) => {
@@ -171,6 +175,7 @@ async function gracefulShutdown(signal) {
     }
 
     server.close?.();
+    stopAnalyticsSnapshotSweep();
 
     try {
         const cancelled = await cancelActiveJobsOnShutdown('Interrupted (server shutdown)');
