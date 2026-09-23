@@ -3572,6 +3572,21 @@ export default function ClientPage() {
         setLeadFilters((prev) => prev.filter((item) => item.id !== filterId));
     }, []);
 
+    // Insert a copy directly after the filter, joined with AND. joinOp is the connector
+    // AFTER a clause, so the copy inherits the original's connector (keeping any OR to the
+    // next clause intact) and the original's connector becomes AND.
+    const duplicateLeadFilter = useCallback((filterId: string) => {
+        setLeadFilters((prev) => {
+            const index = prev.findIndex((item) => item.id === filterId);
+            if (index === -1) return prev;
+            const source = prev[index];
+            const next = [...prev];
+            next[index] = { ...source, joinOp: 'AND' };
+            next.splice(index + 1, 0, { ...source, id: createLeadFilterId() });
+            return next;
+        });
+    }, []);
+
     const applyLeadFilters = useCallback(() => {
         setAppliedLeadFilters(normalizedLeadFilters);
         // Force a refetch even when the filters haven't changed
@@ -3621,6 +3636,7 @@ export default function ClientPage() {
                     field={field}
                     onChange={updateLeadFilter}
                     onRemove={removeLeadFilter}
+                    onDuplicate={duplicateLeadFilter}
                 />
             );
         };
@@ -3701,6 +3717,7 @@ export default function ClientPage() {
             );
         });
     }, [
+        duplicateLeadFilter,
         leadFilterFieldMap,
         leadFilterFields,
         leadFilterFieldsLoading,

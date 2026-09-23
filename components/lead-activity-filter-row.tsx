@@ -62,6 +62,8 @@ type LeadActivityFilterRowProps = {
     field: FilterField;
     onChange: (filterId: string, updates: Partial<FilterClause> & { value?: string; op?: string; field?: string }) => void;
     onRemove: (filterId: string) => void;
+    /** Inserts a copy of this filter directly after it, joined with AND. */
+    onDuplicate?: (filterId: string) => void;
 };
 
 function nextTimeframe(kind: string, previous: LeadActivityTimeframe): LeadActivityTimeframe {
@@ -105,7 +107,8 @@ export function LeadActivityFilterRow({
     fields,
     field,
     onChange,
-    onRemove
+    onRemove,
+    onDuplicate
 }: LeadActivityFilterRowProps) {
     const category = leadFilterCategory(field);
     const activityField = fields.find((item) => isLeadActivityCategory(item)) || field;
@@ -221,11 +224,26 @@ export function LeadActivityFilterRow({
                     aria-label="Filter category"
                     onChange={applyCategory}
                 />
+                {onDuplicate && (
+                    <button
+                        type="button"
+                        className="lead-activity-filter__icon-btn"
+                        onClick={() => onDuplicate(filter.id)}
+                        aria-label="Duplicate filter"
+                        title="Duplicate filter (adds a copy joined with AND)"
+                    >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <rect x="8" y="8" width="12" height="12" rx="2" stroke="currentColor" strokeWidth="1.7"/>
+                            <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/>
+                        </svg>
+                    </button>
+                )}
                 <button
                     type="button"
                     className="lead-activity-filter__icon-btn"
                     onClick={() => onRemove(filter.id)}
                     aria-label="Remove filter"
+                    title="Remove filter"
                 >
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                         <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0v12a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V7h12Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/>
