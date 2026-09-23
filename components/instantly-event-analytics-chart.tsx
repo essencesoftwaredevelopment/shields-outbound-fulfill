@@ -49,7 +49,7 @@ const outreachChartConfig = {
     },
     meetings_booked: {
         label: "Meetings booked",
-        color: "var(--app-teal-solid)",
+        color: "var(--app-violet-solid)",
     },
 } satisfies ChartConfig;
 
@@ -163,7 +163,7 @@ export default function InstantlyEventAnalyticsChart({
                             )}
                             {showMeetingsBooked && (
                                 <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
-                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "var(--app-teal-solid)" }} />
+                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "var(--app-violet-solid)" }} />
                                     Meetings booked
                                 </div>
                             )}
@@ -193,7 +193,7 @@ export default function InstantlyEventAnalyticsChart({
                                 </p>
                             )}
                             {showMeetingsBooked && (
-                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "var(--app-teal-text)" }}>
+                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "var(--app-violet-text)" }}>
                                     {totalMeetingsBookedCount.toLocaleString()}
                                     <span style={{ marginLeft: "0.25rem", fontSize: "0.72rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
                                         meetings
