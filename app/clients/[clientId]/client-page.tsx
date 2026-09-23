@@ -51,6 +51,7 @@ import {
     shouldShowCreditExhaustionNotice,
 } from "@/lib/pipeline/creditExhaustion";
 import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
+import { useConfirm } from "@/components/confirm-dialog";
 import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
 import { LeadToolbarMoreMenu } from "@/components/lead-toolbar-more-menu";
@@ -1293,11 +1294,11 @@ const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
     error: "Error",
 };
 
-const JOB_STATUS_COLORS: Record<JobStatus, string> = {
-    queued: "#9ca3af",    // Grey for neutral/waiting
-    running: "#3b82f6",   // Blue for processing
-    failed: "#ef4444",    // Red for failure only
-    completed: "#22c55e", // Green for success only
+const JOB_STATUS_COLORS: Record<JobStatus, { text: string; bg: string; border: string; solid: string }> = {
+    queued: { text: "var(--app-text-muted)", bg: "var(--app-surface-2)", border: "var(--app-border-highlight)", solid: "var(--app-text-ghost)" },
+    running: { text: "var(--app-info-text)", bg: "var(--app-info-bg)", border: "var(--app-info-border)", solid: "var(--app-info-solid)" },
+    failed: { text: "var(--app-danger-text)", bg: "var(--app-danger-bg)", border: "var(--app-danger-border)", solid: "var(--app-danger-solid)" },
+    completed: { text: "var(--app-success-text)", bg: "var(--app-success-bg)", border: "var(--app-success-border)", solid: "var(--app-success-solid)" },
 };
 
 const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
@@ -1729,15 +1730,13 @@ const calculateJobProgress = (job: PipelineJob): { processed: number; total: num
 };
 
 type DomainStatDownloadButtonProps = {
-    /** RGB triplet, e.g. "16, 185, 129" — used to derive the border/background tints. */
-    rgb: string;
     busy: boolean;
     label: string;
     onClick: () => void;
 };
 
-function DomainStatDownloadButton({ rgb, busy, label, onClick }: DomainStatDownloadButtonProps) {
-    const color = `rgb(${rgb})`;
+function DomainStatDownloadButton({ busy, label, onClick }: DomainStatDownloadButtonProps) {
+    const color = 'var(--app-text-muted)';
     return (
         <button
             type="button"
@@ -1752,9 +1751,9 @@ function DomainStatDownloadButton({ rgb, busy, label, onClick }: DomainStatDownl
                 width: '22px',
                 height: '22px',
                 padding: 0,
-                border: `1px solid rgba(${rgb}, 0.4)`,
+                border: '1px solid var(--app-border-strong)',
                 borderRadius: '5px',
-                background: `rgba(${rgb}, 0.12)`,
+                background: 'var(--app-surface-2)',
                 color,
                 cursor: busy ? 'wait' : 'pointer',
                 opacity: busy ? 0.7 : 1,
@@ -1765,7 +1764,7 @@ function DomainStatDownloadButton({ rgb, busy, label, onClick }: DomainStatDownl
                     style={{
                         width: '11px',
                         height: '11px',
-                        border: `2px solid rgba(${rgb}, 0.3)`,
+                        border: '2px solid var(--app-border-strong)',
                         borderTopColor: color,
                         borderRadius: '50%',
                         animation: 'spin 0.8s linear infinite'
@@ -1798,6 +1797,7 @@ export default function ClientPage() {
     const clientId = (params?.clientId as string) || "";
     const { user, loading } = useAuth();
     const { agencyId } = useAgencyId();
+    const [confirmAction, confirmDialog] = useConfirm();
 
     const [activeTab, setActiveTabState] = useState<ClientTab>(() => parseClientTab(searchParams?.get("tab")));
     const selectTab = useCallback((tab: ClientTab) => {
@@ -6112,6 +6112,14 @@ export default function ClientPage() {
 
     const handleStopJob = async () => {
         if (!jobState || !user) return;
+        const cancelling = jobState.paused;
+        const confirmed = await confirmAction({
+            title: cancelling ? 'Cancel this run?' : 'Stop this run?',
+            message: 'Stages that haven’t finished are stopped and the run can’t be resumed. Leads already enriched are kept.',
+            confirmLabel: cancelling ? 'Cancel run' : 'Stop run',
+            cancelLabel: 'Keep running',
+        });
+        if (!confirmed) return;
         setStoppingJob(true);
         setJobStatusMessage('Stopping job...');
         try {
@@ -6151,9 +6159,12 @@ export default function ClientPage() {
 
     const handleCompleteJob = async () => {
         if (!jobState || !user) return;
-        const confirmed = window.confirm(
-            'Mark this pipeline as completed? Unfinished work will be closed and the job cannot be resumed.'
-        );
+        const confirmed = await confirmAction({
+            title: 'Mark this run completed?',
+            message: 'Unfinished work is closed and the run can’t be resumed.',
+            confirmLabel: 'Mark completed',
+            tone: 'default',
+        });
         if (!confirmed) return;
         setCompletingJob(true);
         setJobStatusMessage('Marking job completed...');
@@ -6701,7 +6712,11 @@ export default function ClientPage() {
         const name = hasValidFounderName(selectedLead.founderName)
             ? selectedLead.founderName
             : (selectedLead.email || selectedLead.domain || 'this lead');
-        if (!confirm(`Stop automated warm follow-ups for ${name}? The Instantly label is left unchanged.`)) return;
+        if (!(await confirmAction({
+            title: `Stop warm follow-ups for ${name}?`,
+            message: 'No more automated follow-ups are sent to this lead. The Instantly label is left unchanged.',
+            confirmLabel: 'Stop follow-ups',
+        }))) return;
 
         setRemovingWarmFollowUp(true);
         try {
@@ -6816,7 +6831,11 @@ export default function ClientPage() {
 
     const handleDeleteAutoResponderPrompt = async (promptId: number) => {
         if (!user || !clientId) return;
-        if (!window.confirm('Delete this auto-responder prompt?')) return;
+        if (!(await confirmAction({
+            title: 'Delete this auto-responder prompt?',
+            message: 'This can’t be undone.',
+            confirmLabel: 'Delete prompt',
+        }))) return;
 
         setDeletingAutoResponderPromptId(promptId);
         try {
@@ -7001,7 +7020,11 @@ export default function ClientPage() {
 
     const handleDeleteSegment = async (segmentId: string) => {
         if (!user || !clientId) return;
-        const confirmDelete = window.confirm("Delete this segment?");
+        const confirmDelete = await confirmAction({
+            title: 'Delete this segment?',
+            message: 'Leads in the segment are not deleted.',
+            confirmLabel: 'Delete segment',
+        });
         if (!confirmDelete) return;
 
         setDeletingSegmentId(segmentId);
@@ -7268,13 +7291,21 @@ export default function ClientPage() {
             || followUpScripts.some((script) => Boolean(script.step_instruction?.trim()))
         );
         if (enabled) {
-            const confirmed = window.confirm(
-                aiReady
-                    ? 'Switch live warm follow-ups to AI for this client? New sends will generate copy. Static scripts stay as fallback if generation fails.'
-                    : 'No system prompt or step instructions yet. Live AI sends will keep using static templates until you add one. Switch anyway?'
-            );
+            const confirmed = await confirmAction({
+                title: 'Switch live follow-ups to AI?',
+                message: aiReady
+                    ? 'New sends for this client will generate their copy. Static scripts stay as the fallback if generation fails.'
+                    : 'There’s no system prompt or step instruction yet, so live sends keep using the static templates until you add one.',
+                confirmLabel: 'Switch to AI',
+                tone: 'default',
+            });
             if (!confirmed) return;
-        } else if (!window.confirm('Switch live warm follow-ups back to the static HTML/text scripts?')) {
+        } else if (!(await confirmAction({
+            title: 'Switch live follow-ups to static scripts?',
+            message: 'New sends use the HTML/text scripts instead of AI-generated copy.',
+            confirmLabel: 'Switch to static',
+            tone: 'default',
+        }))) {
             return;
         }
         const previous = followUpAiEnabled;
@@ -7355,7 +7386,11 @@ export default function ClientPage() {
 
     const handleDeleteFollowUpScript = async (id: number) => {
         if (!user || !clientId) return;
-        const confirmed = window.confirm('Delete this follow-up script? This cannot be undone.');
+        const confirmed = await confirmAction({
+            title: 'Delete this follow-up script?',
+            message: 'This can’t be undone.',
+            confirmLabel: 'Delete script',
+        });
         if (!confirmed) return;
         setDeletingFollowUpScriptId(id);
         try {
@@ -7458,7 +7493,11 @@ export default function ClientPage() {
 
     const handleDeleteClient = async () => {
         if (!user || !clientId) return;
-        const confirmed = window.confirm("Delete this client? This removes the client record and related leads.");
+        const confirmed = await confirmAction({
+            title: `Delete ${clientName || 'this client'}?`,
+            message: 'The client, its leads, runs and settings are permanently removed. This can’t be undone.',
+            confirmLabel: 'Delete client',
+        });
         if (!confirmed) return;
 
         setIsDeletingClient(true);
@@ -7840,6 +7879,12 @@ export default function ClientPage() {
 
     const handleDiscardJob = async () => {
         if (!user || !clientId) return;
+        const confirmed = await confirmAction({
+            title: 'Discard this run?',
+            message: 'The run is closed without uploading to Instantly and can’t be reopened.',
+            confirmLabel: 'Discard run',
+        });
+        if (!confirmed) return;
 
         try {
             await apiFetch(`/api/clients/${encodeURIComponent(clientId)}/active-job/discard`, {
@@ -7851,12 +7896,17 @@ export default function ClientPage() {
             setActiveJobStatus("discarded");
         } catch (error) {
             console.error("Failed to discard job:", error);
+            setToastMessage(error instanceof Error && error.message ? `Couldn’t discard the run: ${error.message}` : 'Couldn’t discard the run. Try again.');
         }
     };
 
     const handleDeleteJob = async (jobId: string) => {
         if (!user || !clientId) return;
-        const confirmDelete = window.confirm("Delete this job? This removes the job record and cached files.");
+        const confirmDelete = await confirmAction({
+            title: 'Delete this run?',
+            message: 'The run record and its cached files are removed. Leads already enriched are kept. This can’t be undone.',
+            confirmLabel: 'Delete run',
+        });
         if (!confirmDelete) return;
 
         setDeletingJobId(jobId);
@@ -8285,7 +8335,11 @@ export default function ClientPage() {
     };
 
     const handleRevertManualUpload = async (jobId: string, campaignId: string, campaignName: string) => {
-        if (!confirm(`Are you sure you want to revert the manual upload to "${campaignName}"?`)) {
+        if (!(await confirmAction({
+            title: `Remove the upload record for “${campaignName}”?`,
+            message: 'This only clears the app’s record of the manual upload. Leads already in the Instantly campaign stay there.',
+            confirmLabel: 'Remove record',
+        }))) {
             return;
         }
 
@@ -8582,11 +8636,13 @@ export default function ClientPage() {
         if (selectedLeadDeleteCount <= 0) return;
 
         const countLabel = selectedLeadDeleteCount.toLocaleString();
-        const confirmed = window.confirm(
-            selectAllMatchingLeadResults
-                ? `Delete all ${countLabel} matching leads? This cannot be undone.`
-                : `Delete ${countLabel} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'}? This cannot be undone.`
-        );
+        const confirmed = await confirmAction({
+            title: selectAllMatchingLeadResults
+                ? `Delete all ${countLabel} matching leads?`
+                : `Delete ${countLabel} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'}?`,
+            message: 'This can’t be undone.',
+            confirmLabel: `Delete ${selectedLeadDeleteCount === 1 && !selectAllMatchingLeadResults ? 'lead' : 'leads'}`,
+        });
         if (!confirmed) return;
 
         setDeletingLeads(true);
@@ -8638,6 +8694,7 @@ export default function ClientPage() {
         }
     }, [
         buildLeadDeleteQuery,
+        confirmAction,
         clearLeadSelection,
         clientId,
         fetchLeadTotal,
@@ -8788,11 +8845,13 @@ export default function ClientPage() {
         if (selectedLeadDeleteCount <= 0) return;
         const list = leadLists.find((item) => String(item.id) === listFilterId);
         const countLabel = selectedLeadDeleteCount.toLocaleString();
-        const confirmed = window.confirm(
-            selectAllMatchingLeadResults
-                ? `Remove all ${countLabel} matching leads from “${list?.name || 'this list'}”? Leads are not deleted.`
-                : `Remove ${countLabel} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'} from “${list?.name || 'this list'}”? Leads are not deleted.`
-        );
+        const confirmed = await confirmAction({
+            title: selectAllMatchingLeadResults
+                ? `Remove all ${countLabel} matching leads from “${list?.name || 'this list'}”?`
+                : `Remove ${countLabel} selected lead${selectedLeadDeleteCount === 1 ? '' : 's'} from “${list?.name || 'this list'}”?`,
+            message: 'The leads stay in All Leads; only their membership in this list is removed.',
+            confirmLabel: 'Remove from list',
+        });
         if (!confirmed) return;
 
         setMutatingLists(true);
@@ -8830,6 +8889,7 @@ export default function ClientPage() {
         }
     }, [
         clientId,
+        confirmAction,
         clearLeadSelection,
         fetchLeadTotal,
         fetchLeads,
@@ -8844,9 +8904,11 @@ export default function ClientPage() {
     const handleDeleteCurrentList = useCallback(async () => {
         if (!user || !clientId || !listFilterId) return;
         const list = leadLists.find((item) => String(item.id) === listFilterId);
-        const confirmed = window.confirm(
-            `Delete list “${list?.name || 'this list'}”? Leads are not deleted — only the list is removed.`
-        );
+        const confirmed = await confirmAction({
+            title: `Delete the list “${list?.name || 'this list'}”?`,
+            message: 'Leads are not deleted — only the list is removed.',
+            confirmLabel: 'Delete list',
+        });
         if (!confirmed) return;
         setMutatingLists(true);
         try {
@@ -8877,7 +8939,7 @@ export default function ClientPage() {
         } finally {
             setMutatingLists(false);
         }
-    }, [clientId, fetchLeadTotal, fetchLeads, leadLists, listFilterId, refreshLeadLists, user]);
+    }, [clientId, confirmAction, fetchLeadTotal, fetchLeads, leadLists, listFilterId, refreshLeadLists, user]);
 
     const handleRemoveLeadFromList = useCallback(async (contactId: string, listId: number) => {
         if (!user || !clientId) return;
@@ -8943,7 +9005,7 @@ export default function ClientPage() {
                 {listFilterId && (
                     <button
                         type="button"
-                        className="secondary-button secondary-button--active"
+                        className="destructive-button"
                         onClick={handleDeleteCurrentList}
                         disabled={mutatingLists || leadsLoading}
                         style={{ flex: '0 0 auto' }}
@@ -9016,7 +9078,7 @@ export default function ClientPage() {
                                 </button>
                                 <div className="leads-filter-actions__end">
                                     {leadFiltersDirty && leadFilters.length > 0 && (
-                                        <span style={{ fontSize: '0.82rem', color: '#fbbf24', fontWeight: 600 }}>
+                                        <span style={{ fontSize: '0.82rem', color: 'var(--app-warn-text)', fontWeight: 600 }}>
                                             Unapplied changes
                                         </span>
                                     )}
@@ -9133,23 +9195,9 @@ export default function ClientPage() {
                             </span>
                             <button
                                 type="button"
+                                className="destructive-button destructive-button--compact"
                                 onClick={handleDeleteSelectedLeads}
                                 disabled={leadsLoading || deletingLeads || selectedLeadDeleteCount <= 0}
-                                style={{
-                                    padding: '0.4rem 0.85rem',
-                                    fontSize: '0.82rem',
-                                    fontWeight: 600,
-                                    flex: '0 0 auto',
-                                    width: 'auto',
-                                    height: 'auto',
-                                    minHeight: 0,
-                                    background: '#dc2626',
-                                    border: '1px solid #dc2626',
-                                    borderRadius: '20px',
-                                    color: '#ffffff',
-                                    cursor: leadsLoading || deletingLeads || selectedLeadDeleteCount <= 0 ? 'not-allowed' : 'pointer',
-                                    opacity: leadsLoading || deletingLeads || selectedLeadDeleteCount <= 0 ? 0.65 : 1
-                                }}
                             >
                                 {deletingLeads
                                     ? 'Deleting...'
@@ -9157,20 +9205,18 @@ export default function ClientPage() {
                             </button>
                             <button
                                 type="button"
-                                className="secondary-button secondary-button--active"
+                                className="secondary-button secondary-button--compact"
                                 onClick={() => openAddToListModal()}
                                 disabled={leadsLoading || listModalBusy || mutatingLists || selectedLeadDeleteCount <= 0}
-                                style={{ padding: '0.35rem 0.65rem', fontSize: '0.82rem', flex: '0 0 auto', height: 'auto', minHeight: 0 }}
                             >
                                 Add to list
                             </button>
                             {listFilterId && (
                                 <button
                                     type="button"
-                                    className="secondary-button secondary-button--active"
+                                    className="destructive-button destructive-button--compact"
                                     onClick={handleRemoveSelectedFromList}
                                     disabled={leadsLoading || mutatingLists || selectedLeadDeleteCount <= 0}
-                                    style={{ padding: '0.35rem 0.65rem', fontSize: '0.82rem', flex: '0 0 auto', height: 'auto', minHeight: 0 }}
                                 >
                                     {mutatingLists ? 'Removing...' : `Remove from list (${selectAllMatchingLeadResults ? displayedLeadTotalLabel : selectedLeadDeleteCount.toLocaleString()})`}
                                 </button>
@@ -9224,7 +9270,7 @@ export default function ClientPage() {
                                     left: 0,
                                     right: 0,
                                     bottom: 0,
-                                    background: 'rgba(0, 0, 0, 0.7)',
+                                    background: 'color-mix(in srgb, var(--app-bg) 70%, transparent)',
                                     display: 'flex',
                                     alignItems: 'center',
                                     justifyContent: 'center',
@@ -9237,11 +9283,13 @@ export default function ClientPage() {
                                         alignItems: 'center',
                                         gap: '0.75rem',
                                         padding: '1.5rem',
-                                        background: 'rgba(0, 0, 0, 0.8)',
+                                        background: 'var(--app-bg-modal)',
+                                        color: 'var(--app-text)',
                                         borderRadius: '12px',
-                                        border: '1px solid var(--app-border)'
+                                        border: '1px solid var(--app-border-subtle)',
+                                        boxShadow: 'var(--app-shadow-modal)'
                                     }}>
-                                        <svg className="spinner" style={{ width: '32px', height: '32px', color: '#3b82f6' }} viewBox="0 0 24 24" fill="none">
+                                        <svg className="spinner" style={{ width: '32px', height: '32px', color: 'var(--app-info-solid)' }} viewBox="0 0 24 24" fill="none">
                                             <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
                                             <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
                                         </svg>
@@ -9440,6 +9488,7 @@ export default function ClientPage() {
 
     return (
         <>
+            {confirmDialog}
             <AppShell>
                 <section className="hero-panel client-workspace">
                     <header className="client-page-header">
@@ -9527,13 +9576,13 @@ export default function ClientPage() {
                                         gap: "0.4rem",
                                         padding: "0.35rem 0.7rem",
                                         borderRadius: "999px",
-                                        background: "rgba(34, 197, 94, 0.12)",
-                                        border: "1px solid rgba(34, 197, 94, 0.28)",
-                                        color: "#86efac",
+                                        background: "var(--app-success-bg)",
+                                        border: "1px solid var(--app-success-border)",
+                                        color: "var(--app-success-text)",
                                         fontSize: "0.78rem",
                                         fontWeight: 600
                                     }}>
-                                        <span style={{ width: "8px", height: "8px", borderRadius: "999px", background: "#22c55e" }} />
+                                        <span style={{ width: "8px", height: "8px", borderRadius: "999px", background: "var(--app-success-solid)" }} />
                                         Live
                                     </span>
                                     {(() => {
@@ -9596,9 +9645,9 @@ export default function ClientPage() {
                                 <div style={{
                                     padding: "1rem 1.25rem",
                                     borderRadius: "12px",
-                                    border: "1px solid rgba(239, 68, 68, 0.35)",
-                                    background: "rgba(239, 68, 68, 0.08)",
-                                    color: "#fca5a5"
+                                    border: "1px solid var(--app-danger-border)",
+                                    background: "var(--app-danger-bg)",
+                                    color: "var(--app-danger-text)"
                                 }}>
                                     {instantlyEventAnalyticsError}
                                 </div>
@@ -9608,9 +9657,9 @@ export default function ClientPage() {
                                 <div style={{
                                     padding: "1rem 1.25rem",
                                     borderRadius: "12px",
-                                    border: "1px solid rgba(245, 158, 11, 0.35)",
-                                    background: "rgba(245, 158, 11, 0.08)",
-                                    color: "#fcd34d"
+                                    border: "1px solid var(--app-warn-border)",
+                                    background: "var(--app-warn-bg)",
+                                    color: "var(--app-warn-text)"
                                 }}>
                                     {instantlyEventRealtimeError}
                                 </div>
@@ -9961,9 +10010,9 @@ export default function ClientPage() {
                                     // Helper: color dot for a sub-event
                                     function subDotColor(et: string, dl?: string | null): string {
                                         const n = String(et).toLowerCase();
-                                        if (n === "email_sent") return "#3b82f6";
-                                        if (n === "reply_received" || n === "lead_interested" || n === "lead_meeting_booked" || n === "lead_meeting_completed" || n === "lead_closed") return "#22c55e";
-                                        if (n === "email_bounced" || n === "lead_not_interested" || n === "lead_wrong_person" || n === "lead_no_show") return "#ef4444";
+                                        if (n === "email_sent") return "var(--app-info-solid)";
+                                        if (n === "reply_received" || n === "lead_interested" || n === "lead_meeting_booked" || n === "lead_meeting_completed" || n === "lead_closed") return "var(--app-success-solid)";
+                                        if (n === "email_bounced" || n === "lead_not_interested" || n === "lead_wrong_person" || n === "lead_no_show") return "var(--app-danger-solid)";
                                         return getInstantlyActivityColor(et, dl);
                                     }
 
@@ -9988,13 +10037,13 @@ export default function ClientPage() {
 
                                                 // Color family (based on primary event)
                                                 const colorFamily = isAutoReply
-                                                    ? { dot: "#8b5cf6", pill: "rgba(139,92,246,0.15)", pillText: "var(--app-evtpill-purple)", pillBorder: "rgba(139,92,246,0.25)", rowBg: "rgba(139,92,246,0.04)" }
+                                                    ? { dot: "var(--app-violet-solid)", pill: "rgba(139,92,246,0.15)", pillText: "var(--app-evtpill-purple)", pillBorder: "rgba(139,92,246,0.25)", rowBg: "rgba(139,92,246,0.04)" }
                                                     : isEmailSent
-                                                        ? { dot: "#3b82f6", pill: "rgba(59,130,246,0.15)", pillText: "var(--app-evtpill-blue)", pillBorder: "rgba(59,130,246,0.25)", rowBg: "transparent" }
+                                                        ? { dot: "var(--app-info-solid)", pill: "rgba(59,130,246,0.15)", pillText: "var(--app-evtpill-blue)", pillBorder: "rgba(59,130,246,0.25)", rowBg: "transparent" }
                                                         : isPositive
-                                                            ? { dot: "#22c55e", pill: "rgba(34,197,94,0.15)", pillText: "var(--app-evtpill-green)", pillBorder: "rgba(34,197,94,0.25)", rowBg: "rgba(34,197,94,0.04)" }
+                                                            ? { dot: "var(--app-success-solid)", pill: "rgba(34,197,94,0.15)", pillText: "var(--app-evtpill-green)", pillBorder: "rgba(34,197,94,0.25)", rowBg: "rgba(34,197,94,0.04)" }
                                                             : isNegative
-                                                                ? { dot: "#ef4444", pill: "rgba(239,68,68,0.15)", pillText: "var(--app-evtpill-red)", pillBorder: "rgba(239,68,68,0.25)", rowBg: "transparent" }
+                                                                ? { dot: "var(--app-danger-solid)", pill: "rgba(239,68,68,0.15)", pillText: "var(--app-evtpill-red)", pillBorder: "rgba(239,68,68,0.25)", rowBg: "transparent" }
                                                                 : { dot: getInstantlyActivityColor(primaryEvt.event_type, primaryEvt.displayLabel), pill: "var(--app-evtrow-default-pill)", pillText: "var(--app-evtrow-default-text)", pillBorder: "var(--app-evtrow-default-border)", rowBg: "transparent" };
 
                                                 const evtDate = new Date(primaryEvt.event_timestamp);
@@ -10189,7 +10238,7 @@ export default function ClientPage() {
                                                                         const itemSnippet = item.reply_text_snippet || (item.message_text ? item.message_text.split("\n").find((l) => l.trim()) || null : null);
                                                                         return (
                                                                             <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.25rem 0.5rem" }}>
-                                                                                <div className="are-dot" style={{ background: "#3b82f6", flexShrink: 0 }} />
+                                                                                <div className="are-dot" style={{ background: "var(--app-info-solid)", flexShrink: 0 }} />
                                                                                 <span style={{ fontSize: "0.78rem", color: "var(--app-text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "160px", flexShrink: 0 }}>{itemEmail || "—"}</span>
                                                                                 <div style={{ flex: 1 }} />
                                                                                 {itemSnippet && (
@@ -10288,7 +10337,7 @@ export default function ClientPage() {
                                                         onClick={() => setExpandedFailedDraftId(isExpanded ? null : draft.id)}
                                                     >
                                                         <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-                                                            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#ef4444", flexShrink: 0 }} />
+                                                            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: "var(--app-danger-solid)", flexShrink: 0 }} />
                                                             <span style={{ fontSize: "0.83rem", fontWeight: 500, color: "var(--app-text-high)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                                                                 {draft.lead_email}
                                                             </span>
@@ -10374,7 +10423,7 @@ export default function ClientPage() {
                                 )}
                                 {pendingReviewDraftsLoading && pendingReviewDrafts.length === 0 ? (
                                     <div className="pipeline-panel__empty">
-                                        <svg className="spinner" style={{ width: "24px", height: "24px", color: "#8b5cf6" }} viewBox="0 0 24 24" fill="none">
+                                        <svg className="spinner" style={{ width: "24px", height: "24px", color: "var(--app-violet-solid)" }} viewBox="0 0 24 24" fill="none">
                                             <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
                                             <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                                         </svg>
@@ -10422,7 +10471,7 @@ export default function ClientPage() {
                                                                 width: "8px",
                                                                 height: "8px",
                                                                 borderRadius: "50%",
-                                                                background: isResearching ? "#6d5cae" : "#8b5cf6",
+                                                                background: isResearching ? "var(--app-violet-border)" : "var(--app-violet-solid)",
                                                                 flexShrink: 0,
                                                                 animation: isResearching ? "irpDotPulse 1.6s ease-in-out infinite" : undefined,
                                                             }} />
@@ -10782,9 +10831,9 @@ export default function ClientPage() {
                                                         fontSize: '0.75rem',
                                                         fontWeight: 600,
                                                         letterSpacing: '0.02em',
-                                                        background: 'rgba(34, 197, 94, 0.12)',
-                                                        color: '#22c55e',
-                                                        border: '1px solid rgba(34, 197, 94, 0.35)'
+                                                        background: 'var(--app-success-bg)',
+                                                        color: 'var(--app-success-text)',
+                                                        border: '1px solid var(--app-success-border)'
                                                     }}
                                                 >
                                                     {uploadedSummary}
@@ -10804,7 +10853,6 @@ export default function ClientPage() {
                                                     type="button"
                                                     className="destructive-button"
                                                     onClick={handleDiscardJob}
-                                                    style={{ color: 'rgba(239, 68, 68, 0.9)' }}
                                                 >
                                                     Discard
                                                 </button>
@@ -10846,9 +10894,9 @@ export default function ClientPage() {
                                                     <span style={{ opacity: 0.4 }}>→</span>
                                                     <span style={{ fontWeight: '600' }}><AnimatedNumber value={emailsFound} /></span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: '#22c55e' }}><AnimatedNumber value={safe} /></span>
+                                                    <span style={{ fontWeight: '600', color: 'var(--app-success-text)' }}><AnimatedNumber value={safe} /></span>
                                                     <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: '#3b82f6' }}><AnimatedNumber value={personalized} /></span>
+                                                    <span style={{ fontWeight: '600', color: 'var(--app-info-text)' }}><AnimatedNumber value={personalized} /></span>
                                                 </div>
                                             );
                                         })()}
@@ -11246,8 +11294,8 @@ export default function ClientPage() {
                                                                 flexDirection: 'column',
                                                                 padding: '1.25rem',
                                                                 borderRadius: '12px',
-                                                                border: `1px solid ${isSelected ? 'rgba(59, 130, 246, 0.65)' : 'var(--app-border)'}`,
-                                                                background: isSelected ? 'rgba(59, 130, 246, 0.12)' : 'var(--app-surface-3)',
+                                                                border: `1px solid ${isSelected ? 'var(--app-selected-border)' : 'var(--app-border)'}`,
+                                                                background: isSelected ? 'var(--app-selected-bg)' : 'var(--app-surface-3)',
                                                                 cursor: 'pointer',
                                                                 transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.2s ease',
                                                                 position: 'relative'
@@ -11260,7 +11308,7 @@ export default function ClientPage() {
                                                             }}
                                                             onMouseLeave={(event) => {
                                                                 event.currentTarget.style.transform = 'translateY(0)';
-                                                                event.currentTarget.style.borderColor = isSelected ? 'rgba(59, 130, 246, 0.65)' : 'var(--app-border)';
+                                                                event.currentTarget.style.borderColor = isSelected ? 'var(--app-selected-border)' : 'var(--app-border)';
                                                             }}
                                                         >
                                                             {/* Top row: Filename + Badge */}
@@ -11293,9 +11341,9 @@ export default function ClientPage() {
                                                                     fontWeight: 700,
                                                                     letterSpacing: '0.04em',
                                                                     textTransform: 'uppercase',
-                                                                    background: `${statusColor}22`,
-                                                                    color: statusColor,
-                                                                    border: `1.5px solid ${statusColor}`,
+                                                                    background: statusColor.bg,
+                                                                    color: statusColor.text,
+                                                                    border: `1.5px solid ${statusColor.border}`,
                                                                     flexShrink: 0
                                                                 }}>{JOB_STATUS_LABELS[job.status]}</span>
                                                             </div>
@@ -11312,7 +11360,7 @@ export default function ClientPage() {
                                                                         <span style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>
                                                                             Processing: {progress.processed.toLocaleString()} / {progress.total.toLocaleString()} rows
                                                                         </span>
-                                                                        <span style={{ fontSize: '0.85rem', fontWeight: 600, color: statusColor }}>
+                                                                        <span style={{ fontSize: '0.85rem', fontWeight: 600, color: statusColor.text }}>
                                                                             {progress.percent}%
                                                                         </span>
                                                                     </div>
@@ -11326,7 +11374,7 @@ export default function ClientPage() {
                                                                         <div style={{
                                                                             width: `${progress.percent}%`,
                                                                             height: '100%',
-                                                                            background: statusColor,
+                                                                            background: statusColor.solid,
                                                                             transition: 'width 0.3s ease'
                                                                         }}/>
                                                                     </div>
@@ -11360,9 +11408,9 @@ export default function ClientPage() {
                                                                                     borderRadius: '6px',
                                                                                     fontSize: '0.75rem',
                                                                                     fontWeight: 500,
-                                                                                    backgroundColor: upload.upload_source === 'manual' ? '#1e3a8a' : '#065f46',
-                                                                                    color: '#fff',
-                                                                                    border: `1px solid ${upload.upload_source === 'manual' ? '#3b82f6' : '#10b981'}`
+                                                                                    backgroundColor: upload.upload_source === 'manual' ? 'var(--app-info-bg)' : 'var(--app-success-bg)',
+                                                                                    color: upload.upload_source === 'manual' ? 'var(--app-info-text)' : 'var(--app-success-text)',
+                                                                                    border: `1px solid ${upload.upload_source === 'manual' ? 'var(--app-info-border)' : 'var(--app-success-border)'}`
                                                                                 }}
                                                                             >
                                                                                 <span>{upload.upload_source === 'manual' ? '📝' : '🤖'}</span>
@@ -11374,25 +11422,14 @@ export default function ClientPage() {
                                                                                 </div>
                                                                                 {upload.upload_source === 'manual' && (
                                                                                     <button
+                                                                                        type="button"
+                                                                                        className="action-button action-button--danger"
                                                                                         onClick={(e) => {
                                                                                             e.stopPropagation();
                                                                                             handleRevertManualUpload(job.id, upload.campaign_id, upload.campaign_name);
                                                                                         }}
-                                                                                        style={{
-                                                                                            padding: '2px 6px',
-                                                                                            fontSize: '0.65rem',
-                                                                                            fontWeight: 600,
-                                                                                            backgroundColor: '#dc2626',
-                                                                                            color: '#fff',
-                                                                                            border: 'none',
-                                                                                            borderRadius: '4px',
-                                                                                            cursor: 'pointer',
-                                                                                            transition: 'background-color 0.2s'
-                                                                                        }}
-                                                                                        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#b91c1c'}
-                                                                                        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#dc2626'}
                                                                                     >
-                                                                                        Undo
+                                                                                        Remove
                                                                                     </button>
                                                                                 )}
                                                                             </div>
@@ -11408,22 +11445,8 @@ export default function ClientPage() {
                                                                     handleDeleteJob(job.id);
                                                                 }}
                                                                 disabled={deletingJobId === job.id}
-                                                                className="destructive-button"
-                                                                style={{
-                                                                    position: 'absolute',
-                                                                    top: '10px',
-                                                                    right: '10px',
-                                                                    padding: '0.35rem 0.75rem',
-                                                                    height: 'auto',
-                                                                    minHeight: 'auto',
-                                                                    fontSize: '0.7rem',
-                                                                    borderRadius: '8px',
-                                                                    boxShadow: 'none',
-                                                                    opacity: 0.6,
-                                                                    transition: 'opacity 0.2s ease'
-                                                                }}
-                                                                onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
-                                                                onMouseLeave={(e) => e.currentTarget.style.opacity = '0.6'}
+                                                                className="destructive-button destructive-button--compact"
+                                                                style={{ position: 'absolute', top: '10px', right: '10px' }}
                                                             >
                                                                 {deletingJobId === job.id ? 'Deleting...' : 'Delete'}
                                                             </button>
@@ -11463,10 +11486,10 @@ export default function ClientPage() {
                                                                         width: '100%',
                                                                         padding: '0.75rem',
                                                                         marginTop: '0.5rem',
-                                                                        background: 'rgba(239, 68, 68, 0.1)',
-                                                                        border: '1px solid rgba(239, 68, 68, 0.3)',
+                                                                        background: 'var(--app-danger-bg)',
+                                                                        border: '1px solid var(--app-danger-border)',
                                                                         borderRadius: '8px',
-                                                                        color: '#ef4444',
+                                                                        color: 'var(--app-danger-text)',
                                                                         fontSize: '0.85rem',
                                                                         fontWeight: 600,
                                                                         cursor: 'pointer',
@@ -11475,8 +11498,6 @@ export default function ClientPage() {
                                                                         justifyContent: 'space-between',
                                                                         transition: 'background 0.2s ease'
                                                                     }}
-                                                                    onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)'}
-                                                                    onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(239, 68, 68, 0.1)'}
                                                                 >
                                                                     <span>❌ View Error Details</span>
                                                                     <span style={{ fontSize: '1rem' }}>{isExpanded ? '▼' : '▶'}</span>
@@ -11494,7 +11515,7 @@ export default function ClientPage() {
                                                                             margin: 0,
                                                                             fontSize: '0.9rem',
                                                                             fontWeight: 700,
-                                                                            color: '#ef4444',
+                                                                            color: 'var(--app-danger-text)',
                                                                             marginBottom: '0.75rem'
                                                                         }}>
                                                                             Job failed during {job.errorStage ? STAGE_METADATA[job.errorStage]?.title || job.errorStage : 'processing'}
@@ -11647,7 +11668,7 @@ export default function ClientPage() {
                                             {instantlySyncRun.completedAt && <span>Completed: {new Date(instantlySyncRun.completedAt).toLocaleString()}</span>}
                                         </div>
                                         {formatInstantlySyncPhase(instantlySyncRun.phase) && (
-                                            <div style={{ marginTop: '0.45rem', fontSize: '0.84rem', color: 'rgba(191,219,254,0.95)' }}>
+                                            <div style={{ marginTop: '0.45rem', fontSize: '0.84rem', color: 'var(--app-info-text)' }}>
                                                 Phase: {formatInstantlySyncPhase(instantlySyncRun.phase)}
                                             </div>
                                         )}
@@ -11661,10 +11682,10 @@ export default function ClientPage() {
                                                 marginTop: '0.65rem',
                                                 padding: '0.75rem',
                                                 borderRadius: '8px',
-                                                background: 'rgba(15,23,42,0.45)',
-                                                border: '1px solid rgba(148,163,184,0.18)'
+                                                background: 'var(--app-info-bg)',
+                                                border: '1px solid var(--app-info-border)'
                                             }}>
-                                                <div style={{ fontSize: '0.85rem', color: '#bfdbfe' }}>
+                                                <div style={{ fontSize: '0.85rem', color: 'var(--app-info-text)' }}>
                                                     Current campaign: {instantlySyncRun.currentCampaignName}
                                                 </div>
                                                 {typeof instantlySyncRun.currentCampaignProcessedLeads === 'number' && typeof instantlySyncRun.currentCampaignLeadTotal === 'number' && (
@@ -11692,7 +11713,7 @@ export default function ClientPage() {
                                             <span>Unmatched: {instantlySyncRun.unmatchedLeads}</span>
                                         </div>
                                         {instantlySyncRun.error && (
-                                            <div style={{ marginTop: '0.5rem', color: '#fca5a5', fontSize: '0.875rem' }}>
+                                            <div style={{ marginTop: '0.5rem', color: 'var(--app-danger-text)', fontSize: '0.875rem' }}>
                                                 Error: {instantlySyncRun.error}
                                             </div>
                                         )}
@@ -11787,6 +11808,12 @@ export default function ClientPage() {
                                 >
                                     {isSavingClient ? 'Saving...' : 'Save'}
                                 </button>
+                            </div>
+                            <div className="danger-zone">
+                                <div>
+                                    <p className="danger-zone__title">Delete client</p>
+                                    <p className="danger-zone__text">Permanently removes this client with its leads, runs and settings.</p>
+                                </div>
                                 <button
                                     type="button"
                                     className="destructive-button"
@@ -11873,7 +11900,7 @@ export default function ClientPage() {
                                                     padding: '1rem',
                                                     borderRadius: '10px',
                                                     border: '1px solid var(--app-border)',
-                                                    background: 'rgba(0,0,0,0.16)',
+                                                    background: 'var(--app-code-bg)',
                                                     display: 'flex',
                                                     gap: '1rem',
                                                     alignItems: 'flex-start'
@@ -11913,28 +11940,25 @@ export default function ClientPage() {
                                                 <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
                                                     <button
                                                         type="button"
-                                                        className="secondary-button"
-                                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                        className="secondary-button secondary-button--compact"
                                                         onClick={() => openAutoResponderTestModal(prompt)}
                                                     >
                                                         Test
                                                     </button>
                                                     <button
                                                         type="button"
-                                                        className="secondary-button"
-                                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                        className="secondary-button secondary-button--compact"
                                                         onClick={() => openAutoResponderPromptModal(prompt)}
                                                     >
                                                         Edit
                                                     </button>
                                                     <button
                                                         type="button"
-                                                        className="destructive-button"
-                                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                                        className="destructive-button destructive-button--compact"
                                                         onClick={() => handleDeleteAutoResponderPrompt(prompt.id)}
                                                         disabled={deletingAutoResponderPromptId === prompt.id}
                                                     >
-                                                        {deletingAutoResponderPromptId === prompt.id ? '…' : 'Delete'}
+                                                        {deletingAutoResponderPromptId === prompt.id ? 'Deleting…' : 'Delete'}
                                                     </button>
                                                 </div>
                                             </div>
@@ -12175,8 +12199,7 @@ export default function ClientPage() {
                                     />
                                     <button
                                         type="button"
-                                        className="secondary-button"
-                                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                                        className="secondary-button secondary-button--compact"
                                         onClick={() => loadInstantlyLeadLabels()}
                                         disabled={instantlyLeadLabelsLoading}
                                     >
@@ -12303,12 +12326,11 @@ export default function ClientPage() {
                                                 </button>
                                                 <button
                                                     type="button"
-                                                    className="destructive-button"
-                                                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem', minHeight: 0, height: 'auto', flex: '0 0 auto' }}
+                                                    className="destructive-button destructive-button--compact"
                                                     onClick={() => handleDeleteFollowUpScript(script.id)}
                                                     disabled={deletingFollowUpScriptId === script.id || updatingFollowUpScriptId === script.id}
                                                 >
-                                                    {deletingFollowUpScriptId === script.id ? '…' : 'Delete'}
+                                                    {deletingFollowUpScriptId === script.id ? 'Deleting…' : 'Delete'}
                                                 </button>
                                             </div>
                                         </div>
@@ -12457,14 +12479,14 @@ export default function ClientPage() {
                                                         padding: '0.9rem 1rem',
                                                         border: 'none',
                                                         borderTop: '1px solid var(--app-border)',
-                                                        background: isSelected ? 'rgba(59,130,246,0.12)' : 'transparent',
+                                                        background: isSelected ? 'var(--app-selected-bg)' : 'transparent',
                                                         color: 'inherit',
                                                         cursor: autoResponderTestLoading ? 'wait' : 'pointer',
                                                     }}
                                                 >
                                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
                                                         <div style={{ minWidth: 0 }}>
-                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: isSelected ? '#93c5fd' : 'var(--app-text)' }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '0.92rem', color: isSelected ? 'var(--app-info-text)' : 'var(--app-text)' }}>
                                                                 {lead.founderName || lead.email || lead.domain || 'Unnamed lead'}
                                                             </div>
                                                             <div style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -12472,7 +12494,7 @@ export default function ClientPage() {
                                                             </div>
                                                         </div>
                                                         {isSelected && (
-                                                            <span style={{ fontSize: '0.75rem', color: '#93c5fd', flexShrink: 0 }}>Selected</span>
+                                                            <span style={{ fontSize: '0.75rem', color: 'var(--app-info-text)', flexShrink: 0 }}>Selected</span>
                                                         )}
                                                     </div>
                                                 </button>
@@ -12543,9 +12565,9 @@ export default function ClientPage() {
                                     fontSize: '0.7rem',
                                     fontWeight: 700,
                                     flexShrink: 0,
-                                    background: complete ? 'rgba(34,197,94,0.2)' : active ? 'rgba(59,130,246,0.25)' : 'var(--app-surface-3)',
-                                    color: complete ? '#4ade80' : active ? '#93c5fd' : 'var(--app-text-ghost)',
-                                    border: complete ? '1px solid rgba(34,197,94,0.35)' : active ? '1px solid rgba(59,130,246,0.4)' : '1px solid var(--app-border)',
+                                    background: complete ? 'var(--app-success-bg)' : active ? 'var(--app-info-bg)' : 'var(--app-surface-3)',
+                                    color: complete ? 'var(--app-success-text)' : active ? 'var(--app-info-text)' : 'var(--app-text-ghost)',
+                                    border: complete ? '1px solid var(--app-success-border)' : active ? '1px solid var(--app-info-border)' : '1px solid var(--app-border)',
                                 });
 
                                 const kvRow = (label: string, value: string | null | undefined) => value ? (
@@ -12602,11 +12624,11 @@ export default function ClientPage() {
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '0 1rem 0.9rem' }}>
                                                 <div>
                                                     <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-ghost)', marginBottom: '0.35rem' }}>System Prompt (rendered)</div>
-                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'rgba(0,0,0,0.25)', color: 'var(--app-text-high)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{d.renderedSystemPrompt || '—'}</pre>
+                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'var(--app-code-bg)', color: 'var(--app-text-high)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{d.renderedSystemPrompt || '—'}</pre>
                                                 </div>
                                                 <div>
                                                     <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-ghost)', marginBottom: '0.35rem' }}>User message sent to model</div>
-                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'rgba(0,0,0,0.25)', color: 'var(--app-text-high)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{[
+                                                    <pre style={{ margin: 0, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'var(--app-code-bg)', color: 'var(--app-text-high)', fontSize: '0.78rem', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '220px', overflowY: 'auto' }}>{[
                                                         `Campaign: ${d.contextSentToAI?.campaignName || '—'}`,
                                                         `Lead email: ${d.contextSentToAI?.leadEmail || '—'}`,
                                                         `Thread subject: ${d.contextSentToAI?.threadSubject || '(none)'}`,
@@ -12627,7 +12649,7 @@ export default function ClientPage() {
                                                 <div>
                                                     <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-ghost)', marginBottom: '0.35rem' }}>Generated Reply</div>
                                                     <div
-                                                        style={{ padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'rgba(0,0,0,0.25)', color: 'var(--app-text-high)', fontSize: '0.85rem', lineHeight: 1.6 }}
+                                                        style={{ padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--app-border)', background: 'var(--app-code-bg)', color: 'var(--app-text-high)', fontSize: '0.85rem', lineHeight: 1.6 }}
                                                         dangerouslySetInnerHTML={{ __html: r.renderedText }}
                                                     />
                                                 </div>
@@ -12642,7 +12664,7 @@ export default function ClientPage() {
                                                         href={r.reviewUrl}
                                                         target="_blank"
                                                         rel="noopener noreferrer"
-                                                        style={{ fontSize: '0.82rem', color: '#60a5fa', textDecoration: 'underline', alignSelf: 'flex-start' }}
+                                                        style={{ fontSize: '0.82rem', color: 'var(--app-link)', textDecoration: 'underline', alignSelf: 'flex-start' }}
                                                     >
                                                         Open review &amp; approve page →
                                                     </a>
@@ -12868,7 +12890,7 @@ export default function ClientPage() {
                                                         padding: '0.9rem 1rem',
                                                         border: 'none',
                                                         borderTop: '1px solid var(--app-border)',
-                                                        background: isSelected ? 'rgba(59,130,246,0.16)' : 'transparent',
+                                                        background: isSelected ? 'var(--app-selected-bg)' : 'transparent',
                                                         color: 'inherit',
                                                         cursor: followUpPreviewLoading ? 'wait' : 'pointer',
                                                     }}
@@ -13068,7 +13090,7 @@ export default function ClientPage() {
                                             flex: 1,
                                             height: '4px',
                                             borderRadius: '2px',
-                                            background: step <= wizardStep ? '#3b82f6' : 'var(--app-surface-2)',
+                                            background: step <= wizardStep ? 'var(--app-info-solid)' : 'var(--app-surface-2)',
                                             transition: 'background 0.3s ease'
                                         }}
                                     />
@@ -13127,7 +13149,7 @@ export default function ClientPage() {
                                                         width: '14px',
                                                         height: '14px',
                                                         border: '2px solid var(--app-border-mid)',
-                                                        borderTopColor: '#3b82f6',
+                                                        borderTopColor: 'var(--app-info-solid)',
                                                         borderRadius: '50%',
                                                         animation: 'spin 0.8s linear infinite'
                                                     }} />
@@ -13145,18 +13167,17 @@ export default function ClientPage() {
                                                             <strong style={{ color: 'var(--app-text)' }}>{domainCheckStats.total.toLocaleString()}</strong> total
                                                         </span>
                                                         <span>
-                                                            <strong style={{ color: '#60a5fa' }}>{domainCheckStats.unique.toLocaleString()}</strong> unique
+                                                            <strong style={{ color: 'var(--app-text)' }}>{domainCheckStats.unique.toLocaleString()}</strong> unique
                                                         </span>
                                                         <span>
-                                                            <strong style={{ color: '#f59e0b' }}>{domainCheckStats.existing.toLocaleString()}</strong> existing
+                                                            <strong style={{ color: 'var(--app-warn-text)' }}>{domainCheckStats.existing.toLocaleString()}</strong> existing
                                                         </span>
                                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
                                                             <span>
-                                                                <strong style={{ color: '#10b981' }}>{domainCheckStats.new.toLocaleString()}</strong> new
+                                                                <strong style={{ color: 'var(--app-success-text)' }}>{domainCheckStats.new.toLocaleString()}</strong> new
                                                             </span>
                                                             {domainCheckStats.new > 0 && (
                                                                 <DomainStatDownloadButton
-                                                                    rgb="16, 185, 129"
                                                                     busy={downloadingNewDomains}
                                                                     label="Download CSV of new domains"
                                                                     onClick={handleDownloadNewDomainsCsv}
@@ -13168,10 +13189,10 @@ export default function ClientPage() {
                                                     {/* Row 2: Run status */}
                                                     <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)', marginBottom: '0.5rem' }}>
                                                         <span>
-                                                            <strong style={{ color: '#22c55e' }}>{domainCheckStats.run.toLocaleString()}</strong> run
+                                                            <strong style={{ color: 'var(--app-success-text)' }}>{domainCheckStats.run.toLocaleString()}</strong> run
                                                         </span>
                                                         <span>
-                                                            <strong style={{ color: '#94a3b8' }}>{domainCheckStats.notRun.toLocaleString()}</strong> not run
+                                                            <strong style={{ color: 'var(--app-text-muted)' }}>{domainCheckStats.notRun.toLocaleString()}</strong> not run
                                                         </span>
                                                     </div>
 
@@ -13179,11 +13200,10 @@ export default function ClientPage() {
                                                     <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)' }}>
                                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
                                                             <span>
-                                                                <strong style={{ color: '#8b5cf6' }}>{domainCheckStats.withFounders.toLocaleString()}</strong> w/ founders
+                                                                <strong style={{ color: 'var(--app-text)' }}>{domainCheckStats.withFounders.toLocaleString()}</strong> w/ founders
                                                             </span>
                                                             {domainCheckStats.withFounders > 0 && (
                                                                 <DomainStatDownloadButton
-                                                                    rgb="139, 92, 246"
                                                                     busy={downloadingExistingScope === 'founders'}
                                                                     label="Download CSV of existing founders (domain + name)"
                                                                     onClick={() => handleDownloadExistingDomainsCsv('founders')}
@@ -13192,11 +13212,10 @@ export default function ClientPage() {
                                                         </span>
                                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
                                                             <span>
-                                                                <strong style={{ color: '#ec4899' }}>{domainCheckStats.withEmails.toLocaleString()}</strong> w/ emails
+                                                                <strong style={{ color: 'var(--app-text)' }}>{domainCheckStats.withEmails.toLocaleString()}</strong> w/ emails
                                                             </span>
                                                             {domainCheckStats.withEmails > 0 && (
                                                                 <DomainStatDownloadButton
-                                                                    rgb="236, 72, 153"
                                                                     busy={downloadingExistingScope === 'emails'}
                                                                     label="Download CSV of existing emails (domain + name + email)"
                                                                     onClick={() => handleDownloadExistingDomainsCsv('emails')}
@@ -13205,11 +13224,10 @@ export default function ClientPage() {
                                                         </span>
                                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
                                                             <span>
-                                                                <strong style={{ color: '#06b6d4' }}>{domainCheckStats.withPersonalization.toLocaleString()}</strong> w/ personalization
+                                                                <strong style={{ color: 'var(--app-text)' }}>{domainCheckStats.withPersonalization.toLocaleString()}</strong> w/ personalization
                                                             </span>
                                                             {domainCheckStats.withPersonalization > 0 && (
                                                                 <DomainStatDownloadButton
-                                                                    rgb="6, 182, 212"
                                                                     busy={downloadingExistingScope === 'personalization'}
                                                                     label="Download CSV of existing personalization (domain + name + email + personalization)"
                                                                     onClick={() => handleDownloadExistingDomainsCsv('personalization')}
@@ -13238,7 +13256,7 @@ export default function ClientPage() {
                                     </div>
 
                                     <label className="settings-field">
-                                        <span className="settings-field__label">Domain column <span style={{ color: '#f87171' }}>*</span></span>
+                                        <span className="settings-field__label">Domain column <span style={{ color: 'var(--app-danger-text)' }}>*</span></span>
                                         <AppSelect
                                             value={domainColumn}
                                             emptyLabel="Select column"
@@ -13323,7 +13341,7 @@ export default function ClientPage() {
                                                             width: '14px',
                                                             height: '14px',
                                                             border: '2px solid var(--app-border-mid)',
-                                                            borderTopColor: '#3b82f6',
+                                                            borderTopColor: 'var(--app-info-solid)',
                                                             borderRadius: '50%',
                                                             animation: 'spin 0.8s linear infinite'
                                                         }} />
@@ -13336,16 +13354,16 @@ export default function ClientPage() {
                                                         </div>
                                                         <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
                                                             <span><strong style={{ color: 'var(--app-text)' }}>{filteredEnrichPreview.totalDomains.toLocaleString()}</strong> domains</span>
-                                                            <span><strong style={{ color: '#60a5fa' }}>{filteredEnrichPreview.founderContacts.toLocaleString()}</strong> pipeline-eligible leads</span>
+                                                            <span><strong style={{ color: 'var(--app-text)' }}>{filteredEnrichPreview.founderContacts.toLocaleString()}</strong> pipeline-eligible leads</span>
                                                             {filteredEnrichPreview.nonFounderContacts > 0 && (
-                                                                <span><strong style={{ color: '#f59e0b' }}>{filteredEnrichPreview.nonFounderContacts.toLocaleString()}</strong> non-founder rows (stages skip these)</span>
+                                                                <span><strong style={{ color: 'var(--app-warn-text)' }}>{filteredEnrichPreview.nonFounderContacts.toLocaleString()}</strong> non-founder rows (stages skip these)</span>
                                                             )}
                                                         </div>
                                                         <div style={{ display: 'flex', gap: '1.25rem', color: 'var(--app-text-muted)', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--app-border)' }}>
-                                                            <span><strong style={{ color: '#8b5cf6' }}>{filteredEnrichPreview.withFounderName.toLocaleString()}</strong> w/ names</span>
-                                                            <span><strong style={{ color: '#ec4899' }}>{filteredEnrichPreview.withEmail.toLocaleString()}</strong> w/ emails</span>
-                                                            <span><strong style={{ color: '#22c55e' }}>{filteredEnrichPreview.verifiedValid.toLocaleString()}</strong> verified valid</span>
-                                                            <span><strong style={{ color: '#06b6d4' }}>{filteredEnrichPreview.withFirstLine.toLocaleString()}</strong> w/ first lines</span>
+                                                            <span><strong style={{ color: 'var(--app-text)' }}>{filteredEnrichPreview.withFounderName.toLocaleString()}</strong> w/ names</span>
+                                                            <span><strong style={{ color: 'var(--app-text)' }}>{filteredEnrichPreview.withEmail.toLocaleString()}</strong> w/ emails</span>
+                                                            <span><strong style={{ color: 'var(--app-success-text)' }}>{filteredEnrichPreview.verifiedValid.toLocaleString()}</strong> verified valid</span>
+                                                            <span><strong style={{ color: 'var(--app-text)' }}>{filteredEnrichPreview.withFirstLine.toLocaleString()}</strong> w/ first lines</span>
                                                         </div>
                                                     </div>
                                                 ) : (
@@ -13432,7 +13450,7 @@ export default function ClientPage() {
                                                     width: '16px',
                                                     height: '16px',
                                                     cursor: 'pointer',
-                                                    accentColor: '#3b82f6',
+                                                    accentColor: 'var(--app-info-solid)',
                                                     flexShrink: 0
                                                 }}
                                             />
@@ -13546,7 +13564,7 @@ export default function ClientPage() {
                                                     borderRadius: '4px',
                                                     appearance: 'none',
                                                     border: '2px solid var(--app-border-mid)',
-                                                    background: findFounder ? '#3b82f6' : 'transparent',
+                                                    background: findFounder ? 'var(--app-info-solid)' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
                                                 }}
@@ -13611,7 +13629,7 @@ export default function ClientPage() {
                                                     borderRadius: '4px',
                                                     appearance: 'none',
                                                     border: (findFounder || skipFounderFinder) ? '2px solid var(--app-border-mid)' : '2px solid var(--app-border)',
-                                                    background: findEmail ? '#3b82f6' : 'transparent',
+                                                    background: findEmail ? 'var(--app-info-solid)' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
                                                 }}
@@ -13669,7 +13687,7 @@ export default function ClientPage() {
                                                     borderRadius: '4px',
                                                     appearance: 'none',
                                                     border: (findEmail || skipEmailFinder) && emailProvider !== 'self_hosted' ? '2px solid var(--app-border-mid)' : '2px solid var(--app-border)',
-                                                    background: (verifyEmail && emailProvider !== 'self_hosted') ? '#3b82f6' : 'transparent',
+                                                    background: (verifyEmail && emailProvider !== 'self_hosted') ? 'var(--app-info-solid)' : 'transparent',
                                                     position: 'relative',
                                                     flexShrink: 0
                                                 }}
@@ -13703,7 +13721,7 @@ export default function ClientPage() {
                                                     fontSize: '0.875rem',
                                                     marginTop: '0.125rem',
                                                     color: skipEmailFinder && !verifyEmail && !emailStatusColumn && emailProvider !== 'self_hosted'
-                                                        ? '#f59e0b'
+                                                        ? 'var(--app-warn-text)'
                                                         : 'var(--app-text-muted)'
                                                 }}>
                                                     {emailProvider === 'self_hosted'
@@ -13982,7 +14000,7 @@ export default function ClientPage() {
                                                             {autoInstantlyConfig.requireFirstLine ? ' · must have a first line' : ''}
                                                         </span>
                                                         {autoInstantlyConfig.requireFirstLine && !personalizeFirstLine && (
-                                                            <span style={{ color: '#f59e0b' }}>
+                                                            <span style={{ color: 'var(--app-warn-text)' }}>
                                                                 Personalization is off, so only leads that already have a first line will be added.
                                                             </span>
                                                         )}
@@ -14337,7 +14355,7 @@ export default function ClientPage() {
                                             {LEAD_IMPORT_TARGET_FIELDS.map((target) => (
                                                 <label key={target.key} className="settings-field">
                                                     <span className="settings-field__label">
-                                                        {target.label}{target.required ? <span style={{ color: '#f87171' }}> *</span> : ''}
+                                                        {target.label}{target.required ? <span style={{ color: 'var(--app-danger-text)' }}> *</span> : ''}
                                                         <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', color: 'var(--app-text-faint)' }}>{target.group}</span>
                                                     </span>
                                                     <AppSelect
@@ -14429,15 +14447,15 @@ export default function ClientPage() {
                                             <div style={{
                                                 height: '100%',
                                                 width: `${Math.min(100, Math.round((leadImportBatch.processedRows / Math.max(1, leadImportBatch.totalRows)) * 100))}%`,
-                                                background: leadImportBatch.status === 'failed' ? '#ef4444' : '#3b82f6',
+                                                background: leadImportBatch.status === 'failed' ? 'var(--app-danger-solid)' : 'var(--app-info-solid)',
                                                 transition: 'width 0.4s ease'
                                             }} />
                                         </div>
                                         <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', marginTop: '0.75rem', fontSize: '0.875rem', color: 'var(--app-text-muted)' }}>
-                                            <span><strong style={{ color: '#10b981' }}>{leadImportBatch.createdCount.toLocaleString()}</strong> new</span>
-                                            <span><strong style={{ color: '#60a5fa' }}>{leadImportBatch.updatedCount.toLocaleString()}</strong> updated</span>
-                                            <span><strong style={{ color: '#f59e0b' }}>{leadImportBatch.skippedCount.toLocaleString()}</strong> skipped</span>
-                                            <span><strong style={{ color: leadImportBatch.errorCount ? '#ef4444' : 'var(--app-text)' }}>{leadImportBatch.errorCount.toLocaleString()}</strong> error rows</span>
+                                            <span><strong style={{ color: 'var(--app-success-text)' }}>{leadImportBatch.createdCount.toLocaleString()}</strong> new</span>
+                                            <span><strong style={{ color: 'var(--app-text)' }}>{leadImportBatch.updatedCount.toLocaleString()}</strong> updated</span>
+                                            <span><strong style={{ color: 'var(--app-warn-text)' }}>{leadImportBatch.skippedCount.toLocaleString()}</strong> skipped</span>
+                                            <span><strong style={{ color: leadImportBatch.errorCount ? 'var(--app-danger-text)' : 'var(--app-text)' }}>{leadImportBatch.errorCount.toLocaleString()}</strong> error rows</span>
                                         </div>
                                         {leadImportBatch.error && (
                                             <p className="form-error" role="alert" style={{ marginTop: '0.75rem' }}>{leadImportBatch.error}</p>
@@ -14634,18 +14652,18 @@ export default function ClientPage() {
                                         <div style={{
                                             padding: '1rem',
                                             borderRadius: '10px',
-                                            border: '1px solid rgba(134,239,172,0.25)',
-                                            background: 'rgba(134,239,172,0.05)',
+                                            border: '1px solid var(--app-success-border)',
+                                            background: 'var(--app-success-bg)',
                                             display: 'flex',
                                             flexDirection: 'column',
                                             gap: '0.5rem'
                                         }}>
-                                            <div style={{ fontWeight: 600, color: '#86efac' }}>Import Complete</div>
+                                            <div style={{ fontWeight: 600, color: 'var(--app-success-text)' }}>Import Complete</div>
                                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '0.5rem', fontSize: '0.9rem' }}>
                                                 <div>Total rows: <strong>{verificationImportResult.totalRows.toLocaleString()}</strong></div>
                                                 <div>Matched: <strong>{verificationImportResult.matched.toLocaleString()}</strong></div>
-                                                <div>Updated: <strong style={{ color: '#86efac' }}>{verificationImportResult.updated.toLocaleString()}</strong></div>
-                                                <div>Not found: <strong style={{ color: verificationImportResult.notFound > 0 ? '#fca5a5' : undefined }}>{verificationImportResult.notFound.toLocaleString()}</strong></div>
+                                                <div>Updated: <strong style={{ color: 'var(--app-success-text)' }}>{verificationImportResult.updated.toLocaleString()}</strong></div>
+                                                <div>Not found: <strong style={{ color: verificationImportResult.notFound > 0 ? 'var(--app-danger-text)' : undefined }}>{verificationImportResult.notFound.toLocaleString()}</strong></div>
                                                 <div>Skipped: <strong>{verificationImportResult.skipped.toLocaleString()}</strong></div>
                                             </div>
                                             {verificationImportResult.notFound > 0 && (
@@ -14784,11 +14802,8 @@ export default function ClientPage() {
                                                 <button
                                                     key={preset}
                                                     type="button"
-                                                    className={
-                                                        leadExportMaxRows === preset
-                                                            ? 'secondary-button secondary-button--active'
-                                                            : 'secondary-button'
-                                                    }
+                                                    className="secondary-button"
+                                                    aria-pressed={leadExportMaxRows === preset}
                                                     onClick={() => setLeadExportMaxRows(preset)}
                                                     disabled={exportingCsv}
                                                 >
@@ -14841,10 +14856,10 @@ export default function ClientPage() {
                                                     padding: '0.75rem 0.85rem',
                                                     borderRadius: '10px',
                                                     border: selectedLeadExportFields.includes(field.key)
-                                                        ? '1px solid rgba(59, 130, 246, 0.55)'
+                                                        ? '1px solid var(--app-selected-border)'
                                                         : '1px solid var(--app-border)',
                                                     background: selectedLeadExportFields.includes(field.key)
-                                                        ? 'rgba(59, 130, 246, 0.12)'
+                                                        ? 'var(--app-selected-bg)'
                                                         : 'var(--app-surface-3)',
                                                     cursor: exportingCsv ? 'default' : 'pointer'
                                                 }}
@@ -15031,8 +15046,8 @@ export default function ClientPage() {
                                         alignItems: 'flex-start',
                                         padding: '0.85rem 1rem',
                                         borderRadius: '10px',
-                                        border: downloadScope === option.value ? '1px solid rgba(59, 130, 246, 0.6)' : '1px solid var(--app-border)',
-                                        background: downloadScope === option.value ? 'rgba(59, 130, 246, 0.12)' : 'var(--app-surface-3)',
+                                        border: downloadScope === option.value ? '1px solid var(--app-selected-border)' : '1px solid var(--app-border)',
+                                        background: downloadScope === option.value ? 'var(--app-selected-bg)' : 'var(--app-surface-3)',
                                         cursor: 'pointer'
                                     }}
                                 >
@@ -15163,7 +15178,7 @@ export default function ClientPage() {
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
                                                 {instantlyCsvImportResult.unresolvedCampaignNames.slice(0, 10).map((campaignName) => (
                                                     <div key={campaignName} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: '0.5rem', alignItems: 'center' }}>
-                                                        <span style={{ fontSize: '0.85rem', color: '#fca5a5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                        <span style={{ fontSize: '0.85rem', color: 'var(--app-danger-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                             {campaignName}
                                                         </span>
                                                         <AppSelect
@@ -15184,7 +15199,7 @@ export default function ClientPage() {
                                                     </div>
                                                 ))}
                                                 {!instantlyCsvCampaignsLoading && instantlyCsvOverrideCampaigns.length === 0 && (
-                                                    <div style={{ fontSize: '0.8rem', color: '#fca5a5' }}>
+                                                    <div style={{ fontSize: '0.8rem', color: 'var(--app-danger-text)' }}>
                                                         No campaigns available in SQL cache. Sync campaigns first.
                                                     </div>
                                                 )}
@@ -15420,7 +15435,7 @@ export default function ClientPage() {
                                                         cursor: 'pointer',
                                                         padding: '0.5rem',
                                                         borderRadius: '6px',
-                                                        background: segmentEmailStatus.includes(status) ? 'rgba(59, 130, 246, 0.1)' : 'transparent'
+                                                        background: segmentEmailStatus.includes(status) ? 'var(--app-selected-bg)' : 'transparent'
                                                     }}
                                                 >
                                                     <input
@@ -15594,7 +15609,7 @@ export default function ClientPage() {
                                             border: 'none',
                                             padding: 0,
                                             cursor: selectedLead.email ? 'pointer' : 'default',
-                                            color: emailCopied ? '#4ade80' : 'var(--app-text-ghost)',
+                                            color: emailCopied ? 'var(--app-success-text)' : 'var(--app-text-ghost)',
                                             display: 'flex',
                                             alignItems: 'center',
                                             flexShrink: 0,
@@ -15849,9 +15864,9 @@ export default function ClientPage() {
                                                 ? 'rgba(239, 68, 68, 0.2)'
                                                 : 'var(--app-border)';
                                         const statusColor = isPositive
-                                            ? '#4ade80'
+                                            ? 'var(--app-success-text)'
                                             : isNegative
-                                                ? '#f87171'
+                                                ? 'var(--app-danger-text)'
                                                 : 'var(--app-text-ghost)';
 
                                         const bounceDate = campaign.lastBounceAt ? new Date(campaign.lastBounceAt) : null;
@@ -16025,10 +16040,9 @@ export default function ClientPage() {
                                             {active && (
                                                 <button
                                                     type="button"
-                                                    className="secondary-button secondary-button--active"
+                                                    className="destructive-button destructive-button--compact"
                                                     onClick={handleRemoveFromWarmFollowUps}
                                                     disabled={removingWarmFollowUp}
-                                                    style={{ flex: '0 0 auto', height: 'auto', minHeight: 0, padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
                                                 >
                                                     {removingWarmFollowUp ? 'Removing…' : 'Remove from warm follow-ups'}
                                                 </button>
@@ -16351,15 +16365,15 @@ export default function ClientPage() {
                                                     const labelNorm = evt.displayLabel.toLowerCase().replace(/[_ ]+/g, ' ').trim();
                                                     const isDayN = /^day \d+$/.test(labelNorm);
                                                     const dotColor = evt.event_type === 'added_to_campaign'
-                                                        ? '#f59e0b'
+                                                        ? 'var(--app-warn-solid)'
                                                         : evt.event_type === 'email_found'
-                                                            ? '#22c55e'
+                                                            ? 'var(--app-success-solid)'
                                                             : evt.event_type === 'email_not_found'
                                                                 ? 'var(--app-text-ghost)'
                                                                 : evt.event_type === 'email_verified'
-                                                                    ? '#3b82f6'
+                                                                    ? 'var(--app-info-solid)'
                                                                     : isDayN
-                                                                        ? '#22c55e'
+                                                                        ? 'var(--app-success-solid)'
                                                                         : getInstantlyActivityColor(evt.event_type, evt.displayLabel);
 
                                                     const dateTimeStr = formatLeadActivityTimestamp(evt.event_timestamp);
@@ -16571,8 +16585,8 @@ export default function ClientPage() {
                                                                             borderRadius: '4px',
                                                                             fontSize: '0.72rem',
                                                                             fontWeight: 500,
-                                                                            background: evt.reply_category === 'Interested' ? 'rgba(34, 197, 94, 0.15)' : 'var(--app-surface-3)',
-                                                                            color: evt.reply_category === 'Interested' ? '#4ade80' : 'var(--app-text-ghost)'
+                                                                            background: evt.reply_category === 'Interested' ? 'var(--app-success-bg)' : 'var(--app-surface-3)',
+                                                                            color: evt.reply_category === 'Interested' ? 'var(--app-success-text)' : 'var(--app-text-ghost)'
                                                                         }}>{evt.reply_category}</span>
                                                                     )}
                                                                 </div>

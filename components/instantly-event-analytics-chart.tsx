@@ -41,22 +41,22 @@ type ChartDataPoint = {
 const outreachChartConfig = {
     emails_sent: {
         label: "Emails sent",
-        color: "#3b82f6",
+        color: "var(--app-info-solid)",
     },
     positive_replies: {
         label: "Positive replies",
-        color: "#22c55e",
+        color: "var(--app-success-solid)",
     },
     meetings_booked: {
         label: "Meetings booked",
-        color: "#a855f7",
+        color: "var(--app-teal-solid)",
     },
 } satisfies ChartConfig;
 
 const filteredChartConfig = {
     count: {
         label: "Events",
-        color: "#3b82f6",
+        color: "var(--app-info-solid)",
     },
 } satisfies ChartConfig;
 
@@ -152,18 +152,18 @@ export default function InstantlyEventAnalyticsChart({
                     {useOutreachView && !loading && rows.length > 0 && (
                         <div style={{ display: "flex", gap: "1rem", marginTop: "0.65rem", flexWrap: "wrap" }}>
                             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
-                                <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #93c5fd, #3b82f6)" }} />
+                                <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "var(--app-info-solid)" }} />
                                 Emails sent
                             </div>
                             {showPositiveReplies && (
                                 <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
-                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #86efac, #22c55e)" }} />
+                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "var(--app-success-solid)" }} />
                                     Positive replies
                                 </div>
                             )}
                             {showMeetingsBooked && (
                                 <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.72rem", color: "var(--app-text-muted)" }}>
-                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "linear-gradient(90deg, #c4b5fd, #a855f7)" }} />
+                                    <span style={{ width: "14px", height: "3px", borderRadius: "999px", background: "var(--app-teal-solid)" }} />
                                     Meetings booked
                                 </div>
                             )}
@@ -185,7 +185,7 @@ export default function InstantlyEventAnalyticsChart({
                                 {primaryTotalLabel}
                             </p>
                             {showPositiveReplies && (
-                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "#22c55e" }}>
+                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "var(--app-success-text)" }}>
                                     {totalPositiveCount.toLocaleString()}
                                     <span style={{ marginLeft: "0.25rem", fontSize: "0.72rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
                                         positive
@@ -193,7 +193,7 @@ export default function InstantlyEventAnalyticsChart({
                                 </p>
                             )}
                             {showMeetingsBooked && (
-                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "#a855f7" }}>
+                                <p style={{ margin: "0.55rem 0 0", fontSize: "0.95rem", fontWeight: 600, lineHeight: 1, color: "var(--app-teal-text)" }}>
                                     {totalMeetingsBookedCount.toLocaleString()}
                                     <span style={{ marginLeft: "0.25rem", fontSize: "0.72rem", fontWeight: 500, color: "var(--app-text-ghost)" }}>
                                         meetings
