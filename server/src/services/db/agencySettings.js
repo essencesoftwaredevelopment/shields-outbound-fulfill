@@ -183,16 +183,33 @@ export function rateLimitsFromSettings(settings) {
 export function enrowOptionsFromSettings(settings, clientId = null) {
     const hasKey = !!String(settings?.enrow_key || '').trim();
     const features = agencyFeaturesFromSettings(settings);
-    const allowed = String(features.enrowClients?.ids ?? '')
-        .split(',')
-        .map((v) => v.trim())
-        .filter(Boolean);
-    const clientAllowed = !allowed.length
-        || (clientId != null && allowed.includes(String(clientId)));
+    const clientAllowed = enrowClientAllowed(features, clientId);
     return {
         find: hasKey && clientAllowed && features.enrowFallback === true,
         verify: hasKey && clientAllowed && features.enrowVerifyRisky === true
     };
+}
+
+/**
+ * Enrow Phone Finder on positive replies (features.enrowPhoneLookup). Same rules
+ * as the email options above: the agency's OWN key only, and the
+ * `features.enrowClients.ids` list scopes it to those clients.
+ *
+ * @param {object | null} settings
+ * @param {number | string | null} [clientId]
+ */
+export function enrowPhoneLookupEnabled(settings, clientId = null) {
+    const hasKey = !!String(settings?.enrow_key || '').trim();
+    const features = agencyFeaturesFromSettings(settings);
+    return hasKey && features.enrowPhoneLookup === true && enrowClientAllowed(features, clientId);
+}
+
+function enrowClientAllowed(features, clientId) {
+    const allowed = String(features.enrowClients?.ids ?? '')
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
+    return !allowed.length || (clientId != null && allowed.includes(String(clientId)));
 }
 
 export function hasVercelEnrichmentRunner(settings) {

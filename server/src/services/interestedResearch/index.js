@@ -19,6 +19,7 @@ import { getAgencySettings, apiKeysFromSettings } from '../db/agencySettings.js'
 import { resolveTemplateVars, renderTemplate } from '../followUpSender.js';
 import {
     applyActiveFungiStoryUrlToTemplateVars,
+    loadContactPhone,
     buildClientAutoresponderUrl,
     buildReviewUrl,
     classifyDraftFailure,
@@ -47,6 +48,7 @@ import {
     RESEARCH_INDUSTRIES
 } from './briefUtils.js';
 import { attachWorkflowRunId, stampResearchStep } from './progress.js';
+import { findPhoneForContact } from '../phoneFinder.js';
 
 export { attachWorkflowRunId, stampResearchStep };
 
@@ -145,6 +147,22 @@ export async function hydrateResearchContext({ draftId, agencyId }) {
         domain,
         companyName
     };
+}
+
+/**
+ * Founder phone lookup (Enrow), in parallel with the research sources. Gated by
+ * features.enrowPhoneLookup inside findPhoneForContact; best-effort and never
+ * throws for Enrow/Serper failures. The number lands on the contact row, where
+ * finalize (ntfy) and the review page read it.
+ */
+export async function runPhoneLookup({ draftId, agencyId }) {
+    const draft = await loadResearchingDraft(pool, draftId, agencyId);
+    const result = await findPhoneForContact({
+        agencyId,
+        contactId: draft.contact_id,
+        clientId: draft.client_id
+    });
+    return { status: result.status, number: result.number ?? null, country: result.country ?? null };
 }
 
 /** Fetch and distill a company homepage. Draft-independent; null on any failure. */
@@ -608,7 +626,8 @@ export async function finalizeResearchDraft({
                 leadEmail: draft.lead_email,
                 campaignName: promptConfig.campaign_name,
                 reviewUrl,
-                isFollowUp
+                isFollowUp,
+                phone: await loadContactPhone(pool, draft.contact_id)
             });
         } catch (error) {
             console.error(

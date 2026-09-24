@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2 } from "lucide-react";
+import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2, Phone } from "lucide-react";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import {
@@ -50,7 +50,21 @@ type ReviewDraft = {
     researchBrief?: ResearchBrief | null;
     researchCompletedAt?: string | null;
     thread?: ThreadMessage[] | null;
+    /** Founder phone from the Enrow lookup; null when never looked up. */
+    phone?: {
+        number: string | null;
+        country: string | null;
+        telUri: string | null;
+        status: "found" | "not_found" | "pending" | "timeout" | "error" | string;
+    } | null;
 };
+
+/** Pill label for a phone lookup that has no number (null = show nothing). */
+function phoneStatusLabel(status: string | undefined): string | null {
+    if (status === "pending" || status === "timeout") return "Phone lookup running";
+    if (status === "not_found") return "No phone found";
+    return null;
+}
 
 /** Review-page preview: Vulcan public audit → admin edit; Essence links unchanged. */
 function extractReviewPreviewUrl(renderedText: string): string | null {
@@ -1000,6 +1014,29 @@ export default function InterestedAutoResponderReviewPage() {
                                 <p className="ar-header__meta">{draft.campaignName}</p>
                             </div>
                             <div className="ar-header__links">
+                                {draft.phone?.number && (
+                                    draft.phone.telUri ? (
+                                        <a
+                                            className="ar-link"
+                                            href={draft.phone.telUri}
+                                            title={draft.phone.country ? `Call (${draft.phone.country})` : "Call"}
+                                        >
+                                            <Phone size={15} strokeWidth={2} />
+                                            {draft.phone.number}
+                                        </a>
+                                    ) : (
+                                        <span className="ar-link ar-link--static">
+                                            <Phone size={15} strokeWidth={2} />
+                                            {draft.phone.number}
+                                        </span>
+                                    )
+                                )}
+                                {!draft.phone?.number && phoneStatusLabel(draft.phone?.status) && (
+                                    <span className="ar-link ar-link--static ar-link--muted">
+                                        <Phone size={15} strokeWidth={2} />
+                                        {phoneStatusLabel(draft.phone?.status)}
+                                    </span>
+                                )}
                                 {website && (
                                     <a
                                         className="ar-link"

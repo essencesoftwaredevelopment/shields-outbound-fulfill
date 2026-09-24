@@ -185,32 +185,3 @@ export async function searchLead({ name, email, serperKey, openaiKey, openaiMode
         source: chosen.source || 'heuristic'
     };
 }
-
-export async function sendToClay({ webhookUrl, linkedinUrl, name, email, domain, callbackUrl, logger = () => {} }) {
-    if (!webhookUrl) {
-        return { sent: false, reason: 'Missing Clay webhook URL' };
-    }
-    if (!linkedinUrl) {
-        return { sent: false, reason: 'Missing linkedinUrl' };
-    }
-
-    const payload = {
-        linkedin_url: linkedinUrl,
-        name,
-        email,
-        domain: domain || null,
-        callback_url: callbackUrl || null
-    };
-
-    const res = await withRetry(
-        () => axios.post(webhookUrl, payload, { timeout: 10_000 }),
-        'Clay webhook',
-        logger
-    );
-
-    return {
-        sent: true,
-        status: res.status,
-        data: res.data
-    };
-}

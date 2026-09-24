@@ -27,6 +27,8 @@ function enrowError(status, message) {
     // 402 = out of credits, 401 = bad key: retrying never helps, and the caller
     // skips the fallback rather than failing the enrichment batch.
     if (status === 402) err.code = 'ENROW_CREDIT_EXHAUSTED';
+    // The key is fine but the plan lacks phone search — must not read as a bad key.
+    else if (status === 401 && /phone/i.test(message)) err.code = 'ENROW_PHONE_NOT_ALLOWED';
     else if (status === 401) err.code = 'ENROW_UNAUTHORIZED';
     return err;
 }
@@ -125,6 +127,62 @@ export async function getEnrowBulk(apiKey, kind, id) {
     const path = kind === 'find' ? '/email/find/bulk' : '/email/verify/bulk';
     const { body } = await enrowRequest('GET', `${path}?id=${encodeURIComponent(id)}`, apiKey);
     return body;
+}
+
+/**
+ * Launch one Phone Finder search. Credits are charged here, at launch — the GET
+ * is free. A LinkedIn URL wins over name + company when both are sent.
+ *
+ * @param {string} apiKey
+ * @param {{ linkedinUrl?: string | null, firstName?: string, lastName?: string, companyDomain?: string, custom?: string }} search
+ * @returns {Promise<{ id: string, creditsUsed: number | null }>}
+ */
+export async function submitEnrowPhoneFind(apiKey, search) {
+    const body = {};
+    if (search.linkedinUrl) {
+        body.linkedin_url = search.linkedinUrl;
+    } else {
+        // Enrow's field names really are firstname / lastname (no underscore).
+        body.firstname = search.firstName;
+        body.lastname = search.lastName;
+        body.company_domain = search.companyDomain;
+    }
+    if (search.custom) body.custom = search.custom;
+    const { body: res } = await enrowRequest('POST', '/phone/single', apiKey, body);
+    if (!res?.id) throw new Error('Enrow phone find returned no id');
+    return { id: String(res.id), creditsUsed: numberOrNull(res.credits_used) };
+}
+
+/**
+ * @param {string} apiKey
+ * @param {string} id
+ * @returns {Promise<{ qualification: 'found' | 'not_found' | 'ongoing', number: string | null, country: string | null }>}
+ */
+export async function getEnrowPhone(apiKey, id) {
+    const { status, body } = await enrowRequest('GET', `/phone/single?id=${encodeURIComponent(id)}`, apiKey);
+    return mapEnrowPhoneResult(status, body);
+}
+
+/**
+ * 200 + found / not_found, 202 while the search is still running. A `found`
+ * without a usable number is treated as not_found rather than stored.
+ *
+ * @param {number} status
+ * @param {object | null} body
+ */
+export function mapEnrowPhoneResult(status, body) {
+    const q = String(body?.qualification || '').toLowerCase();
+    if (status === 202 || q === 'ongoing' || !q) {
+        return { qualification: 'ongoing', number: null, country: null };
+    }
+    const number = typeof body?.number === 'string' ? body.number.trim() : '';
+    if (q === 'found' && /\d{6,}/.test(number.replace(/\D/g, ''))) {
+        const country = typeof body?.country === 'string' && body.country.trim()
+            ? body.country.trim().toUpperCase()
+            : null;
+        return { qualification: 'found', number, country };
+    }
+    return { qualification: 'not_found', number: null, country: null };
 }
 
 function numberOrNull(value) {
