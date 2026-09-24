@@ -4,6 +4,7 @@ import {
     isTryKittPaidAccount,
     rateLimitsFromSettings,
     enrowOptionsFromSettings,
+    enrowPhoneLookupEnabled,
     TRYKITT_FREE_TIER_LIMITS
 } from '../agencySettings.js';
 
@@ -106,5 +107,21 @@ describe('enrowOptionsFromSettings client scope', () => {
     it('blank list means every client', () => {
         const all = { ...base, features: { ...base.features, enrowClients: { ids: ' ' } } };
         assert.deepEqual(enrowOptionsFromSettings(all, 24), { find: true, verify: true });
+    });
+});
+
+describe('enrowPhoneLookupEnabled', () => {
+    it('needs the flag and the agency\'s own key', () => {
+        assert.equal(enrowPhoneLookupEnabled(null), false);
+        assert.equal(enrowPhoneLookupEnabled({ enrow_key: 'k', features: {} }), false);
+        assert.equal(enrowPhoneLookupEnabled({ features: { enrowPhoneLookup: true } }), false);
+        assert.equal(enrowPhoneLookupEnabled({ enrow_key: 'k', features: { enrowPhoneLookup: true } }), true);
+    });
+
+    it('is independent of the email options but shares the client list', () => {
+        const features = { enrowPhoneLookup: true, enrowClients: { ids: '2' } };
+        assert.equal(enrowPhoneLookupEnabled({ enrow_key: 'k', features }, 2), true);
+        assert.equal(enrowPhoneLookupEnabled({ enrow_key: 'k', features }, 3), false);
+        assert.deepEqual(enrowOptionsFromSettings({ enrow_key: 'k', features }, 2), { find: false, verify: false });
     });
 });

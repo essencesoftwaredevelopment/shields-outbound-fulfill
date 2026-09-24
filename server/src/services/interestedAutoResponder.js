@@ -13,6 +13,7 @@ import {
     triggerInterestedResearchWorkflow
 } from './interestedResearch/trigger.js';
 import { attachWorkflowRunId, stampResearchStep } from './interestedResearch/progress.js';
+import { findPhoneForContact } from './phoneFinder.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import {
     fetchThreadReplyMetadata,
@@ -27,6 +28,8 @@ import {
 
 const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-5.5').trim() || 'gpt-5.5';
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** How long the inline review alert waits on a still-running phone lookup. */
+const PHONE_NTFY_GRACE_MS = 15_000;
 const POPUP_FORM_GENERATE_URL = 'https://essence-retention-ai-popup-demo.vercel.app/api/popup-form/generate';
 const POPUP_FORM_API_KEY = 'CNl6iVR6YwmlPU9iw6gOW1LAF4roUxxPNB9YrI2kdIeMmbcfUKh4Rgdl0gdmZBQo';
 const POPUP_FORM_GENERATE_TIMEOUT_MS = Math.max(
@@ -1126,7 +1129,84 @@ async function runDraftChat({
     });
 }
 
-export async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false }) {
+/** The promise's value if it settles within `ms`, else null (the promise keeps running). */
+async function settleWithin(promise, ms) {
+    let timer;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((resolve) => {
+                timer = setTimeout(() => resolve(null), ms);
+            })
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** E.164-ish number safe for a `tel:` URI, or null. */
+export function telUriForPhone(number) {
+    const digits = String(number || '').replace(/[^\d+]/g, '');
+    const normalized = digits.startsWith('+') ? `+${digits.slice(1).replace(/\+/g, '')}` : digits.replace(/\+/g, '');
+    return normalized.replace(/\D/g, '').length >= 6 ? `tel:${normalized}` : null;
+}
+
+function formatPhoneLine(phone) {
+    return phone.country ? `${phone.number} (${phone.country})` : phone.number;
+}
+
+/** ntfy "Call" button (view action → tel:), when there is a number. */
+export function ntfyCallActionHeader(phone) {
+    const tel = telUriForPhone(phone?.number);
+    return tel ? { 'Actions': `view, Call, ${tel}` } : {};
+}
+
+/** Founder phone found by the Enrow lookup, or null. */
+export async function loadContactPhone(db, contactId) {
+    if (contactId == null) return null;
+    try {
+        const result = await db.query(
+            `SELECT phone, phone_country FROM contacts WHERE id = $1`,
+            [contactId]
+        );
+        const row = result.rows[0];
+        const number = String(row?.phone || '').trim();
+        return number ? { number, country: row.phone_country || null } : null;
+    } catch (error) {
+        console.warn(`[interested-autoresponder] phone lookup read failed contact=${contactId}:`, error?.message || error);
+        return null;
+    }
+}
+
+/**
+ * Follow-up push when the phone lookup finishes after the review alert already
+ * went out (inline path) — so the number still reaches whoever works the lead.
+ */
+export async function sendNtfyPhoneFoundNotification(topic, { leadEmail, phone, reviewUrl }) {
+    if (!topic || !phone?.number) return { notified: false };
+    const response = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Title': `Phone found: ${leadEmail}`,
+            'Tags': 'telephone_receiver',
+            ...(reviewUrl ? { 'Click': reviewUrl } : {}),
+            ...ntfyCallActionHeader(phone)
+        },
+        body: [
+            `Lead: ${leadEmail}`,
+            `Phone: ${formatPhoneLine(phone)}`,
+            reviewUrl ? `Review URL: ${reviewUrl}` : null
+        ].filter(Boolean).join('\n')
+    });
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`ntfy phone notification failed (${response.status}): ${text || response.statusText}`);
+    }
+    return { notified: true };
+}
+
+export async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false, phone = null }) {
     if (!topic) return { notified: false, reason: 'missing_topic' };
 
     const titlePrefix = isFollowUp
@@ -1139,11 +1219,13 @@ export async function sendNtfyNotification(topic, { leadEmail, campaignName, rev
             'Content-Type': 'text/plain; charset=utf-8',
             'Title': `${titlePrefix}: ${leadEmail}`,
             'Tags': 'mailbox_with_mail,robot_face',
-            'Click': reviewUrl
+            'Click': reviewUrl,
+            ...ntfyCallActionHeader(phone)
         },
         body: [
             `Lead: ${leadEmail}`,
             `Campaign: ${campaignName || 'Unknown campaign'}`,
+            phone?.number ? `Phone: ${formatPhoneLine(phone)}` : null,
             isFollowUp ? 'Type: Post-autoresponder follow-up' : null,
             `Review URL: ${reviewUrl}`
         ].filter(Boolean).join('\n')
@@ -1818,6 +1900,10 @@ export async function createInterestedAutoResponderDraftFromEvent({
             }
         }
 
+        // Founder phone (Enrow), in parallel with generation. Never rejects; the
+        // number is stored on the contact whether or not it beats the ntfy below.
+        const phoneLookup = findPhoneForContact({ agencyId, contactId, clientId, logger });
+
         let generation;
         try {
             const signalRow = await resolveContactSignalContext(client, contactId);
@@ -1934,15 +2020,34 @@ export async function createInterestedAutoResponderDraftFromEvent({
 
         if (settings.ntfyTopic && savedDraft?.review_token) {
             const reviewUrl = buildReviewUrl(savedDraft.review_token);
+            // Give a still-running lookup a short grace so the number usually rides
+            // the review alert; otherwise a second push follows when it lands.
+            const early = await settleWithin(phoneLookup, PHONE_NTFY_GRACE_MS);
+            const phone = early?.status === 'found' && early.number
+                ? { number: early.number, country: early.country || null }
+                : null;
             try {
                 await sendNtfyNotification(settings.ntfyTopic, {
                     leadEmail: normalizedLeadEmail,
                     campaignName: promptConfig.campaign_name,
                     reviewUrl,
-                    isFollowUp
+                    isFollowUp,
+                    phone
                 });
             } catch (error) {
                 logger(`[interested-autoresponder] ntfy notification failed for draft=${savedDraft.id}: ${error.message}`);
+            }
+            if (!early) {
+                phoneLookup.then(async (late) => {
+                    if (late?.status !== 'found' || !late.number) return;
+                    await sendNtfyPhoneFoundNotification(settings.ntfyTopic, {
+                        leadEmail: normalizedLeadEmail,
+                        phone: { number: late.number, country: late.country || null },
+                        reviewUrl
+                    });
+                }).catch((error) => {
+                    logger(`[interested-autoresponder] phone ntfy failed for draft=${savedDraft.id}: ${error.message}`);
+                });
             }
         }
 
@@ -2040,6 +2145,9 @@ async function loadDraftByReviewToken(token) {
                 c.warm_follow_up_interest_value AS client_warm_follow_up_interest_value,
                 c.warm_follow_up_interest_label AS client_warm_follow_up_interest_label,
                 co.domain_normalized AS company_domain,
+                ct.phone AS contact_phone,
+                ct.phone_country AS contact_phone_country,
+                ct.phone_status AS contact_phone_status,
                 COALESCE(s.features->>'autoresponderShoppingAudit', 'false') = 'true'
                     AS agency_shopping_audit_reply
          FROM interested_autoresponder_drafts d
@@ -2124,6 +2232,19 @@ export function stripForeignAuditLinks(html, { fallbackUrl = null } = {}) {
     );
 }
 
+/** Contact phone for the review page: the number, or just the lookup state. */
+export function serializeReviewPhone(draft) {
+    const number = String(draft?.contact_phone || '').trim();
+    const status = draft?.contact_phone_status || null;
+    if (!number && !status) return null;
+    return {
+        number: number || null,
+        country: number ? draft.contact_phone_country || null : null,
+        telUri: number ? telUriForPhone(number) : null,
+        status: number ? 'found' : status
+    };
+}
+
 function serializeReviewDraft(draft) {
     const website = resolveLeadWebsite(draft.company_domain, draft.lead_email);
     return {
@@ -2140,7 +2261,8 @@ function serializeReviewDraft(draft) {
         websiteDomain: website.domain,
         websiteUrl: website.url,
         researchBrief: serializeResearchBriefForReview(draft.research_brief),
-        researchCompletedAt: draft.research_completed_at || null
+        researchCompletedAt: draft.research_completed_at || null,
+        phone: serializeReviewPhone(draft)
     };
 }
 

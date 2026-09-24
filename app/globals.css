@@ -4363,6 +4363,20 @@ select.lead-activity-chip {
   flex-shrink: 0;
 }
 
+.ar-link--static,
+.ar-link--static:hover {
+  cursor: default;
+  background: var(--app-surface-2);
+  border-color: var(--app-border-strong);
+  color: var(--app-text-high);
+}
+
+.ar-link--muted,
+.ar-link--muted:hover {
+  color: var(--app-text-muted, var(--app-text-high));
+  font-weight: 500;
+}
+
 .ar-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

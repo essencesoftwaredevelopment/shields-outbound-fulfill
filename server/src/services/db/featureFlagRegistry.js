@@ -77,11 +77,19 @@ export const FEATURE_FLAGS = [
         description: 'Emails TryKitt verifies as risky / unknown (catch-all) are re-checked with Enrow\'s verifier and become valid or invalid (0.25 credits each). Needs an Enrow key in the API Vault.'
     },
     {
+        key: 'enrowPhoneLookup',
+        group: 'pipeline',
+        type: 'boolean',
+        default: false,
+        label: 'Enrow phone lookup on positive replies',
+        description: 'When a lead replies interested, look up the founder\'s mobile number with Enrow (LinkedIn first, then name + domain) and show it in the ntfy alert and on the review page. Enrow charges ~50 credits per search at launch; each contact is searched once. Needs an Enrow key in the API Vault and phone search on the Enrow plan.'
+    },
+    {
         key: 'enrowClients',
         group: 'pipeline',
         type: 'object',
         label: 'Enrow clients',
-        description: 'Limit both Enrow options to these client IDs (comma-separated). Leave blank to use Enrow for every client of this agency.',
+        description: 'Limit the Enrow options to these client IDs (comma-separated). Leave blank to use Enrow for every client of this agency.',
         fields: [
             { key: 'ids', type: 'string', label: 'Client IDs', placeholder: 'all clients' }
         ]

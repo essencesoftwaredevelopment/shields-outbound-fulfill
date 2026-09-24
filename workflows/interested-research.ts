@@ -5,7 +5,8 @@
  * POST /internal/interested-research/start after a draft shell is inserted at
  * status='researching'. Single linear run per draft — no fan-out:
  *
- *   hydrate → homepage + Serper research → synthesize brief (GPT only) →
+ *   hydrate → homepage + Serper research (+ Enrow founder phone lookup) →
+ *   synthesize brief (GPT only) →
  *   persist brief on the draft → external popup URL (Essence/Vulcan, stays
  *   external by design) → generate reply with the brief → promote to
  *   pending_review + ntfy.
@@ -57,9 +58,15 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
     }
 
     // Research sources are independent and best-effort — either may be null.
+    // The phone lookup rides alongside the research sources; it only writes the
+    // contact row (finalize reads the number for ntfy) and must never fail the run.
     const [homepage, serper] = await Promise.all([
       homepageStep(input),
       serperStep(input),
+      phoneStep(input).catch((err) => {
+        console.warn('[interested-research] phone step failed:', toResearchErrorInfo(err).message);
+        return null;
+      }),
     ]);
     if (isResearchSupersededResult(homepage) || isResearchSupersededResult(serper)) {
       return { status: 'superseded' as const, draftId: input.draftId };
@@ -141,6 +148,20 @@ async function serperStep(input: InterestedResearchInput) {
   } catch (err) {
     if (isResearchSupersededError(err)) return researchSupersededResult();
     console.warn('[interested-research] serper step failed:', toResearchErrorInfo(err).message);
+    return null;
+  }
+}
+
+async function phoneStep(input: InterestedResearchInput) {
+  'use step';
+
+  const research = await loadResearch();
+  try {
+    return await research.runPhoneLookup(input);
+  } catch (err) {
+    if (isResearchSupersededError(err)) return researchSupersededResult();
+    // Best-effort like the research sources — a missing number never blocks the reply.
+    console.warn('[interested-research] phone step failed:', toResearchErrorInfo(err).message);
     return null;
   }
 }
@@ -231,6 +252,9 @@ hydrateStep.maxRetries = 0;
 // transient network blips without double-spending Serper/fetch budgets.
 homepageStep.maxRetries = 1;
 serperStep.maxRetries = 1;
+// No retry: the contact row already records the paid Enrow search, and the next
+// reply resumes polling it for free.
+phoneStep.maxRetries = 0;
 // A retry would re-bill the OpenAI call; the step degrades to null on failure.
 synthesizeBriefStep.maxRetries = 0;
 // DB write only — safe to retry; never re-runs GPT.
