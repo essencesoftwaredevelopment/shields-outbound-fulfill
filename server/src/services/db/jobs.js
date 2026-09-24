@@ -617,6 +617,9 @@ export async function closeRemainingPipelineWork({ agencyId, clientId, jobId }) 
             AND status IN ('pending', 'processing')`,
         [jobId]
     );
+    // Only leads the email finder would search (a real founder name): stamping a
+    // no-founder lead as searched shows it as "Email Not Found" when no search
+    // ever ran (9k+ ESSENCE Retention leads before this, 2026-09-24).
     await pool.query(
         `UPDATE contacts c
             SET email_find_completed_at = COALESCE(c.email_find_completed_at, NOW()),
@@ -629,6 +632,8 @@ export async function closeRemainingPipelineWork({ agencyId, clientId, jobId }) 
            AND c.client_id = $2
            AND c.role_type = 'founder'
            AND c.email_find_completed_at IS NULL
+           AND c.full_name IS NOT NULL AND BTRIM(c.full_name) <> ''
+           AND LOWER(BTRIM(c.full_name)) NOT IN ('not found', 'n/a', 'unknown')
            AND jd.status <> 'skipped'`,
         [agencyId, clientId, jobId]
     );
