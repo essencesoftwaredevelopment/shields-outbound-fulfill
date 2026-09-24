@@ -116,6 +116,9 @@ export interface PipelineJob {
     queueStatus?: string | null;
     /** True while a child process is still running this job. */
     workerActive?: boolean;
+    /** From GET /api/jobs: only the most recent job is `full`; the rest are list
+     *  overviews (stage status/error only) until opened via GET /api/jobs/:id. */
+    detail?: "full" | "overview";
     activityMessage?: string | null;
     activityUpdatedAt?: string | null;
     timingTotals?: Record<string, { count: number; totalMs: number; totalRows: number; maxMs: number }>;

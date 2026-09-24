@@ -23,7 +23,7 @@ import {
     setActiveJob,
     updateJobControl,
     updateActiveJobStatus,
-    listJobsForClient,
+    listJobOverviewsForClient,
     getActiveJobForClient,
     deleteJobFromDb,
     clearActiveJobForClient,
@@ -724,8 +724,16 @@ router.get('/jobs', async (req, res) => {
             return res.status(400).json({ error: 'clientId required' });
         }
         const { agencyId, sqlClientId } = await clientContextFromRequest(req, clientSlug);
-        const rows = await listJobsForClient(agencyId, sqlClientId);
-        res.json({ jobs: rows.map(jobRowToState) });
+        // Overview rows for the history list; the most recent job comes back in
+        // full so the Pipeline panel can show it without a second round trip.
+        const rows = await listJobOverviewsForClient(agencyId, sqlClientId);
+        const latest = rows[0] ? await getJobById(rows[0].id, agencyId) : null;
+        const jobs = rows.map((row, index) => (
+            index === 0 && latest
+                ? { ...jobRowToState(latest), detail: 'full' }
+                : { ...jobRowToState(row), detail: 'overview' }
+        ));
+        res.json({ jobs });
     } catch (error) {
         console.error('LIST jobs error:', error);
         res.status(500).json({ error: 'Failed to list jobs' });

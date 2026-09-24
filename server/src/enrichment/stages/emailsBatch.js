@@ -1,4 +1,5 @@
 import { runEmailFinder } from '../../services/emailFinder.js';
+import { DEFAULT_PRICING } from '../../utils/pricing.js';
 import { getEmailFindQueue, getJobById, listJobDomainsForJob } from '../../services/db/jobs.js';
 import { upsertLeadRowsBatch, upsertCsvEmailRowsBatch } from '../../services/leads.js';
 import { isNotFoundValue, normalizeCsvEmailStatus } from '../../services/enrichmentCohort.js';
@@ -11,6 +12,7 @@ import {
     createStageLogger
 } from '../stageProgress.js';
 import { shouldScheduleChildReconcile } from '../reconcilePolicy.js';
+import { refreshProviderCreditsAfterBatch } from '../../services/providerCredits.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -166,31 +168,40 @@ export async function runEmailsBatch(ctx, batchDomains, batchOpts = {}) {
 
     const job = contextToJob(ctx);
 
-    const summary = await runEmailFinder({
-        founders,
-        apiKeys: { ...ctx.apiKeys, kitt: ctx.apiKeys.trykitt },
-        log: stageLog,
-        job,
-        checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
-        checkPaused: () => assertJobActive(ctx.jobId, ctx.agencyId),
-        pricing: ctx.pricing,
-        progressOffset: 0,
-        progressTotal: null,
-        rateLimitHooks: createRateLimitHooks(ctx),
-        onBatch: async (rows) => {
-            if (!rows?.length) return;
-            await upsertLeadRowsBatch({
-                agencyId: ctx.agencyId,
-                clientId: ctx.clientId,
-                rows,
-                type: 'emails',
-                jobId: ctx.jobId,
-                mergeMode: enrichmentMergeMode(ctx),
-                reconcileAfterWrite: shouldScheduleChildReconcile(ctx),
-                source: 'trykitt'
-            });
-        }
-    });
+    let summary;
+    try {
+        summary = await runEmailFinder({
+            founders,
+            apiKeys: { ...ctx.apiKeys, kitt: ctx.apiKeys.trykitt },
+            log: stageLog,
+            job,
+            checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
+            checkPaused: () => assertJobActive(ctx.jobId, ctx.agencyId),
+            // The service reads this stage's rates, not the whole { stages } map.
+            pricing: ctx.pricing?.stages?.emailDiscovery || DEFAULT_PRICING.stages.emailDiscovery,
+            progressOffset: 0,
+            progressTotal: null,
+            rateLimitHooks: createRateLimitHooks(ctx),
+            onBatch: async (rows) => {
+                if (!rows?.length) return;
+                await upsertLeadRowsBatch({
+                    agencyId: ctx.agencyId,
+                    clientId: ctx.clientId,
+                    rows,
+                    type: 'emails',
+                    jobId: ctx.jobId,
+                    mergeMode: enrichmentMergeMode(ctx),
+                    reconcileAfterWrite: shouldScheduleChildReconcile(ctx),
+                    source: 'trykitt'
+                });
+            }
+        });
+    } catch (err) {
+        // Possibly out of credits: refresh now so the Pipeline tab shows it.
+        await refreshProviderCreditsAfterBatch(ctx.agencyId, { force: true });
+        throw err;
+    }
+    await refreshProviderCreditsAfterBatch(ctx.agencyId);
 
     await finishJobStage(ctx, 'emailDiscovery', summary);
     return summary;

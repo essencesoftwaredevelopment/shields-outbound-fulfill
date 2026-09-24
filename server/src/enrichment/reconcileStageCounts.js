@@ -263,13 +263,26 @@ function buildStagesFromStats(row, stats, ctx, { finalize = false } = {}) {
     const ordered = STANDARD_STAGE_KEYS.filter((k) => stageKeys.includes(k));
     const now = new Date().toISOString();
 
+    let upstreamStatus = null;
     for (const stageKey of ordered) {
         const prior = stages[stageKey] || {};
         const priorSummary = prior.summary || {};
         const summary = summaryFromStats(stageKey, stats, priorSummary, denominators);
         const stageTotal = denominators[stageKey]?.total ?? jobTotal;
         const progress = buildCanonicalProgress(stageKey, summary, stageTotal ?? jobTotal, {});
-        const status = deriveStageStatus(stageKey, stats, denominators, { jobRunning, finalize });
+        let status = deriveStageStatus(stageKey, stats, denominators, { jobRunning, finalize });
+        // Denominators grow while earlier stages still feed this one, so catching
+        // up is not finishing: only complete once the stage before it has.
+        if (
+            status === 'completed'
+            && !finalize
+            && !stageSkipped(stageKey, stats)
+            && upstreamStatus !== null
+            && upstreamStatus !== 'completed'
+        ) {
+            status = 'running';
+        }
+        upstreamStatus = status;
         const wasRunning = prior.status === 'running';
         const isActive = status === 'running' || status === 'completed';
 

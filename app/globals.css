@@ -471,6 +471,70 @@ body {
   justify-content: flex-end;
 }
 
+/* Remaining provider credits — pinned to the left of the Pipeline toolbar. */
+.provider-credits {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-right: auto;
+}
+
+.provider-credits__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-3);
+  color: var(--app-text-high);
+  font-size: 0.8125rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.provider-credits__chip:disabled {
+  cursor: progress;
+}
+
+.provider-credits__label {
+  color: var(--app-text-muted);
+}
+
+.provider-credits__value {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.provider-credits__coin {
+  flex: none;
+  color: #000;
+}
+
+/* Black would vanish on the dark surface. */
+.dark .provider-credits__coin {
+  color: var(--app-text-high);
+}
+
+.provider-credits__chip--muted .provider-credits__value {
+  font-weight: 500;
+  color: var(--app-text-muted);
+}
+
+.provider-credits__chip--empty {
+  border-color: rgba(217, 119, 6, 0.45);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.dark .provider-credits__chip--empty .provider-credits__value {
+  color: #fbbf24;
+}
+
 .pipeline-actions {
   display: flex;
   gap: 0.75rem;
@@ -739,6 +803,10 @@ body {
 .pipeline-actions .secondary-button,
 .pipeline-actions .secondary-button--active,
 .pipeline-actions .destructive-button,
+.pipeline-run__actions .primary-button,
+.pipeline-run__actions .secondary-button,
+.pipeline-run__actions .secondary-button--active,
+.pipeline-run__actions .destructive-button,
 .leads-filter-actions .primary-button,
 .leads-filter-actions .secondary-button,
 .leads-filter-actions .secondary-button--active {
@@ -823,27 +891,274 @@ body {
   color: var(--job-pill-paused);
 }
 
+/* ── Pipeline run panel (Pipeline tab) ─────────────────────────────── */
+.pipeline-run {
+  margin-top: 1.5rem;
+  padding: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  background: var(--app-surface-3);
+  border: 1px solid var(--app-border);
+  border-radius: 20px;
+}
+
+.pipeline-run__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+}
+
+.pipeline-run__intro {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.pipeline-run__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.pipeline-run__percent {
+  font-size: 0.8125rem;
+  color: var(--app-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pipeline-run__title {
+  margin: 0;
+  font-size: 1.375rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--app-text-high);
+  overflow-wrap: anywhere;
+}
+
+.pipeline-run__meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+  font-size: 0.8125rem;
+  color: var(--app-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pipeline-run__meta strong {
+  color: var(--app-text);
+  font-weight: 600;
+}
+
+.pipeline-run__link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--app-link);
+  cursor: pointer;
+}
+
+.pipeline-run__link:hover {
+  text-decoration: underline;
+}
+
+.pipeline-run__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.pipeline-run__actions .primary-button,
+.pipeline-run__actions .secondary-button,
+.pipeline-run__actions .destructive-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.pipeline-run__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  margin-left: 0.25rem;
+  padding: 0;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--app-text-muted);
+  cursor: pointer;
+}
+
+.pipeline-run__close:hover {
+  background: var(--app-surface-hover);
+  color: var(--app-text);
+}
+
+.pipeline-run__bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--app-border);
+  overflow: hidden;
+}
+
+.pipeline-run__bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--app-info-solid);
+  transition: width 400ms ease;
+}
+
+.pipeline-run__bar--completed > span {
+  background: var(--app-success-solid);
+}
+
+.pipeline-run__bar--paused > span {
+  background: var(--app-text-ghost);
+}
+
+.pipeline-run__bar--failed > span {
+  background: var(--app-danger-solid);
+}
+
+.pipeline-run__activity {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-top: -0.5rem;
+  font-size: 0.8125rem;
+  color: var(--app-text-muted);
+}
+
+.pipeline-run__activity p {
+  margin: 0;
+}
+
+.pipeline-run__log {
+  color: var(--app-text-faint);
+}
+
+/* Status pill: run header + stage cards share the same palette. */
+.run-status,
+.stage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-2);
+  color: var(--app-text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.run-status--running,
+.run-status--queued,
+.stage-chip--running {
+  color: var(--app-info-text);
+  background: var(--app-info-bg);
+  border-color: var(--app-info-border);
+}
+
+.run-status--completed,
+.stage-chip--completed {
+  color: var(--app-success-text);
+  background: var(--app-success-bg);
+  border-color: var(--app-success-border);
+}
+
+.run-status--failed,
+.stage-chip--error {
+  color: var(--app-danger-text);
+  background: var(--app-danger-bg);
+  border-color: var(--app-danger-border);
+}
+
+.run-status--running::before,
+.stage-chip--running::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: runPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes runPulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.copyable-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.copyable-id__value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--app-text);
+  overflow-wrap: anywhere;
+}
+
+.copyable-id__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: var(--app-surface-2);
+  color: var(--app-text-muted);
+  cursor: pointer;
+}
+
+.copyable-id__button:hover {
+  color: var(--app-text);
+  background: var(--app-surface-hover);
+}
+
+/* ── Stage cards ───────────────────────────────────────────────────── */
 .stage-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.75rem;
 }
 
 .stage-card {
-  border-radius: 24px;
-  border: 1px solid var(--app-border-mid);
+  border-radius: 16px;
+  border: 1px solid var(--app-border);
   background: var(--app-bg-inset-deep);
   position: relative;
   overflow: hidden;
   /* ensure pseudo border is clipped to card */
   isolation: isolate;
   /* create stacking context so ::before stays consistent */
-  padding: 1.5rem;
+  padding: 1.1rem 1.15rem 1rem;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  min-height: 220px;
-
+  gap: 0.6rem;
+  min-height: 176px;
 }
 
 /* Running card animation and border (apply to the same element) */
@@ -852,20 +1167,18 @@ body {
 }
 
 .stage-card.stage-card--running::before {
-  padding: 1px;
-  /* animated border thickness */
   position: absolute;
   inset: 0;
-  border-radius: 24px;
+  border-radius: 16px;
   padding: 2px;
   /* animated border thickness */
-  /* Green → transparent across 50% of the perimeter */
+  /* Blue (the panel's "running" colour) → transparent across half the perimeter */
   background: conic-gradient(from 0deg,
-      rgba(16, 185, 129, 0.95) 0%,
-      rgba(16, 185, 129, 0.75) 20%,
-      rgba(16, 185, 129, 0.45) 35%,
-      rgba(16, 185, 129, 0.15) 50%,
-      rgba(16, 185, 129, 0.0) 100%);
+      rgba(59, 130, 246, 0.95) 0%,
+      rgba(59, 130, 246, 0.75) 20%,
+      rgba(59, 130, 246, 0.45) 35%,
+      rgba(59, 130, 246, 0.15) 50%,
+      rgba(59, 130, 246, 0.0) 100%);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
@@ -911,77 +1224,89 @@ body {
   }
 }
 
-.stage-card__progress-number {
-  font-size: 1.05rem;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-  color: var(--app-text);
-}
-
-.stage-card__progress-total {
-  color: var(--app-text-muted);
-}
-
-.stage-card__progress-percentage {
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: var(--app-success-text);
-}
-
-.stage-card--running {
-  border-color: rgba(96, 165, 250, 0.6);
-}
-
 .stage-card--completed {
-  border-color: rgba(52, 211, 153, 0.6);
+  border-color: var(--app-success-border);
 }
 
 .stage-card--error {
-  border-color: rgba(248, 113, 113, 0.7);
+  border-color: var(--app-danger-border);
 }
 
 /* Stage present in the overview but not run for this job (not a CSV import). */
 .stage-card--skipped {
-  border-color: var(--app-border);
   border-style: dashed;
-  opacity: 0.7;
+  background: transparent;
+}
+
+.stage-card--pending .stage-card__hero,
+.stage-card--skipped .stage-card__hero {
+  opacity: 0.45;
 }
 
 .stage-card__head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.5rem;
 }
 
 .stage-card__label {
   margin: 0;
-  font-size: 1rem;
+  font-size: 0.875rem;
   font-weight: 600;
+  color: var(--app-text);
 }
 
-.stage-card__detail {
-  margin: 0.15rem 0 0;
-  font-size: 0.85rem;
+.stage-card__hero {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.stage-card__hero-value {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--app-text-high);
+  font-variant-numeric: tabular-nums;
+}
+
+.stage-card__hero-value--empty {
+  color: var(--app-text-ghost);
+}
+
+.stage-card__hero-label {
+  font-size: 0.8125rem;
+  font-weight: 500;
   color: var(--app-text-muted);
 }
 
-.stage-card__status {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--app-text-mid);
+.stage-card__detail {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--app-text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
-.stage-card__progress {
-  margin: 0;
-  font-size: 0.9rem;
-  color: var(--app-text-mid);
-}
-
-.stage-card__error {
-  margin: 0;
+.stage-card__detail--error {
   color: var(--app-danger-text);
-  font-size: 0.85rem;
+}
+
+.stage-card__foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: auto;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--app-border-subtle);
+  min-height: 1.6rem;
+  font-size: 0.75rem;
+  color: var(--app-text-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 .credit-exhaustion-notice {
@@ -5142,5 +5467,81 @@ textarea {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 720px) {
+  .pipeline-run {
+    padding: 1.1rem;
+    border-radius: 16px;
+  }
+
+  .pipeline-run__actions {
+    justify-content: flex-start;
+  }
+
+  .stage-grid {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-status--running::before,
+  .stage-chip--running::before {
+    animation: none;
+  }
+}
+
+/* Job history placeholder rows until GET /api/jobs answers. */
+.job-history-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.job-history-loading__label {
+  font-size: 0.8125rem;
+  color: var(--app-text-muted);
+}
+
+.job-history-loading__row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 1.25rem;
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+  background: var(--app-surface-3);
+}
+
+.job-history-loading__line {
+  display: block;
+  width: 22%;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--app-border) 0%, var(--app-surface-hover) 50%, var(--app-border) 100%);
+  background-size: 200% 100%;
+  animation: jobHistoryShimmer 1.3s ease-in-out infinite;
+}
+
+.job-history-loading__line--title {
+  width: 38%;
+  height: 0.9rem;
+}
+
+@keyframes jobHistoryShimmer {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: -100% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .job-history-loading__line {
+    animation: none;
   }
 }

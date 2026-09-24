@@ -1,4 +1,5 @@
 import { runFounderFinder } from '../../services/founderFinder.js';
+import { DEFAULT_PRICING } from '../../utils/pricing.js';
 import {
     listPendingJobDomains,
     loadSerperCacheMap,
@@ -115,7 +116,8 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
         jobId: ctx.jobId,
         agencyId: ctx.agencyId,
         apiKeys: ctx.apiKeys,
-        pricing: ctx.pricing,
+        // The service reads this stage's rates, not the whole { stages } map.
+        pricing: ctx.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
         log: stageLog,
         onBatch: async (rows) => {
             if (!rows?.length) return;

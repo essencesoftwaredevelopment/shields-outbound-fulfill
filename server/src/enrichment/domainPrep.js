@@ -15,7 +15,9 @@ import { createDebouncedAsync } from '../lib/singleFlight.js';
 import { env } from '../config/env.js';
 import {
     DNS_QUERY_TIMEOUT_MS,
-    DNS_CHECK_CONCURRENCY
+    DNS_CHECK_CONCURRENCY,
+    DNS_RECHECK_CONCURRENCY,
+    DNS_RECHECK_BUDGET_MS
 } from './domainPrepConfig.js';
 
 if (env.PGPOOL_MAX <= 10 && DNS_CHECK_CONCURRENCY > 50) {
@@ -64,7 +66,33 @@ async function checkDomainDns(domain) {
 
     const errors = settled.filter((r) => r.status === 'rejected').map((r) => r.reason);
     if (errors.length > 0 && errors.every(isDnsMiss)) return { domain, status: 'dead' };
-    return { domain, status: 'unknown' };
+    return { domain, status: 'unknown', codes: errors.map((e) => String(e?.code || 'ERR')) };
+}
+
+/**
+ * Second opinion for an `unknown`: repeat the record lookups (now at low
+ * concurrency), then ask the OS resolver (getaddrinfo), which answers for most
+ * domains the c-ares burst failed on. Still unknown only when both disagree.
+ */
+async function recheckDomainDns(domain) {
+    const retry = await checkDomainDns(domain);
+    if (retry.status !== 'unknown') return retry;
+    try {
+        const addresses = await withTimeout(dns.lookup(domain, { all: true }), DNS_QUERY_TIMEOUT_MS * 2);
+        if (Array.isArray(addresses) && addresses.length > 0) return { domain, status: 'live' };
+    } catch {
+        // Fall through: keep the retry's error codes for the log.
+    }
+    return retry;
+}
+
+function tallyCodes(results) {
+    const tally = {};
+    for (const r of results) {
+        const key = (r?.codes || []).join(',') || 'none';
+        tally[key] = (tally[key] || 0) + 1;
+    }
+    return tally;
 }
 
 const DNS_STATUS_FLUSH_SIZE = 100;
@@ -171,6 +199,26 @@ async function dnsFilterDomains(jobId, agencyId, onProgress) {
             return result;
         }
     );
+
+    const firstUnknown = checks.filter((r) => r?.status === 'unknown' && r.domain);
+    if (firstUnknown.length) {
+        // Time-boxed: past the budget, the rest keep `unknown` (still processed).
+        const deadline = Date.now() + DNS_RECHECK_BUDGET_MS;
+        const rechecked = await mapWithConcurrency(firstUnknown, DNS_RECHECK_CONCURRENCY, (r) => (
+            Date.now() < deadline ? recheckDomainDns(r.domain) : Promise.resolve(r)
+        ));
+        const byDomain = new Map(rechecked.filter((r) => r?.domain).map((r) => [r.domain, r]));
+        for (let i = 0; i < checks.length; i += 1) {
+            const next = checks[i]?.domain ? byDomain.get(checks[i].domain) : null;
+            if (next) checks[i] = next;
+        }
+        const stillUnknown = rechecked.filter((r) => r?.status === 'unknown');
+        console.log(
+            `[domainPrep] job ${jobId}: rechecked ${firstUnknown.length} unknown domain(s); `
+            + `${firstUnknown.length - stillUnknown.length} resolved`
+            + (stillUnknown.length ? `, ${stillUnknown.length} still unknown ${JSON.stringify(tallyCodes(stillUnknown))}` : '')
+        );
+    }
 
     // Write spreadsheet cells in chunks (live/dead/unknown), not only dead→skipped.
     const buckets = { live: [], dead: [], unknown: [] };

@@ -50,7 +50,7 @@ function num(value: unknown): number {
 function deriveStatus(
     processed: number,
     total: number,
-    opts: { skipped?: boolean; jobRunning?: boolean; jobCompleted?: boolean } = {}
+    opts: { skipped?: boolean; jobRunning?: boolean; jobCompleted?: boolean; upstream?: PipelineStageStatus } = {}
 ): PipelineStageStatus {
     // A completed job has no in-flight stages: finalize only marks a job
     // completed once no pipeline work remains, so count-vs-denominator math
@@ -59,7 +59,12 @@ function deriveStatus(
     // and its phantom ETA.
     if (opts.jobCompleted) return "completed";
     if (opts.skipped) return "completed";
-    if (total > 0 && processed >= total) return "completed";
+    // Denominators grow while the stage before still feeds this one (batches run
+    // in parallel), so catching up is not finishing: only complete once the
+    // upstream stage has. Otherwise cards flicker completed → running mid-run.
+    if (total > 0 && processed >= total) {
+        return opts.upstream && opts.upstream !== "completed" ? "running" : "completed";
+    }
     if (processed > 0) return "running";
     if (opts.jobRunning) return "pending";
     return "pending";
@@ -117,7 +122,12 @@ export function stageCountsToStages(
     const statusFromCsv = skipVerify && (mapping ? !!mapping.emailStatus : num(counts.verification?.verified) > 0);
     // A CSV-import stage derives status from its counts like any other stage; the
     // `skipped` shortcut (instant "completed") is only for stages that never run.
-    const skippedOpt = (skipped: boolean, fromCsv: boolean) => ({ skipped: skipped && !fromCsv, jobRunning, jobCompleted });
+    const skippedOpt = (skipped: boolean, fromCsv: boolean, upstream?: PipelineStageStatus) => ({
+        skipped: skipped && !fromCsv,
+        jobRunning,
+        jobCompleted,
+        upstream,
+    });
     const totalDomains = num(counts.domainPrep?.total);
     // Domain-prep "processable" = input cohort after DNS (not post-waterfall leftovers).
     // RPC returns dns-aware processable; fall back to total when DNS was skipped.
@@ -241,7 +251,7 @@ export function stageCountsToStages(
     const foundersProcessed = num(counts.founders?.processed);
     const foundersFound = num(counts.founders?.found);
     const foundersTotal = foundersFromCsv ? importTotal : contactTotal;
-    const foundersStatus = deriveStatus(foundersProcessed, foundersTotal, skippedOpt(skipFounders, foundersFromCsv));
+    const foundersStatus = deriveStatus(foundersProcessed, foundersTotal, skippedOpt(skipFounders, foundersFromCsv, domainStatus));
     out.founders = {
         status: foundersStatus,
         startedAt: prior?.founders?.startedAt ?? null,
@@ -274,8 +284,14 @@ export function stageCountsToStages(
         : num(counts.emailDiscovery?.found);
     const emailNotFound = num(counts.emailDiscovery?.notFound);
     const emailErrors = num(counts.emailDiscovery?.errors);
-    const emailTotal = emailsFromCsv ? importTotal : contactTotal;
-    const emailStatus = deriveStatus(emailProcessed, emailTotal, skippedOpt(skipEmails, emailsFromCsv));
+    // Emails are only searched for contacts with a founder, so founders found is
+    // the real denominator; contactTotal kept the card "running" until the job ended.
+    const emailTotal = emailsFromCsv
+        ? importTotal
+        : skipFounders && !foundersFromCsv
+          ? contactTotal
+          : foundersFound || contactTotal;
+    const emailStatus = deriveStatus(emailProcessed, emailTotal, skippedOpt(skipEmails, emailsFromCsv, foundersStatus));
     out.emailDiscovery = {
         status: emailStatus,
         startedAt: prior?.emailDiscovery?.startedAt ?? null,
@@ -313,7 +329,7 @@ export function stageCountsToStages(
     const verifyTotal = skipEmails
         ? (processable || contactTotal)
         : (emailFound || contactTotal);
-    const verifyStatus = deriveStatus(verified, verifyTotal, skippedOpt(skipVerify, statusFromCsv));
+    const verifyStatus = deriveStatus(verified, verifyTotal, skippedOpt(skipVerify, statusFromCsv, emailStatus));
     out.verification = {
         status: verifyStatus,
         startedAt: prior?.verification?.startedAt ?? null,
@@ -360,6 +376,7 @@ export function stageCountsToStages(
         skipped: skipPersonalize,
         jobRunning,
         jobCompleted,
+        upstream: verifyStatus,
     });
     out.personalization = {
         status: personalizeStatus,

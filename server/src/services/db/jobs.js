@@ -443,9 +443,40 @@ export async function getActiveJobForClient(agencyId, clientId) {
     return result.rows[0] || null;
 }
 
-export async function listJobsForClient(agencyId, clientId, limit = 50) {
+/**
+ * Job history rows without the heavy columns: full `stages` summaries/progress
+ * and `options` (timing logs, filters, mappings) make SELECT * over 50 jobs slow
+ * to query and ship. Stages keep only status/error per key (credit-exhaustion
+ * notices and pipeline-mode detection need them); options keep the flags the
+ * list and jobRowToState read. Open a job via getJobById for the full row.
+ */
+export async function listJobOverviewsForClient(agencyId, clientId, limit = 50) {
     const result = await pool.query(
-        `SELECT * FROM jobs
+        `SELECT id, status, error, paused, paused_at, resumed_at, cancelled, file_name,
+                created_at, completed_at, client_id, client_slug, agency_id, cost,
+                upload_status, is_active, dedupe_stats,
+                jsonb_strip_nulls(jsonb_build_object(
+                    'activityMessage', options->'activityMessage',
+                    'activityUpdatedAt', options->'activityUpdatedAt',
+                    'pipelineMode', options->'pipelineMode',
+                    'nicheId', options->'nicheId',
+                    'nicheLabel', options->'nicheLabel',
+                    'industry', options->'industry',
+                    'executionRunner', options->'executionRunner',
+                    'dedupeStrategy', options->'dedupeStrategy',
+                    'personalizeFirstLine', options->'personalizeFirstLine',
+                    'skipFounderFinder', options->'skipFounderFinder',
+                    'skipEmailFinder', options->'skipEmailFinder',
+                    'skipVerification', options->'skipVerification',
+                    'skipDomainCheck', options->'skipDomainCheck'
+                )) AS options,
+                (SELECT COALESCE(
+                    jsonb_object_agg(s.key, jsonb_build_object('status', s.value->'status', 'error', s.value->'error')),
+                    '{}'::jsonb
+                 )
+                 FROM jsonb_each(CASE WHEN jsonb_typeof(stages) = 'object' THEN stages ELSE '{}'::jsonb END) AS s
+                ) AS stages
+         FROM jobs
          WHERE agency_id = $1 AND client_id = $2
          ORDER BY created_at DESC LIMIT $3`,
         [agencyId, clientId, limit]

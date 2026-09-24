@@ -12,6 +12,7 @@
  * Rows are only stamped attempted once results are applied, so a batch that was
  * skipped or timed out is picked up again by a resume.
  */
+import { refreshProviderCreditsAfterBatch } from '../../services/providerCredits.js';
 import {
     submitEnrowFindBulk,
     submitEnrowVerifyBulk,
@@ -134,6 +135,7 @@ export async function submitEnrowBatch(ctx, kind, batchDomains, { batchKey }) {
             ? `Enrow: searching ${queue.length} email(s) TryKitt missed…`
             : `Enrow: re-checking ${queue.length} risky email(s)…`
     );
+    await refreshProviderCreditsAfterBatch(ctx.agencyId);
     return { requestId: submitted.id, requested: queue.length, reused: false };
 }
 
@@ -168,6 +170,7 @@ export async function collectEnrowBatch(ctx, kind, requestId) {
         // Rows stay unstamped, so a resume submits them again.
         await closeEnrowRequest(requestId, { status: 'failed', error: 'Enrow reported the batch as failed' });
         await reportActivity(ctx, kind, `Enrow batch ${requestId} failed — those leads keep their TryKitt result.`);
+        await refreshProviderCreditsAfterBatch(ctx.agencyId, { force: true });
         return { done: true, failed: true };
     }
 
@@ -201,6 +204,9 @@ export async function collectEnrowBatch(ctx, kind, requestId) {
         );
         result = { done: true, valid: counts.valid, invalid: counts.invalid };
     }
+
+    // Misses are refunded once the batch completes, so read the settled balance.
+    await refreshProviderCreditsAfterBatch(ctx.agencyId, { force: true });
 
     if (shouldScheduleChildReconcile(ctx)) {
         void import('../stageReconcileScheduler.js')

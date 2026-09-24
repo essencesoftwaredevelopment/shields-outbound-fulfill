@@ -35,7 +35,7 @@ const InstantlyEventAnalyticsChart = dynamic(
     () => import("@/components/instantly-event-analytics-chart"),
     { ssr: false },
 );
-import { CalendarCheck, Download, MessageCircleCheck, MessageCircleReply, SendHorizontal } from "lucide-react";
+import { CalendarCheck, Download, Filter, MessageCircleCheck, MessageCircleReply, Pause, Play, SendHorizontal, X } from "lucide-react";
 import {
     ALL_PIPELINE_STAGE_KEYS,
     isShoppingAuditPipelineJob,
@@ -44,13 +44,15 @@ import {
     PipelineJob,
     PipelineStageKey,
     PipelineStageState,
-    PipelineStageStatus,
 } from "@/lib/pipeline/types";
 import {
     isCreditExhaustionText,
     shouldShowCreditExhaustionNotice,
 } from "@/lib/pipeline/creditExhaustion";
 import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
+import { ProviderCredits } from "@/components/provider-credits";
+import { CopyableId } from "@/components/copyable-id";
+import { buildStageCardModel, formatStageCost } from "@/lib/pipeline/stageCardModel";
 import { useConfirm } from "@/components/confirm-dialog";
 import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
@@ -1235,7 +1237,6 @@ type InstantlyCsvMergeResult = {    summary: {
 };
 
 type JobStatus = PipelineJob["status"];
-type StageStatus = PipelineStageStatus;
 
 function resolveStageOrder(job?: PipelineJob | null): PipelineStageKey[] {
     return resolveVisibleStageKeys(job);
@@ -1287,46 +1288,11 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
     completed: "Completed",
 };
 
-const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
-    pending: "Pending",
-    running: "Running",
-    completed: "Completed",
-    error: "Error",
-};
-
 const JOB_STATUS_COLORS: Record<JobStatus, { text: string; bg: string; border: string; solid: string }> = {
     queued: { text: "var(--app-text-muted)", bg: "var(--app-surface-2)", border: "var(--app-border-highlight)", solid: "var(--app-text-ghost)" },
     running: { text: "var(--app-info-text)", bg: "var(--app-info-bg)", border: "var(--app-info-border)", solid: "var(--app-info-solid)" },
     failed: { text: "var(--app-danger-text)", bg: "var(--app-danger-bg)", border: "var(--app-danger-border)", solid: "var(--app-danger-solid)" },
     completed: { text: "var(--app-success-text)", bg: "var(--app-success-bg)", border: "var(--app-success-border)", solid: "var(--app-success-solid)" },
-};
-
-const formatStageStatus = (status?: StageStatus) => (status ? STAGE_STATUS_LABELS[status] : "Pending");
-
-/**
- * Was this stage skipped because its data came from the upload (vs. not run at
- * all)? The live-count mapper only sets `imported` for CSV-mapped stages; the
- * server reconcile writes `imported: 0` for any skipped stage, so a completed
- * stage with nothing imported still reads as plain "Skipped".
- */
-const stageImportedFromCsv = (
-    summary: Record<string, unknown> | null | undefined,
-    status?: StageStatus | null,
-) =>
-    summary?.skipped === true
-    && typeof summary?.imported === "number"
-    && ((summary.imported as number) > 0 || (status !== undefined && status !== null && status !== "completed"));
-
-/** Chip text for a stage card: skipped stages say so instead of "Completed". */
-const formatStageChip = (stage?: PipelineStageState | null) => {
-    const summary = stage?.summary as Record<string, unknown> | null | undefined;
-    if (summary?.skipped === true && stage?.status !== "error") {
-        if (stageImportedFromCsv(summary, stage?.status)) {
-            return stage?.status === "running" ? "Importing CSV" : stage?.status === "completed" ? "From CSV" : "Pending";
-        }
-        return "Skipped";
-    }
-    return formatStageStatus(stage?.status);
 };
 
 const humanizeKey = (value: string) =>
@@ -1356,45 +1322,6 @@ const formatInstantlySyncPhase = (phase?: string | null) => {
         default:
             return humanizeKey(phase);
     }
-};
-
-const describeStageProgress = (stage?: PipelineStageState) => {
-    if (!stage) {
-        return "Awaiting scheduler.";
-    }
-    const processed = typeof stage.progress?.processed === "number" ? stage.progress.processed : null;
-    const total = typeof stage.progress?.total === "number" ? stage.progress.total : null;
-
-    if (processed !== null && total) {
-        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
-        return `${processed.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`;
-    }
-
-    const stats = stage.progress?.stats;
-    if (stats && Object.keys(stats).length > 0) {
-        const summary = Object.entries(stats)
-            .filter(([, value]) => typeof value === "number")
-            .slice(0, 3)
-            .map(([key, value]) => `${humanizeKey(key)}: ${value}`)
-            .join(" • ");
-        if (summary) {
-            return summary;
-        }
-    }
-
-    if (stage.status === "completed") {
-        return "Stage completed.";
-    }
-
-    if (stage.status === "running") {
-        return "Running...";
-    }
-
-    if (stage.status === "error") {
-        return stage.error || "Stage failed.";
-    }
-
-    return "Queued.";
 };
 
 const extractStageSummary = (stage?: PipelineStageState) => {
@@ -1942,6 +1869,8 @@ export default function ClientPage() {
     const [uploadError, setUploadError] = useState("");
     const [jobState, setJobState] = useState<PipelineJob | null>(null);
     const [jobHistory, setJobHistory] = useState<PipelineJob[]>([]);
+    /** Client whose job history has loaded at least once (drives the loading row). */
+    const [jobHistoryLoadedFor, setJobHistoryLoadedFor] = useState<string | null>(null);
     const [jobStatusMessage, setJobStatusMessage] = useState("");
     const lastWatchedJobIdRef = useRef<string | null>(null);
     const lastActiveStatusRef = useRef<string | null>(null);
@@ -4070,7 +3999,7 @@ export default function ClientPage() {
             if (typeof value === "string" && value) return value;
             return new Date().toISOString();
         };
-        const dedupe = data.dedupeStats as { total?: number; skipped?: number; new?: number } | undefined;
+        const dedupe = data.dedupeStats as { total?: number; skipped?: number; new?: number; processable?: number } | undefined;
         const totalVal = Number(dedupe?.total ?? 0);
         const skippedVal = Number(dedupe?.skipped ?? 0);
         const newVal = Number(dedupe?.new ?? 0);
@@ -4104,11 +4033,17 @@ export default function ClientPage() {
                     total: Number.isFinite(totalVal) ? totalVal : 0,
                     skipped: Number.isFinite(skippedVal) ? skippedVal : 0,
                     new: Number.isFinite(newVal) ? newVal : 0,
+                    // Post-DNS cohort: the stage baseline. Dropping it left the
+                    // baseline at 0, which blanked the Founder Finder card.
+                    ...(Number.isFinite(Number(dedupe.processable))
+                        ? { processable: Number(dedupe.processable) }
+                        : {}),
                 }
                 : null,
             paused: data.paused === true,
             queueStatus: typeof data.queueStatus === 'string' ? data.queueStatus : null,
             workerActive: data.workerActive === true,
+            detail: data.detail === "overview" ? "overview" : data.detail === "full" ? "full" : undefined,
         };
     }, [normalizeStages]);
 
@@ -4123,6 +4058,8 @@ export default function ClientPage() {
         } catch (error) {
             console.error("Job history fetch error:", error);
             setJobHistory([]);
+        } finally {
+            setJobHistoryLoadedFor(clientId);
         }
     }, [clientId, mapApiJobToJob]);
 
@@ -5054,6 +4991,24 @@ export default function ClientPage() {
 
         // Selected job from history only (completed / not live-watched).
         if (selectedFromHistory) {
+            const isOverview = selectedFromHistory.detail === "overview";
+            // Overview rows only carry lifecycle fields: their placeholder stages
+            // and default column mapping must not overwrite a job opened in full.
+            const incoming = isOverview
+                ? {
+                    id: selectedFromHistory.id,
+                    status: selectedFromHistory.status,
+                    error: selectedFromHistory.error,
+                    paused: selectedFromHistory.paused,
+                    completedAt: selectedFromHistory.completedAt,
+                    cost: selectedFromHistory.cost,
+                    activityMessage: selectedFromHistory.activityMessage,
+                    activityUpdatedAt: selectedFromHistory.activityUpdatedAt,
+                }
+                : selectedFromHistory;
+            if (isOverview && jobStateRef.current?.id !== selectedFromHistory.id) {
+                void fetchJobSnapshot(selectedFromHistory.id);
+            }
             setJobState((prev) => {
                 if (prev?.id === selectedFromHistory.id) {
                     if (
@@ -5062,7 +5017,7 @@ export default function ClientPage() {
                     ) {
                         return prev;
                     }
-                    const merged = mergeJobState(prev, selectedFromHistory);
+                    const merged = mergeJobState(prev, incoming);
                     if (
                         merged.status === prev.status
                         && merged.error === prev.error
@@ -5085,7 +5040,26 @@ export default function ClientPage() {
             setSelectedJobId(null);
             setJobState(null);
         }
-    }, [jobHistory, realtimeJobId, selectedJobId, mergeJobState]);
+    }, [jobHistory, realtimeJobId, selectedJobId, mergeJobState, fetchJobSnapshot]);
+
+    // The most recent job arrives in full with the history list: open it right
+    // away unless something is already showing. Once per client visit, so
+    // closing the panel keeps it closed.
+    const autoOpenedLatestForRef = useRef<string | null>(null);
+    useEffect(() => {
+        if (!clientId || jobHistoryLoadedFor !== clientId) return;
+        if (autoOpenedLatestForRef.current === clientId) return;
+        autoOpenedLatestForRef.current = clientId;
+        const latest = jobHistory[0];
+        if (!latest || jobStateRef.current || selectedJobId) return;
+        if (latest.status === ("discarded" as string) || latest.status === ("cancelled" as string)) return;
+        if (latest.status === "running" || latest.status === "queued") {
+            startJobWatch(latest.id);
+            return;
+        }
+        setSelectedJobId(latest.id);
+        setJobState(latest);
+    }, [clientId, jobHistoryLoadedFor, jobHistory, selectedJobId, startJobWatch]);
 
     // Instantly upload badges on history cards (not pipeline progress — do not poll during runs).
     const fetchJobsUploadStatus = useCallback(async () => {
@@ -10565,6 +10539,7 @@ export default function ClientPage() {
                         <>
                             <div style={{ marginTop: '2rem' }}>
                                 <div className="pipeline-toolbar">
+                                    <ProviderCredits />
                                     <button
                                         type="button"
                                         className="primary-button"
@@ -10606,81 +10581,41 @@ export default function ClientPage() {
                             </div>
 
                             {/* Pipeline Panel */}
-                            {pipelineVisible && jobState && (
-                                <div style={{ 
-                                    marginTop: '2rem',
-                                    background: 'var(--app-surface-3)',
-                                    border: '1px solid var(--app-border)',
-                                    borderRadius: '16px',
-                                    padding: '2rem',
-                                    position: 'relative'
-                                }}>
-                                    <button
-                                        type="button"
-                                        onClick={() => {
-                                            setSelectedJobId(null);
-                                            setJobState(null);
-                                            stopJobWatch();
-                                        }}
-                                        aria-label="Deselect job"
-                                        style={{
-                                            position: 'absolute',
-                                            top: '1rem',
-                                            right: '1rem',
-                                            background: 'var(--app-surface-3)',
-                                            border: '1px solid var(--app-border)',
-                                            borderRadius: '8px',
-                                            width: '32px',
-                                            height: '32px',
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            justifyContent: 'center',
-                                            cursor: 'pointer',
-                                            color: 'var(--app-text-muted)',
-                                            fontSize: '1.25rem',
-                                            transition: 'all 0.2s ease',
-                                            padding: 0
-                                        }}
-                                        onMouseEnter={(e) => {
-                                            e.currentTarget.style.background = 'var(--app-surface-hover)';
-                                            e.currentTarget.style.borderColor = 'var(--app-border-mid)';
-                                            e.currentTarget.style.color = 'var(--app-text)';
-                                        }}
-                                        onMouseLeave={(e) => {
-                                            e.currentTarget.style.background = 'var(--app-surface-3)';
-                                            e.currentTarget.style.borderColor = 'var(--app-border)';
-                                            e.currentTarget.style.color = 'var(--app-text-muted)';
-                                        }}
-                                    >
-                                        ×
-                                    </button>
-                                <div className="pipeline-panel__header">
-                                    <div>
-                                        <p className="eyebrow eyebrow--muted">
-                                            {jobState ? "Live pipeline" : "Pipeline monitor"}
-                                        </p>
-                                        <h2 className="pipeline-panel__title">
-                                            {jobState
-                                                ? `${stageCompletionPercent || 0}% completed`
-                                                : "No runs yet"}
-                                        </h2>
-                                        {!jobState && (
-                                            <p className="pipeline-panel__subtitle">
-                                                Upload leads to see stage progress and pipeline status.
-                                            </p>
-                                        )}
-                                        {jobState && (
-                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.35rem', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
-                                                <span>Valid leads: {validLeadsCompleted.toLocaleString()} · Job ID: {jobState.id}</span>
+                            {pipelineVisible && jobState && (() => {
+                                const runActive = jobState.status === 'running' || jobState.status === 'queued';
+                                const runStatus = jobState.paused ? 'paused' : jobState.status;
+                                const runStatusLabel = jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status];
+                                const percent = jobState.status === 'completed' ? 100 : (stageCompletionPercent || 0);
+                                const displayStageKeys = resolveDisplayStageKeys(jobState);
+                                return (
+                                <section className="pipeline-run" aria-label="Pipeline run">
+                                    <div className="pipeline-run__head">
+                                        <div className="pipeline-run__intro">
+                                            <div className="pipeline-run__eyebrow">
+                                                <span className={`run-status run-status--${runStatus}`}>{runStatusLabel}</span>
+                                                {jobState.status !== 'completed' && (
+                                                    <span className="pipeline-run__percent">{percent}% complete</span>
+                                                )}
+                                            </div>
+                                            <h2 className="pipeline-run__title">{jobState.fileName || 'Pipeline run'}</h2>
+                                            <div className="pipeline-run__meta">
+                                                <span>
+                                                    <strong>{validLeadsCompleted.toLocaleString()}</strong> valid leads
+                                                </span>
+                                                {displayJobCost !== null && displayJobCost > 0 && (
+                                                    <span>
+                                                        <strong><AnimatedNumber value={displayJobCost} decimals={2} prefix="$" /></strong> est. cost
+                                                    </span>
+                                                )}
+                                                <CopyableId value={jobState.id} label="Job ID" />
                                                 <button
                                                     type="button"
+                                                    className="pipeline-run__link"
                                                     onClick={() => {
-                                                        const currentJobId = jobState.id;
-                                                        if (!currentJobId) return;
                                                         const clause = {
                                                             field: 'job_id',
                                                             op: 'contains',
-                                                            value: currentJobId,
+                                                            value: jobState.id,
                                                             joinOp: 'AND' as const
                                                         };
                                                         setLeadFilters([{ id: createLeadFilterId(), ...clause }]);
@@ -10688,562 +10623,163 @@ export default function ClientPage() {
                                                         setLeadSearch("");
                                                         selectTab("leads");
                                                     }}
-                                                    title="View leads for this job"
-                                                    aria-label="View leads for this job"
-                                                    style={{
-                                                        display: 'inline-flex',
-                                                        alignItems: 'center',
-                                                        gap: '0.35rem',
-                                                        padding: '0.2rem 0.6rem',
-                                                        fontSize: '0.75rem',
-                                                        fontWeight: 500,
-                                                        lineHeight: 1.2,
-                                                        color: 'var(--app-text-muted)',
-                                                        background: 'var(--app-surface-2)',
-                                                        border: '1px solid var(--app-border)',
-                                                        borderRadius: '6px',
-                                                        cursor: 'pointer',
-                                                        transition: 'all 0.15s ease'
-                                                    }}
-                                                    onMouseEnter={(e) => {
-                                                        e.currentTarget.style.background = 'var(--app-surface-hover)';
-                                                        e.currentTarget.style.borderColor = 'var(--app-border-mid)';
-                                                        e.currentTarget.style.color = 'var(--app-text)';
-                                                    }}
-                                                    onMouseLeave={(e) => {
-                                                        e.currentTarget.style.background = 'var(--app-surface-2)';
-                                                        e.currentTarget.style.borderColor = 'var(--app-border)';
-                                                        e.currentTarget.style.color = 'var(--app-text-muted)';
-                                                    }}
                                                 >
-                                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                                                        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
-                                                    </svg>
+                                                    <Filter size={12} strokeWidth={2} aria-hidden="true" />
                                                     View leads
                                                 </button>
-                                            </p>
-                                        )}
-                                        {jobState && (
-                                            <div className="pipeline-status-row">
-                                                <p className="pipeline-panel__subtitle pipeline-panel__subtitle--status">
-                                                    Viewing job: {jobState.fileName || jobState.id} · {jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status]}
-                                                </p>
-                                                {(jobState.status === 'running' || jobState.status === 'queued' || jobState.paused) && (
-                                                    <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                                                        {(jobState.status === 'running' || jobState.paused) && (
-                                                            <button
-                                                                type="button"
-                                                                className="primary-button"
-                                                                onClick={handlePauseResumeJob}
-                                                                disabled={pausingJob || stoppingJob || completingJob}
-                                                                style={{ 
-                                                                    minWidth: '120px',
-                                                                    display: 'flex',
-                                                                    alignItems: 'center',
-                                                                    justifyContent: 'center',
-                                                                    gap: '0.5rem'
-                                                                }}
-                                                            >
-                                                                {pausingJob ? (
-                                                                    pendingPauseControlRef.current === 'resume'
-                                                                        ? 'Resuming...'
-                                                                        : 'Pausing...'
-                                                                ) : (
-                                                                    <>
-                                                                        {jobState.paused ? (
-                                                                            <>
-                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-                                                                                    <polygon points="5 3 19 12 5 21 5 3"/>
-                                                                                </svg>
-                                                                                Resume
-                                                                            </>
-                                                                        ) : (
-                                                                            <>
-                                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-                                                                                    <rect x="6" y="4" width="4" height="16"/>
-                                                                                    <rect x="14" y="4" width="4" height="16"/>
-                                                                                </svg>
-                                                                                Pause
-                                                                            </>
-                                                                        )}
-                                                                    </>
-                                                                )}
-                                                            </button>
-                                                        )}
-                                                        <button
-                                                            type="button"
-                                                            className="destructive-button"
-                                                            onClick={handleStopJob}
-                                                            disabled={stoppingJob || pausingJob || completingJob}
-                                                            style={{ minWidth: '100px' }}
-                                                        >
-                                                            {stoppingJob
-                                                                ? (jobState.paused ? 'Cancelling...' : 'Stopping...')
-                                                                : (jobState.paused ? 'Cancel run' : 'Stop run')}
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            className="secondary-button secondary-button--active"
-                                                            onClick={handleCompleteJob}
-                                                            disabled={completingJob || pausingJob || stoppingJob}
-                                                            style={{ minWidth: '148px' }}
-                                                        >
-                                                            {completingJob ? 'Completing...' : 'Mark completed'}
-                                                        </button>
-                                                    </div>
-                                                )}
                                             </div>
-                                        )}
-                                        {activeStatusLabel && jobState && (
-                                            <p className="pipeline-panel__subtitle" style={{ marginTop: '0.75rem' }}>
-                                                {activeStatusLabel}
-                                            </p>
-                                        )}
-                                        {(jobState?.status === 'running' || jobState?.status === 'queued') && recentJobLogLines.length > 0 && (
-                                            <ul
-                                                className="pipeline-panel__subtitle"
-                                                style={{
-                                                    marginTop: '0.5rem',
-                                                    marginBottom: 0,
-                                                    paddingLeft: '1.1rem',
-                                                    fontSize: '0.8rem',
-                                                    opacity: 0.75,
-                                                    lineHeight: 1.45
-                                                }}
-                                            >
-                                                {recentJobLogLines.map((line, index) => (
-                                                    <li key={`${line}-${index}`}>{line}</li>
-                                                ))}
-                                            </ul>
-                                        )}
-                                    </div>
-                                    {(jobState?.status === 'completed' || canUploadToInstantly) && (
-                                        <div className="pipeline-actions">
-                                            <button
-                                                type="button"
-                                                className="secondary-button secondary-button--active"
-                                                onClick={() => {
-                                                    setDownloadScope('all');
-                                                    setDownloadModalOpen(true);
-                                                }}
-                                            >
-                                                Download CSV
-                                            </button>
-                                            {canUploadToInstantly ? (
+                                        </div>
+                                        <div className="pipeline-run__actions">
+                                            {(jobState.status === 'running' || jobState.paused) && (
                                                 <button
                                                     type="button"
                                                     className="primary-button"
-                                                    onClick={handleUploadToInstantly}
-                                                    disabled={uploading}
+                                                    onClick={handlePauseResumeJob}
+                                                    disabled={pausingJob || stoppingJob || completingJob}
                                                 >
-                                                    {uploading ? 'Uploading...' : 'Upload to Instantly'}
-                                                </button>
-                                            ) : activeJobStatus === 'uploaded' ? (
-                                                <span
-                                                    style={{
-                                                        display: 'inline-flex',
-                                                        alignItems: 'center',
-                                                        padding: '0.35rem 0.75rem',
-                                                        borderRadius: '999px',
-                                                        fontSize: '0.75rem',
-                                                        fontWeight: 600,
-                                                        letterSpacing: '0.02em',
-                                                        background: 'var(--app-success-bg)',
-                                                        color: 'var(--app-success-text)',
-                                                        border: '1px solid var(--app-success-border)'
-                                                    }}
-                                                >
-                                                    {uploadedSummary}
-                                                </span>
-                                            ) : null}
-                                            {jobState?.status === 'completed' && (
-                                                <button
-                                                    type="button"
-                                                    className="secondary-button secondary-button--active"
-                                                    onClick={handleOpenJobPreviewLeads}
-                                                >
-                                                    Preview Leads
+                                                    {pausingJob
+                                                        ? (pendingPauseControlRef.current === 'resume' ? 'Resuming…' : 'Pausing…')
+                                                        : jobState.paused
+                                                            ? <><Play size={14} fill="currentColor" strokeWidth={0} aria-hidden="true" /> Resume</>
+                                                            : <><Pause size={14} fill="currentColor" strokeWidth={0} aria-hidden="true" /> Pause</>}
                                                 </button>
                                             )}
-                                            {canDiscardJob && (
-                                                <button
-                                                    type="button"
-                                                    className="destructive-button"
-                                                    onClick={handleDiscardJob}
-                                                >
-                                                    Discard
-                                                </button>
+                                            {(runActive || jobState.paused) && (
+                                                <>
+                                                    <button
+                                                        type="button"
+                                                        className="secondary-button secondary-button--active"
+                                                        onClick={handleCompleteJob}
+                                                        disabled={completingJob || pausingJob || stoppingJob}
+                                                    >
+                                                        {completingJob ? 'Completing…' : 'Mark completed'}
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="destructive-button"
+                                                        onClick={handleStopJob}
+                                                        disabled={stoppingJob || pausingJob || completingJob}
+                                                    >
+                                                        {stoppingJob
+                                                            ? (jobState.paused ? 'Cancelling…' : 'Stopping…')
+                                                            : (jobState.paused ? 'Cancel run' : 'Stop run')}
+                                                    </button>
+                                                </>
                                             )}
+                                            {jobState.status === 'completed' && (
+                                                <>
+                                                    <button
+                                                        type="button"
+                                                        className="secondary-button secondary-button--active"
+                                                        onClick={handleOpenJobPreviewLeads}
+                                                    >
+                                                        Preview leads
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="secondary-button secondary-button--active"
+                                                        onClick={() => {
+                                                            setDownloadScope('all');
+                                                            setDownloadModalOpen(true);
+                                                        }}
+                                                    >
+                                                        Download CSV
+                                                    </button>
+                                                    {canUploadToInstantly ? (
+                                                        <button
+                                                            type="button"
+                                                            className="primary-button"
+                                                            onClick={handleUploadToInstantly}
+                                                            disabled={uploading}
+                                                        >
+                                                            {uploading ? 'Uploading…' : 'Upload to Instantly'}
+                                                        </button>
+                                                    ) : activeJobStatus === 'uploaded' ? (
+                                                        <span className="run-status run-status--completed">{uploadedSummary}</span>
+                                                    ) : null}
+                                                    {canDiscardJob && (
+                                                        <button
+                                                            type="button"
+                                                            className="destructive-button"
+                                                            onClick={handleDiscardJob}
+                                                        >
+                                                            Discard
+                                                        </button>
+                                                    )}
+                                                </>
+                                            )}
+                                            <button
+                                                type="button"
+                                                className="pipeline-run__close"
+                                                onClick={() => {
+                                                    setSelectedJobId(null);
+                                                    setJobState(null);
+                                                    stopJobWatch();
+                                                }}
+                                                aria-label="Close pipeline"
+                                                title="Close"
+                                            >
+                                                <X size={16} strokeWidth={2} aria-hidden="true" />
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div
+                                        className={`pipeline-run__bar pipeline-run__bar--${runStatus}`}
+                                        role="progressbar"
+                                        aria-label="Run progress"
+                                        aria-valuemin={0}
+                                        aria-valuemax={100}
+                                        aria-valuenow={percent}
+                                    >
+                                        <span style={{ width: `${percent}%` }} />
+                                    </div>
+
+                                    {runActive && (activeStatusLabel || recentJobLogLines.length > 0) && (
+                                        <div className="pipeline-run__activity" aria-live="polite">
+                                            {activeStatusLabel && <p>{activeStatusLabel}</p>}
+                                            {recentJobLogLines.map((line, index) => (
+                                                <p key={`${line}-${index}`} className="pipeline-run__log">{line}</p>
+                                            ))}
                                         </div>
                                     )}
-                                </div>
 
-                                {jobState ? (
-                                    <>
-                                        {/* Pipeline flow summary */}
-                                        {(() => {
-                                            const dedupedTotal = deriveDedupedDomainBaseline(jobState);
-                                            const foundersFound = deriveStageTotals(jobState.stages.founders, dedupedTotal).throughputNum ?? 0;
-                                            const foundersProcessedRaw = deriveStageTotals(jobState.stages.founders, dedupedTotal).total ?? 0;
-                                            const foundersProcessed = foundersProcessedRaw > 0 ? foundersProcessedRaw : (dedupedTotal ?? 0);
-                                            const foundersFoundDisplay = foundersProcessed > 0 ? Math.min(foundersFound, foundersProcessed) : foundersFound;
-                                            const emailsFound = deriveStageTotals(jobState.stages.emailDiscovery, dedupedTotal).throughputNum ?? 0;
-                                            const safe = deriveStageTotals(jobState.stages.verification, dedupedTotal).throughputNum ?? 0;
-                                            const personalized = deriveStageTotals(jobState.stages.personalization, dedupedTotal).throughputNum ?? 0;
-                                            
+                                    <div className="stage-grid">
+                                        {displayStageKeys.map((stageKey, index) => {
+                                            const upstreamKey = index > 0 ? displayStageKeys[index - 1] : null;
+                                            const model = buildStageCardModel(stageKey, jobState.stages[stageKey], {
+                                                upstreamTitle: upstreamKey ? STAGE_METADATA[upstreamKey].title : null,
+                                                personalizeFirstLine: jobState.personalizeFirstLine === true,
+                                            });
+                                            const eta = model.tone === 'running' ? stageEtas[stageKey] : undefined;
                                             return (
-                                                <div style={{ 
-                                                    display: 'flex', 
-                                                    alignItems: 'center', 
-                                                    gap: '0.75rem',
-                                                    padding: '1rem 1.5rem',
-                                                    background: 'var(--app-surface-3)',
-                                                    borderRadius: '8px',
-                                                    border: '1px solid var(--app-border)',
-                                                    marginTop: '1.5rem',
-                                                    fontSize: '0.875rem',
-                                                    fontVariantNumeric: 'tabular-nums'
-                                                }}>
-                                                    <span style={{ opacity: 0.5, fontSize: '0.75rem' }}>Pipeline flow:</span>
-                                                    <span style={{ fontWeight: '600' }}><AnimatedNumber value={foundersProcessed} /></span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}><AnimatedNumber value={foundersFoundDisplay} /></span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600' }}><AnimatedNumber value={emailsFound} /></span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: 'var(--app-success-text)' }}><AnimatedNumber value={safe} /></span>
-                                                    <span style={{ opacity: 0.4 }}>→</span>
-                                                    <span style={{ fontWeight: '600', color: 'var(--app-info-text)' }}><AnimatedNumber value={personalized} /></span>
-                                                </div>
-                                            );
-                                        })()}
-
-                                        {displayJobCost !== null && displayJobCost > 0 && (
-                                            <div style={{
-                                                marginTop: "1rem",
-                                                padding: "0.75rem 1rem",
-                                                background: "var(--app-surface-3)",
-                                                borderRadius: "8px",
-                                                border: "1px solid var(--app-border)",
-                                                fontSize: "0.875rem",
-                                                fontVariantNumeric: "tabular-nums",
-                                            }}>
-                                                <span style={{ opacity: 0.65 }}>Estimated run cost </span>
-                                                <strong><AnimatedNumber value={displayJobCost} decimals={2} prefix="$" /></strong>
-                                            </div>
-                                        )}
-                                        
-                                        <div className="stage-grid" style={{ marginTop: '1.5rem' }}>
-                                        {resolveDisplayStageKeys(jobState).map((stageKey) => {
-                                            const stage = jobState.stages[stageKey];
-                                            const meta = STAGE_METADATA[stageKey];
-                                            const dedupedTotal = deriveDedupedDomainBaseline(jobState);
-                                            const { throughputNum, total } = deriveStageTotals(stage, dedupedTotal);
-                                            const summary = stage?.summary as Record<string, unknown> | null;
-                                            const batchAgg = stage?.progress?.batches && typeof stage.progress.batches === "object"
-                                                ? aggregateBatchProgress(stageKey, stage.progress.batches as Record<string, Record<string, unknown>>)
-                                                : null;
-                                            const stats = (batchAgg?.stats as Record<string, unknown> | undefined)
-                                                ?? (stage?.progress?.stats as Record<string, unknown> | undefined);
-                                            
-                                            // Simplified metrics based on stage type
-                                            let heroNumber = null;
-                                            let heroLabel = "";
-                                            let subtext = "";
-                                            let costFooter = "";
-                                            
-                                            if (stageKey === "domainPrep") {
-                                                const domainCheckSkipped = summary?.domainCheckSkipped === true;
-                                                const checked = (summary?.checked as number) ?? (summary?.normalized as number) ?? total ?? 0;
-                                                const live = (summary?.live as number) ?? 0;
-                                                const dead = (summary?.dead as number) ?? 0;
-                                                const unknown = (summary?.unknown as number) ?? 0;
-                                                const processable = (summary?.processable as number) ?? throughputNum ?? live;
-                                                heroNumber = processable;
-                                                heroLabel = "Processable";
-                                                subtext = domainCheckSkipped
-                                                    ? `${processable.toLocaleString()} processable • domain check skipped`
-                                                    : checked > 0
-                                                    ? `${checked.toLocaleString()} checked • ${live.toLocaleString()} live • ${dead.toLocaleString()} dead${unknown > 0 ? ` • ${unknown.toLocaleString()} unknown` : ""}`
-                                                    : "Awaiting...";
-                                            } else if (stageKey === "shopifyCatalog") {
-                                                const shopify = (summary?.shopify as number) ?? (stats?.shopify as number) ?? throughputNum ?? 0;
-                                                const nonShopify = (summary?.nonShopify as number) ?? 0;
-                                                const processed = (summary?.processed as number) ?? total ?? shopify + nonShopify;
-                                                heroNumber = shopify;
-                                                heroLabel = "Shopify";
-                                                subtext = processed > 0
-                                                    ? `${processed.toLocaleString()} scanned • ${nonShopify.toLocaleString()} non-Shopify`
-                                                    : "Awaiting...";
-                                            } else if (stageKey === "heroSelection") {
-                                                const heroes = (summary?.processed as number) ?? throughputNum ?? total ?? 0;
-                                                heroNumber = heroes;
-                                                heroLabel = "Heroes";
-                                                subtext = heroes > 0 ? `${heroes.toLocaleString()} products selected` : "Awaiting...";
-                                            } else if (stageKey === "serperShopping") {
-                                                const clean = (summary?.clean as number) ?? 0;
-                                                const none = (summary?.none as number) ?? 0;
-                                                const ambiguous = (summary?.ambiguous as number) ?? 0;
-                                                const matched = (summary?.matched as number) ?? clean;
-                                                const processed = (summary?.processed as number) ?? total ?? clean + none + ambiguous;
-                                                heroNumber = matched;
-                                                heroLabel = "Ads Matched";
-                                                subtext = processed > 0
-                                                    ? `${processed.toLocaleString()} queried • ${none.toLocaleString()} no match${ambiguous > 0 ? ` • ${ambiguous.toLocaleString()} ambiguous` : ""}`
-                                                    : "Awaiting...";
-                                                const serperCost = stageCostFromStage(stage);
-                                                if (serperCost !== null && serperCost > 0) costFooter = `Cost $${serperCost.toFixed(2)}`;
-                                            } else if (stageKey === "signalWaterfall") {
-                                                // summary.processed counts domains THROUGH the waterfall (incl. no-signal
-                                                // skips) — the emission count is summary.signals. PM2-written stage
-                                                // summaries predate the signals key; their processed IS the emission count.
-                                                const signals = (summary?.signals as number)
-                                                    ?? (stats?.signals as number)
-                                                    ?? (summary?.processed as number)
-                                                    ?? throughputNum
-                                                    ?? 0;
-                                                const candidates = (summary?.totalCandidates as number) ?? total ?? 0;
-                                                heroNumber = signals;
-                                                heroLabel = "Signals";
-                                                subtext = candidates > 0
-                                                    ? `${signals.toLocaleString()} emitted • ${candidates.toLocaleString()} candidates`
-                                                    : signals > 0
-                                                    ? `${signals.toLocaleString()} emitted`
-                                                    : "Awaiting...";
-                                            } else if (stageKey === "founders") {
-                                                const processedRaw = total ?? dedupedTotal ?? 0;
-                                                const processed = processedRaw > 0 ? Math.min(processedRaw, dedupedTotal ?? processedRaw) : (dedupedTotal ?? 0);
-                                                const found = processed > 0 ? Math.min(throughputNum ?? 0, processed) : (throughputNum ?? 0);
-                                                const skippedStage = summary?.skipped === true;
-                                                const importedFromCsv = stageImportedFromCsv(summary, stage?.status)
-                                                    || (!skippedStage
-                                                        && !extractNumberFrom(summary, ["Found", "found"])
-                                                        && (extractNumberFrom(summary, ["processed", "imported"]) ?? found) > 0);
-                                                const cost = stageCostFromStage(stage);
-                                                heroNumber = found;
-                                                heroLabel = importedFromCsv ? "Imported" : skippedStage ? "Skipped" : "Found";
-                                                subtext = importedFromCsv
-                                                    ? found > 0
-                                                        ? `${found.toLocaleString()} imported from CSV`
-                                                        : "Importing founder names from CSV…"
-                                                    : skippedStage
-                                                        ? "Not run for this job"
-                                                        : processed > 0
-                                                            ? `${processed.toLocaleString()} processed • ${((found / processed) * 100).toFixed(0)}% yield`
-                                                            : "Awaiting...";
-                                                if (cost !== null && cost > 0) costFooter = `Cost $${cost.toFixed(2)}`;
-                                            } else if (stageKey === "emailDiscovery") {
-                                                const skippedStage = summary?.skipped === true;
-                                                const skippedImport = stageImportedFromCsv(summary, stage?.status);
-                                                // Imports are stamped like finder results now, so the counts are real —
-                                                // no need to assume the whole domain baseline was imported.
-                                                const imported = extractNumberFrom(stats, ["imported", "Found", "found"])
-                                                    ?? (typeof stage?.progress?.found === "number"
-                                                        ? stage.progress.found
-                                                        : null)
-                                                    ?? extractNumberFrom(summary, ["imported", "Found", "found"])
-                                                    ?? throughputNum
-                                                    ?? 0;
-                                                const found = imported;
-                                                // Attempted finds = emailDone (`processed`), not `found` alone.
-                                                // Outcome split (Found / Not Found / errors) is preferred when
-                                                // present; otherwise processed is the spreadsheet truth. Using
-                                                // found as the denominator is what produced the fake 100% hit rate.
-                                                const notFound =
-                                                    extractNumberFrom(stats, ["Not Found", "not_found", "notFound"])
-                                                    ?? extractNumberFrom(summary, ["Not Found", "not_found", "notFound"])
-                                                    ?? (typeof stage?.progress?.notFound === "number"
-                                                        ? stage.progress.notFound
-                                                        : null)
-                                                    ?? 0;
-                                                const errored =
-                                                    extractNumberFrom(stats, ["errors", "Errors"])
-                                                    ?? extractNumberFrom(summary, ["errors", "Errors"])
-                                                    ?? 0;
-                                                const processedCount =
-                                                    typeof stage?.progress?.processed === "number"
-                                                        ? stage.progress.processed
-                                                        : extractNumberFrom(summary, ["processed"])
-                                                        ?? 0;
-                                                const outcomeChecked = found + notFound + errored;
-                                                const attempted = skippedImport
-                                                    ? found
-                                                    : Math.max(processedCount, outcomeChecked);
-                                                heroNumber = found;
-                                                heroLabel = skippedImport || (found > 0 && outcomeChecked === 0 && attempted > 0 && processedCount === 0)
-                                                    ? "Emails Imported"
-                                                    : skippedStage
-                                                        ? "Skipped"
-                                                        : "Emails Found";
-                                                subtext = skippedImport
-                                                    ? found > 0
-                                                        ? `${found.toLocaleString()} imported from CSV${notFound > 0 ? ` • ${notFound.toLocaleString()} already on another contact` : ""}`
-                                                        : "Importing emails from CSV…"
-                                                    : skippedStage
-                                                        ? "Not run for this job"
-                                                        : attempted > 0
-                                                            ? `${attempted.toLocaleString()} checked • ${((found / attempted) * 100).toFixed(1)}% hit rate`
-                                                            : "Awaiting...";
-                                                const emailCost = stageCostFromStage(stage);
-                                                if (emailCost !== null && emailCost > 0) {
-                                                    costFooter = `Cost $${emailCost.toFixed(2)}`;
-                                                }
-                                            } else if (stageKey === "verification") {
-                                                const safe =
-                                                    extractNumberFrom(stats, ["valid", "Valid"])
-                                                    ?? extractNumberFrom(summary, ["Valid", "valid"])
-                                                    ?? 0;
-                                                const risky =
-                                                    extractNumberFrom(summary, ["Valid-Risky", "valid-risky"])
-                                                    ?? extractNumberFrom(stats, ["valid-risky", "Valid-Risky"])
-                                                    ?? 0;
-                                                const checked =
-                                                    typeof batchAgg?.processed === "number"
-                                                        ? batchAgg.processed
-                                                        : typeof stage?.progress?.processed === "number"
-                                                        ? stage.progress.processed
-                                                        : total ?? 0;
-                                                // "Verified" = deliverable emails (safe + risky); "checked" = every
-                                                // verification performed, including invalid/unknown outcomes.
-                                                heroNumber = safe + risky;
-                                                heroLabel = "Verified";
-                                                const riskyText = risky > 0 ? ` • ${risky} Risky` : "";
-                                                // Statuses imported from the upload's email-status column (stage skipped).
-                                                const importedStatuses = summary?.skipped === true
-                                                    ? (extractNumberFrom(summary, ["imported", "verified", "Verified"]) ?? 0)
-                                                    : 0;
-                                                if (summary?.skipped === true && !stageImportedFromCsv(summary, stage?.status)) {
-                                                    heroLabel = "Skipped";
-                                                }
-                                                subtext =
-                                                    importedStatuses > 0
-                                                        ? `${safe.toLocaleString()} safe • ${importedStatuses.toLocaleString()} from CSV${riskyText}`
-                                                        : stageImportedFromCsv(summary, stage?.status)
-                                                            ? "Importing email statuses from CSV…"
-                                                            : summary?.skipped === true
-                                                                ? "Not run for this job — emails carry no status"
-                                                                : checked > 0
-                                                                    ? `${safe.toLocaleString()} safe • ${checked.toLocaleString()} checked${riskyText}`
-                                                                    : stage?.status === "completed"
-                                                                        ? "No emails to verify"
-                                                                        : "Awaiting...";
-                                                const verifyCost = stageCostFromStage(stage);
-                                                if (verifyCost !== null && verifyCost > 0) {
-                                                    costFooter = `Cost $${verifyCost.toFixed(2)}`;
-                                                }
-                                            } else if (stageKey === "personalization") {
-                                                const personalized =
-                                                    extractNumberFrom(stats, ["personalized", "Personalized"])
-                                                    ?? (typeof batchAgg?.processed === "number"
-                                                        ? batchAgg.processed
-                                                        : null)
-                                                    ?? (typeof stage?.progress?.processed === "number"
-                                                        ? stage.progress.processed
-                                                        : null)
-                                                    ?? extractNumberFrom(summary, ["personalized", "Personalized"])
-                                                    ?? throughputNum
-                                                    ?? 0;
-                                                const candidates =
-                                                    (typeof batchAgg?.total === "number" ? batchAgg.total : null)
-                                                    ?? total
-                                                    ?? extractNumberFrom(summary, ["total", "queued", "attempted"])
-                                                    ?? 0;
-                                                const processedNow =
-                                                    typeof batchAgg?.processed === "number"
-                                                        ? batchAgg.processed
-                                                        : typeof stage?.progress?.processed === "number"
-                                                        ? stage.progress.processed
-                                                        : personalized;
-                                                const failed = (summary?.failed as number) ?? (stats?.failed as number) ?? 0;
-                                                const skipped = summary?.skipped === true;
-                                                const shopifyStores = (summary?.shopifyStores as number) ?? (summary?.["Shopify Stores"] as number) ?? 0;
-                                                heroNumber = personalized;
-                                                heroLabel = "Ready";
-                                                if (skipped && jobState.personalizeFirstLine !== true) {
-                                                    heroLabel = "Skipped";
-                                                    subtext = "Not enabled for this job";
-                                                } else if (stage?.status === "completed" && skipped) {
-                                                    subtext =
-                                                        shopifyStores > 0
-                                                            ? `Skipped — ${shopifyStores.toLocaleString()} Shopify, 0 personalized`
-                                                            : "Skipped — no Shopify stores / no eligible leads";
-                                                } else if (
-                                                    stage?.status === "running"
-                                                    && candidates > 0
-                                                ) {
-                                                    subtext = `${processedNow.toLocaleString()} / ${candidates.toLocaleString()} personalized`;
-                                                } else if (candidates > 0) {
-                                                    subtext = `${candidates.toLocaleString()} total`;
-                                                } else if (stage?.status === "completed") {
-                                                    subtext = "Completed — none personalized";
-                                                } else {
-                                                    subtext = "Awaiting...";
-                                                }
-                                                if (failed > 0) subtext += ` • ${failed} failed`;
-                                                const personalizationCost = stageCostFromStage(stage);
-                                                if (personalizationCost !== null && personalizationCost > 0) {
-                                                    costFooter = `Cost $${personalizationCost.toFixed(2)}`;
-                                                }
-                                            }
-                                            
-                                            return (
-                                                <article
-                                                    key={stageKey}
-                                                    className={`stage-card stage-card--${stage?.status ?? "pending"} ${stage?.status === "running" ? "stage-card--running" : ""} ${summary?.skipped === true && !stageImportedFromCsv(summary, stage?.status) ? "stage-card--skipped" : ""}`}
-                                                >
+                                                <article key={stageKey} className={`stage-card stage-card--${model.tone}`}>
                                                     <div className="stage-card__head">
-                                                        <div>
-                                                            <p className="stage-card__label">{meta.title}</p>
-                                                        </div>
-                                                        <span className="stage-card__status">{formatStageChip(stage)}</span>
+                                                        <p className="stage-card__label">{STAGE_METADATA[stageKey].title}</p>
+                                                        <span className={`stage-chip stage-chip--${model.tone}`}>{model.chip}</span>
                                                     </div>
-                                                    
-                                                    {isCreditExhaustionText(stage?.error) ? (
-                                                        <p className="stage-card__error">Add credits to TryKitt, then resume.</p>
-                                                    ) : stage?.error ? (
-                                                        <p className="stage-card__error">{stage.error}</p>
-                                                    ) : heroNumber !== null ? (
-                                                        <>
-                                                            <div style={{ marginTop: '0.75rem' }}>
-                                                                <div style={{ fontSize: '2.25rem', fontWeight: '700', lineHeight: '1' }}>
-                                                                    <AnimatedNumber value={heroNumber} />
-                                                                    <span style={{ fontSize: '1rem', fontWeight: '500', marginLeft: '0.5rem', opacity: 0.7 }}>{heroLabel}</span>
-                                                                </div>
-                                                                <div style={{ fontSize: '0.875rem', marginTop: '0.5rem', opacity: 0.65 }}>
-                                                                    {subtext}
-                                                                </div>
-                                                                {stageEtas[stageKey] && (
-                                                                    <div style={{ fontSize: '0.75rem', marginTop: '0.35rem', opacity: 0.5, fontVariantNumeric: 'tabular-nums' }}>
-                                                                        ~{stageEtas[stageKey]} remaining
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                            {costFooter && (
-                                                                <div style={{ fontSize: '0.75rem', marginTop: '0.75rem', opacity: 0.5 }}>
-                                                                    {costFooter}
-                                                                </div>
-                                                            )}
-                                                        </>
-                                                    ) : (
-                                                        <p className="stage-card__progress" style={{ marginTop: '0.75rem', opacity: 0.6 }}>
-                                                            {describeStageProgress(stage)}
-                                                        </p>
-                                                    )}
+                                                    <div className="stage-card__hero">
+                                                        {model.hero === null ? (
+                                                            <span className="stage-card__hero-value stage-card__hero-value--empty">—</span>
+                                                        ) : (
+                                                            <span className="stage-card__hero-value"><AnimatedNumber value={model.hero} /></span>
+                                                        )}
+                                                        {model.heroLabel && <span className="stage-card__hero-label">{model.heroLabel}</span>}
+                                                    </div>
+                                                    <p className={`stage-card__detail${model.tone === 'error' ? ' stage-card__detail--error' : ''}`}>
+                                                        {model.detail}
+                                                    </p>
+                                                    <div className="stage-card__foot">
+                                                        <span>{model.cost !== null ? `Cost ${formatStageCost(model.cost)}` : ''}</span>
+                                                        {eta && <span>~{eta} left</span>}
+                                                    </div>
                                                 </article>
                                             );
                                         })}
                                     </div>
-                                    </>
-                                ) : (
-                                    <div className="pipeline-panel__empty" style={{ marginTop: '1.5rem' }}>
-                                        <p>No pipeline runs yet.</p>
-                                        <p className="pipeline-panel__subtitle">
-                                            Upload a CSV to start processing leads.
-                                        </p>
-                                    </div>
-                                )}
-                                </div>
-                            )}
+                                </section>
+                                );
+                            })()}
 
                             {!pipelineVisible && jobState && (
                                 <div style={{ marginTop: '2rem', textAlign: 'center' }}>
@@ -11582,6 +11118,16 @@ export default function ClientPage() {
                                                     </div>
                                                 );
                                             })}
+                                        </div>
+                                    ) : jobHistoryLoadedFor !== clientId ? (
+                                        <div className="job-history-loading" role="status" aria-live="polite">
+                                            <span className="job-history-loading__label">Loading pipeline jobs…</span>
+                                            {[0, 1, 2].map((row) => (
+                                                <div key={row} className="job-history-loading__row" aria-hidden="true">
+                                                    <span className="job-history-loading__line job-history-loading__line--title" />
+                                                    <span className="job-history-loading__line" />
+                                                </div>
+                                            ))}
                                         </div>
                                     ) : (
                                         <p className="pipeline-panel__subtitle" style={{ marginTop: '1rem' }}>

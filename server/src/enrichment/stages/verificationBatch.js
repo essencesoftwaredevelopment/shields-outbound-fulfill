@@ -1,4 +1,5 @@
 import { runEmailVerifier } from '../../services/emailVerifier.js';
+import { DEFAULT_PRICING } from '../../utils/pricing.js';
 import { getVerifyQueue, getJobById } from '../../services/db/jobs.js';
 import { upsertLeadRowsBatch } from '../../services/leads.js';
 import { assertJobActive } from '../persist.js';
@@ -13,6 +14,7 @@ import {
 } from '../stageProgress.js';
 import { shouldScheduleChildReconcile } from '../reconcilePolicy.js';
 import { isEnrowEnabled } from './enrowBatch.js';
+import { refreshProviderCreditsAfterBatch } from '../../services/providerCredits.js';
 
 /**
  * TryKitt emails that stay throttled / timed out are handed to Enrow's verifier
@@ -131,7 +133,8 @@ export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
         rateLimitHooks: createRateLimitHooks(ctx),
         checkpoint: () => assertJobActive(ctx.jobId, ctx.agencyId),
         checkPaused: () => assertJobActive(ctx.jobId, ctx.agencyId),
-        pricing: ctx.pricing,
+        // The service reads this stage's rates, not the whole { stages } map.
+        pricing: ctx.pricing?.stages?.verification || DEFAULT_PRICING.stages.verification,
         onBatch: async (rows) => {
             if (!rows?.length) return;
             await upsertLeadRowsBatch({
@@ -151,7 +154,11 @@ export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
     try {
         summary = await verify(candidates);
     } catch (err) {
-        if (err?.code !== 'TRYKITT_THROTTLED' || !isEnrowEnabled(ctx, 'verify')) throw err;
+        if (err?.code !== 'TRYKITT_THROTTLED' || !isEnrowEnabled(ctx, 'verify')) {
+            // Possibly out of credits: refresh now so the Pipeline tab shows it.
+            await refreshProviderCreditsAfterBatch(ctx.agencyId, { force: true });
+            throw err;
+        }
         summary = await handOffStuckEmailsToEnrow(ctx, {
             err,
             verify,
@@ -165,6 +172,7 @@ export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
             stageLog
         });
     }
+    await refreshProviderCreditsAfterBatch(ctx.agencyId);
 
     await finishJobStage(ctx, 'verification', summary);
     return summary;

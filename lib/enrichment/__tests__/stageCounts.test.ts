@@ -223,3 +223,60 @@ describe('stageCountsToStages (email discovery hit rate)', () => {
     assert.equal(2377 + 5842, 8219);
   });
 });
+
+/** Standard job mid-run: parallel batches mean founders is still searching while
+ *  later stages have caught up with everything produced so far. */
+function midRunCounts(overrides: Partial<JobStageCounts> = {}): JobStageCounts {
+  return {
+    jobId: 'mid-run',
+    pipelineMode: 'standard',
+    domainPrep: {
+      total: 845,
+      pending: 400,
+      processing: 0,
+      done: 444,
+      skipped: 1,
+      processable: 844,
+      dns: { checked: 845, live: 843, dead: 1, unknown: 1, skipped: 0 },
+    },
+    founders: { processed: 444, found: 200 },
+    emailDiscovery: { processed: 200, found: 30, notFound: 170 },
+    verification: { verified: 30, valid: 25, invalid: 5, unknown: 0, validRisky: 0 },
+    personalization: { processed: 25, personalized: 25 },
+    contacts: { total: 844 },
+    ...overrides,
+  };
+}
+
+describe('stageCountsToStages (monotonic stage status)', () => {
+  it('keeps caught-up stages running while an earlier stage is still feeding them', () => {
+    const stages = stageCountsToStages(midRunCounts(), null, { jobRunning: true });
+    assert.equal(stages.founders?.status, 'running');
+    // Each of these has processed >= its current total, but more input is coming.
+    assert.equal(stages.emailDiscovery?.status, 'running');
+    assert.equal(stages.verification?.status, 'running');
+    assert.equal(stages.personalization?.status, 'running');
+  });
+
+  it('completes stages in order once their upstream has finished', () => {
+    const stages = stageCountsToStages(
+      midRunCounts({
+        domainPrep: {
+          total: 845, pending: 0, processing: 0, done: 844, skipped: 1, processable: 844,
+          dns: { checked: 845, live: 843, dead: 1, unknown: 1, skipped: 0 },
+        },
+        founders: { processed: 844, found: 371 },
+        emailDiscovery: { processed: 371, found: 54, notFound: 317 },
+        verification: { verified: 40, valid: 35, invalid: 5, unknown: 0, validRisky: 0 },
+      }),
+      null,
+      { jobRunning: true },
+    );
+    assert.equal(stages.founders?.status, 'completed');
+    // Denominator is founders found (371), not every contact on the job (844).
+    assert.equal(stages.emailDiscovery?.progress?.total, 371);
+    assert.equal(stages.emailDiscovery?.status, 'completed');
+    assert.equal(stages.verification?.status, 'running');
+    assert.equal(stages.personalization?.status, 'running');
+  });
+});
