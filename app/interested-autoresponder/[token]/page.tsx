@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2, Phone } from "lucide-react";
+import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2, MessageSquare, Phone } from "lucide-react";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import {
@@ -54,7 +54,7 @@ type ReviewDraft = {
     phone?: {
         number: string | null;
         country: string | null;
-        telUri: string | null;
+        links: { facetime: string; sms: string } | null;
         status: "found" | "not_found" | "pending" | "timeout" | "error" | string;
     } | null;
 };
@@ -1015,21 +1015,25 @@ export default function InterestedAutoResponderReviewPage() {
                             </div>
                             <div className="ar-header__links">
                                 {draft.phone?.number && (
-                                    draft.phone.telUri ? (
-                                        <a
-                                            className="ar-link"
-                                            href={draft.phone.telUri}
-                                            title={draft.phone.country ? `Call (${draft.phone.country})` : "Call"}
-                                        >
+                                    <span
+                                        className="ar-link ar-link--static"
+                                        title={draft.phone.country ? `Phone (${draft.phone.country})` : "Phone"}
+                                    >
+                                        <Phone size={15} strokeWidth={2} />
+                                        {draft.phone.number}
+                                    </span>
+                                )}
+                                {draft.phone?.links && (
+                                    <>
+                                        <a className="ar-link" href={draft.phone.links.facetime} title="Call with FaceTime Audio">
                                             <Phone size={15} strokeWidth={2} />
-                                            {draft.phone.number}
+                                            FaceTime
                                         </a>
-                                    ) : (
-                                        <span className="ar-link ar-link--static">
-                                            <Phone size={15} strokeWidth={2} />
-                                            {draft.phone.number}
-                                        </span>
-                                    )
+                                        <a className="ar-link" href={draft.phone.links.sms} title="Send a text">
+                                            <MessageSquare size={15} strokeWidth={2} />
+                                            Text
+                                        </a>
+                                    </>
                                 )}
                                 {!draft.phone?.number && phoneStatusLabel(draft.phone?.status) && (
                                     <span className="ar-link ar-link--static ar-link--muted">

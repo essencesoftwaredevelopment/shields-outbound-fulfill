@@ -1144,21 +1144,22 @@ async function settleWithin(promise, ms) {
     }
 }
 
-/** E.164-ish number safe for a `tel:` URI, or null. */
-export function telUriForPhone(number) {
+/** FaceTime audio + SMS URIs for an E.164-ish number, or null when too short to dial. */
+export function phoneLinksForPhone(number) {
     const digits = String(number || '').replace(/[^\d+]/g, '');
     const normalized = digits.startsWith('+') ? `+${digits.slice(1).replace(/\+/g, '')}` : digits.replace(/\+/g, '');
-    return normalized.replace(/\D/g, '').length >= 6 ? `tel:${normalized}` : null;
+    if (normalized.replace(/\D/g, '').length < 6) return null;
+    return { facetime: `facetime-audio://${normalized}`, sms: `sms:${normalized}` };
 }
 
 function formatPhoneLine(phone) {
     return phone.country ? `${phone.number} (${phone.country})` : phone.number;
 }
 
-/** ntfy "Call" button (view action → tel:), when there is a number. */
+/** ntfy "FaceTime" + "Text" buttons (view actions), when there is a number. */
 export function ntfyCallActionHeader(phone) {
-    const tel = telUriForPhone(phone?.number);
-    return tel ? { 'Actions': `view, Call, ${tel}` } : {};
+    const links = phoneLinksForPhone(phone?.number);
+    return links ? { 'Actions': `view, FaceTime, ${links.facetime}; view, Text, ${links.sms}` } : {};
 }
 
 /** Founder phone found by the Enrow lookup, or null. */
@@ -2240,7 +2241,7 @@ export function serializeReviewPhone(draft) {
     return {
         number: number || null,
         country: number ? draft.contact_phone_country || null : null,
-        telUri: number ? telUriForPhone(number) : null,
+        links: number ? phoneLinksForPhone(number) : null,
         status: number ? 'found' : status
     };
 }
