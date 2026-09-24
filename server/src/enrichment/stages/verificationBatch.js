@@ -162,7 +162,10 @@ export async function runVerificationBatch(ctx, batchDomains, batchOpts = {}) {
         summary = await handOffStuckEmailsToEnrow(ctx, {
             err,
             verify,
-            batchSize: candidates.length,
+            // The batch's full size, not this attempt's queue: a retried step only
+            // reloads the emails still unverified (e.g. the 9 slow ones of 100), and
+            // judging 9-of-9 as "TryKitt is down" failed every retry.
+            batchSize: Math.max(candidates.length, Array.isArray(batchDomains) ? batchDomains.length : 0),
             queueOpts: {
                 reprocessInclude,
                 limit: batchDomains.length + 500,

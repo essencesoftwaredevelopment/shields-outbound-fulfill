@@ -15,7 +15,10 @@ export const DEFAULT_PRICING = {
             openai_per_million_output: 2.0
         },
         serperShopping: { request_cost: 0.001 },
-        headlessRescue: { request_cost: 0.05 }
+        headlessRescue: { request_cost: 0.05 },
+        /** Enrow fallback: billed in credits. Finder misses are refunded, so a
+         *  find costs a credit only when Enrow returns an email. */
+        enrow: { credit_usd: 0.012, find_credits: 1, verify_credits: 0.25 }
     },
     currency: 'USD'
 };
@@ -46,6 +49,7 @@ export async function loadPricing(uid) {
     pricing.stages.personalization = pricing.stages.personalization || DEFAULT_PRICING.stages.personalization;
     pricing.stages.serperShopping = pricing.stages.serperShopping || DEFAULT_PRICING.stages.serperShopping;
     pricing.stages.headlessRescue = pricing.stages.headlessRescue || DEFAULT_PRICING.stages.headlessRescue;
+    pricing.stages.enrow = pricing.stages.enrow || DEFAULT_PRICING.stages.enrow;
     return pricing;
 }
 

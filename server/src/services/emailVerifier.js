@@ -328,6 +328,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
     let completed = 0;
     let creditExhausted = false;
     let transientSkipped = 0;
+    let transientTimedOut = 0;
     let stageCost = 0;
     const controller = new AbortController();
 
@@ -436,6 +437,7 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
                 // below once the batch drains.
                 if (result?.transient) {
                     transientSkipped += 1;
+                    if (result.validity === 'timeout') transientTimedOut += 1;
                     return;
                 }
 
@@ -527,7 +529,9 @@ export async function runEmailVerifier({ inputCsv, outputCsv, candidates: candid
         }
         if (transientSkipped > 0) {
             log(`Verify: ${transientSkipped}/${toVerify.length} throttled or timed out — left unverified for a resume to retry.`);
-            throw createTryKittThrottledError('email verification', transientSkipped, toVerify.length);
+            throw createTryKittThrottledError('email verification', transientSkipped, toVerify.length, {
+                timedOut: transientTimedOut
+            });
         }
     } catch (error) {
         if (controller.signal.aborted) {

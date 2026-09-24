@@ -5545,3 +5545,55 @@ textarea {
     animation: none;
   }
 }
+
+/* Info tab: Instantly lead cleanup */
+.instantly-cleanup__controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.5rem;
+  margin-top: 0.25rem;
+}
+
+.instantly-cleanup__toggle,
+.instantly-cleanup__days {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--app-text);
+}
+
+.instantly-cleanup__toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--app-success-solid);
+  cursor: pointer;
+}
+
+.settings-field .instantly-cleanup__days input[type="number"] {
+  width: 5.5rem;
+  height: 36px;
+  min-height: 36px;
+  border-radius: 10px;
+  padding: 0 0.6rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.instantly-cleanup__line {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--app-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.instantly-cleanup__line strong {
+  color: var(--app-text);
+}
+
+.instantly-cleanup__error {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--app-danger-text);
+}

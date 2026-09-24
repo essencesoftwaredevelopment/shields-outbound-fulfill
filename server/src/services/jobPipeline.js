@@ -550,6 +550,8 @@ function enrowContextForJob(job) {
         agencyId: job.uid,
         clientId: job.sqlClientId,
         apiKeys: job.apiKeys || {},
+        // Enrow credit rates for the batch cost (agency overrides included).
+        pricing: job.pricing || null,
         options: {
             dedupeStrategy: job.dedupeStrategy || 'skip',
             skipEmailFinder: !!job.skipEmailFinder,

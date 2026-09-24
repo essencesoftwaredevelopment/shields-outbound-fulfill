@@ -81,4 +81,18 @@ describe('createTryKittThrottledError', () => {
         assert.match(err.message, /email verification/);
         assert.match(err.message, /resume/i);
     });
+
+    it('says "timed out" and skips the rate-limit advice when nothing was throttled', () => {
+        const err = createTryKittThrottledError('email verification', 9, 9, { timedOut: 9 });
+        assert.equal(err.code, 'TRYKITT_THROTTLED');
+        assert.match(err.message, /timed out on 9 of 9 email verification requests/);
+        assert.doesNotMatch(err.message, /throttled/);
+        assert.doesNotMatch(err.message, /TRYKITT_MAX_CONCURRENT/);
+    });
+
+    it('splits throttled from timed-out and keeps the rate-limit advice', () => {
+        const err = createTryKittThrottledError('email verification', 12, 100, { timedOut: 5 });
+        assert.match(err.message, /throttled 7 and timed out on 5 of 100/);
+        assert.match(err.message, /TRYKITT_MAX_CONCURRENT/);
+    });
 });

@@ -33,6 +33,7 @@ import resendWebhookRouter from './routes/resendWebhook.js';
 import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobPipeline.js';
 import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/jobRunner.js';
 import { startAnalyticsSnapshotSweep } from './services/analyticsSnapshots.js';
+import { startInstantlyCleanupSweep } from './services/instantlyCleanup.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
@@ -124,6 +125,7 @@ app.get('/health', (req, res) => {
 });
 
 let stopAnalyticsSnapshotSweep = () => {};
+let stopInstantlyCleanupSweep = () => {};
 
 const server = app.listen(PORT, async () => {
     if (env.DB_WRITE_FREEZE) {
@@ -137,6 +139,7 @@ const server = app.listen(PORT, async () => {
         console.error('Database connectivity check failed:', err.message);
     }
     stopAnalyticsSnapshotSweep = startAnalyticsSnapshotSweep(pool);
+    stopInstantlyCleanupSweep = startInstantlyCleanupSweep();
 });
 
 server.on('error', (err) => {
@@ -176,6 +179,7 @@ async function gracefulShutdown(signal) {
 
     server.close?.();
     stopAnalyticsSnapshotSweep();
+    stopInstantlyCleanupSweep();
 
     try {
         const cancelled = await cancelActiveJobsOnShutdown('Interrupted (server shutdown)');

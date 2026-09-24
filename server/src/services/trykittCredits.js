@@ -69,12 +69,29 @@ export function createCreditExhaustedError(stage = '') {
  * @param {number} skipped rows left unprocessed
  * @param {number} total rows attempted in this batch
  */
-export function createTryKittThrottledError(stage, skipped, total) {
-    const err = new Error(
-        `TryKitt throttled or timed out on ${skipped} of ${total} ${stage} requests — `
-        + `they were left unprocessed; resume the job to retry them. If the account is on `
-        + `the free tier, lower TRYKITT_MAX_CONCURRENT / TRYKITT_RPM_LIMIT or upgrade the plan.`
-    );
+/**
+ * @param {string} stage
+ * @param {number} skipped requests left without a verdict
+ * @param {number} total
+ * @param {{ timedOut?: number | null }} [opts] how many of `skipped` were timeouts
+ *        (slow recipient mail servers — rate limits don't help); unknown when omitted.
+ */
+export function createTryKittThrottledError(stage, skipped, total, { timedOut = null } = {}) {
+    const throttled = timedOut === null ? null : Math.max(0, skipped - timedOut);
+    let what;
+    if (timedOut !== null && throttled === 0) {
+        what = `TryKitt timed out on ${skipped} of ${total} ${stage} requests (the recipients' mail servers did not answer in time)`;
+    } else if (timedOut) {
+        what = `TryKitt throttled ${throttled} and timed out on ${timedOut} of ${total} ${stage} requests`;
+    } else {
+        what = timedOut === null
+            ? `TryKitt throttled or timed out on ${skipped} of ${total} ${stage} requests`
+            : `TryKitt throttled ${skipped} of ${total} ${stage} requests`;
+    }
+    const advice = throttled === 0
+        ? ''
+        : ` If the account is on the free tier, lower TRYKITT_MAX_CONCURRENT / TRYKITT_RPM_LIMIT or upgrade the plan.`;
+    const err = new Error(`${what} — they were left unprocessed; resume the job to retry them.${advice}`);
     err.code = 'TRYKITT_THROTTLED';
     err.userFacing = true;
     err.retryable = true;

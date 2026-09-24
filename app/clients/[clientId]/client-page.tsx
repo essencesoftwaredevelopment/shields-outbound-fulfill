@@ -52,6 +52,7 @@ import {
 import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
 import { ProviderCredits } from "@/components/provider-credits";
 import { CopyableId } from "@/components/copyable-id";
+import { InstantlyCleanupSettings } from "@/components/instantly-cleanup-settings";
 import { buildStageCardModel, formatStageCost } from "@/lib/pipeline/stageCardModel";
 import { useConfirm } from "@/components/confirm-dialog";
 import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
@@ -11349,6 +11350,7 @@ export default function ClientPage() {
                                     )}
                                 </div>
                             </label>
+                            {clientId && <InstantlyCleanupSettings clientId={clientId} />}
                             <div className="settings-field">
                                 <span className="settings-field__label">Instantly CSV Merge Import</span>
                                 <span className="settings-field__hint" style={{ marginBottom: '0.5rem' }}>

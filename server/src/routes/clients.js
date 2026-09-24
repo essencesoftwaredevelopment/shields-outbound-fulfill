@@ -53,6 +53,12 @@ import {
     sanitizeHtml
 } from '../services/followUpSender.js';
 import { runFollowUpsForClient } from '../services/followUpSender.js';
+import {
+    getCleanupSettings,
+    getLatestCleanupRun,
+    previewCleanup,
+    updateCleanupSettings
+} from '../services/instantlyCleanup.js';
 import { shouldUseAiFollowUpCopy } from '../services/warmFollowUpGeneration/prompt.js';
 import {
     getGenerationRun,
@@ -552,6 +558,53 @@ router.get('/clients/:clientId/instantly/lead-labels', requireAuth, async (req, 
         const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 502;
         console.error('GET instantly lead-labels error:', error?.message || error);
         res.status(statusCode).json({ error: error?.statusCode ? error.message : 'Failed to fetch Instantly lead labels.' });
+    }
+});
+
+// Automatic Instantly lead cleanup (Info tab): settings, what a run would
+// delete right now, and the latest run's summary.
+router.get('/clients/:clientId/instantly-cleanup', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const row = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const settings = await getCleanupSettings(row.id);
+        const instantlyKey = String(row.instantly_key || '').trim();
+        let preview = null;
+        let previewError = null;
+        if (instantlyKey) {
+            try {
+                preview = await previewCleanup({ clientSqlId: row.id, instantlyKey, days: settings.days });
+            } catch (error) {
+                previewError = error?.message || 'Preview failed';
+            }
+        } else {
+            previewError = 'Client is missing Instantly API key.';
+        }
+        res.json({ settings, preview, previewError, lastRun: await getLatestCleanupRun(row.id) });
+    } catch (error) {
+        console.error('GET instantly-cleanup error:', error?.message || error);
+        res.status(500).json({ error: 'Failed to load Instantly cleanup settings.' });
+    }
+});
+
+// Body: { enabled?: boolean, days?: integer 1–365 }
+router.put('/clients/:clientId/instantly-cleanup', requireAuth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+            return res.status(400).json({ error: 'enabled must be a boolean.' });
+        }
+        if (body.days !== undefined && (!Number.isInteger(body.days) || body.days < 1 || body.days > 365)) {
+            return res.status(400).json({ error: 'days must be a whole number between 1 and 365.' });
+        }
+        const row = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const settings = await updateCleanupSettings(row.id, { enabled: body.enabled, days: body.days });
+        res.json({ settings });
+    } catch (error) {
+        console.error('PUT instantly-cleanup error:', error?.message || error);
+        res.status(500).json({ error: 'Failed to save Instantly cleanup settings.' });
     }
 });
 

@@ -13,6 +13,8 @@
  * skipped or timed out is picked up again by a resume.
  */
 import { refreshProviderCreditsAfterBatch } from '../../services/providerCredits.js';
+import { addJobStageCost } from '../../services/db/jobStageCosts.js';
+import { DEFAULT_PRICING } from '../../utils/pricing.js';
 import {
     submitEnrowFindBulk,
     submitEnrowVerifyBulk,
@@ -56,6 +58,36 @@ async function reportActivity(ctx, kind, message) {
         await setJobActivity(ctx.jobId, ctx.agencyId, message);
     } catch {
         // activity text is cosmetic
+    }
+}
+
+/**
+ * USD cost of an applied Enrow batch. Enrow bills credits: a find costs
+ * `find_credits` per email it returns (misses are refunded), a verification
+ * `verify_credits` per email checked, each credit `credit_usd`.
+ *
+ * @param {'find' | 'verify'} kind
+ * @param {number} units emails Enrow found (find) / emails verified (verify)
+ * @param {object | null} [pricing] ctx.pricing ({ stages: {...} })
+ */
+export function enrowBatchCost(kind, units, pricing) {
+    const rates = { ...DEFAULT_PRICING.stages.enrow, ...(pricing?.stages?.enrow || {}) };
+    const perUnit = kind === 'find' ? Number(rates.find_credits) : Number(rates.verify_credits);
+    const cost = Math.max(0, Number(units) || 0) * (perUnit || 0) * (Number(rates.credit_usd) || 0);
+    return Number(cost.toFixed(6));
+}
+
+/** Enrow runs inside these stages, so its spend shows on their cards. */
+const COST_STAGE = { find: 'emailDiscovery', verify: 'verification' };
+
+async function recordEnrowCost(ctx, kind, units) {
+    const cost = enrowBatchCost(kind, units, ctx.pricing);
+    if (!(cost > 0)) return;
+    try {
+        await addJobStageCost(ctx.jobId, ctx.agencyId, COST_STAGE[kind], cost);
+    } catch (err) {
+        // Cost is bookkeeping: never fail a batch whose results are already applied.
+        logLine(ctx, kind, `cost record failed: ${err?.message || err}`);
     }
 }
 
@@ -184,6 +216,8 @@ export async function collectEnrowBatch(ctx, kind, requestId) {
             found
         );
         await closeEnrowRequest(requestId, { status: 'applied', found: written, creditsFinal: credits.final });
+        // Billed per email Enrow returned, including ones skipped as duplicates here.
+        await recordEnrowCost(ctx, kind, found.length);
         await reportActivity(
             ctx,
             kind,
@@ -196,6 +230,7 @@ export async function collectEnrowBatch(ctx, kind, requestId) {
         const { verdicts, credits } = mapEnrowVerifyResults(body, items);
         const counts = await applyEnrowVerifyResults(ctx.agencyId, items, verdicts);
         await closeEnrowRequest(requestId, { status: 'applied', found: counts.valid, creditsFinal: credits.final });
+        await recordEnrowCost(ctx, kind, items.length);
         await reportActivity(
             ctx,
             kind,

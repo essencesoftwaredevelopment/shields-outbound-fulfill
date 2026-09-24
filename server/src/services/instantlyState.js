@@ -529,7 +529,7 @@ async function sleepWithCancellation(ms, syncRunId = null) {
     }
 }
 
-async function instantlyRequest({ apiKey, path, method = 'GET', body, syncRunId = null }) {
+export async function instantlyRequest({ apiKey, path, method = 'GET', body, syncRunId = null }) {
     for (let attempt = 0; attempt <= INSTANTLY_MAX_RETRIES; attempt += 1) {
         await assertSyncRunNotCancelled(syncRunId);
         await waitForInstantlyRateLimitSlot(apiKey, syncRunId);
@@ -2180,6 +2180,20 @@ export async function syncClientInstantlyState({
         }
     } catch (error) {
         logger(`[instantly-sync] failed loading custom interest labels: ${error?.message || error}`);
+    }
+    // Every custom label's name (e.g. "Bad Fit" = -499), so synced statuses are
+    // stored with a label instead of a bare number. The client's configured
+    // warm follow-up label keeps precedence.
+    try {
+        for (const label of await listInstantlyLeadLabels(instantlyKey)) {
+            const value = asNullableInt(label?.interest_status);
+            const name = asNullableText(label?.label);
+            if (value !== null && name && !customInterestLabels.has(value)) {
+                customInterestLabels.set(value, name);
+            }
+        }
+    } catch (error) {
+        logger(`[instantly-sync] failed loading workspace lead labels: ${error?.message || error}`);
     }
 
     try {
