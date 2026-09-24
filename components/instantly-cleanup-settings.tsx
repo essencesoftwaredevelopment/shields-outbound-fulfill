@@ -30,8 +30,6 @@ type CleanupState = {
     error: string | null;
     summary: {
       deleted?: number;
-      skippedUnreconciled?: number;
-      repliesBackfilled?: number;
       byCategory?: Partial<Record<CleanupCategory, number>>;
     };
   } | null;
@@ -119,7 +117,7 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
       const ok = window.confirm(
         `Turn on automatic cleanup?\n\n${
           typeof total === "number" ? `About ${total.toLocaleString()} lead(s) qualify right now. ` : ""
-        }They are deleted from Instantly (this can't be undone there) after their statuses and replies are synced here. Runs about once a day.`,
+        }They are deleted from Instantly (this can't be undone there) right after the usual Instantly sync. Runs about once a day.`,
       );
       if (!ok) return;
     }
@@ -146,7 +144,7 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
         Deletes leads from Instantly once their own sequence is finished and they are out of office, not
         interested, bad fit, wrong person, bounced, unsubscribed, or completed without a reply. Campaigns keep
         running. Interested, meeting booked, warm follow-up and replied-but-unlabelled leads are always kept.
-        Each run syncs their statuses and replies here first.
+        Each run does the usual Instantly sync first, so everything is saved here before the leads are deleted.
       </span>
 
       <div className="instantly-cleanup__controls">
@@ -200,10 +198,6 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
               ? `failed — ${run.error || "unknown error"}`
               : `deleted ${(run.summary.deleted ?? 0).toLocaleString()}${
                   run.summary.deleted ? ` (${describeCategories(run.summary.byCategory)})` : ""
-                }${
-                  run.summary.skippedUnreconciled
-                    ? `; kept ${run.summary.skippedUnreconciled.toLocaleString()} whose replies couldn't be fully synced`
-                    : ""
                 }.`}
         </p>
       )}

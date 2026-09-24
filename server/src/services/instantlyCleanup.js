@@ -15,22 +15,22 @@
  * labels (Interested, Meeting booked, Warm Follow Up, Day N, …) and replied-but-
  * unlabelled leads are always kept.
  *
- * Order per run — our copy must be complete before Instantly forgets the lead:
- *   1. select candidates, group by campaign
- *   2. sync those campaigns (statuses, labels, counters, timestamps)
- *   3. backfill their replies from /api/v2/emails (webhooks miss some)
- *   4. re-select from the fresh data; skip any lead whose stored replies don't
- *      cover Instantly's reply count
- *   5. DELETE /api/v2/leads/{id} one lead at a time, then mark our membership
- *      rows removed (kept for lead filters, analytics and Deal Flow)
+ * Order per run — our copy must be current before Instantly forgets the lead:
+ *   1. the usual full Instantly sync (same as the Info tab's sync button), so
+ *      statuses, labels, counters and timestamps are fresh; if it fails,
+ *      nothing is deleted
+ *   2. select candidates from the freshly synced data
+ *   3. bulk DELETE /api/v2/leads by exact ids + lead status (per-lead fallback
+ *      on a count mismatch), then mark our membership rows removed (kept for
+ *      lead filters, analytics and Deal Flow)
  */
 
-import crypto from 'crypto';
 import { pool } from '../config/db.js';
 import {
+    getInstantlySyncRun,
     instantlyRequest,
     listInstantlyLeadLabels,
-    syncClientInstantlyState
+    runInstantlySyncJob
 } from './instantlyState.js';
 
 export const CLEANUP_CATEGORIES = [
@@ -43,10 +43,11 @@ export const CLEANUP_CATEGORIES = [
     'unsubscribed'
 ];
 
-/** GET /api/v2/emails allows 20 requests/minute. */
-const EMAILS_REQUEST_SPACING_MS = 3200;
-/** Membership rows are marked removed in batches of this size while deleting. */
-const DELETE_CHUNK = 100;
+/** Waiting on a sync someone else already started (e.g. from the Info tab). */
+const SYNC_WAIT_POLL_MS = 10_000;
+const SYNC_WAIT_MAX_MS = 60 * 60 * 1000;
+/** Lead ids per bulk DELETE (Instantly allows up to 10,000). */
+const BULK_DELETE_CHUNK = 500;
 /** Scheduled runs happen at most this often per client. */
 export const CLEANUP_MIN_INTERVAL_MS = 20 * 60 * 60 * 1000;
 
@@ -82,6 +83,7 @@ export async function selectCleanupCandidates(db, clientSqlId, { days, badFitSta
                    cic.campaign_id,
                    ic.instantly_campaign_id,
                    cic.instantly_lead_id,
+                   cic.lead_status,
                    COALESCE(cic.email_reply_count, 0)::int AS email_reply_count,
                    CASE
                      WHEN cic.lead_status = -1 THEN 'bounced'
@@ -152,8 +154,7 @@ function countByCategory(rows) {
 
 /**
  * What a run would delete right now (DB only — no sync, no Instantly writes).
- * Leads whose replies aren't all stored yet are counted, but a real run
- * backfills first and skips any it still can't reconcile.
+ * A real run syncs first, so the count can shift slightly.
  */
 export async function previewCleanup({ clientSqlId, instantlyKey, days }) {
     let badFitStatuses = [];
@@ -174,114 +175,82 @@ export async function previewCleanup({ clientSqlId, instantlyKey, days }) {
 }
 
 /**
- * Store the campaign's received emails we don't have yet (matched on Instantly's
- * email id, whichever source stored it). Returns how many were added.
+ * The usual full Instantly sync. If one is already running (someone pressed
+ * sync on the Info tab), wait for it instead of starting a second. Throws when
+ * the sync didn't complete, so nothing is deleted on stale data.
  */
-async function backfillCampaignReplies({ apiKey, agencyId, clientSqlId, campaign, since, logger }) {
-    let added = 0;
-    let cursor = null;
-    for (let page = 0; page < 500; page += 1) {
-        const params = new URLSearchParams({ campaign_id: campaign.instantly_campaign_id, email_type: 'received', limit: '100' });
-        if (since) params.set('min_timestamp_created', new Date(since).toISOString());
-        if (cursor) params.set('starting_after', cursor);
-        const body = await instantlyRequest({ apiKey, path: `/api/v2/emails?${params.toString()}` });
-        await wait(EMAILS_REQUEST_SPACING_MS);
-
-        const items = Array.isArray(body?.items) ? body.items : [];
-        if (items.length) {
-            const ids = items.map((e) => String(e?.id || '')).filter(Boolean);
-            const { rows: known } = await pool.query(
-                `SELECT reply_to_uuid FROM contact_instantly_events WHERE reply_to_uuid = ANY($1::text[])`,
-                [ids]
-            );
-            const knownIds = new Set(known.map((r) => r.reply_to_uuid));
-            for (const email of items) {
-                const emailId = String(email?.id || '');
-                const leadEmail = String(email?.lead || '').trim().toLowerCase();
-                if (!emailId || knownIds.has(emailId) || !leadEmail) continue;
-                const { rows: [contact] } = await pool.query(
-                    `SELECT id FROM contacts WHERE client_id = $1 AND LOWER(email) = $2 LIMIT 1`,
-                    [clientSqlId, leadEmail]
-                );
-                const text = typeof email?.body?.text === 'string' ? email.body.text : null;
-                const inserted = await pool.query(
-                    `INSERT INTO contact_instantly_events (
-                        agency_id, client_id, contact_id, campaign_id, instantly_campaign_id,
-                        event_type, lead_email, email_account, step, message_text, reply_text_snippet,
-                        reply_to_uuid, event_timestamp, fingerprint, source, payload
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'cleanup_backfill', $15::jsonb)
-                     ON CONFLICT (source, fingerprint) DO NOTHING`,
-                    [
-                        agencyId,
-                        clientSqlId,
-                        contact?.id ?? null,
-                        campaign.campaign_id,
-                        campaign.instantly_campaign_id,
-                        Number(email?.is_auto_reply) === 1 ? 'auto_reply_received' : 'reply_received',
-                        leadEmail,
-                        email?.eaccount || null,
-                        // Webhook steps are plain numbers; the emails API sends e.g. "0_0_0".
-                        /^\d+$/.test(String(email?.step ?? '')) ? Number(email.step) : null,
-                        text,
-                        text ? text.slice(0, 500) : null,
-                        emailId,
-                        email?.timestamp_email || email?.timestamp_created || null,
-                        crypto.createHash('sha256').update(`cleanup_backfill|${emailId}`).digest('hex'),
-                        JSON.stringify({
-                            id: emailId,
-                            subject: email?.subject ?? null,
-                            thread_id: email?.thread_id ?? null,
-                            i_status: email?.i_status ?? null,
-                            timestamp_email: email?.timestamp_email ?? null
-                        })
-                    ]
-                );
-                added += inserted.rowCount;
-            }
-        }
-
-        cursor = body?.next_starting_after || null;
-        if (!cursor || !items.length) break;
-    }
-    if (added) logger(`backfilled ${added} reply event(s) for campaign ${campaign.instantly_campaign_id}`);
-    return added;
-}
-
-/** Candidates whose stored replies (incl. auto-replies) cover Instantly's count. */
-async function splitByReplyReconcile(candidates) {
-    const withReplies = candidates.filter((c) => c.email_reply_count > 0);
-    if (!withReplies.length) return { ready: candidates, unreconciled: [] };
-    const { rows } = await pool.query(
-        `SELECT i.contact_id, i.campaign_id, COUNT(e.id)::int AS stored
-         FROM jsonb_to_recordset($1::jsonb) AS i(contact_id BIGINT, campaign_id BIGINT)
-         LEFT JOIN contact_instantly_events e
-           ON e.contact_id = i.contact_id AND e.campaign_id = i.campaign_id
-          AND e.event_type IN ('reply_received', 'auto_reply_received')
-         GROUP BY 1, 2`,
-        [JSON.stringify(withReplies.map((c) => ({ contact_id: c.contact_id, campaign_id: c.campaign_id })))]
-    );
-    const stored = new Map(rows.map((r) => [`${r.contact_id}:${r.campaign_id}`, r.stored]));
-    const ready = [];
-    const unreconciled = [];
-    for (const c of candidates) {
-        if (c.email_reply_count > 0 && (stored.get(`${c.contact_id}:${c.campaign_id}`) || 0) < c.email_reply_count) {
-            unreconciled.push(c);
-        } else {
-            ready.push(c);
+async function syncBeforeCleanup({ agencyId, clientSlug, instantlyKey, logger }) {
+    const result = await runInstantlySyncJob({
+        agencyId,
+        clientSlug,
+        instantlyKey,
+        triggerSource: 'manual',
+        logger: (m) => logger(`[sync] ${m}`)
+    });
+    let run = result.run;
+    if (result.alreadyRunning && run?.id) {
+        logger(`a sync is already running (${run.id}); waiting for it`);
+        const deadline = Date.now() + SYNC_WAIT_MAX_MS;
+        while (Date.now() < deadline) {
+            await wait(SYNC_WAIT_POLL_MS);
+            run = await getInstantlySyncRun({ agencyId, clientSlug, runId: run.id });
+            if (run && run.status !== 'running' && run.status !== 'queued') break;
         }
     }
-    return { ready, unreconciled };
+    const status = String(run?.status || '');
+    if (status !== 'completed') {
+        throw new Error(`Instantly sync did not complete (${status || 'unknown'}${run?.error ? `: ${run.error}` : ''}); no leads deleted.`);
+    }
+    return run;
 }
 
 /**
- * Delete each lead by its own id (DELETE /api/v2/leads/{id}) — never a
- * campaign-wide bulk call, so nothing outside the candidate list can go. A 404
- * means Instantly no longer has it; either way our row is marked removed.
+ * Bulk-delete by exact lead ids, grouped by lead status, with two guards that
+ * were verified against Instantly (2026-09-24): ids + `status` are ANDed, and
+ * `limit` caps the call at the chunk size. A count mismatch (some already gone,
+ * or anything unexpected) re-does that chunk one lead at a time, where a 404
+ * means the lead is already gone. Our rows are marked removed per chunk.
  */
-async function deleteFromInstantly({ apiKey, rows, logger }) {
+async function deleteFromInstantly({ apiKey, campaign, rows, logger }) {
     let deleted = 0;
-    let alreadyGone = 0;
     const removed = [];
+    const byStatus = new Map();
+    for (const row of rows) {
+        const key = Number(row.lead_status);
+        if (!byStatus.has(key)) byStatus.set(key, []);
+        byStatus.get(key).push(row);
+    }
+    for (const [status, group] of byStatus) {
+        for (let i = 0; i < group.length; i += BULK_DELETE_CHUNK) {
+            const chunk = group.slice(i, i + BULK_DELETE_CHUNK);
+            const body = await instantlyRequest({
+                apiKey,
+                path: '/api/v2/leads',
+                method: 'DELETE',
+                body: {
+                    campaign_id: campaign.instantly_campaign_id,
+                    ids: chunk.map((r) => r.instantly_lead_id),
+                    status,
+                    limit: chunk.length
+                }
+            });
+            const count = Number(body?.count) || 0;
+            if (count === chunk.length) {
+                deleted += count;
+            } else {
+                logger(`campaign ${campaign.instantly_campaign_id}: bulk delete removed ${count} of ${chunk.length} (status ${status}); checking each`);
+                deleted += count + await deleteOneByOne({ apiKey, rows: chunk });
+            }
+            await markRemoved(chunk);
+            removed.push(...chunk);
+        }
+    }
+    return { deleted, removed };
+}
+
+/** Per-lead fallback; returns how many this call deleted (404 = already gone). */
+async function deleteOneByOne({ apiKey, rows }) {
+    let deleted = 0;
     for (const row of rows) {
         try {
             await instantlyRequest({
@@ -292,17 +261,9 @@ async function deleteFromInstantly({ apiKey, rows, logger }) {
             deleted += 1;
         } catch (error) {
             if (error?.statusCode !== 404) throw error;
-            alreadyGone += 1;
-        }
-        removed.push(row);
-        if (removed.length % DELETE_CHUNK === 0) {
-            await markRemoved(removed.slice(-DELETE_CHUNK));
         }
     }
-    const tail = removed.length % DELETE_CHUNK;
-    if (tail) await markRemoved(removed.slice(-tail));
-    if (alreadyGone) logger(`${alreadyGone} lead(s) were already gone from Instantly`);
-    return { deleted, removed };
+    return deleted;
 }
 
 async function markRemoved(rows) {
@@ -345,65 +306,40 @@ export async function runInstantlyCleanup({
     const summary = {
         candidates: 0,
         campaigns: 0,
-        repliesBackfilled: 0,
         deleted: 0,
         instantlyReportedDeleted: 0,
-        skippedUnreconciled: 0,
         byCategory: {},
         badFitLabelFound: false
     };
     try {
+        // 1. Everything current in our database first.
+        await syncBeforeCleanup({ agencyId, clientSlug, instantlyKey, logger });
+
+        // 2. Candidates from the freshly synced data.
         const badFitStatuses = badFitStatusesFromLabels(await listInstantlyLeadLabels(instantlyKey));
         summary.badFitLabelFound = badFitStatuses.length > 0;
-
-        const initial = await selectCleanupCandidates(pool, clientSqlId, { days, badFitStatuses });
-        const campaigns = [...new Map(initial.map((r) => [r.campaign_id, {
-            campaign_id: r.campaign_id,
-            instantly_campaign_id: r.instantly_campaign_id
-        }])).values()];
-        summary.campaigns = campaigns.length;
-        logger(`${initial.length} candidate lead(s) across ${campaigns.length} campaign(s)`);
-
-        const { rows: [previous] } = await pool.query(
-            `SELECT started_at FROM instantly_cleanup_runs
-             WHERE client_id = $1 AND status = 'completed' AND id <> $2
-             ORDER BY started_at DESC LIMIT 1`,
-            [clientSqlId, run.id]
-        );
-        // Incremental after the first full pass; a day of overlap for late arrivals.
-        const since = previous ? new Date(new Date(previous.started_at).getTime() - 24 * 3600 * 1000) : null;
-
-        for (const campaign of campaigns) {
-            // 1. Statuses, labels, counters and timestamps straight from Instantly.
-            await syncClientInstantlyState({
-                agencyId,
-                clientSlug,
-                instantlyKey,
-                instantlyCampaignId: campaign.instantly_campaign_id,
-                logger: (m) => logger(`[sync] ${m}`)
-            });
-            // 2. Replies the webhooks never delivered.
-            summary.repliesBackfilled += await backfillCampaignReplies({
-                apiKey: instantlyKey, agencyId, clientSqlId, campaign, since, logger
-            });
-
-            // 3. Decide from the fresh data only.
-            const fresh = await selectCleanupCandidates(pool, clientSqlId, {
-                days, badFitStatuses, campaignIds: [campaign.campaign_id]
-            });
-            const { ready, unreconciled } = await splitByReplyReconcile(fresh);
-            summary.candidates += fresh.length;
-            summary.skippedUnreconciled += unreconciled.length;
-            if (unreconciled.length) {
-                logger(`campaign ${campaign.instantly_campaign_id}: kept ${unreconciled.length} lead(s) whose replies aren't all stored`);
+        const candidates = await selectCleanupCandidates(pool, clientSqlId, { days, badFitStatuses });
+        const byCampaign = new Map();
+        for (const row of candidates) {
+            if (!byCampaign.has(row.campaign_id)) {
+                byCampaign.set(row.campaign_id, {
+                    campaign: { campaign_id: row.campaign_id, instantly_campaign_id: row.instantly_campaign_id },
+                    rows: []
+                });
             }
-            if (!ready.length) continue;
+            byCampaign.get(row.campaign_id).rows.push(row);
+        }
+        summary.candidates = candidates.length;
+        summary.campaigns = byCampaign.size;
+        logger(`${candidates.length} lead(s) to delete across ${byCampaign.size} campaign(s)`);
 
-            // 4. Delete by exact lead id and keep our record.
-            const { deleted, removed } = await deleteFromInstantly({ apiKey: instantlyKey, rows: ready, logger });
+        // 3. Delete by exact lead id and keep our record.
+        for (const { campaign, rows } of byCampaign.values()) {
+            const { deleted, removed } = await deleteFromInstantly({ apiKey: instantlyKey, campaign, rows, logger });
             summary.instantlyReportedDeleted += deleted;
             summary.deleted += removed.length;
             for (const r of removed) summary.byCategory[r.category] = (summary.byCategory[r.category] || 0) + 1;
+            logger(`campaign ${campaign.instantly_campaign_id}: removed ${removed.length}`);
         }
 
         await pool.query(
@@ -411,7 +347,7 @@ export async function runInstantlyCleanup({
             [run.id, JSON.stringify(summary)]
         );
         await pool.query(`UPDATE clients SET instantly_cleanup_last_run_at = NOW() WHERE id = $1`, [clientSqlId]);
-        logger(`deleted ${summary.deleted} lead(s); kept ${summary.skippedUnreconciled} unreconciled`);
+        logger(`deleted ${summary.deleted} lead(s)`);
         return { runId: run.id, summary };
     } catch (error) {
         await pool.query(
