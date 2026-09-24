@@ -17,10 +17,13 @@ import { isEnrowEnabled } from './enrowBatch.js';
 import { refreshProviderCreditsAfterBatch } from '../../services/providerCredits.js';
 
 /**
- * TryKitt emails that stay throttled / timed out are handed to Enrow's verifier
- * only while they are a small share of the batch. A larger share means TryKitt
- * itself is down or throttling the account: keep failing the stage (the job
- * pauses, resumable) rather than paying Enrow to verify everything.
+ * TryKitt emails left unverified are handed to Enrow's verifier. Timeouts always
+ * are: they are slow recipient mail servers that time out on every retry, and a
+ * resume re-runs only those leftovers, so any share-based limit would pause the
+ * job forever. Throttled requests (402/429/5xx) are handed over only while they
+ * are a small share of the batch; more means TryKitt itself is down or throttling
+ * the account: keep failing the stage (the job pauses, resumable) rather than
+ * paying Enrow to verify everything.
  */
 export function enrowHandoffLimit(batchSize) {
     return Math.max(5, Math.ceil(batchSize * 0.1));
@@ -47,7 +50,9 @@ const toCandidates = (queue) => queue.map((r) => ({
 async function handOffStuckEmailsToEnrow(ctx, { err, verify, batchSize, queueOpts, stageLog }) {
     const stuck = await getVerifyQueue(ctx.agencyId, ctx.clientId, ctx.jobId, queueOpts);
     if (!stuck.length) return { handedToEnrow: 0 };
-    if (stuck.length > enrowHandoffLimit(batchSize)) throw err;
+    // Unknown split (older error shape) → treat every stuck email as throttled.
+    const throttled = Number.isInteger(err?.throttled) ? err.throttled : stuck.length;
+    if (throttled > enrowHandoffLimit(batchSize)) throw err;
 
     let summary = { handedToEnrow: 0 };
     try {

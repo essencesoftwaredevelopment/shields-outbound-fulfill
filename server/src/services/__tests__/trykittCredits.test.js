@@ -90,6 +90,16 @@ describe('createTryKittThrottledError', () => {
         assert.doesNotMatch(err.message, /TRYKITT_MAX_CONCURRENT/);
     });
 
+    it('exposes the timed-out / throttled split for the Enrow hand-off', () => {
+        const allTimeouts = createTryKittThrottledError('email verification', 6, 7, { timedOut: 6 });
+        assert.equal(allTimeouts.timedOut, 6);
+        assert.equal(allTimeouts.throttled, 0);
+        const mixed = createTryKittThrottledError('email verification', 12, 100, { timedOut: 5 });
+        assert.equal(mixed.throttled, 7);
+        const legacy = createTryKittThrottledError('email discovery', 3, 10);
+        assert.equal(legacy.throttled, null);
+    });
+
     it('splits throttled from timed-out and keeps the rate-limit advice', () => {
         const err = createTryKittThrottledError('email verification', 12, 100, { timedOut: 5 });
         assert.match(err.message, /throttled 7 and timed out on 5 of 100/);

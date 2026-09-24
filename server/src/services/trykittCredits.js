@@ -95,5 +95,10 @@ export function createTryKittThrottledError(stage, skipped, total, { timedOut = 
     err.code = 'TRYKITT_THROTTLED';
     err.userFacing = true;
     err.retryable = true;
+    // Split for callers: timeouts are slow recipient mail servers (retrying
+    // won't help); throttles say something about TryKitt itself. null = unknown.
+    err.skipped = skipped;
+    err.timedOut = timedOut;
+    err.throttled = throttled;
     return err;
 }
