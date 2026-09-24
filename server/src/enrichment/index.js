@@ -34,7 +34,7 @@ export { runFoundersBatch } from './stages/foundersBatch.js';
 export { runEmailsBatch } from './stages/emailsBatch.js';
 export { runVerificationBatch } from './stages/verificationBatch.js';
 export { submitEnrowBatch, collectEnrowBatch, runEnrowInline, isEnrowEnabled } from './stages/enrowBatch.js';
-export { runInstantlyAutoAddBatch } from './stages/instantlyBatch.js';
+export { runInstantlyAutoAddBatch, retryFailedAutoAdds } from './stages/instantlyBatch.js';
 export { runPersonalizationBatch } from './stages/personalizationBatch.js';
 export {
     createStageLogger,

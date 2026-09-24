@@ -182,6 +182,10 @@ export async function enrichmentParentWorkflow(input: ParentWorkflowInput) {
       );
     }
 
+    // Batches only retry their own Instantly adds; sweep up whatever any batch
+    // failed to add (best-effort) before the job is marked complete.
+    await retryFailedAutoAddsStep(input);
+
     return finalizeStep(input, state.completedOk);
   } catch (err) {
     // A guardWorkflowStart rejection means THIS run is a duplicate (double
@@ -320,6 +324,14 @@ async function finalizeStep(
   return { ...result, batches: batchResults.length };
 }
 
+async function retryFailedAutoAddsStep(input: ParentWorkflowInput) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  return enrichment.retryFailedAutoAdds(ctx);
+}
+
 async function handleWorkflowFailureStep(
   input: ParentWorkflowInput,
   errorInfo: { message: string; code: string | null }
@@ -347,6 +359,9 @@ prepareBatchPlanStep.maxRetries = 2;
 // resumable like any batch failure.
 spawnChildStep.maxRetries = 0;
 reconcileStagesStep.maxRetries = 0; // best-effort (wrapped in try/catch above)
+// Never throws (errors are logged inside); a retry would re-send nothing twice
+// because leads already in the campaign are excluded.
+retryFailedAutoAddsStep.maxRetries = 1;
 finalizeStep.maxRetries = 2;
 // Recording the failure state must itself be resilient — this is the last line of
 // defense against a silent zombie job, so retry it harder than the work steps.

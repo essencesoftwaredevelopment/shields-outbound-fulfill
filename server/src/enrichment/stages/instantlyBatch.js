@@ -42,7 +42,11 @@ async function getClientInstantlyKey(agencyId, clientId) {
 }
 
 /** Running totals on the job, for the UI and debugging. Single atomic UPDATE. */
-async function recordAutoAddStats(jobId, agencyId, { added, failed, error }) {
+/**
+ * `replaceFailed`: the end-of-job sweep retries every failed add, so its count
+ * is what's still outstanding rather than more failures on top.
+ */
+async function recordAutoAddStats(jobId, agencyId, { added, failed, error, replaceFailed = false }) {
     await pool.query(
         `UPDATE jobs SET
             options = jsonb_set(
@@ -50,14 +54,17 @@ async function recordAutoAddStats(jobId, agencyId, { added, failed, error }) {
                 '{autoInstantlyStats}',
                 jsonb_build_object(
                     'added', COALESCE((options->'autoInstantlyStats'->>'added')::int, 0) + $3,
-                    'failed', COALESCE((options->'autoInstantlyStats'->>'failed')::int, 0) + $4,
-                    'lastError', COALESCE($5, options->'autoInstantlyStats'->>'lastError'),
+                    'failed', CASE WHEN $6::boolean THEN $4
+                        ELSE COALESCE((options->'autoInstantlyStats'->>'failed')::int, 0) + $4 END,
+                    -- A sweep that left nothing failed clears the old error.
+                    'lastError', CASE WHEN $6::boolean AND $4 = 0 THEN NULL
+                        ELSE COALESCE($5, options->'autoInstantlyStats'->>'lastError') END,
                     'updatedAt', NOW()
                 )
             ),
             updated_at = NOW()
          WHERE id = $1 AND agency_id = $2`,
-        [jobId, agencyId, added, failed, error]
+        [jobId, agencyId, added, failed, error, replaceFailed]
     );
 }
 
@@ -72,7 +79,7 @@ export function autoInstantlyConfigFromJob(jobRow) {
  * @param {string[] | null} batchDomains null = whole job (PM2)
  * @returns {Promise<{ skipped?: boolean, added?: number, failed?: number }>}
  */
-export async function runInstantlyAutoAddBatch(ctx, batchDomains) {
+export async function runInstantlyAutoAddBatch(ctx, batchDomains, { finalSweep = false } = {}) {
     const jobRow = await getJobById(ctx.jobId, ctx.agencyId);
     const config = autoInstantlyConfigFromJob(jobRow);
     if (!config) return { skipped: true };
@@ -134,7 +141,7 @@ export async function runInstantlyAutoAddBatch(ctx, batchDomains) {
         }
     }
 
-    await recordAutoAddStats(ctx.jobId, ctx.agencyId, { added, failed, error: lastError });
+    await recordAutoAddStats(ctx.jobId, ctx.agencyId, { added, failed, error: lastError, replaceFailed: finalSweep });
     const campaignLabel = config.campaignName ? `"${config.campaignName}"` : 'the campaign';
     await reportActivity(
         ctx,
@@ -143,4 +150,25 @@ export async function runInstantlyAutoAddBatch(ctx, batchDomains) {
             : `Instantly: added ${added} lead(s) to ${campaignLabel}.`
     );
     return { added, failed };
+}
+
+/**
+ * End-of-job retry of every lead a batch failed to add (e.g. Instantly's lead
+ * limit). Batches only retry their own adds when they re-run, and a resume
+ * re-runs just the batches with work left, so without this a failed add stays
+ * failed. Candidates already in the campaign are excluded, so it only sends
+ * what's missing. Best-effort: never blocks the job from finishing.
+ *
+ * @param {import('../context.js').EnrichmentContext} ctx
+ */
+export async function retryFailedAutoAdds(ctx) {
+    try {
+        const jobRow = await getJobById(ctx.jobId, ctx.agencyId);
+        const failed = Number(jobRow?.options?.autoInstantlyStats?.failed) || 0;
+        if (!autoInstantlyConfigFromJob(jobRow) || failed <= 0) return { skipped: true };
+        return await runInstantlyAutoAddBatch(ctx, null, { finalSweep: true });
+    } catch (err) {
+        console.error(`[${ctx.jobId}] [instantly] end-of-job add retry failed: ${err?.message || err}`);
+        return { skipped: true };
+    }
 }

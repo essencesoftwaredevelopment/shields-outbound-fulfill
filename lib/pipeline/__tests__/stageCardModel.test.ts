@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildStageCardModel } from '../stageCardModel.ts';
+import { buildInstantlyCardModel, buildStageCardModel } from '../stageCardModel.ts';
+import { autoInstantlyFromOptions } from '../realtimeRow.ts';
 import { stageCountsToStages, type JobStageCounts } from '../../enrichment/stageCounts.ts';
 
 /** Job 1790204345024-0vdyss as get_job_stage_counts returned it once complete. */
@@ -92,5 +93,46 @@ describe('buildStageCardModel', () => {
     assert.equal(model.tone, 'error');
     assert.equal(model.creditExhausted, true);
     assert.match(model.detail, /add credits/i);
+  });
+});
+
+describe('buildInstantlyCardModel', () => {
+  const auto = (added: number, failed = 0, lastError: string | null = null) =>
+    ({ campaignName: 'Email Conversion System', added, failed, lastError });
+
+  it('waits for personalization before any add', () => {
+    const m = buildInstantlyCardModel(auto(0), { status: 'running', paused: false }, { upstreamTitle: 'Personalization' });
+    assert.equal(m.tone, 'pending');
+    assert.equal(m.hero, null);
+    assert.match(m.detail, /Waiting for Personalization/);
+  });
+
+  it('counts adds while the job runs, including failures', () => {
+    const m = buildInstantlyCardModel(auto(2349, 94, 'Lead limit reached'), { status: 'running', paused: false });
+    assert.equal(m.tone, 'running');
+    assert.equal(m.hero, 2349);
+    assert.match(m.detail, /Email Conversion System.*94 failed/);
+  });
+
+  it('completes clean, or flags adds that still failed after the end-of-job retry', () => {
+    const ok = buildInstantlyCardModel(auto(4487), { status: 'completed', paused: false });
+    assert.equal(ok.tone, 'completed');
+    assert.equal(ok.hero, 4487);
+    const bad = buildInstantlyCardModel(auto(2349, 2139, 'Lead limit reached. Remaining uploads: 52.'), { status: 'completed', paused: false });
+    assert.equal(bad.tone, 'error');
+    assert.equal(bad.chip, 'Needs retry');
+    assert.match(bad.detail, /2,139 failed — Lead limit reached/);
+  });
+
+  it('parses the job options (realtime row and API share this)', () => {
+    assert.equal(autoInstantlyFromOptions({}), null);
+    assert.equal(autoInstantlyFromOptions({ autoInstantly: {} }), null);
+    assert.deepEqual(
+      autoInstantlyFromOptions({
+        autoInstantly: { campaignId: 'c1', campaignName: 'Email Conversion System' },
+        autoInstantlyStats: { added: 46, failed: 0, lastError: null },
+      }),
+      { campaignName: 'Email Conversion System', added: 46, failed: 0, lastError: null },
+    );
   });
 });

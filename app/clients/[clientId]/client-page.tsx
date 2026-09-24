@@ -10,7 +10,7 @@ import {
     type JobRealtimeState,
 } from "@/lib/hooks/useJobRealtime";
 import { useJobStageCounts } from "@/lib/hooks/useJobStageCounts";
-import { columnMappingFromOptions } from "@/lib/pipeline/realtimeRow";
+import { autoInstantlyFromOptions, columnMappingFromOptions } from "@/lib/pipeline/realtimeRow";
 import { useIntervalWhenVisible } from "@/lib/hooks/useIntervalWhenVisible";
 import { useAnalyticsRealtime } from "@/lib/hooks/useAnalyticsRealtime";
 import { useAuth } from "@/hooks/use-auth";
@@ -53,7 +53,7 @@ import { CreditExhaustionNotice } from "@/components/credit-exhaustion-notice";
 import { ProviderCredits } from "@/components/provider-credits";
 import { CopyableId } from "@/components/copyable-id";
 import { InstantlyCleanupSettings } from "@/components/instantly-cleanup-settings";
-import { buildStageCardModel, formatStageCost } from "@/lib/pipeline/stageCardModel";
+import { buildInstantlyCardModel, buildStageCardModel, formatStageCost, type StageCardModel } from "@/lib/pipeline/stageCardModel";
 import { useConfirm } from "@/components/confirm-dialog";
 import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
@@ -4045,6 +4045,10 @@ export default function ClientPage() {
             queueStatus: typeof data.queueStatus === 'string' ? data.queueStatus : null,
             workerActive: data.workerActive === true,
             detail: data.detail === "overview" ? "overview" : data.detail === "full" ? "full" : undefined,
+            autoInstantly: autoInstantlyFromOptions({
+                autoInstantly: data.autoInstantly,
+                autoInstantlyStats: data.autoInstantlyStats,
+            }),
         };
     }, [normalizeStages]);
 
@@ -10588,6 +10592,29 @@ export default function ClientPage() {
                                 const runStatusLabel = jobState.paused ? 'Paused' : JOB_STATUS_LABELS[jobState.status];
                                 const percent = jobState.status === 'completed' ? 100 : (stageCompletionPercent || 0);
                                 const displayStageKeys = resolveDisplayStageKeys(jobState);
+                                const renderStageCard = (key: string, title: string, model: StageCardModel, eta?: string) => (
+                                    <article key={key} className={`stage-card stage-card--${model.tone}`}>
+                                        <div className="stage-card__head">
+                                            <p className="stage-card__label">{title}</p>
+                                            <span className={`stage-chip stage-chip--${model.tone}`}>{model.chip}</span>
+                                        </div>
+                                        <div className="stage-card__hero">
+                                            {model.hero === null ? (
+                                                <span className="stage-card__hero-value stage-card__hero-value--empty">—</span>
+                                            ) : (
+                                                <span className="stage-card__hero-value"><AnimatedNumber value={model.hero} /></span>
+                                            )}
+                                            {model.heroLabel && <span className="stage-card__hero-label">{model.heroLabel}</span>}
+                                        </div>
+                                        <p className={`stage-card__detail${model.tone === 'error' ? ' stage-card__detail--error' : ''}`}>
+                                            {model.detail}
+                                        </p>
+                                        <div className="stage-card__foot">
+                                            <span>{model.cost !== null ? `Cost ${formatStageCost(model.cost)}` : ''}</span>
+                                            {eta && <span>~{eta} left</span>}
+                                        </div>
+                                    </article>
+                                );
                                 return (
                                 <section className="pipeline-run" aria-label="Pipeline run">
                                     <div className="pipeline-run__head">
@@ -10753,30 +10780,17 @@ export default function ClientPage() {
                                                 personalizeFirstLine: jobState.personalizeFirstLine === true,
                                             });
                                             const eta = model.tone === 'running' ? stageEtas[stageKey] : undefined;
-                                            return (
-                                                <article key={stageKey} className={`stage-card stage-card--${model.tone}`}>
-                                                    <div className="stage-card__head">
-                                                        <p className="stage-card__label">{STAGE_METADATA[stageKey].title}</p>
-                                                        <span className={`stage-chip stage-chip--${model.tone}`}>{model.chip}</span>
-                                                    </div>
-                                                    <div className="stage-card__hero">
-                                                        {model.hero === null ? (
-                                                            <span className="stage-card__hero-value stage-card__hero-value--empty">—</span>
-                                                        ) : (
-                                                            <span className="stage-card__hero-value"><AnimatedNumber value={model.hero} /></span>
-                                                        )}
-                                                        {model.heroLabel && <span className="stage-card__hero-label">{model.heroLabel}</span>}
-                                                    </div>
-                                                    <p className={`stage-card__detail${model.tone === 'error' ? ' stage-card__detail--error' : ''}`}>
-                                                        {model.detail}
-                                                    </p>
-                                                    <div className="stage-card__foot">
-                                                        <span>{model.cost !== null ? `Cost ${formatStageCost(model.cost)}` : ''}</span>
-                                                        {eta && <span>~{eta} left</span>}
-                                                    </div>
-                                                </article>
-                                            );
+                                            return renderStageCard(stageKey, STAGE_METADATA[stageKey].title, model, eta);
                                         })}
+                                        {jobState.autoInstantly && renderStageCard(
+                                            'instantly',
+                                            'Add to Instantly',
+                                            buildInstantlyCardModel(jobState.autoInstantly, jobState, {
+                                                upstreamTitle: displayStageKeys.length
+                                                    ? STAGE_METADATA[displayStageKeys[displayStageKeys.length - 1]].title
+                                                    : null,
+                                            }),
+                                        )}
                                     </div>
                                 </section>
                                 );

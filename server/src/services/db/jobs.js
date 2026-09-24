@@ -100,7 +100,15 @@ export function jobRowToState(row) {
         cost: Number(row.cost) || 0,
         uploadStatus: row.upload_status,
         isActive: !!row.is_active,
-        executionRunner: options.executionRunner || 'pm2'
+        executionRunner: options.executionRunner || 'pm2',
+        // Auto-add to Instantly (Pipeline tab card): target campaign + running tally.
+        autoInstantly: options.autoInstantly?.campaignId
+            ? {
+                campaignId: options.autoInstantly.campaignId,
+                campaignName: options.autoInstantly.campaignName || null
+            }
+            : null,
+        autoInstantlyStats: options.autoInstantlyStats || null
     };
 }
 
@@ -468,7 +476,12 @@ export async function listJobOverviewsForClient(agencyId, clientId, limit = 50) 
                     'skipFounderFinder', options->'skipFounderFinder',
                     'skipEmailFinder', options->'skipEmailFinder',
                     'skipVerification', options->'skipVerification',
-                    'skipDomainCheck', options->'skipDomainCheck'
+                    'skipDomainCheck', options->'skipDomainCheck',
+                    'autoInstantly', jsonb_build_object(
+                        'campaignId', options->'autoInstantly'->'campaignId',
+                        'campaignName', options->'autoInstantly'->'campaignName'
+                    ),
+                    'autoInstantlyStats', options->'autoInstantlyStats'
                 )) AS options,
                 (SELECT COALESCE(
                     jsonb_object_agg(s.key, jsonb_build_object('status', s.value->'status', 'error', s.value->'error')),

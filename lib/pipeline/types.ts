@@ -119,6 +119,8 @@ export interface PipelineJob {
     /** From GET /api/jobs: only the most recent job is `full`; the rest are list
      *  overviews (stage status/error only) until opened via GET /api/jobs/:id. */
     detail?: "full" | "overview";
+    /** Mid-run add to Instantly (jobs.options.autoInstantly + autoInstantlyStats); null when off. */
+    autoInstantly?: AutoInstantlyJobState | null;
     activityMessage?: string | null;
     activityUpdatedAt?: string | null;
     timingTotals?: Record<string, { count: number; totalMs: number; totalRows: number; maxMs: number }>;
@@ -236,3 +238,10 @@ export interface CreateJobResponse {
     jobId: string;
     job: PipelineJob;
 }
+
+export type AutoInstantlyJobState = {
+    campaignName: string | null;
+    added: number;
+    failed: number;
+    lastError: string | null;
+};

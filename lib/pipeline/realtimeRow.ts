@@ -1,3 +1,4 @@
+import type { AutoInstantlyJobState } from "@/lib/pipeline/types";
 /**
  * Realtime `jobs` row → page job state. Pure so it can be unit-tested away from
  * the Supabase client (the hook in lib/hooks/useJobRealtime.ts re-exports it).
@@ -37,6 +38,24 @@ export function columnMappingFromOptions(options: Record<string, unknown>): JobC
     };
 }
 
+/**
+ * Auto-add config + tally from job options (realtime row) or the API's
+ * `autoInstantly` / `autoInstantlyStats` fields. null when the job doesn't add
+ * to Instantly.
+ */
+export function autoInstantlyFromOptions(options: Record<string, unknown>): AutoInstantlyJobState | null {
+    const config = options.autoInstantly as Record<string, unknown> | null | undefined;
+    if (!config || typeof config !== "object" || !config.campaignId) return null;
+    const stats = (options.autoInstantlyStats || {}) as Record<string, unknown>;
+    const count = (value: unknown) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    return {
+        campaignName: typeof config.campaignName === "string" && config.campaignName ? config.campaignName : null,
+        added: count(stats.added),
+        failed: count(stats.failed),
+        lastError: typeof stats.lastError === "string" && stats.lastError ? stats.lastError : null,
+    };
+}
+
 /** Option-derived job fields; only emitted when the payload actually carried `options`. */
 function optionsToJobState(options: Record<string, unknown>) {
     // Prefer explicit options.pipelineMode. Do not infer shopping_audit from stage
@@ -58,6 +77,7 @@ function optionsToJobState(options: Record<string, unknown>) {
         columnMapping: columnMappingFromOptions(options),
         activityMessage: typeof options.activityMessage === 'string' ? options.activityMessage : null,
         activityUpdatedAt: typeof options.activityUpdatedAt === 'string' ? options.activityUpdatedAt : null,
+        autoInstantly: autoInstantlyFromOptions(options),
     };
 }
 

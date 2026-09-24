@@ -1,4 +1,4 @@
-import type { PipelineStageKey, PipelineStageState } from "@/lib/pipeline/types";
+import type { AutoInstantlyJobState, PipelineJob, PipelineStageKey, PipelineStageState } from "@/lib/pipeline/types";
 
 /**
  * What a Pipeline-tab stage card shows. Every card has the same anatomy — one
@@ -261,4 +261,52 @@ export function buildStageCardModel(
       return { ...base, hero: processed, heroLabel: "Processed", detail: total > 0 ? `${fmt(processed)} of ${fmt(total)}` : "" };
     }
   }
+}
+
+/**
+ * "Add to Instantly" card: the job's mid-run auto-add (after personalization).
+ * Adds happen per batch, so while the job runs the count keeps growing; a
+ * failed add is retried once more before the job completes.
+ */
+export function buildInstantlyCardModel(
+  auto: AutoInstantlyJobState,
+  job: Pick<PipelineJob, "status" | "paused">,
+  opts: { upstreamTitle?: string | null } = {},
+): StageCardModel {
+  const campaign = auto.campaignName ? `to \u201c${auto.campaignName}\u201d` : "to the campaign";
+  const failedText = auto.failed > 0 ? ` · ${fmt(auto.failed)} failed` : "";
+  const base: StageCardModel = {
+    tone: "pending",
+    chip: "Pending",
+    hero: null,
+    heroLabel: "",
+    detail: opts.upstreamTitle ? `Waiting for ${opts.upstreamTitle}` : "Queued",
+    cost: null,
+    creditExhausted: false,
+  };
+  const attempted = auto.added + auto.failed;
+  const active = job.status === "running" || job.status === "queued";
+
+  if (job.status === "completed" || (!active && attempted > 0)) {
+    if (auto.failed > 0) {
+      return {
+        ...base,
+        tone: "error",
+        chip: "Needs retry",
+        hero: auto.added,
+        heroLabel: "Added",
+        detail: `${campaign}${failedText}${auto.lastError ? ` — ${auto.lastError.slice(0, 90)}` : ""}`,
+      };
+    }
+    return { ...base, tone: "completed", chip: "Completed", hero: auto.added, heroLabel: "Added", detail: campaign };
+  }
+  if (attempted === 0) return { ...base, detail: `${base.detail} · ${campaign}` };
+  return {
+    ...base,
+    tone: job.paused ? "pending" : "running",
+    chip: job.paused ? "Paused" : "Running",
+    hero: auto.added,
+    heroLabel: "Added",
+    detail: `${campaign}${failedText}`,
+  };
 }
