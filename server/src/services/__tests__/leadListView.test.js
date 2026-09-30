@@ -16,6 +16,9 @@ const fullRow = {
     last_contacted_at: '2026-02-01T00:00:00.000Z',
     personalization_first_line: 'Loved the launch.',
     job_id: 'job-1',
+    phone: ' +15705551234 ',
+    phone_country: 'US',
+    phone_status: 'found',
     created_at: '2026-01-01T00:00:00.000Z',
     updated_at: '2026-03-01T00:00:00.000Z',
     campaign_count_all_time: 3,
@@ -107,6 +110,9 @@ describe('mapLeadListRow', () => {
         const mapped = mapLeadListRow(fullRow);
         assert.equal(mapped.roleType, 'instantly_lead');
         assert.equal(mapped.firstLine, 'Loved the launch.');
+        assert.equal(mapped.phone, '+15705551234');
+        assert.equal(mapped.phoneCountry, 'US');
+        assert.equal(mapped.phoneStatus, 'found');
         assert.equal(mapped.insights.attributes.linkedin, 'https://linkedin.com/in/ada');
         assert.equal(mapped.campaignsData[0].lastReplyAt, '2026-03-04T00:00:00.000Z');
         assert.equal(mapped.latestEvent.eventType, 'reply_received');

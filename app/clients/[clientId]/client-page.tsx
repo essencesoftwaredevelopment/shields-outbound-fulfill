@@ -144,6 +144,10 @@ type Lead = {
     emailVerifySource?: string;
     enrowFindAttemptedAt?: string;
     enrowVerifyAttemptedAt?: string;
+    /** Founder phone from Enrow Phone Finder, when found. */
+    phone?: string;
+    phoneCountry?: string;
+    phoneStatus?: string;
     lastContactedAt?: string;
     jobId?: string;
     campaignCountAllTime?: number | null;
@@ -2580,6 +2584,7 @@ export default function ClientPage() {
     const leadDetailRequestSeqRef = useRef(0);
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [emailCopied, setEmailCopied] = useState(false);
+    const [phoneCopied, setPhoneCopied] = useState(false);
     const [showLeadAdvanced, setShowLeadAdvanced] = useState(false);
     const [leadEvents, setLeadEvents] = useState<Array<{ id: string; event_type: string; campaign_name?: string; lead_email?: string; email_account?: string; step?: number; event_timestamp: string; message_text?: string; reply_text_snippet?: string; reply_category?: string; source?: string; unibox_url?: string | null; instantly_lead_id?: string | null; payload?: Record<string, unknown> | null }>>([]);
     const [leadEventsLoading, setLeadEventsLoading] = useState(false);
@@ -2643,6 +2648,7 @@ export default function ClientPage() {
         setShowLeadAdvanced(false);
         setExpandedLeadActivityIds([]);
         setEmailCopied(false);
+        setPhoneCopied(false);
         const campaigns = selectedLead?.campaignsData || [];
         setLeadStatusCampaignId(campaigns[0]?.campaignId || '');
         setLeadStatusInterestValue('');
@@ -4164,6 +4170,9 @@ export default function ClientPage() {
         emailVerifySource: row.emailVerifySource || "",
         enrowFindAttemptedAt: row.enrowFindAttemptedAt || "",
         enrowVerifyAttemptedAt: row.enrowVerifyAttemptedAt || "",
+        phone: row.phone || "",
+        phoneCountry: row.phoneCountry || "",
+        phoneStatus: row.phoneStatus || "",
         lastContactedAt: row.lastContactedAt || "",
         jobId: row.jobId || "",
         campaignCountAllTime: typeof row.campaignCountAllTime === "number" ? row.campaignCountAllTime : null,
@@ -15173,7 +15182,9 @@ export default function ClientPage() {
                                     alignItems: 'center',
                                     gap: '0.5rem',
                                     flexWrap: 'wrap',
-                                    margin: '-0.25rem 0 1rem'
+                                    margin: selectedLead.phone
+                                        ? '-0.25rem 0 0.35rem'
+                                        : '-0.25rem 0 1rem'
                                 }}>
                                     <button
                                         type="button"
@@ -15262,6 +15273,68 @@ export default function ClientPage() {
                                             </a>
                                         );
                                     })()}
+                                </div>
+                            )}
+
+                            {/* Phone — underneath email when Enrow found a number */}
+                            {selectedLead.phone && (
+                                <div style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    flexWrap: 'wrap',
+                                    margin: (selectedLead.email || selectedLead.emailFindCompletedAt)
+                                        ? '0 0 1rem'
+                                        : '-0.25rem 0 1rem'
+                                }}>
+                                    <button
+                                        type="button"
+                                        title={phoneCopied ? 'Copied!' : 'Copy phone'}
+                                        onClick={() => {
+                                            if (!selectedLead.phone) return;
+                                            navigator.clipboard.writeText(selectedLead.phone);
+                                            setPhoneCopied(true);
+                                            setTimeout(() => setPhoneCopied(false), 2000);
+                                        }}
+                                        style={{
+                                            background: 'none',
+                                            border: 'none',
+                                            padding: 0,
+                                            cursor: 'pointer',
+                                            color: phoneCopied ? 'var(--app-success-text)' : 'var(--app-text-ghost)',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            flexShrink: 0,
+                                            transition: 'color 0.15s ease'
+                                        }}
+                                    >
+                                        {phoneCopied ? (
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                                <polyline points="20 6 9 17 4 12"/>
+                                            </svg>
+                                        ) : (
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                            </svg>
+                                        )}
+                                    </button>
+                                    <span
+                                        style={{
+                                            fontSize: '1.05rem',
+                                            fontWeight: 500,
+                                            color: 'var(--app-text-high)',
+                                            wordBreak: 'break-all'
+                                        }}
+                                        title={selectedLead.phoneCountry ? `Phone (${selectedLead.phoneCountry})` : 'Phone'}
+                                    >
+                                        {selectedLead.phone}
+                                    </span>
+                                    {selectedLead.phoneCountry && (
+                                        <span style={{ fontSize: '0.75rem', color: 'var(--app-text-ghost)', flexShrink: 0 }}>
+                                            {selectedLead.phoneCountry}
+                                        </span>
+                                    )}
                                 </div>
                             )}
 

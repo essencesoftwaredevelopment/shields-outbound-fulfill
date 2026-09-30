@@ -67,6 +67,8 @@ export function mapLeadListRow(row, { tableView = false } = {}) {
 
     if (tableView) return mapped;
 
+    const phone = typeof row.phone === 'string' ? row.phone.trim() : '';
+
     return {
         ...mapped,
         roleType: mapRoleType(row.role_type),
@@ -79,6 +81,9 @@ export function mapLeadListRow(row, { tableView = false } = {}) {
         emailVerifySource: row.email_verify_source ?? null,
         enrowFindAttemptedAt: row.enrow_find_attempted_at ?? null,
         enrowVerifyAttemptedAt: row.enrow_verify_attempted_at ?? null,
+        phone: phone || null,
+        phoneCountry: phone ? (row.phone_country ?? null) : null,
+        phoneStatus: row.phone_status ?? null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         campaignCountAllTime: row.campaign_count_all_time,
