@@ -571,6 +571,20 @@ const LEAD_FILTER_FIELDS = [
         ]
     },
     {
+        key: 'phone',
+        label: 'Phone',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Contains' },
+            { key: 'not_contains', label: 'Does Not Contain' },
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'starts_with', label: 'Starts With' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
         key: 'email_status',
         label: 'Email Status',
         type: 'enum',
@@ -1839,6 +1853,31 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
                 clauses.push(`(c.email IS NULL OR BTRIM(c.email) = '')`);
             } else if (operatorKey === 'not_empty') {
                 clauses.push(`(c.email IS NOT NULL AND BTRIM(c.email) <> '')`);
+            }
+            continue;
+        }
+
+        // ── phone (contacts.phone from Enrow Phone Finder) ─────────────────
+        if (fieldKey === 'phone') {
+            if (operatorKey === 'contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`c.phone IS NOT NULL AND LOWER(c.phone) LIKE ${ref}`);
+            } else if (operatorKey === 'not_contains') {
+                const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`(c.phone IS NULL OR LOWER(c.phone) NOT LIKE ${ref})`);
+            } else if (operatorKey === 'eq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`c.phone IS NOT NULL AND LOWER(c.phone) = ${ref}`);
+            } else if (operatorKey === 'neq') {
+                const ref = bindParam(String(normalizedValue).toLowerCase());
+                clauses.push(`(c.phone IS NULL OR LOWER(c.phone) <> ${ref})`);
+            } else if (operatorKey === 'starts_with') {
+                const ref = bindParam(`${String(normalizedValue).toLowerCase()}%`);
+                clauses.push(`c.phone IS NOT NULL AND LOWER(c.phone) LIKE ${ref}`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`(c.phone IS NULL OR BTRIM(c.phone) = '')`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`(c.phone IS NOT NULL AND BTRIM(c.phone) <> '')`);
             }
             continue;
         }
