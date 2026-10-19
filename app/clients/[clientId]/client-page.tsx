@@ -24,6 +24,10 @@ import { InterestedResearchProgress } from "@/components/interested-research-pro
 import { WarmFollowUpProgress } from "@/components/warm-follow-up-progress";
 import { LeadReplyEditor, type LeadReplyEditorHandle, type LeadReplyEditorState } from "@/components/lead-reply-editor";
 import { FOLLOW_UP_CODE_CONTRACT, FOLLOW_UP_MAX_CHARS, formatBriefForFollowUpPrompt } from "@server/services/warmFollowUpGeneration/prompt.js";
+import { normalizeDomain } from "@server/utils/domain.js";
+
+/** Unique domains per domain-check request. Each call stays well under the proxy timeout. */
+const DOMAIN_CHECK_BATCH = 5000;
 
 // Loaded lazily so dnd-kit and recharts stay out of this route's initial chunk;
 // both only render behind a tab/section, so first paint never needs them.
@@ -1855,6 +1859,8 @@ export default function ClientPage() {
         withPersonalization: number;
     } | null>(null);
     const [checkingDomains, setCheckingDomains] = useState(false);
+    const [domainCheckProgress, setDomainCheckProgress] = useState<{ checked: number; total: number } | null>(null);
+    const domainCheckRequestRef = useRef(0);
     const [downloadingNewDomains, setDownloadingNewDomains] = useState(false);
     const [downloadingExistingScope, setDownloadingExistingScope] = useState<ExistingDomainExportScope | null>(null);
     const uploadedCsvDomainsRef = useRef<string[]>([]);
@@ -5581,9 +5587,11 @@ export default function ClientPage() {
     };
 
     const processSelectedFile = async (file: File | null) => {
+        const requestId = ++domainCheckRequestRef.current;
         setSelectedFile(file);
         setUploadError("");
         setDomainCheckStats(null);
+        setDomainCheckProgress(null);
         uploadedCsvDomainsRef.current = [];
 
         // Reset mappings when a new file is chosen
@@ -5593,13 +5601,19 @@ export default function ClientPage() {
         setEmailColumn("");
         setEmailStatusColumn("");
 
-        if (!file) return;
+        if (!file) {
+            setCheckingDomains(false);
+            return;
+        }
 
+        setCheckingDomains(true);
         try {
             const text = await file.text();
+            if (requestId !== domainCheckRequestRef.current) return;
+
             const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
             if (!lines.length) return;
-            
+
             const headerLine = lines[0];
             const columns = headerLine
                 .split(",")
@@ -5618,76 +5632,122 @@ export default function ClientPage() {
                     ["email_status", "email_verification", "verification_status", "verification", "lookup_status", "status"]
                 )
                 : "";
-            
-            if (detectedDomain) {
-                setDomainColumn(detectedDomain);
-                
-                // Extract domains from CSV and check against database
-                const domainColumnIndex = columns.indexOf(detectedDomain);
-                if (domainColumnIndex >= 0 && user && clientId && agencyId) {
-                    setCheckingDomains(true);
-                    
-                    try {
-                        // Parse domains from all rows
-                        const domains = lines.slice(1) // Skip header
-                            .map(line => {
-                                const values = line.split(",").map(v => v.trim().replace(/^"|"$/g, ""));
-                                return values[domainColumnIndex];
-                            })
-                            .filter(Boolean);
-                        uploadedCsvDomainsRef.current = domains;
 
-                        // Check domains against database
-                        const token = await getAccessToken();
-            if (!token) return;
-                        const response = await fetch(
-                            `${getPipelineBaseUrl()}/api/jobs/check-domains`,
-                            {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${token}`
-                                },
-                                body: JSON.stringify({
-                                    domains,
-                                    clientId,
-                                })
-                            }
-                        );
+            if (detectedDomain) setDomainColumn(detectedDomain);
+            if (detectedFounder) setFounderColumn(detectedFounder);
+            if (detectedEmail) setEmailColumn(detectedEmail);
+            if (detectedEmailStatus) setEmailStatusColumn(detectedEmailStatus);
 
-                        if (response.ok) {
-                            const data = await response.json();
-                            setDomainCheckStats({
-                                total: data.totalDomains,
-                                unique: data.uniqueDomains ?? data.totalDomains,
-                                existing: data.existingDomains,
-                                new: data.newDomains,
-                                run: data.run || 0,
-                                notRun: data.notRun || 0,
-                                withFounders: data.withFounders || 0,
-                                withEmails: data.withEmails || 0,
-                                withPersonalization: data.withPersonalization || 0
-                            });
-                        }
-                    } catch (error) {
-                        console.error('Error checking domains:', error);
-                    } finally {
-                        setCheckingDomains(false);
-                    }
+            const domainColumnIndex = detectedDomain ? columns.indexOf(detectedDomain) : -1;
+            if (domainColumnIndex < 0 || !user || !clientId || !agencyId) return;
+
+            const rawDomains: string[] = [];
+            const uniqueDomains: string[] = [];
+            const seen = new Set<string>();
+            let normalizedTotal = 0;
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(",").map((value) => value.trim().replace(/^"|"$/g, ""));
+                const raw = values[domainColumnIndex];
+                if (!raw) continue;
+                rawDomains.push(raw);
+                const domain = normalizeDomain(raw);
+                if (!domain) continue;
+                normalizedTotal += 1;
+                if (!seen.has(domain)) {
+                    seen.add(domain);
+                    uniqueDomains.push(domain);
                 }
             }
-            
-            if (detectedFounder) {
-                setFounderColumn(detectedFounder);
+            uploadedCsvDomainsRef.current = rawDomains;
+            if (!uniqueDomains.length) {
+                setDomainCheckStats({
+                    total: normalizedTotal,
+                    unique: 0,
+                    existing: 0,
+                    new: 0,
+                    run: 0,
+                    notRun: 0,
+                    withFounders: 0,
+                    withEmails: 0,
+                    withPersonalization: 0
+                });
+                return;
             }
-            if (detectedEmail) {
-                setEmailColumn(detectedEmail);
+
+            const token = await getAccessToken();
+            if (requestId !== domainCheckRequestRef.current) return;
+            if (!token) {
+                setUploadError("Session expired. Sign in again and retry.");
+                return;
             }
-            if (detectedEmailStatus) {
-                setEmailStatusColumn(detectedEmailStatus);
+
+            const totals = {
+                existing: 0,
+                run: 0,
+                withFounders: 0,
+                withEmails: 0,
+                withPersonalization: 0
+            };
+
+            for (let offset = 0; offset < uniqueDomains.length; offset += DOMAIN_CHECK_BATCH) {
+                if (requestId !== domainCheckRequestRef.current) return;
+                const batch = uniqueDomains.slice(offset, offset + DOMAIN_CHECK_BATCH);
+                setDomainCheckProgress({
+                    checked: Math.min(offset + batch.length, uniqueDomains.length),
+                    total: uniqueDomains.length
+                });
+
+                const response = await fetch(
+                    `${getPipelineBaseUrl()}/api/jobs/check-domains`,
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            Authorization: `Bearer ${token}`
+                        },
+                        body: JSON.stringify({
+                            domains: batch,
+                            clientId
+                        })
+                    }
+                );
+
+                if (!response.ok) {
+                    const payload = await response.json().catch(() => null);
+                    const message = (payload && typeof payload.error === "string" && payload.error)
+                        || `Domain check failed (${response.status}).`;
+                    throw new Error(message);
+                }
+
+                const data = await response.json();
+                totals.existing += Number(data.existingDomains) || 0;
+                totals.run += Number(data.run) || 0;
+                totals.withFounders += Number(data.withFounders) || 0;
+                totals.withEmails += Number(data.withEmails) || 0;
+                totals.withPersonalization += Number(data.withPersonalization) || 0;
             }
+
+            if (requestId !== domainCheckRequestRef.current) return;
+            setDomainCheckStats({
+                total: normalizedTotal,
+                unique: uniqueDomains.length,
+                existing: totals.existing,
+                new: uniqueDomains.length - totals.existing,
+                run: totals.run,
+                notRun: totals.existing - totals.run,
+                withFounders: totals.withFounders,
+                withEmails: totals.withEmails,
+                withPersonalization: totals.withPersonalization
+            });
         } catch (error) {
-            console.error("Failed to read CSV header", error);
+            if (requestId !== domainCheckRequestRef.current) return;
+            console.error("Failed to check uploaded domains", error);
+            setUploadError(error instanceof Error ? error.message : "Failed to check domains.");
+        } finally {
+            if (requestId === domainCheckRequestRef.current) {
+                setCheckingDomains(false);
+                setDomainCheckProgress(null);
+            }
         }
     };
 
@@ -12742,7 +12802,9 @@ export default function ClientPage() {
                                                         borderRadius: '50%',
                                                         animation: 'spin 0.8s linear infinite'
                                                     }} />
-                                                    Checking domains...
+                                                    {domainCheckProgress
+                                                        ? `Checking domains… ${domainCheckProgress.checked.toLocaleString()} / ${domainCheckProgress.total.toLocaleString()}`
+                                                        : "Reading CSV…"}
                                                 </div>
                                             ) : domainCheckStats ? (
                                                 <div style={{ color: 'var(--app-text)' }}>

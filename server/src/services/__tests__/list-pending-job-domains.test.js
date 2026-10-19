@@ -24,4 +24,16 @@ describe('listPendingJobDomains (large upload contract)', () => {
             'documents that callers must omit limit for full job cohort'
         );
     });
+
+    it('inserts large CSV uploads in one transaction via unnest, not a per-row VALUES list', () => {
+        const source = readFileSync(jobsModulePath, 'utf8');
+        assert.match(source, /export const JOB_DOMAIN_INSERT_CHUNK = 2000/);
+        assert.match(source, /FROM unnest\(\$3::text\[\], \$4::text\[\], \$5::text\[\]\)/);
+        const insertFn = source.slice(
+            source.indexOf('export async function bulkInsertJobDomains'),
+            source.indexOf('export async function markJobDomainsSkipped')
+        );
+        assert.match(insertFn, /await client\.query\('BEGIN'\)/);
+        assert.doesNotMatch(insertFn, /VALUES \$\{values\.join/);
+    });
 });

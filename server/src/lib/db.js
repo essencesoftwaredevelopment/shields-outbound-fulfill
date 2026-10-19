@@ -13,6 +13,7 @@
 
 import { pool as dbPool } from '../config/db.js';
 import { normalizeDomain } from '../utils/domain.js';
+import { collectExistingDomains } from '../services/domainLookup.js';
 
 // Re-export pool for convenience
 export const pool = dbPool;
@@ -584,33 +585,15 @@ export async function getExistingDomainsSet(clientId, domains, { reauditMonths =
     if (!domains.length) return new Set();
     if (!clientId) throw new Error('clientId is required');
 
-    const normalizedDomains = domains.map((d) => normalizeDomain(d)).filter(Boolean);
+    const normalizedDomains = [...new Set(domains.map((d) => normalizeDomain(d)).filter(Boolean))];
     if (!normalizedDomains.length) return new Set();
 
-    const months = Number(reauditMonths);
-    const useReaudit = Number.isFinite(months) && months > 0;
-
-    const query = useReaudit
-        ? `
-        SELECT domain_normalized
-        FROM companies
-        WHERE client_id = $1
-          AND domain_normalized = ANY($2::text[])
-          AND last_audit_at IS NOT NULL
-          AND last_audit_at > NOW() - ($3::text || ' months')::interval
-    `
-        : `
-        SELECT domain_normalized
-        FROM companies
-        WHERE client_id = $1 AND domain_normalized = ANY($2::text[])
-    `;
-
-    const params = useReaudit
-        ? [clientId, normalizedDomains, String(months)]
-        : [clientId, normalizedDomains];
-
-    const result = await pool.query(query, params);
-    return new Set(result.rows.map((r) => r.domain_normalized));
+    return collectExistingDomains(
+        (sql, params) => pool.query(sql, params),
+        clientId,
+        normalizedDomains,
+        { reauditMonths }
+    );
 }
 
 /**

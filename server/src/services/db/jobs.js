@@ -191,39 +191,57 @@ export async function insertJob({
     );
 }
 
+/** Rows per INSERT. One transaction, array-bound, so a 50k upload is tens of statements not hundreds. */
+export const JOB_DOMAIN_INSERT_CHUNK = 2000;
+
+const DOMAIN_STATUS_BATCH = 500;
+
 export async function bulkInsertJobDomains(jobId, agencyId, domainEntries) {
     if (!domainEntries.length) return 0;
-    const CHUNK = 500;
+    const client = await pool.connect();
     let inserted = 0;
-    for (let i = 0; i < domainEntries.length; i += CHUNK) {
-        const chunk = domainEntries.slice(i, i + CHUNK);
-        const values = [];
-        const params = [jobId, agencyId];
-        let idx = 3;
-        for (let j = 0; j < chunk.length; j++) {
-            const entry = chunk[j];
-            values.push(`($1, $2, $${idx}, 'pending', $${idx + 1}, $${idx + 2}::jsonb)`);
-            params.push(entry.domain, i + j, entry.raw ? JSON.stringify(entry.raw) : '{}');
-            idx += 3;
+    try {
+        await client.query('BEGIN');
+        for (let i = 0; i < domainEntries.length; i += JOB_DOMAIN_INSERT_CHUNK) {
+            const chunk = domainEntries.slice(i, i + JOB_DOMAIN_INSERT_CHUNK);
+            const domains = new Array(chunk.length);
+            const sortOrders = new Array(chunk.length);
+            const rawRows = new Array(chunk.length);
+            for (let j = 0; j < chunk.length; j++) {
+                const entry = chunk[j];
+                domains[j] = entry.domain;
+                sortOrders[j] = String(i + j);
+                rawRows[j] = entry.raw ? JSON.stringify(entry.raw) : '{}';
+            }
+            await client.query(
+                `INSERT INTO job_domains (job_id, agency_id, domain_normalized, status, sort_order, raw_row)
+                 SELECT $1, $2, d.domain, 'pending', d.sort_order::integer, d.raw_row::jsonb
+                 FROM unnest($3::text[], $4::text[], $5::text[]) AS d(domain, sort_order, raw_row)
+                 ON CONFLICT (job_id, domain_normalized) DO NOTHING`,
+                [jobId, agencyId, domains, sortOrders, rawRows]
+            );
+            inserted += chunk.length;
         }
-        await pool.query(
-            `INSERT INTO job_domains (job_id, agency_id, domain_normalized, status, sort_order, raw_row)
-             VALUES ${values.join(', ')}
-             ON CONFLICT (job_id, domain_normalized) DO NOTHING`,
-            params
-        );
-        inserted += chunk.length;
+        await client.query('COMMIT');
+        return inserted;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
     }
-    return inserted;
 }
 
 export async function markJobDomainsSkipped(jobId, domains) {
     if (!domains?.length) return;
-    await pool.query(
-        `UPDATE job_domains SET status = 'skipped', updated_at = NOW()
-         WHERE job_id = $1 AND domain_normalized = ANY($2::text[])`,
-        [jobId, domains]
-    );
+    for (let offset = 0; offset < domains.length; offset += DOMAIN_STATUS_BATCH) {
+        const chunk = domains.slice(offset, offset + DOMAIN_STATUS_BATCH);
+        await pool.query(
+            `UPDATE job_domains SET status = 'skipped', updated_at = NOW()
+             WHERE job_id = $1 AND domain_normalized = ANY($2::text[])`,
+            [jobId, chunk]
+        );
+    }
 }
 
 /**
@@ -266,8 +284,6 @@ export async function markJobDomainProcessing(jobId, domain) {
         [jobId, domain]
     );
 }
-
-const DOMAIN_STATUS_BATCH = 500;
 
 export async function markJobDomainDone(jobId, domain) {
     await markJobDomainsDone(jobId, [domain]);

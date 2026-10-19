@@ -69,6 +69,7 @@ async function enrichJobWithQueueRuntime(jobState, jobId) {
 }
 import { forceTerminateRunner } from '../services/jobRunner.js';
 import { normalizeDomain } from '../utils/domain.js';
+import { chunkList, collectExistingDomains, summarizeDomains } from '../services/domainLookup.js';
 import OpenAI from 'openai';
 
 const router = express.Router();
@@ -369,7 +370,8 @@ async function loadApiKeys(uid) {
 
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+    // Domain lists of 20–50k rows with extra columns clear 10MB easily.
+    limits: { fileSize: 50 * 1024 * 1024 }
 });
 
 const uploadFields = upload.fields([
@@ -1604,109 +1606,32 @@ router.post('/jobs/check-domains', async (req, res) => {
 
         const normalizedDomainsRaw = domains.map((d) => normalizeDomain(d)).filter(Boolean);
         const uniqueDomains = Array.from(new Set(normalizedDomainsRaw));
+        const startedAt = Date.now();
 
         const clientRow = await resolveClientRow(agencyId, String(clientSlug).trim());
-        if (!clientRow?.id) {
-            return res.json({
-                totalDomains: normalizedDomainsRaw.length,
-                uniqueDomains: uniqueDomains.length,
-                existingDomains: 0,
-                newDomains: uniqueDomains.length,
-                run: 0,
-                notRun: 0,
-                withFounders: 0,
-                withEmails: 0,
-                withPersonalization: 0
-            });
-        }
+        const stats = clientRow?.id
+            ? await summarizeDomains(
+                (sql, params) => pool.query(sql, params),
+                clientRow.id,
+                uniqueDomains
+            )
+            : { existing: 0, run: 0, withFounders: 0, withEmails: 0, withPersonalization: 0 };
 
-        const sqlClientId = clientRow.id;
-
-        // First, find which domains exist in the database
-        const existingDomainsQuery = `
-            SELECT DISTINCT domain_normalized 
-            FROM companies 
-            WHERE client_id = $1 
-            AND domain_normalized = ANY($2::text[])
-        `;
-        const existingResult = await pool.query(existingDomainsQuery, [sqlClientId, uniqueDomains]);
-        const existingDomainsList = existingResult.rows.map(row => row.domain_normalized);
-        const existingCount = existingDomainsList.length;
-        const newCount = uniqueDomains.length - existingCount;
-
-        // If no existing domains, return zeros for all enrichment stats
-        if (existingCount === 0) {
-            return res.json({
-                totalDomains: normalizedDomainsRaw.length,
-                uniqueDomains: uniqueDomains.length,
-                existingDomains: 0,
-                newDomains: newCount,
-                run: 0,
-                notRun: 0,
-                withFounders: 0,
-                withEmails: 0,
-                withPersonalization: 0
-            });
-        }
-
-        // Now check enrichment stats for ONLY the existing domains
-        const enrichmentQuery = `
-            SELECT 
-                COUNT(DISTINCT CASE 
-                    WHEN EXISTS (
-                        SELECT 1 FROM contacts ct 
-                        WHERE ct.company_id = c.id 
-                        AND ct.job_id IS NOT NULL
-                    ) THEN c.domain_normalized 
-                END) as run_count,
-                COUNT(DISTINCT CASE 
-                    WHEN EXISTS (
-                        SELECT 1 FROM contacts ct 
-                        WHERE ct.company_id = c.id 
-                        AND ct.full_name IS NOT NULL 
-                        AND ct.full_name != ''
-                        AND ct.job_id IS NOT NULL
-                    ) THEN c.domain_normalized 
-                END) as with_founders_count,
-                COUNT(DISTINCT CASE 
-                    WHEN EXISTS (
-                        SELECT 1 FROM contacts ct 
-                        WHERE ct.company_id = c.id 
-                        AND ct.email IS NOT NULL 
-                        AND ct.email != ''
-                        AND ct.job_id IS NOT NULL
-                    ) THEN c.domain_normalized 
-                END) as with_emails_count,
-                COUNT(DISTINCT CASE 
-                    WHEN EXISTS (
-                        SELECT 1 FROM contacts ct 
-                        WHERE ct.company_id = c.id 
-                        AND ct.personalization_first_line IS NOT NULL 
-                        AND ct.personalization_first_line != ''
-                        AND ct.job_id IS NOT NULL
-                    ) THEN c.domain_normalized 
-                END) as with_personalization_count
-            FROM companies c
-            WHERE c.client_id = $1 
-            AND c.domain_normalized = ANY($2::text[])
-        `;
-
-        const enrichmentResult = await pool.query(enrichmentQuery, [sqlClientId, existingDomainsList]);
-        const enrichment = enrichmentResult.rows[0];
-
-        const runCount = parseInt(enrichment.run_count) || 0;
-        const notRunCount = existingCount - runCount;
+        console.log(
+            `[check-domains] rows=${normalizedDomainsRaw.length} unique=${uniqueDomains.length} `
+            + `existing=${stats.existing} ${Date.now() - startedAt}ms`
+        );
 
         res.json({
             totalDomains: normalizedDomainsRaw.length,
             uniqueDomains: uniqueDomains.length,
-            existingDomains: existingCount,
-            newDomains: newCount,
-            run: runCount,
-            notRun: notRunCount,
-            withFounders: parseInt(enrichment.with_founders_count) || 0,
-            withEmails: parseInt(enrichment.with_emails_count) || 0,
-            withPersonalization: parseInt(enrichment.with_personalization_count) || 0
+            existingDomains: stats.existing,
+            newDomains: uniqueDomains.length - stats.existing,
+            run: stats.run,
+            notRun: stats.existing - stats.run,
+            withFounders: stats.withFounders,
+            withEmails: stats.withEmails,
+            withPersonalization: stats.withPersonalization
         });
 
     } catch (error) {
@@ -1734,14 +1659,11 @@ router.post('/jobs/check-domains/new.csv', async (req, res) => {
         let newDomainList = uniqueDomains;
         const clientRow = await resolveClientRow(agencyId, String(clientSlug).trim());
         if (clientRow?.id) {
-            const existingResult = await pool.query(
-                `SELECT DISTINCT domain_normalized
-                 FROM companies
-                 WHERE client_id = $1
-                 AND domain_normalized = ANY($2::text[])`,
-                [clientRow.id, uniqueDomains]
+            const existingSet = await collectExistingDomains(
+                (sql, params) => pool.query(sql, params),
+                clientRow.id,
+                uniqueDomains
             );
-            const existingSet = new Set(existingResult.rows.map((row) => row.domain_normalized));
             newDomainList = uniqueDomains.filter((domain) => !existingSet.has(domain));
         }
 
@@ -1810,29 +1732,38 @@ router.post('/jobs/check-domains/existing.csv', async (req, res) => {
 
         // One row per domain. Only 'founder' contacts are written in practice, but prefer
         // them explicitly so the row count stays aligned with the distinct-domain stats.
-        const result = await pool.query(
-            `SELECT DISTINCT ON (co.domain_normalized)
+        // Chunked from unnest so a 50k download does not seq-scan companies.
+        const exportSql = `
+            SELECT DISTINCT ON (co.domain_normalized)
                 co.domain_normalized AS domain,
                 c.full_name AS founder_name,
                 c.email,
                 c.email_status,
                 c.personalization_first_line AS personalization
-             FROM companies co
-             JOIN contacts c ON c.company_id = co.id
-             WHERE co.client_id = $1
-             AND co.domain_normalized = ANY($2::text[])
-             AND c.job_id IS NOT NULL
-             AND ${exportScope.predicate}
-             ORDER BY co.domain_normalized ASC, (c.role_type = 'founder') DESC, c.updated_at DESC`,
-            [clientRow.id, uniqueDomains]
-        );
+            FROM (SELECT DISTINCT domain FROM unnest($2::text[]) AS input(domain)) input
+            JOIN LATERAL (
+                SELECT id, domain_normalized
+                FROM companies
+                WHERE client_id = $1 AND domain_normalized = input.domain
+                LIMIT 1
+            ) co ON true
+            JOIN contacts c ON c.company_id = co.id
+            WHERE c.job_id IS NOT NULL
+            AND ${exportScope.predicate}
+            ORDER BY co.domain_normalized ASC, (c.role_type = 'founder') DESC, c.updated_at DESC`;
+        const rows = [];
+        for (const chunk of chunkList(uniqueDomains)) {
+            const result = await pool.query(exportSql, [clientRow.id, chunk]);
+            rows.push(...result.rows);
+        }
+        rows.sort((a, b) => String(a.domain).localeCompare(String(b.domain)));
 
         const { headers } = exportScope;
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="existing_${scope}.csv"`);
         res.setHeader('X-Accel-Buffering', 'no');
         res.write(`${headers.join(',')}\n`);
-        for (const row of result.rows) {
+        for (const row of rows) {
             const parts = String(row.founder_name || '').trim().split(/\s+/);
             res.write(`${formatUnifiedCsvLine(headers, {
                 domain: row.domain,
