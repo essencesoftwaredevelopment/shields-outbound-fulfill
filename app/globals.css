@@ -4397,6 +4397,10 @@ select.lead-activity-chip {
   min-width: 0;
 }
 
+.ar-aside > .ar-panel + .ar-panel {
+  margin-top: 1rem;
+}
+
 @media (min-width: 1024px) {
   .ar-layout--with-aside {
     grid-template-columns: minmax(0, 1fr) 420px;

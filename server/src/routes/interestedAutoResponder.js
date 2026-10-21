@@ -21,6 +21,7 @@ import {
     applyActiveFungiStoryUrlToTemplateVars,
     FAILED_DRAFT_STATUSES,
     INTERESTED_PENDING_REVIEW_LAST_EVENT_TYPES,
+    replyAgentOptions,
     resolveReplyPreviewBehavior,
     withAuditUrlVars
 } from '../services/interestedAutoResponder.js';
@@ -55,7 +56,7 @@ router.get('/clients/:clientId/interested-autoresponder/prompts', requireAuth, a
 
         const result = await pool.query(
             `SELECT p.id, p.agency_id, p.client_id, p.campaign_id, p.version, p.system_prompt,
-                    p.active, p.created_at, p.updated_at, ic.name AS campaign_name
+                    p.active, p.agent_mode, p.created_at, p.updated_at, ic.name AS campaign_name
              FROM interested_autoresponder_prompts p
              JOIN instantly_campaigns ic ON ic.id = p.campaign_id
              WHERE p.client_id = $1
@@ -80,6 +81,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts', requireAuth, 
         const version = String(req.body?.version || '').trim();
         const systemPrompt = String(req.body?.systemPrompt || '').trim();
         const active = req.body?.active !== false;
+        const agentMode = req.body?.agentMode === true;
 
         if (!Number.isInteger(campaignId) || campaignId <= 0) {
             return res.status(400).json({ error: 'Valid campaignId is required.' });
@@ -109,11 +111,11 @@ router.post('/clients/:clientId/interested-autoresponder/prompts', requireAuth, 
         }
         const result = await client.query(
             `INSERT INTO interested_autoresponder_prompts (
-                agency_id, client_id, campaign_id, version, system_prompt, active
+                agency_id, client_id, campaign_id, version, system_prompt, active, agent_mode
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING *`,
-            [req.agencyId, clientRow.id, campaignId, version, systemPrompt, active]
+            [req.agencyId, clientRow.id, campaignId, version, systemPrompt, active, agentMode]
         );
         await client.query('COMMIT');
         res.status(201).json({
@@ -143,6 +145,7 @@ router.put('/clients/:clientId/interested-autoresponder/prompts/:promptId', requ
         const version = String(req.body?.version || '').trim();
         const systemPrompt = String(req.body?.systemPrompt || '').trim();
         const active = req.body?.active !== false;
+        const agentMode = req.body?.agentMode === true;
 
         if (!Number.isInteger(promptId) || promptId <= 0) {
             return res.status(400).json({ error: 'Valid prompt id is required.' });
@@ -180,11 +183,12 @@ router.put('/clients/:clientId/interested-autoresponder/prompts/:promptId', requ
                  version = $3,
                  system_prompt = $4,
                  active = $5,
+                 agent_mode = $7,
                  updated_at = NOW()
              WHERE id = $1
                AND client_id = $6
              RETURNING *`,
-            [promptId, campaignId, version, systemPrompt, active, clientRow.id]
+            [promptId, campaignId, version, systemPrompt, active, clientRow.id, agentMode]
         );
         if (!result.rows.length) {
             await client.query('ROLLBACK');
@@ -226,7 +230,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
 
         const [promptResult, contactResult] = await Promise.all([
             pool.query(
-                `SELECT p.id, p.campaign_id, p.system_prompt, p.version, ic.name AS campaign_name
+                `SELECT p.id, p.campaign_id, p.system_prompt, p.version, p.agent_mode, ic.name AS campaign_name
                  FROM interested_autoresponder_prompts p
                  JOIN instantly_campaigns ic ON ic.id = p.campaign_id
                  WHERE p.id = $1 AND p.client_id = $2
@@ -321,7 +325,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
         // Substitute template variables in the system prompt
         const renderedSystemPrompt = renderTemplate(prompt.system_prompt, templateVars);
 
-        const { renderedText, model, previewUrl: generatedPreviewUrl } = await generateDraftReply({
+        const { renderedText, model, previewUrl: generatedPreviewUrl, agentTrace } = await generateDraftReply({
             openaiKey,
             systemPrompt: renderedSystemPrompt,
             campaignName: prompt.campaign_name,
@@ -331,7 +335,13 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
             auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
             systemPromptOwnsCta: preview.systemPromptOwnsCta,
             essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
-            previewDomain: contact.company_domain || null
+            previewDomain: contact.company_domain || null,
+            agent: replyAgentOptions(prompt, {
+                contactId,
+                campaignId: prompt.campaign_id,
+                templateVars,
+                settings
+            })
         });
 
         // Create a real pending_review draft so we can send a clickable review link
@@ -342,18 +352,19 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                 agency_id, client_id, campaign_id, contact_id, instantly_lead_id, source_event_id,
                 review_token, review_token_expires_at, status, blocked_reason,
                 reply_to_uuid, eaccount, thread_subject, lead_email, previous_lead_message,
-                system_prompt_version, model, rendered_text
+                system_prompt_version, model, rendered_text, agent_trace
             ) VALUES (
                 $1, $2, $3, $4, NULL, NULL,
                 $5, $6, 'pending_review', NULL,
                 NULL, NULL, $7, $8, $9,
-                $10, $11, $12
+                $10, $11, $12, $13::jsonb
             )`,
             [
                 req.agencyId, clientRow.id, prompt.campaign_id, contactId,
                 reviewToken, reviewTokenExpiresAt,
                 threadSubject, contact.email, previousLeadMessage,
-                prompt.version, model, renderedText
+                prompt.version, model, renderedText,
+                agentTrace ? JSON.stringify(agentTrace) : null
             ]
         );
 
@@ -386,6 +397,7 @@ router.post('/clients/:clientId/interested-autoresponder/prompts/:promptId/test'
                 threadSubject: threadSubject || null,
                 storyUrl: templateVars.story_url || null,
                 renderedSystemPrompt,
+                agentTrace: agentTrace || null,
                 contextSentToAI: {
                     campaignName: prompt.campaign_name,
                     leadEmail: contact.email,

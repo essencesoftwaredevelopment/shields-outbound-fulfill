@@ -263,7 +263,8 @@ persistBriefStep.maxRetries = 1;
 popupStep.maxRetries = 0;
 // Finalize is guarded by status='researching', so a retry after a mid-step crash
 // either completes the promotion or stops as superseded — never double-notifies
-// with two different tokens for the same open draft.
+// with two different tokens for the same open draft. On agent-mode prompts the
+// retry re-runs the whole tool loop (bounded by INTERESTED_REPLY_AGENT_BUDGET_MS).
 finalizeStep.maxRetries = 1;
 // Last line of defense against a draft stranded at 'researching'.
 handleFailureStep.maxRetries = 3;

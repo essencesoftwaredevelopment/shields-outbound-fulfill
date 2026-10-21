@@ -867,6 +867,21 @@ status), cancel, regenerate (§2c).
 | `INTERESTED_RESEARCH_HOMEPAGE_TIMEOUT_MS` | 15 000 |
 | `INTERESTED_RESEARCH_SERPER_TIMEOUT_MS` | 20 000 |
 | `INTERESTED_AUTORESPONDER_POPUP_TIMEOUT_MS` | 90 000, × 2 attempts |
+| `INTERESTED_REPLY_AGENT_MODEL` | falls back to `INTERESTED_AUTORESPONDER_MODEL` — agent-mode replies |
+| `INTERESTED_REPLY_AGENT_REASONING_EFFORT` | `medium` |
+| `INTERESTED_REPLY_AGENT_MAX_TURNS` | 10 (min 2); the last turn is forced to `submit_draft` |
+| `INTERESTED_REPLY_AGENT_BUDGET_MS` | 150 000; once spent, the next model call is forced to `submit_draft` |
+
+Per-prompt: `interested_autoresponder_prompts.agent_mode` ("Free agent mode" in the
+prompt modal, migration 0069). When on, step 3.6's single completion is replaced by
+a Responses API tool loop (`server/src/services/interestedReplyAgent.js`): the model
+picks from `web_search` (agency Serper key), `fetch_page` (public http(s) only),
+`get_thread`, `get_lead_profile`, `generate_store_preview` (same gating as above) and
+ends with `submit_draft(reply, notes_for_reviewer)`. Links in the reply must come from
+the prompt, the input or a tool result — otherwise the submit is bounced once (accepted
+on a forced turn and listed for the reviewer). What it did is stored in
+`interested_autoresponder_drafts.agent_trace` and shown in the review page's Agent panel.
+The research steps (homepage, Serper, brief) still run first as starting context.
 
 Per-agency flags in `agency_settings.features`: `replyResearchAgent` (workflow path),
 `autoresponderShoppingAudit` (Vulcan audit CTA — not set for ESSENCE Retention).

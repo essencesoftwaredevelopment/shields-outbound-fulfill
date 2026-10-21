@@ -14,6 +14,12 @@ import {
 } from './interestedResearch/trigger.js';
 import { attachWorkflowRunId, stampResearchStep } from './interestedResearch/progress.js';
 import { findPhoneForContact } from './phoneFinder.js';
+import {
+    buildAgentLeadProfile,
+    REPLY_AGENT_GUIDANCE,
+    runReplyAgent,
+    serializeAgentTraceForReview
+} from './interestedReplyAgent.js';
 import { getClientRowById, resolveClientRow } from './db/queries.js';
 import {
     fetchThreadReplyMetadata,
@@ -674,7 +680,7 @@ function buildReplySnippet(text = '') {
 
 export async function fetchPromptConfig(db, clientId, campaignId) {
     const result = await db.query(
-        `SELECT p.id, p.campaign_id, p.version, p.system_prompt, p.active,
+        `SELECT p.id, p.campaign_id, p.version, p.system_prompt, p.active, p.agent_mode,
                 ic.name AS campaign_name
          FROM interested_autoresponder_prompts p
          JOIN instantly_campaigns ic ON ic.id = p.campaign_id
@@ -903,6 +909,8 @@ export async function fetchAgencyAndClientSettings(agencyId, clientIdOrSlug) {
     const useActiveFungiStoryUrl = clientSlug === ACTIVE_FUNGI_CLIENT_SLUG;
     return {
         openaiKey: asTrimmedText(agencySettings?.openai_key),
+        // Agent-mode prompts get a web_search tool only when the agency has Serper.
+        serperKey: asTrimmedText(agencySettings?.serper_key),
         ntfyTopic: asTrimmedText(clientRow?.ntfy_topic),
         instantlyKey: asTrimmedText(clientRow?.instantly_key),
         clientSlug: clientSlug || null,
@@ -975,11 +983,13 @@ export async function generateDraftReply({
     // building the popup up front. The model calls it only when the campaign
     // prompt says the preview is the right CTA.
     essenceStorePreviewTool = false,
-    previewDomain = null
+    previewDomain = null,
+    // Prompt agent_mode: { contactId, campaignId, templateVars, serperKey }.
+    // The model runs a tool loop and decides what to look up (interestedReplyAgent.js).
+    agent = null
 }) {
     let previewUrl = asTrimmedText(auditPreviewUrl) || asTrimmedText(essenceAiPreviewUrl);
     const enablePreviewTool = Boolean(essenceStorePreviewTool) && !previewUrl;
-    const client = new OpenAI({ apiKey: openaiKey });
     let ctaBlock = '';
     if (!systemPromptOwnsCta) {
         ctaBlock = previewUrl
@@ -991,6 +1001,26 @@ export async function generateDraftReply({
         prependPriorityInstructions(systemPrompt, additionalInstructions),
         { auditUrl: previewUrl }
     );
+
+    if (agent) {
+        return generateAgentDraftReply({
+            openaiKey,
+            effectiveSystemPrompt,
+            campaignName,
+            leadEmail,
+            threadSubject,
+            previousLeadMessage,
+            previewUrl,
+            ctaBlock: systemPromptOwnsCta ? '' : ctaBlock,
+            briefBlock,
+            researchBrief,
+            enablePreviewTool,
+            previewDomain,
+            agent
+        });
+    }
+
+    const client = new OpenAI({ apiKey: openaiKey });
     const userContent = [
         `Campaign: ${campaignName || 'Unknown campaign'}`,
         `Lead email: ${leadEmail || 'Unknown lead'}`,
@@ -1052,7 +1082,84 @@ export async function generateDraftReply({
     return {
         model: response.model || DEFAULT_MODEL,
         renderedText: applyReplyLinkPlaceholders(String(content).trim(), { auditUrl: previewUrl }),
-        previewUrl: previewUrl || null
+        previewUrl: previewUrl || null,
+        agentTrace: null
+    };
+}
+
+async function generateAgentDraftReply({
+    openaiKey,
+    effectiveSystemPrompt,
+    campaignName,
+    leadEmail,
+    threadSubject,
+    previousLeadMessage,
+    previewUrl,
+    ctaBlock,
+    briefBlock,
+    researchBrief,
+    enablePreviewTool,
+    previewDomain,
+    agent
+}) {
+    const domain = normalizeAuditDomain(previewDomain) || domainFromLeadEmail(leadEmail);
+    const input = [
+        `Campaign: ${campaignName || 'Unknown campaign'}`,
+        `Lead email: ${leadEmail || 'Unknown lead'}`,
+        `Company website: ${domain ? `https://${domain}` : '(unknown)'}`,
+        `Thread subject: ${threadSubject || '(use existing thread subject)'}`,
+        previewUrl ? `Shopping audit URL: ${previewUrl}` : '',
+        ctaBlock,
+        '',
+        briefBlock
+            ? [
+                'Starting research on their company (automated homepage + web search; may be incomplete):',
+                briefBlock,
+                ''
+            ].join('\n')
+            : '',
+        'Lead\'s latest message / thread context:',
+        previousLeadMessage || '(no message text available)'
+    ].filter(Boolean).join('\n');
+
+    const { contactId, campaignId, templateVars, serperKey } = agent;
+    const result = await runReplyAgent({
+        openaiKey,
+        instructions: [effectiveSystemPrompt, '', '---', '', REPLY_AGENT_GUIDANCE].join('\n'),
+        input,
+        serperKey: serperKey || null,
+        loadThread: contactId && campaignId
+            ? () => fetchThreadMessagesForReview(pool, contactId, campaignId, leadEmail)
+            : null,
+        leadProfile: templateVars ? buildAgentLeadProfile(templateVars) : null,
+        generateStorePreview: enablePreviewTool && domain
+            ? (reason) => {
+                console.log(
+                    `[interested-autoresponder] agent ${ESSENCE_STORE_PREVIEW_TOOL_NAME} domain=${domain}`
+                    + (reason ? ` reason=${reason}` : '')
+                );
+                return callPopupFormGenerate(leadEmail, popupOptionsFromResearchBrief(researchBrief, domain));
+            }
+            : null,
+        allowedUrls: domain ? [`https://${domain}`] : []
+    });
+    const finalPreviewUrl = result.previewUrl || previewUrl || null;
+    return {
+        model: result.model,
+        renderedText: applyReplyLinkPlaceholders(result.reply, { auditUrl: finalPreviewUrl }),
+        previewUrl: finalPreviewUrl,
+        agentTrace: result.trace
+    };
+}
+
+/** generateDraftReply's `agent` option for a prompt row, or null when agent mode is off. */
+export function replyAgentOptions(promptConfig, { contactId, campaignId, templateVars, settings }) {
+    if (!promptConfig?.agent_mode) return null;
+    return {
+        contactId: contactId || null,
+        campaignId: campaignId || null,
+        templateVars: templateVars || null,
+        serperKey: settings?.serperKey || null
     };
 }
 
@@ -1691,12 +1798,14 @@ async function insertDraftRow(db, draft) {
         `INSERT INTO interested_autoresponder_drafts (
             agency_id, client_id, campaign_id, contact_id, instantly_lead_id, source_event_id,
             review_token, review_token_expires_at, status, blocked_reason, reply_to_uuid, eaccount,
-            thread_subject, lead_email, previous_lead_message, system_prompt_version, model, rendered_text
+            thread_subject, lead_email, previous_lead_message, system_prompt_version, model, rendered_text,
+            agent_trace
         )
         VALUES (
             $1, $2, $3, $4, $5, $6,
             $7, $8, $9, $10, $11, $12,
-            $13, $14, $15, $16, $17, $18
+            $13, $14, $15, $16, $17, $18,
+            $19::jsonb
         )
         RETURNING *`,
         [
@@ -1717,7 +1826,8 @@ async function insertDraftRow(db, draft) {
             draft.previous_lead_message,
             draft.system_prompt_version,
             draft.model,
-            draft.rendered_text
+            draft.rendered_text,
+            draft.agent_trace ? JSON.stringify(draft.agent_trace) : null
         ]
     );
     return result.rows[0] || null;
@@ -1959,7 +2069,8 @@ export async function createInterestedAutoResponderDraftFromEvent({
                 auditPreviewUrl: useActiveFungiStoryUrl ? null : auditPreviewUrl,
                 systemPromptOwnsCta: preview.systemPromptOwnsCta,
                 essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
-                previewDomain: auditDomain
+                previewDomain: auditDomain,
+                agent: replyAgentOptions(promptConfig, { contactId, campaignId, templateVars, settings })
             });
         } catch (error) {
             const failedDraft = await insertDraftRow(client, {
@@ -2016,7 +2127,8 @@ export async function createInterestedAutoResponderDraftFromEvent({
             previous_lead_message: previousLeadMessage,
             system_prompt_version: promptConfig.version,
             model: generation.model,
-            rendered_text: generation.renderedText
+            rendered_text: generation.renderedText,
+            agent_trace: generation.agentTrace
         });
 
         if (settings.ntfyTopic && savedDraft?.review_token) {
@@ -2263,6 +2375,7 @@ function serializeReviewDraft(draft) {
         websiteUrl: website.url,
         researchBrief: serializeResearchBriefForReview(draft.research_brief),
         researchCompletedAt: draft.research_completed_at || null,
+        agentTrace: serializeAgentTraceForReview(draft.agent_trace),
         phone: serializeReviewPhone(draft)
     };
 }
@@ -2683,7 +2796,13 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
         systemPromptOwnsCta: preview.systemPromptOwnsCta,
         additionalInstructions,
         essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
-        previewDomain: auditDomain
+        previewDomain: auditDomain,
+        agent: replyAgentOptions(promptConfig, {
+            contactId: draft.contact_id,
+            campaignId: draft.campaign_id,
+            templateVars,
+            settings
+        })
     });
 
     const reviewTokenExpiresAt = new Date(Date.now() + REVIEW_TOKEN_TTL_MS).toISOString();
@@ -2696,6 +2815,7 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
              system_prompt_version = $5,
              research_brief = NULL,
              research_completed_at = NULL,
+             agent_trace = $7::jsonb,
              blocked_reason = NULL,
              updated_at = NOW()
          WHERE id = $1
@@ -2707,7 +2827,8 @@ async function regenerateDraftInline({ draft, settings, promptConfig, additional
             generation.model,
             generation.renderedText,
             promptConfig.version,
-            ['pending_review', 'researching']
+            ['pending_review', 'researching'],
+            generation.agentTrace ? JSON.stringify(generation.agentTrace) : null
         ]
     );
     if (!result.rowCount) {

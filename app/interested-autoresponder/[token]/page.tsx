@@ -49,6 +49,8 @@ type ReviewDraft = {
     websiteUrl?: string | null;
     researchBrief?: ResearchBrief | null;
     researchCompletedAt?: string | null;
+    /** Free-agent prompts only: what the reply agent looked up and its notes. */
+    agentTrace?: AgentTrace | null;
     thread?: ThreadMessage[] | null;
     /** Founder phone from the Enrow lookup; null when never looked up. */
     phone?: {
@@ -235,6 +237,64 @@ function ThreadView({ messages }: ThreadViewProps) {
                     </article>
                 );
             })}
+        </div>
+    );
+}
+
+type AgentTrace = {
+    notes: string | null;
+    steps: Array<{ tool: string; input: string | null; ok: boolean; error: string | null }>;
+    unapprovedLinks: string[];
+    turns: number;
+    elapsedMs: number;
+};
+
+const AGENT_TOOL_LABELS: Record<string, string> = {
+    web_search: "Searched",
+    fetch_page: "Read page",
+    get_thread: "Read full thread",
+    get_lead_profile: "Checked lead profile",
+    generate_store_preview: "Built store preview",
+};
+
+function AgentPanel({ trace }: { trace: AgentTrace }) {
+    const seconds = Math.round((trace.elapsedMs || 0) / 1000);
+    return (
+        <div className="ar-panel ar-research" aria-label="Reply agent">
+            <div className="ar-panel__head">
+                <p className="eyebrow eyebrow--muted">Agent</p>
+                {seconds > 0 && <span className="ar-save-state">{seconds}s</span>}
+            </div>
+
+            {trace.notes && <p className="ar-research__summary">{trace.notes}</p>}
+
+            <section className="ar-research__section">
+                <p className="ar-research__label">What it checked</p>
+                {trace.steps.length === 0 ? (
+                    <p className="ar-research__empty">Nothing — it drafted from the prompt and thread alone.</p>
+                ) : (
+                    <ul className="ar-research__list">
+                        {trace.steps.map((step, index) => (
+                            <li key={`${index}-${step.tool}`} title={step.error || undefined}>
+                                {AGENT_TOOL_LABELS[step.tool] || step.tool}
+                                {step.input ? `: ${step.input}` : ""}
+                                {!step.ok ? " (failed)" : ""}
+                            </li>
+                        ))}
+                    </ul>
+                )}
+            </section>
+
+            {trace.unapprovedLinks.length > 0 && (
+                <section className="ar-research__section">
+                    <p className="ar-research__label">Check these links</p>
+                    <ul className="ar-research__list ar-research__list--risks">
+                        {trace.unapprovedLinks.map((link) => (
+                            <li key={link}>{link}</li>
+                        ))}
+                    </ul>
+                </section>
+            )}
         </div>
     );
 }
@@ -858,7 +918,7 @@ export default function InterestedAutoResponderReviewPage() {
     const actionsBusy = sending || regenerating || archiving;
     const hasDraftText = Boolean(String(draft?.renderedText || "").trim());
     // Right column only earns its space when there is (or will be) a brief.
-    const showResearch = Boolean(draft && (regenerating || draft.researchBrief));
+    const showResearch = Boolean(draft && (regenerating || draft.researchBrief || draft.agentTrace));
     const thread: ThreadMessage[] = draft?.thread ?? [];
     // The quote already shows the latest lead message; the thread adds value once there is more.
     const canExpandThread = thread.length > 1 || (thread.length === 1 && !draft?.previousLeadMessage);
@@ -1184,6 +1244,7 @@ export default function InterestedAutoResponderReviewPage() {
                                     completedAt={draft.researchCompletedAt}
                                     researching={regenerating}
                                 />
+                                {draft.agentTrace && !regenerating && <AgentPanel trace={draft.agentTrace} />}
                             </aside>
                         )}
                     </div>

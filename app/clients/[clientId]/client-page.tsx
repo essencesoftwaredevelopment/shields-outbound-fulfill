@@ -1192,6 +1192,7 @@ type InterestedAutoResponderPrompt = {
     version: string;
     system_prompt: string;
     active: boolean;
+    agent_mode?: boolean;
     created_at: string;
     updated_at: string;
 };
@@ -1804,6 +1805,7 @@ export default function ClientPage() {
     const [autoResponderPromptVersion, setAutoResponderPromptVersion] = useState('v1');
     const [autoResponderPromptSystemPrompt, setAutoResponderPromptSystemPrompt] = useState('');
     const [autoResponderPromptActive, setAutoResponderPromptActive] = useState(true);
+    const [autoResponderPromptAgentMode, setAutoResponderPromptAgentMode] = useState(false);
     const [autoResponderTestModalOpen, setAutoResponderTestModalOpen] = useState(false);
     const [testingAutoResponderPrompt, setTestingAutoResponderPrompt] = useState<InterestedAutoResponderPrompt | null>(null);
     const [autoResponderTestLeadSearch, setAutoResponderTestLeadSearch] = useState('');
@@ -6816,12 +6818,14 @@ export default function ClientPage() {
             setAutoResponderPromptVersion(prompt.version || 'v1');
             setAutoResponderPromptSystemPrompt(prompt.system_prompt || '');
             setAutoResponderPromptActive(prompt.active);
+            setAutoResponderPromptAgentMode(Boolean(prompt.agent_mode));
         } else {
             setEditingAutoResponderPrompt(null);
             setAutoResponderPromptCampaignId(autoResponderCampaigns[0]?.id || '');
             setAutoResponderPromptVersion('v1');
             setAutoResponderPromptSystemPrompt('');
             setAutoResponderPromptActive(true);
+            setAutoResponderPromptAgentMode(false);
         }
         setAutoResponderPromptModalOpen(true);
     };
@@ -6860,7 +6864,8 @@ export default function ClientPage() {
                         campaignId: Number(autoResponderPromptCampaignId),
                         version: autoResponderPromptVersion.trim(),
                         systemPrompt: autoResponderPromptSystemPrompt.trim(),
-                        active: autoResponderPromptActive
+                        active: autoResponderPromptActive,
+                        agentMode: autoResponderPromptAgentMode
                     })
                 }
             );
@@ -11570,6 +11575,14 @@ export default function ClientPage() {
                                                         <span className={`status-badge ${prompt.active ? 'status-badge--active' : 'status-badge--inactive'}`}>
                                                             {prompt.active ? 'Active' : 'Inactive'}
                                                         </span>
+                                                        {prompt.agent_mode && (
+                                                            <span
+                                                                className="lead-pastel-chip lead-pastel-chip--list"
+                                                                title="Free agent: the model decides which tools to use before drafting"
+                                                            >
+                                                                Agent
+                                                            </span>
+                                                        )}
                                                     </div>
                                                     <pre style={{
                                                         margin: '0.7rem 0 0',
@@ -12040,6 +12053,22 @@ export default function ClientPage() {
                                     style={{ width: '1rem', height: '1rem', flexShrink: 0 }}
                                 />
                                 <span className="settings-field__label" style={{ margin: 0 }}>Set active for this campaign</span>
+                            </label>
+                            <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'flex-start', gap: '0.75rem' }}>
+                                <input
+                                    type="checkbox"
+                                    checked={autoResponderPromptAgentMode}
+                                    onChange={(event) => setAutoResponderPromptAgentMode(event.target.checked)}
+                                    style={{ width: '1rem', height: '1rem', flexShrink: 0, marginTop: '0.15rem' }}
+                                />
+                                <span style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                                    <span className="settings-field__label" style={{ margin: 0 }}>Free agent mode</span>
+                                    <span style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>
+                                        The model decides what to look up before drafting: web search, reading pages,
+                                        the full thread, the lead&apos;s profile and (when the prompt uses it) a live store
+                                        preview. Slower and a few extra model calls per reply; the reviewer sees what it checked.
+                                    </span>
+                                </span>
                             </label>
                         </div>
                         <div className="modal__actions">

@@ -31,6 +31,7 @@ import {
     resolveReplyPreviewBehavior,
     generateReviewToken,
     humanizeDomainAsCompanyName,
+    replyAgentOptions,
     normalizeAuditDomain,
     resolveContactSignalContext,
     sendNtfyDraftFailureNotification,
@@ -586,7 +587,13 @@ export async function finalizeResearchDraft({
         systemPromptOwnsCta: preview.systemPromptOwnsCta,
         additionalInstructions,
         essenceStorePreviewTool: preview.canGenerateEssenceStorePreview,
-        previewDomain: domain
+        previewDomain: domain,
+        agent: replyAgentOptions(promptConfig, {
+            contactId: draft.contact_id,
+            campaignId: draft.campaign_id,
+            templateVars,
+            settings
+        })
     });
 
     const existingToken = String(draft.review_token || '').trim();
@@ -600,6 +607,7 @@ export async function finalizeResearchDraft({
              model = $4,
              rendered_text = $5,
              system_prompt_version = $6,
+             agent_trace = $7::jsonb,
              research_completed_at = NOW(),
              updated_at = NOW()
          WHERE id = $1 AND status = 'researching'
@@ -610,7 +618,8 @@ export async function finalizeResearchDraft({
             reviewTokenExpiresAt,
             generation.model,
             generation.renderedText,
-            promptConfig.version
+            promptConfig.version,
+            generation.agentTrace ? JSON.stringify(generation.agentTrace) : null
         ]
     );
     if (!updateResult.rowCount) {
