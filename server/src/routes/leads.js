@@ -150,6 +150,30 @@ function classifyLeadSearch(value) {
     return { kind: 'text', value: trimmed.toLowerCase() };
 }
 
+// Free-text search over ~1M contacts per client: the planner prices
+// LIKE '%x%' at a few hundred rows and walks idx_contacts_agency_client_created_at,
+// filtering every row — 6.3 s on ESSENCE Retention for a rare term like a
+// half-typed email. Probe the trigram GIN indexes first (6–42 ms). When the
+// term is rare enough to come back in full, the list filters on those ids;
+// common terms overflow the cap and keep the LIKE scan, which fills a page
+// from the top of the created_at index almost immediately.
+const TEXT_SEARCH_ID_PROBE_LIMIT = 2000;
+const TRIGRAM_MIN_TERM_LENGTH = 3;
+
+export async function probeTextSearchContactIds(term, { db = pool, limit = TEXT_SEARCH_ID_PROBE_LIMIT } = {}) {
+    if (String(term || '').length < TRIGRAM_MIN_TERM_LENGTH) return null;
+    const result = await db.query(
+        `SELECT
+            ARRAY(SELECT id FROM contacts WHERE lower(email) LIKE $1 AND email IS NOT NULL LIMIT $2) AS email_ids,
+            ARRAY(SELECT id FROM contacts WHERE lower(full_name) LIKE $1 AND full_name IS NOT NULL LIMIT $2) AS name_ids`,
+        [`%${term}%`, limit + 1]
+    );
+    const emailIds = result.rows[0]?.email_ids || [];
+    const nameIds = result.rows[0]?.name_ids || [];
+    if (emailIds.length > limit || nameIds.length > limit) return null;
+    return [...new Set([...emailIds, ...nameIds].map(String))];
+}
+
 function normalizeOptionalNumber(value) {
     if (value === undefined || value === null || value === '') return undefined;
     const parsed = Number(value);
@@ -1358,11 +1382,17 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
             params.push(searchTerm);
             paramIndex++;
         } else {
-            whereClause += ` AND (
+            const matchedIds = await probeTextSearchContactIds(searchTerm);
+            if (matchedIds) {
+                whereClause += ` AND c.id = ANY($${paramIndex}::bigint[])`;
+                params.push(matchedIds);
+            } else {
+                whereClause += ` AND (
                     LOWER(c.full_name) LIKE $${paramIndex}
                     OR LOWER(c.email) LIKE $${paramIndex}
                 )`;
-            params.push(`%${searchTerm}%`);
+                params.push(`%${searchTerm}%`);
+            }
             paramIndex++;
         }
         paramsState.paramIndex = paramIndex;

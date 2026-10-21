@@ -4507,6 +4507,9 @@ export default function ClientPage() {
                 params.append('clientId', clientId);
                 params.append('limit', '12');
                 params.append('search', query);
+                // Picker only shows name/email/domain — the table shape skips the
+                // insights/campaign payload and the statement-timeout transaction.
+                params.append('view', 'table');
                 const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
                     headers: { Authorization: `Bearer ${idToken}` }
                 });
