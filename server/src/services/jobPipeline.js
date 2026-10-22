@@ -18,7 +18,7 @@ import {
     isShoppingAuditJob,
     runShoppingAuditPipeline
 } from './shoppingAudit/index.js';
-import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature, rateLimitsFromSettings, enrowOptionsFromSettings } from './db/agencySettings.js';
+import { getAgencySettings, agencyFeaturesFromSettings, hasShoppingAuditFeature, rateLimitsFromSettings, enrowOptionsFromSettings, founderVerifyOptionsFromFeatures } from './db/agencySettings.js';
 import { runEnrowInline } from '../enrichment/stages/enrowBatch.js';
 import { runInstantlyAutoAddBatch } from '../enrichment/stages/instantlyBatch.js';
 import { createRateLimitHooks } from '../enrichment/rateLimit.js';
@@ -964,7 +964,8 @@ async function processJob(job) {
                     apiKeys: job.apiKeys,
                     pricing: job.pricing?.stages?.founders || DEFAULT_PRICING.stages.founders,
                     log: (message, meta) => log(job, message, meta),
-                    onBatch: async (rows) => handleFounderBatch(job, rows)
+                    onBatch: async (rows) => handleFounderBatch(job, rows),
+                    verification: founderVerifyOptionsFromFeatures(job.auditFeatures)
                 })
             );
         }

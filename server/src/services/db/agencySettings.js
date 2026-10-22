@@ -89,6 +89,22 @@ export function agencyFeaturesFromSettings(settings) {
     return raw;
 }
 
+/**
+ * Founder-finder verification options from agency features (see
+ * founderDecisionsVerify / founderDecisionsThreshold in featureFlagRegistry.js).
+ * Decisions verification is on unless an agency switches it off.
+ *
+ * @param {object | null | undefined} features agency_settings.features
+ * @returns {{ decisions: boolean, minProbability: number }}
+ */
+export function founderVerifyOptionsFromFeatures(features) {
+    const threshold = Number(features?.founderDecisionsThreshold);
+    return {
+        decisions: features?.founderDecisionsVerify !== false,
+        minProbability: Number.isFinite(threshold) ? Math.min(1, Math.max(0, threshold)) : 0.5
+    };
+}
+
 export function hasShoppingAuditFeature(settings) {
     if (String(process.env.SHOPPING_AUDIT_ENABLED || '').toLowerCase() === 'true') {
         return true;

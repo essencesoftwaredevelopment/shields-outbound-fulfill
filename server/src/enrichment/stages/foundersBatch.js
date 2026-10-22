@@ -20,6 +20,7 @@ import {
     batchProgressOffset
 } from '../stageProgress.js';
 import { shouldScheduleChildReconcile } from '../reconcilePolicy.js';
+import { founderVerifyOptionsFromFeatures } from '../../services/db/agencySettings.js';
 
 function enrichmentMergeMode(ctx) {
     return String(ctx.options.dedupeStrategy || 'skip').toLowerCase() === 'include'
@@ -131,7 +132,8 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
             });
         },
         totalDomainCount: jobTotal || batchDomains.length,
-        rateLimitHooks: createRateLimitHooks(ctx)
+        rateLimitHooks: createRateLimitHooks(ctx),
+        verification: founderVerifyOptionsFromFeatures(ctx.auditFeatures)
     });
 
     await finishJobStage(ctx, 'founders', summary);
