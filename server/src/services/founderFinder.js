@@ -7,6 +7,17 @@ import { OpenAI } from 'openai';
 import { createConcurrencyLimit } from '../lib/concurrency.js';
 import { shouldRetryHttpOrNetwork } from '../utils/transientNetwork.js';
 import { startJobControlPoll, createStopGate } from '../enrichment/jobControlPoll.js';
+import { DEFAULT_PRICING } from '../utils/pricing.js';
+import {
+    FOUNDER_EXTRACT_INSTRUCTIONS,
+    FOUNDER_EXTRACT_SCHEMA,
+    buildExtractInput,
+    founderNameFromExtraction,
+    groundFounderName,
+    buildDecisionsRequest,
+    parseDecisionsResponse,
+    DECISIONS_URL
+} from './founderGrounding.js';
 
 dotenv.config();
 
@@ -27,7 +38,14 @@ function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
-const FOUNDER_MODEL = process.env.OPENAI_FOUNDER_MODEL || 'gpt-4o-mini';
+// Own env names (not OPENAI_FOUNDER_MODEL, which leadWebhook also reads) so an
+// old host value can't pin the founder finder back to gpt-4o-mini. Picked by
+// eval on batches 18/19 (Oct 2026): gpt-5-mini/low kept 90–93% of founders with
+// a valid email; gpt-5.5 was no better.
+const FOUNDER_MODEL = process.env.FOUNDER_EXTRACT_MODEL || 'gpt-5-mini';
+const FOUNDER_REASONING_EFFORT = process.env.FOUNDER_REASONING_EFFORT || 'low';
+const DECISIONS_TIMEOUT_MS = 20_000;
+const DECISIONS_MAX_ATTEMPTS = 3;
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const SERPER_BATCH_SIZE = 25;
@@ -38,7 +56,7 @@ const AI_MIN_RPM = parsePositiveInt(process.env.FOUNDER_AI_MIN_RPM, 120);
 const AI_MAX_RPM = Math.max(AI_MIN_RPM, parsePositiveInt(process.env.FOUNDER_AI_MAX_RPM, 900));
 const AI_SUCCESS_THRESHOLD = parsePositiveInt(process.env.FOUNDER_AI_RECOVERY_SUCCESS_THRESHOLD, 25);
 const AI_RESET_RPM_ON_RESUME = parseBoolean(process.env.FOUNDER_RESET_RPM_ON_RESUME, true);
-const AI_TRUNCATE_CHARS = 900;
+// All ten results, untruncated: the old 900-char cap left the model ~2–3 results.
 const AI_TOP_ORGANIC = 10;
 
 const MAX_RETRIES = 3;
@@ -226,39 +244,49 @@ async function readDomains(filePath) {
     return domains;
 }
 
-async function aiFindFounder(searchResults, companyDomain, logger, openai, rateLimiter, rateLimitHooks) {
-    const slim = searchResults.slice(0, AI_TOP_ORGANIC).map(r => ({
-        t: r.title || '',
-        u: r.link || '',
-        s: r.snippet || ''
-    }));
-    let searchString = JSON.stringify(slim);
-    if (searchString.length > AI_TRUNCATE_CHARS) {
-        searchString = searchString.slice(0, AI_TRUNCATE_CHARS) + '\n[TRUNCATED]';
+/**
+ * OpenAI Decisions API check on a grounded candidate. Best-effort: any failure
+ * (beta API, outage, timeout) returns probability null and the caller keeps the
+ * name, since it already passed the deterministic grounding check. Not behind
+ * the agency OpenAI RPM gate: gpt-6-luna has its own OpenAI limits, and sharing
+ * the gate would slow gpt-5-mini extraction; 429s are retried here instead.
+ *
+ * @returns {Promise<{ probability: number | null, inputTokens: number, error: string | null }>}
+ */
+async function verifyFounderWithDecisions(candidate, searchResults, companyDomain, apiKey) {
+    const body = JSON.stringify(buildDecisionsRequest(candidate, searchResults, companyDomain));
+    let lastError = null;
+    for (let attempt = 1; attempt <= DECISIONS_MAX_ATTEMPTS; attempt++) {
+        try {
+            const res = await fetch(DECISIONS_URL, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                body,
+                signal: AbortSignal.timeout(DECISIONS_TIMEOUT_MS)
+            });
+            const text = await res.text();
+            if (res.ok) {
+                const parsed = parseDecisionsResponse(JSON.parse(text));
+                return { probability: parsed.probability, inputTokens: parsed.inputTokens, error: null };
+            }
+            lastError = `HTTP ${res.status} ${text.slice(0, 200)}`;
+            if (res.status !== 429 && res.status < 500) break;
+        } catch (err) {
+            lastError = err?.cause?.code || err?.message || String(err);
+        }
+        await sleep(jitter(BASE_DELAY_MS * Math.pow(2, attempt - 1)));
     }
+    return { probability: null, inputTokens: 0, error: lastError };
+}
 
-    const promptInput = `
-You are a precise extraction AI. You will receive a list of search results about a company, along with the company name. Your task is to return the full name (first and last) of the founder or CEO, based only on the provided information.
-
-Rules:
-
-Return only the person's full name.
-The name must be exactly two words: first name and last name.
-Do not return the company name, social handles, or extra words.
-If multiple names are mentioned, choose the most consistently associated with the role of founder or CEO.
-If a viable founder can't be determined, return "Not Found".
-If only a first name can be found, and you are sure it is the founder/CEO, return the first name as found, and the second name as "NoLast". Eg: "John NoLast"
-Never return anything other than the name or "Not Found". No explanation. No formatting.
-If it comes to an edge case or error outside of what is described, never give an explanation, just say "Not Found".
-Input will look like:
-Search results: [ { title: "...", snippet: "...", ... }, { ... } ]
-Company Domain: example.com
-
-Your only output should be like this:
-John Smith
-
-Search results (compressed JSON): ${searchString}
-Company Domain: ${companyDomain}`;
+/**
+ * Extract → ground → verify. Returns the stored name ("First Last",
+ * "First NoLast" or "Not Found") plus why, for the stage stats.
+ *
+ * @returns {Promise<{ name: string, outcome: 'found' | 'not_found' | 'ungrounded' | 'rejected', tokensIn: number, tokensOut: number, decisionTokens: number, decisionError: string | null }>}
+ */
+async function aiFindFounder(searchResults, companyDomain, logger, openai, rateLimiter, rateLimitHooks, verification) {
+    const results = searchResults.slice(0, AI_TOP_ORGANIC);
 
     await rateLimiter.acquire();
 
@@ -269,8 +297,12 @@ Company Domain: ${companyDomain}`;
             () =>
                 openai.responses.create({
                     model: FOUNDER_MODEL,
-                    input: promptInput,
-                    text: { format: { type: 'text' } }
+                    instructions: FOUNDER_EXTRACT_INSTRUCTIONS,
+                    input: buildExtractInput(results, companyDomain),
+                    reasoning: { effort: FOUNDER_REASONING_EFFORT },
+                    text: {
+                        format: { type: 'json_schema', name: 'founder', strict: true, schema: FOUNDER_EXTRACT_SCHEMA }
+                    }
                 }),
             `OpenAI for ${companyDomain}`,
             status => status === 429 || (status >= 500 && status < 600),
@@ -303,18 +335,41 @@ Company Domain: ${companyDomain}`;
     }
 
     const usage = res?.usage || {};
-    const inputTokens = usage.input_tokens ?? usage.input_tokens_text ?? usage.prompt_tokens ?? 0;
-    const outputTokens = usage.output_tokens ?? usage.output_tokens_text ?? usage.completion_tokens ?? 0;
+    const tokensIn = usage.input_tokens ?? usage.input_tokens_text ?? usage.prompt_tokens ?? 0;
+    const tokensOut = usage.output_tokens ?? usage.output_tokens_text ?? usage.completion_tokens ?? 0;
+    const base = { tokensIn, tokensOut, decisionTokens: 0, decisionError: null };
 
-    const name = (res && res.output_text) ? res.output_text.trim() : 'Not Found';
-    return { name, tokensIn: inputTokens, tokensOut: outputTokens };
+    let parsed = null;
+    try {
+        parsed = res?.output_text ? JSON.parse(res.output_text) : null;
+    } catch {
+        logger(`Founders: ${companyDomain} returned unparseable JSON, treating as Not Found`);
+    }
+    const candidate = founderNameFromExtraction(parsed);
+    if (!candidate) return { ...base, name: 'Not Found', outcome: 'not_found' };
+
+    if (!groundFounderName(candidate, results, companyDomain).grounded) {
+        return { ...base, name: 'Not Found', outcome: 'ungrounded' };
+    }
+    const name = `${candidate.firstName} ${candidate.lastName}`;
+    if (!verification?.decisions) return { ...base, name, outcome: 'found' };
+
+    const decision = await verifyFounderWithDecisions(candidate, results, companyDomain, verification.apiKey);
+    const verified = { ...base, decisionTokens: decision.inputTokens, decisionError: decision.error };
+    if (decision.probability !== null && decision.probability < verification.minProbability) {
+        return { ...verified, name: 'Not Found', outcome: 'rejected' };
+    }
+    return { ...verified, name, outcome: 'found' };
 }
 
-function computeFounderCost({ tokensIn = 0, tokensOut = 0, pricing }) {
+function computeFounderCost({ tokensIn = 0, tokensOut = 0, decisionTokens = 0, pricing }) {
     const serperCost = pricing?.serper_request_cost || 0;
     const inputRate = pricing?.openai_per_million_input || 0;
     const outputRate = pricing?.openai_per_million_output || 0;
-    const openaiCost = ((tokensIn / 1_000_000) * inputRate) + ((tokensOut / 1_000_000) * outputRate);
+    const decisionsRate = pricing?.decisions_per_million_input ?? DEFAULT_PRICING.stages.founders.decisions_per_million_input;
+    const openaiCost = ((tokensIn / 1_000_000) * inputRate)
+        + ((tokensOut / 1_000_000) * outputRate)
+        + ((decisionTokens / 1_000_000) * decisionsRate);
     const leadCost = serperCost + openaiCost;
     return { serperCost, openaiCost, leadCost };
 }
@@ -352,7 +407,9 @@ export async function runFounderFinder({
     log = () => {},
     onBatch = null,
     totalDomainCount = null,
-    rateLimitHooks = null
+    rateLimitHooks = null,
+    /** { decisions: boolean, minProbability: number } — see founderVerifyOptionsFromFeatures. */
+    verification = null
 }) {
     const OPENAI_API_KEY = apiKeys.openai;
     const SERPER_API_KEY = apiKeys.serper;
@@ -365,6 +422,8 @@ export async function runFounderFinder({
     }
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+    const verify = verification?.decisions ? { ...verification, apiKey: OPENAI_API_KEY } : null;
+    log(`Founders: ${FOUNDER_MODEL} (${FOUNDER_REASONING_EFFORT}) + evidence check${verify ? ` + Decisions ≥ ${verify.minProbability}` : ''}`);
 
     let serperCache = {};
     if (loadSerperCache) {
@@ -427,6 +486,11 @@ export async function runFounderFinder({
     let notFoundCount = 0;
     let foundCount = 0;
     let errorCount = 0;
+    // Subsets of notFoundCount: a name the model gave that no store result backs
+    // up, or that the Decisions check scored below the threshold.
+    let ungroundedCount = 0;
+    let rejectedCount = 0;
+    let decisionErrorCount = 0;
     let stageCost = 0;
     let serperCostTotal = 0;
     let openaiCostTotal = 0;
@@ -585,6 +649,7 @@ export async function runFounderFinder({
                     let name = 'Not Found';
                     let tokensIn = 0;
                     let tokensOut = 0;
+                    let decisionTokens = 0;
 
                     if (searchResults.length > 0) {
                         try {
@@ -595,12 +660,22 @@ export async function runFounderFinder({
                                 log,
                                 openai,
                                 aiRateLimiter,
-                                rateLimitHooks
+                                rateLimitHooks,
+                                verify
                             );
                             await assertNotStopped(control);
                             name = result?.name || 'Not Found';
                             tokensIn = result?.tokensIn || 0;
                             tokensOut = result?.tokensOut || 0;
+                            decisionTokens = result?.decisionTokens || 0;
+                            if (result?.outcome === 'ungrounded') ungroundedCount++;
+                            if (result?.outcome === 'rejected') rejectedCount++;
+                            if (result?.decisionError) {
+                                decisionErrorCount++;
+                                if (decisionErrorCount <= 3) {
+                                    log(`Founders: Decisions check failed for ${domain}, keeping the name (${result.decisionError})`);
+                                }
+                            }
                         } catch (err) {
                             if (err?.isQuotaExceeded) {
                                 fatalQuotaError = fatalQuotaError || err;
@@ -629,6 +704,7 @@ export async function runFounderFinder({
                     const { serperCost, openaiCost, leadCost } = computeFounderCost({
                         tokensIn,
                         tokensOut,
+                        decisionTokens,
                         pricing
                     });
                     serperCostTotal += serperCost;
@@ -650,6 +726,7 @@ export async function runFounderFinder({
                                 'Processed': processed,
                                 'Found': foundCount,
                                 'Not Found': notFoundCount,
+                                'Unverified': ungroundedCount + rejectedCount,
                                 'Errors': errorCount,
                                 'RPM': currentRpm,
                                 'Cost': `$${costNumber.toFixed(2)}`
@@ -721,11 +798,16 @@ export async function runFounderFinder({
         processed: foundCount + notFoundCount,
         'Found': foundCount,
         'Not Found': notFoundCount,
+        'Unverified': ungroundedCount + rejectedCount,
         'Errors': errorCount,
         cost: Number(stageCost.toFixed(6)),
         'Cost': `$${stageCost.toFixed(2)}`
     };
 
-    log('Founders: done.');
+    log(
+        `Founders: done. ${foundCount} found, ${notFoundCount} not found `
+        + `(${ungroundedCount} without store evidence, ${rejectedCount} rejected by Decisions`
+        + `${decisionErrorCount ? `, ${decisionErrorCount} Decisions errors kept` : ''}).`
+    );
     return summary;
 }

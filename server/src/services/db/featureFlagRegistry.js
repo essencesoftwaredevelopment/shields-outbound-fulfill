@@ -95,6 +95,24 @@ export const FEATURE_FLAGS = [
         ]
     },
     {
+        key: 'founderDecisionsVerify',
+        group: 'pipeline',
+        type: 'boolean',
+        default: true,
+        label: 'Verify founders with OpenAI Decisions',
+        description: 'After a founder name passes the search-evidence check, ask the OpenAI Decisions API (gpt-6-luna) whether that person really runs the store, and drop names below the threshold. ~$0.0001 per founder. If the API errors, the name is kept.'
+    },
+    {
+        key: 'founderDecisionsThreshold',
+        group: 'pipeline',
+        type: 'number',
+        default: 0.5,
+        min: 0,
+        max: 1,
+        label: 'Founder Decisions threshold',
+        description: 'Minimum Decisions probability (0–1) for a founder name to be kept. Higher = fewer wrong names, but more real founders dropped.'
+    },
+    {
         key: 'enrichmentRunner',
         group: 'pipeline',
         type: 'enum',
@@ -239,6 +257,7 @@ export function validateFeaturesPatch(input, { allowUnknown = true } = {}) {
                 const n = typeof value === 'number' ? value : Number(value);
                 if (!Number.isFinite(n)) errors.push(invalid(key, 'must be a number'));
                 else if (def.min !== undefined && n < def.min) errors.push(invalid(key, `must be ≥ ${def.min}`));
+                else if (def.max !== undefined && n > def.max) errors.push(invalid(key, `must be ≤ ${def.max}`));
                 else patch[key] = n;
                 break;
             }

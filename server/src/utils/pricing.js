@@ -5,7 +5,9 @@ export const DEFAULT_PRICING = {
         founders: {
             serper_request_cost: 0.001,
             openai_per_million_input: 0.25,
-            openai_per_million_output: 2.0
+            openai_per_million_output: 2.0,
+            /** OpenAI Decisions API (gpt-6-luna) founder check: input tokens only. */
+            decisions_per_million_input: 0.1
         },
         /** Per email found (not per lookup attempt). */
         emailDiscovery: { request_cost: 0.005 },
