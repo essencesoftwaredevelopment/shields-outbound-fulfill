@@ -105,6 +105,14 @@ describe('founderNameFromExtraction', () => {
         assert.equal(founderNameFromExtraction({ found: true, first_name: 'Jane', last_name: '@janedoe' }), null);
     });
 
+    it('title-cases all-caps names but leaves mixed case alone', () => {
+        assert.deepEqual(
+            founderNameFromExtraction({ found: true, first_name: 'ANDRÉS', last_name: "RESTREPO O'NEIL-SMITH", role: 'Founder' }),
+            { firstName: 'Andrés', lastName: "Restrepo O'Neil-Smith", role: 'Founder' }
+        );
+        assert.equal(founderNameFromExtraction({ found: true, first_name: 'Ronan', last_name: 'McDonald', role: '' }).lastName, 'McDonald');
+    });
+
     it('keeps accented and hyphenated names', () => {
         assert.deepEqual(
             founderNameFromExtraction({ found: true, first_name: 'Špela', last_name: 'Jeretina-Novak', role: '' }),

@@ -213,8 +213,14 @@ const HONORIFICS = new Set(['dr', 'mr', 'mrs', 'ms', 'miss', 'mx', 'prof', 'sir'
 // handles (_shafuramalik_), emails, digits and stray punctuation.
 const NAME_PART = /^\p{L}[\p{L}\p{M}'’.\- ]*$/u;
 
+/** "ANDRÉS RESTREPO" → "Andrés Restrepo"; mixed case (McDonald, de la Cruz) is left alone. */
+function titleCaseIfShouting(value) {
+    if (value !== value.toUpperCase() || value === value.toLowerCase()) return value;
+    return value.toLowerCase().replace(/(^|[\s'’-])(\p{L})/gu, (_, sep, ch) => sep + ch.toUpperCase());
+}
+
 function cleanNamePart(value) {
-    return String(value || '').trim().replace(/\s+/g, ' ');
+    return titleCaseIfShouting(String(value || '').trim().replace(/\s+/g, ' '));
 }
 
 /** Collapse a parsed extraction into the stored name ("First Last" / "First NoLast"), or null. */
