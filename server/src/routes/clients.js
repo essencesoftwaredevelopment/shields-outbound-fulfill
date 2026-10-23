@@ -76,6 +76,7 @@ import {
 } from '../utils/instantlyEventAnalytics.js';
 import { INSTANTLY_ANALYTICS_PERIODS } from '../utils/instantlyAnalyticsPeriods.js';
 import { loadCoreAnalyticsWithSnapshot } from '../services/analyticsSnapshots.js';
+import { loadSendingRunway } from '../services/sendingRunway.js';
 
 const router = express.Router();
 const upload = multer({
@@ -816,6 +817,30 @@ function buildInstantlyAnalyticsPayload({
         recentEvents: analytics.recentEvents || []
     };
 }
+
+/**
+ * Sending runway: sending days until active campaigns stop starting new
+ * prospects, from live Instantly campaign + inbox settings. ?refresh=1 skips
+ * the 15-minute cache.
+ */
+router.get('/clients/:clientId/analytics/runway', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const agencyId = await verifyAgencyIdFromRequest(req);
+        const { row, instantlyKey } = await requireClientWithInstantly(agencyId, req.params.clientId);
+        const runway = await loadSendingRunway({
+            pool,
+            agencyId,
+            sqlClientId: Number(row.id),
+            instantlyKey,
+            refresh: String(req.query?.refresh || '') === '1'
+        });
+        res.json(runway);
+    } catch (error) {
+        console.error('Sending runway error:', error?.message || error);
+        res.status(error?.statusCode || 502).json({ error: error?.message || 'Failed to compute sending runway.' });
+    }
+});
 
 router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => {
     try {

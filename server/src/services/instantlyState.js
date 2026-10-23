@@ -662,13 +662,18 @@ export async function fetchInstantlyCampaigns(apiKey, { syncRunId = null } = {})
     return rows;
 }
 
-async function fetchInstantlyAccounts(apiKey, { syncRunId = null } = {}) {
+/**
+ * Every sending account on the workspace, or only those carrying any of
+ * `tagIds` (Instantly's tag_ids filter) — campaigns usually assign inboxes by tag.
+ */
+export async function fetchInstantlyAccounts(apiKey, { syncRunId = null, tagIds = [] } = {}) {
     const rows = [];
     let startingAfter = null;
 
     while (true) {
         const params = new URLSearchParams();
         params.set('limit', String(INSTANTLY_SYNC_PAGE_LIMIT));
+        if (tagIds.length) params.set('tag_ids', tagIds.join(','));
         if (startingAfter) {
             params.set('starting_after', startingAfter);
         }

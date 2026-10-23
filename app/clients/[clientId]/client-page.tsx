@@ -63,6 +63,7 @@ import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
 import { LeadToolbarMoreMenu } from "@/components/lead-toolbar-more-menu";
 import { StoreLeadsImportModal } from "@/components/storeleads-import-modal";
+import { SendingRunwayCard } from "@/components/sending-runway-card";
 import { DatePicker } from "@/components/date-picker";
 import {
     DEFAULT_ACTIVITY_OP,
@@ -9989,6 +9990,8 @@ export default function ClientPage() {
                             </div>
                                 );
                             })()}
+
+                            {clientId && <SendingRunwayCard clientId={clientId} />}
 
                             <InstantlyEventAnalyticsChart
                                 rows={
