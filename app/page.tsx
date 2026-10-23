@@ -46,19 +46,21 @@ type Niche = {
   hint: string;
 };
 
-const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow"] as const;
+const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "storeleads"] as const;
 type ApiKeyName = (typeof API_KEY_FIELDS)[number];
 const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   openai: "openai_key",
   serper: "serper_key",
   kitt: "trykitt_key",
   enrow: "enrow_key",
+  storeleads: "storeleads_key",
 };
 const API_KEY_LABELS: Record<ApiKeyName, string> = {
   openai: "OpenAI",
   serper: "Serper",
   kitt: "TryKitt",
   enrow: "Enrow",
+  storeleads: "Store Leads",
 };
 type ApiKeyState = Record<ApiKeyName, string>;
 
@@ -73,6 +75,7 @@ const createEmptyKeys = (): ApiKeyState => ({
   serper: "",
   kitt: "",
   enrow: "",
+  storeleads: "",
 });
 
 async function hashKeyValue(value: string) {
@@ -110,6 +113,7 @@ type AgencySettingsPayload = {
   serper_key?: string;
   trykitt_key?: string;
   enrow_key?: string;
+  storeleads_key?: string;
   trykitt_paid_account?: boolean;
 };
 
@@ -120,6 +124,7 @@ const readKeysFromAgencySettings = (
   serper: data?.serper_key || "",
   kitt: data?.trykitt_key || "",
   enrow: data?.enrow_key || "",
+  storeleads: data?.storeleads_key || "",
 });
 
 // Absent flag = paid, matching the server's isTryKittPaidAccount default.
@@ -385,6 +390,7 @@ function HomeContent() {
           serper_key: sanitizedKeys.serper,
           trykitt_key: sanitizedKeys.kitt,
           enrow_key: sanitizedKeys.enrow,
+          storeleads_key: sanitizedKeys.storeleads,
           trykitt_paid_account: kittPaidAccount,
         }),
       });
@@ -674,6 +680,19 @@ function HomeContent() {
               />
               <p className="text-xs text-muted-foreground">
                 Backup email finder for leads TryKitt misses. Turn it on in Account → Pipeline &amp; rate limits.
+              </p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="storeleads-key">Store Leads API Key (optional)</Label>
+              <Input
+                id="storeleads-key"
+                type="text"
+                placeholder="Store Leads key"
+                value={apiKeys.storeleads}
+                onChange={(event) => handleKeyChange(event, "storeleads")}
+              />
+              <p className="text-xs text-muted-foreground">
+                Import stores and backfill monthly sales, country and apps from a client&apos;s Leads tab. Needs an active Store Leads plan with API access.
               </p>
             </div>
             {showVaultStatus && (

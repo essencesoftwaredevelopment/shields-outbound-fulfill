@@ -47,6 +47,27 @@ function mapTableCampaigns(campaignsData) {
     }));
 }
 
+function toNumberOrNull(value) {
+    if (value === null || value === undefined) return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Store Leads company fields; null when the domain was never synced. */
+export function mapLeadStore(row) {
+    if (!row.storeleads_synced_at) return null;
+    return {
+        estMonthlySalesUsd: toNumberOrNull(row.est_monthly_sales_usd),
+        countryCode: row.country_code ?? null,
+        platform: row.store_platform ?? null,
+        plan: row.store_plan ?? null,
+        state: row.store_state ?? null,
+        apps: Array.isArray(row.store_apps) ? row.store_apps : [],
+        technologies: Array.isArray(row.store_technologies) ? row.store_technologies : [],
+        syncedAt: row.storeleads_synced_at
+    };
+}
+
 export function mapLeadListRow(row, { tableView = false } = {}) {
     const lists = Array.isArray(row.lists) ? row.lists : [];
     const campaignsData = Array.isArray(row.campaigns_data) ? row.campaigns_data : [];
@@ -90,6 +111,7 @@ export function mapLeadListRow(row, { tableView = false } = {}) {
         campaignCountActive: row.campaign_count_active,
         lastCampaignAddedAt: row.last_campaign_added_at,
         latestEvent: mapLatestEvent(row),
+        store: mapLeadStore(row),
         insights: {
             annualRevenueText: row.annual_revenue_text,
             annualRevenueMin: row.annual_revenue_min,

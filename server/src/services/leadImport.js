@@ -689,6 +689,8 @@ export function serializeImportBatch(row) {
     return {
         id: String(row.id),
         fileName: row.file_name,
+        source: row.source || 'csv',
+        mode: row.options?.mode || null,
         status: row.status,
         stalled,
         collisionStrategy: row.collision_strategy,

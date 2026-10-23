@@ -547,6 +547,31 @@ function sqlShoppingAuditStateClause(state) {
 
 const SHOPPING_AUDIT_SIGNAL_VALUES = Object.values(SIGNAL_TYPES);
 
+const STORE_COUNTRY_OPTIONS = [
+    ['US', 'United States'], ['CA', 'Canada'], ['GB', 'United Kingdom'], ['AU', 'Australia'],
+    ['NZ', 'New Zealand'], ['IE', 'Ireland'], ['DE', 'Germany'], ['FR', 'France'],
+    ['NL', 'Netherlands'], ['BE', 'Belgium'], ['ES', 'Spain'], ['IT', 'Italy'],
+    ['SE', 'Sweden'], ['DK', 'Denmark'], ['NO', 'Norway'], ['FI', 'Finland'],
+    ['CH', 'Switzerland'], ['AT', 'Austria'], ['PT', 'Portugal'], ['PL', 'Poland'],
+    ['AE', 'United Arab Emirates'], ['SG', 'Singapore'], ['HK', 'Hong Kong'], ['JP', 'Japan'],
+    ['IN', 'India'], ['MX', 'Mexico'], ['BR', 'Brazil'], ['ZA', 'South Africa']
+].map(([value, name]) => ({ value, label: `${name} (${value})` }));
+
+/**
+ * Columns every scoped_companies CTE exposes to filter clauses (alias `co`).
+ * The CTE is inlined by the planner, so unused columns cost nothing.
+ */
+const SCOPED_COMPANY_COLUMNS = `
+                    id,
+                    domain_normalized,
+                    est_monthly_sales_usd,
+                    country_code,
+                    store_platform,
+                    store_state,
+                    store_apps,
+                    store_technologies,
+                    storeleads_synced_at`;
+
 const LEAD_FILTER_FIELDS = [
     // ── Contact fields ──────────────────────────────────────────────────────
     {
@@ -912,6 +937,85 @@ const LEAD_FILTER_FIELDS = [
             { key: 'not_empty', label: 'Is Set' }
         ]
     },
+    // ── Store fields (companies, from Store Leads) ───────────────────────────
+    {
+        key: 'est_monthly_sales_usd',
+        label: 'Est. Monthly Sales ($)',
+        type: 'number',
+        operators: [
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' },
+            { key: 'is_empty', label: 'Not Set' },
+            { key: 'not_empty', label: 'Is Set' }
+        ]
+    },
+    {
+        key: 'country_code',
+        label: 'Store Country',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' },
+            { key: 'is_empty', label: 'Not Set' },
+            { key: 'not_empty', label: 'Is Set' }
+        ],
+        options: STORE_COUNTRY_OPTIONS
+    },
+    {
+        key: 'store_platform',
+        label: 'Store Platform',
+        type: 'text',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'contains', label: 'Contains' },
+            { key: 'is_empty', label: 'Is Empty' },
+            { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        key: 'store_technology',
+        label: 'Store App / Technology',
+        type: 'text',
+        operators: [
+            { key: 'contains', label: 'Uses (Name Contains)' },
+            { key: 'not_contains', label: 'Does Not Use' }
+        ]
+    },
+    {
+        key: 'store_state',
+        label: 'Store Status',
+        type: 'enum',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'neq', label: 'Does Not Equal' },
+            { key: 'in', label: 'Is Any Of' },
+            { key: 'not_in', label: 'Is None Of' },
+            { key: 'is_empty', label: 'Not Synced' }
+        ],
+        options: [
+            { value: 'Active', label: 'Active' },
+            { value: 'Inactive', label: 'Inactive' },
+            { value: 'Password Protected', label: 'Password Protected' },
+            { value: 'Redirect', label: 'Redirect' },
+            { value: 'Not Found', label: 'Not Found In Store Leads' }
+        ]
+    },
+    {
+        key: 'storeleads_synced_at',
+        label: 'Store Leads Synced',
+        type: 'date',
+        operators: [
+            { key: 'on_or_after', label: 'On Or After' },
+            { key: 'on_or_before', label: 'On Or Before' },
+            { key: 'is_empty', label: 'Never' },
+            { key: 'not_empty', label: 'Any Time' }
+        ]
+    },
     // ── Import tracking ──────────────────────────────────────────────────────
     {
         key: 'import_batch',
@@ -1093,9 +1197,7 @@ function buildLeadListBaseWithClause(
 ) {
     return `
             WITH scoped_companies AS (
-                SELECT
-                    id,
-                    domain_normalized
+                SELECT${SCOPED_COMPANY_COLUMNS}
                 FROM companies
                 WHERE agency_id = $1
                 AND client_id = $2
@@ -1594,10 +1696,12 @@ function leadFiltersRequireInsights(filters) {
 }
 
 const DATE_FILTER_FIELDS = new Set([
-    'created_at', 'updated_at', 'last_contacted_at', 'added_to_campaign_at', 'email_find_completed_at', 'email_verify_completed_at', 'enrow_verify_attempted_at', 'last_reply_at'
+    'created_at', 'updated_at', 'last_contacted_at', 'added_to_campaign_at', 'email_find_completed_at', 'email_verify_completed_at', 'enrow_verify_attempted_at', 'last_reply_at',
+    'storeleads_synced_at'
 ]);
 const NUMERIC_FILTER_FIELDS = new Set([
-    'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max'
+    'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max',
+    'est_monthly_sales_usd'
 ]);
 
 function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
@@ -2276,6 +2380,71 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
             continue;
         }
 
+        // ── Store Leads fields (co alias = scoped_companies) ──────────────
+        if (fieldKey === 'est_monthly_sales_usd') {
+            const col = 'co.est_monthly_sales_usd';
+            if (operatorKey === 'gt') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} > ${ref}`); }
+            else if (operatorKey === 'gte') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} >= ${ref}`); }
+            else if (operatorKey === 'lt') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} < ${ref}`); }
+            else if (operatorKey === 'lte') { const ref = bindParam(Number(normalizedValue)); clauses.push(`${col} <= ${ref}`); }
+            else if (operatorKey === 'is_empty') clauses.push(`${col} IS NULL`);
+            else if (operatorKey === 'not_empty') clauses.push(`${col} IS NOT NULL`);
+            continue;
+        }
+
+        if (fieldKey === 'country_code' || fieldKey === 'store_state') {
+            const col = `co.${fieldKey}`;
+            const normalize = (value) => (fieldKey === 'country_code' ? String(value).toUpperCase() : String(value));
+            if (operatorKey === 'eq') {
+                clauses.push(`${col} = ${bindParam(normalize(normalizedValue))}`);
+            } else if (operatorKey === 'neq') {
+                clauses.push(`${col} IS DISTINCT FROM ${bindParam(normalize(normalizedValue))}`);
+            } else if (operatorKey === 'in' && Array.isArray(normalizedValue)) {
+                clauses.push(`${col} = ANY(${bindParam(normalizedValue.map(normalize))}::text[])`);
+            } else if (operatorKey === 'not_in' && Array.isArray(normalizedValue)) {
+                clauses.push(`(${col} IS NULL OR NOT (${col} = ANY(${bindParam(normalizedValue.map(normalize))}::text[])))`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`${col} IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`${col} IS NOT NULL`);
+            }
+            continue;
+        }
+
+        if (fieldKey === 'store_platform') {
+            const value = String(normalizedValue ?? '').toLowerCase();
+            if (operatorKey === 'eq') clauses.push(`co.store_platform = ${bindParam(value)}`);
+            else if (operatorKey === 'neq') clauses.push(`co.store_platform IS DISTINCT FROM ${bindParam(value)}`);
+            else if (operatorKey === 'contains') clauses.push(`co.store_platform LIKE ${bindParam(`%${value}%`)}`);
+            else if (operatorKey === 'is_empty') clauses.push(`co.store_platform IS NULL`);
+            else if (operatorKey === 'not_empty') clauses.push(`co.store_platform IS NOT NULL`);
+            continue;
+        }
+
+        if (fieldKey === 'store_technology') {
+            const ref = bindParam(`%${String(normalizedValue)}%`);
+            const usesTech = `EXISTS (
+                SELECT 1 FROM unnest(COALESCE(co.store_technologies, '{}'::text[]) || COALESCE(co.store_apps, '{}'::text[])) AS tech(name)
+                WHERE tech.name ILIKE ${ref}
+            )`;
+            if (operatorKey === 'contains') clauses.push(usesTech);
+            else if (operatorKey === 'not_contains') clauses.push(`NOT ${usesTech}`);
+            continue;
+        }
+
+        if (fieldKey === 'storeleads_synced_at') {
+            if (operatorKey === 'on_or_after') {
+                clauses.push(`co.storeleads_synced_at >= ${bindParam(String(normalizedValue))}::timestamptz`);
+            } else if (operatorKey === 'on_or_before') {
+                clauses.push(`co.storeleads_synced_at < (${bindParam(String(normalizedValue).slice(0, 10))}::date + INTERVAL '1 day')`);
+            } else if (operatorKey === 'is_empty') {
+                clauses.push(`co.storeleads_synced_at IS NULL`);
+            } else if (operatorKey === 'not_empty') {
+                clauses.push(`co.storeleads_synced_at IS NOT NULL`);
+            }
+            continue;
+        }
+
         // ── shopping_audit_state (ad_observations via job_id + domain) ─────
         if (fieldKey === 'shopping_audit_state') {
             const rawStates = operatorKey === 'in' || operatorKey === 'not_in'
@@ -2494,7 +2663,14 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     c.job_id,
                     c.created_at,
                     c.updated_at,
-                    co.domain_normalized
+                    co.domain_normalized,
+                    co.est_monthly_sales_usd,
+                    co.country_code,
+                    co.store_platform,
+                    co.store_state,
+                    co.store_apps,
+                    co.store_technologies,
+                    co.storeleads_synced_at
                     ${requiresFilterCampaignStats ? `,
                     cs.campaign_count_all_time,
                     cs.campaign_count_active,
@@ -2637,6 +2813,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pc.updated_at,`}
                 pc.domain_normalized,
                 ${isTableView ? '' : `
+                pc.est_monthly_sales_usd,
+                pc.country_code,
+                pc.store_platform,
+                pc.store_state,
+                pc.store_apps,
+                pc.store_technologies,
+                pc.storeleads_synced_at,
                 ci.annual_revenue_text,
                 ci.annual_revenue_min,
                 ci.annual_revenue_max,
@@ -2949,6 +3132,14 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                 c.created_at,
                 c.updated_at,
                 co.domain_normalized,
+                co.est_monthly_sales_usd,
+                co.country_code,
+                co.store_platform,
+                co.store_plan,
+                co.store_state,
+                co.store_apps,
+                co.store_technologies,
+                co.storeleads_synced_at,
                 ci.annual_revenue_text,
                 ci.annual_revenue_min,
                 ci.annual_revenue_max,
@@ -4374,9 +4565,7 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
         const requiresKlaviyoInsights = leadFiltersRequireInsights(dynamicFilters);
         const domainResult = await pool.query(
             `WITH scoped_companies AS (
-                SELECT
-                    id,
-                    domain_normalized
+                SELECT${SCOPED_COMPANY_COLUMNS}
                 FROM companies
                 WHERE agency_id = $1
                 AND client_id = $2

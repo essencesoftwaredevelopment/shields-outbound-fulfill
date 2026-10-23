@@ -62,6 +62,7 @@ import { useConfirm } from "@/components/confirm-dialog";
 import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
 import { LeadToolbarMoreMenu } from "@/components/lead-toolbar-more-menu";
+import { StoreLeadsImportModal } from "@/components/storeleads-import-modal";
 import { DatePicker } from "@/components/date-picker";
 import {
     DEFAULT_ACTIVITY_OP,
@@ -179,6 +180,16 @@ type Lead = {
         eventTimestamp?: string | null;
         emailAccount?: string | null;
     } | null;
+    store?: {
+        estMonthlySalesUsd?: number | null;
+        countryCode?: string | null;
+        platform?: string | null;
+        plan?: string | null;
+        state?: string | null;
+        apps?: string[];
+        technologies?: string[];
+        syncedAt?: string | null;
+    } | null;
     insights?: {
         annualRevenueText?: string | null;
         annualRevenueMin?: number | null;
@@ -281,7 +292,7 @@ type LeadFilterClause = {
 type LeadExportFieldDef = {
     key: string;
     label: string;
-    group: "Lead" | "Insights" | "Campaigns" | "Events";
+    group: "Lead" | "Insights" | "Store" | "Campaigns" | "Events";
     defaultSelected?: boolean;
 };
 
@@ -637,6 +648,13 @@ const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
     { key: 'last_discovery_call_at', label: 'Last Discovery Call At', group: 'Insights' },
     { key: 'insight_source', label: 'Insight Source', group: 'Insights' },
     { key: 'insight_notes', label: 'Insight Notes', group: 'Insights' },
+    { key: 'est_monthly_sales_usd', label: 'Est. Monthly Sales ($)', group: 'Store' },
+    { key: 'country_code', label: 'Store Country', group: 'Store' },
+    { key: 'store_platform', label: 'Store Platform', group: 'Store' },
+    { key: 'store_state', label: 'Store Status', group: 'Store' },
+    { key: 'store_apps', label: 'Store Apps', group: 'Store' },
+    { key: 'store_technologies', label: 'Store Technologies', group: 'Store' },
+    { key: 'storeleads_synced_at', label: 'Store Leads Synced At', group: 'Store' },
     { key: 'campaign_names', label: 'Campaign Names', group: 'Campaigns' },
     { key: 'campaign_count_all_time', label: 'Campaign Count All Time', group: 'Campaigns' },
     { key: 'campaign_count_active', label: 'Active Campaign Count', group: 'Campaigns' },
@@ -1100,6 +1118,20 @@ function getLeadExportValue(lead: Lead, key: string): unknown {
         return lead.insights?.source || '';
     case 'insight_notes':
         return lead.insights?.notes || '';
+    case 'est_monthly_sales_usd':
+        return lead.store?.estMonthlySalesUsd ?? '';
+    case 'country_code':
+        return lead.store?.countryCode || '';
+    case 'store_platform':
+        return lead.store?.platform || '';
+    case 'store_state':
+        return lead.store?.state || '';
+    case 'store_apps':
+        return (lead.store?.apps || []).join('; ');
+    case 'store_technologies':
+        return (lead.store?.technologies || []).join('; ');
+    case 'storeleads_synced_at':
+        return lead.store?.syncedAt || '';
     case 'campaign_names':
         return getLeadCampaignNames(lead).join('; ');
     case 'campaign_count_all_time':
@@ -1944,6 +1976,7 @@ export default function ClientPage() {
 
     // No-enrichment lead import (column-mapped CSV) state
     const [leadImportModalOpen, setLeadImportModalOpen] = useState(false);
+    const [storeLeadsModalOpen, setStoreLeadsModalOpen] = useState(false);
     const [leadImportStep, setLeadImportStep] = useState<1 | 2 | 3>(1);
     const [leadImportFile, setLeadImportFile] = useState<File | null>(null);
     const [leadImportHeaders, setLeadImportHeaders] = useState<string[]>([]);
@@ -4189,6 +4222,7 @@ export default function ClientPage() {
         campaigns: row.campaigns || [],
         campaignsData: row.campaignsData || [],
         lists: Array.isArray(row.lists) ? row.lists : [],
+        store: row.store || null,
         insights: row.insights || undefined,
         latestEvent: row.latestEvent || null
     }), []);
@@ -9100,6 +9134,12 @@ export default function ClientPage() {
                                 label: 'Import leads CSV',
                                 onSelect: handleOpenLeadImportModal,
                                 disabled: leadImportStarting
+                            },
+                            {
+                                id: 'import-storeleads',
+                                label: 'Import from Store Leads',
+                                onSelect: () => setStoreLeadsModalOpen(true),
+                                disabled: !clientId
                             },
                             {
                                 id: 'enrich-filtered',
@@ -14189,6 +14229,25 @@ export default function ClientPage() {
                 </div>
             )}
 
+            {clientId && (
+                <StoreLeadsImportModal
+                    open={storeLeadsModalOpen}
+                    clientId={clientId}
+                    onClose={() => setStoreLeadsModalOpen(false)}
+                    onFinished={(batch) => {
+                        if (batch.status === 'completed') {
+                            setToastMessage(`Store Leads import complete: ${batch.createdCount.toLocaleString()} new, ${batch.updatedCount.toLocaleString()} updated, ${batch.skippedCount.toLocaleString()} skipped.`);
+                            setLeadFilterFieldsNonce((prev) => prev + 1);
+                            fetchLeads(true);
+                            fetchLeadTotal();
+                        } else {
+                            setToastMessage(`Store Leads import failed: ${batch.error || 'Unknown error'}`);
+                        }
+                        setToastVisible(true);
+                    }}
+                />
+            )}
+
             {verificationImportModalOpen && (
                 <div
                     className="modal-overlay"
@@ -16450,7 +16509,36 @@ export default function ClientPage() {
                                                 return String(value).trim() !== '';
                                             });
 
+                                        const store = selectedLead.store;
+                                        const formatList = (values?: string[]) => {
+                                            if (!values?.length) return null;
+                                            return values.length > 12
+                                                ? `${values.slice(0, 12).join(', ')} +${values.length - 12} more`
+                                                : values.join(', ');
+                                        };
                                         const insightRows: Array<{ label: string; value: string | null }> = [
+                                            {
+                                                label: 'Est. Monthly Sales',
+                                                value: store?.estMonthlySalesUsd == null
+                                                    ? null
+                                                    : `$${Math.round(store.estMonthlySalesUsd).toLocaleString('en-US')}`
+                                            },
+                                            { label: 'Store Country', value: store?.countryCode || null },
+                                            {
+                                                label: 'Store Platform',
+                                                value: store?.platform
+                                                    ? `${store.platform}${store.plan ? ` (${store.plan})` : ''}`
+                                                    : null
+                                            },
+                                            { label: 'Store Status', value: store?.state || null },
+                                            { label: 'Store Apps', value: formatList(store?.apps) },
+                                            { label: 'Store Technologies', value: formatList(store?.technologies) },
+                                            {
+                                                label: 'Store Leads Synced',
+                                                value: store?.syncedAt
+                                                    ? new Date(store.syncedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                                                    : null
+                                            },
                                             {
                                                 label: 'Annual Revenue',
                                                 value: insights?.annualRevenueText
