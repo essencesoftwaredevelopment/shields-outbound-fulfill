@@ -5,7 +5,7 @@
  * POST /internal/interested-research/start after a draft shell is inserted at
  * status='researching'. Single linear run per draft — no fan-out:
  *
- *   hydrate → homepage + Serper research (+ Enrow founder phone lookup) →
+ *   hydrate → homepage + Serper research (+ Enrow founder phone lookup → Close lead) →
  *   synthesize brief (GPT only) →
  *   persist brief on the draft → external popup URL (Essence/Vulcan, stays
  *   external by design) → generate reply with the brief → promote to
@@ -58,8 +58,9 @@ export async function interestedResearchWorkflow(input: InterestedResearchInput)
     }
 
     // Research sources are independent and best-effort — either may be null.
-    // The phone lookup rides alongside the research sources; it only writes the
-    // contact row (finalize reads the number for ntfy) and must never fail the run.
+    // The phone lookup (then the Close lead) rides alongside the research sources;
+    // it only writes the contact row (finalize reads both for ntfy) and must never
+    // fail the run.
     const [homepage, serper] = await Promise.all([
       homepageStep(input),
       serperStep(input),

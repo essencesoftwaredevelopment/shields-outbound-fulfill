@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
 import {
+    closeLeadsEnabled,
     getAgencySettings,
     hasInterestedReplyShoppingAuditFeature,
     hasReplyResearchAgentFeature
@@ -14,6 +15,8 @@ import {
 } from './interestedResearch/trigger.js';
 import { attachWorkflowRunId, stampResearchStep } from './interestedResearch/progress.js';
 import { findPhoneForContact } from './phoneFinder.js';
+import { syncCloseLeadForContact } from './closeLeadSync.js';
+import { closeLeadUrl } from './close.js';
 import {
     buildAgentLeadProfile,
     REPLY_AGENT_GUIDANCE,
@@ -36,6 +39,8 @@ const DEFAULT_MODEL = String(process.env.INTERESTED_AUTORESPONDER_MODEL || 'gpt-
 const REVIEW_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** How long the inline review alert waits on a still-running phone lookup. */
 const PHONE_NTFY_GRACE_MS = 15_000;
+/** Extra wait for the Close lead once the phone lookup has settled. */
+const CLOSE_NTFY_GRACE_MS = 8_000;
 const POPUP_FORM_GENERATE_URL = 'https://essence-retention-ai-popup-demo.vercel.app/api/popup-form/generate';
 const POPUP_FORM_API_KEY = 'CNl6iVR6YwmlPU9iw6gOW1LAF4roUxxPNB9YrI2kdIeMmbcfUKh4Rgdl0gdmZBQo';
 const POPUP_FORM_GENERATE_TIMEOUT_MS = Math.max(
@@ -1263,10 +1268,15 @@ function formatPhoneLine(phone) {
     return phone.country ? `${phone.number} (${phone.country})` : phone.number;
 }
 
-/** ntfy "FaceTime" + "Text" buttons (view actions), when there is a number. */
-export function ntfyCallActionHeader(phone) {
+/** ntfy "FaceTime" + "Text" buttons when there is a number, plus "Close" when the lead is in Close. */
+export function ntfyCallActionHeader(phone, closeUrl = null) {
     const links = phoneLinksForPhone(phone?.number);
-    return links ? { 'Actions': `view, FaceTime, ${links.facetime}; view, Text, ${links.sms}` } : {};
+    const actions = [
+        links ? `view, FaceTime, ${links.facetime}` : null,
+        links ? `view, Text, ${links.sms}` : null,
+        closeUrl ? `view, Close, ${closeUrl}` : null
+    ].filter(Boolean);
+    return actions.length ? { 'Actions': actions.join('; ') } : {};
 }
 
 /** Founder phone found by the Enrow lookup, or null. */
@@ -1290,7 +1300,7 @@ export async function loadContactPhone(db, contactId) {
  * Follow-up push when the phone lookup finishes after the review alert already
  * went out (inline path) — so the number still reaches whoever works the lead.
  */
-export async function sendNtfyPhoneFoundNotification(topic, { leadEmail, phone, reviewUrl }) {
+export async function sendNtfyPhoneFoundNotification(topic, { leadEmail, phone, reviewUrl, closeUrl = null }) {
     if (!topic || !phone?.number) return { notified: false };
     const response = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
         method: 'POST',
@@ -1299,11 +1309,12 @@ export async function sendNtfyPhoneFoundNotification(topic, { leadEmail, phone, 
             'Title': `Phone found: ${leadEmail}`,
             'Tags': 'telephone_receiver',
             ...(reviewUrl ? { 'Click': reviewUrl } : {}),
-            ...ntfyCallActionHeader(phone)
+            ...ntfyCallActionHeader(phone, closeUrl)
         },
         body: [
             `Lead: ${leadEmail}`,
             `Phone: ${formatPhoneLine(phone)}`,
+            closeUrl ? `Close: ${closeUrl}` : null,
             reviewUrl ? `Review URL: ${reviewUrl}` : null
         ].filter(Boolean).join('\n')
     });
@@ -1314,7 +1325,7 @@ export async function sendNtfyPhoneFoundNotification(topic, { leadEmail, phone, 
     return { notified: true };
 }
 
-export async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false, phone = null }) {
+export async function sendNtfyNotification(topic, { leadEmail, campaignName, reviewUrl, isFollowUp = false, phone = null, closeUrl = null }) {
     if (!topic) return { notified: false, reason: 'missing_topic' };
 
     const titlePrefix = isFollowUp
@@ -1328,12 +1339,13 @@ export async function sendNtfyNotification(topic, { leadEmail, campaignName, rev
             'Title': `${titlePrefix}: ${leadEmail}`,
             'Tags': 'mailbox_with_mail,robot_face',
             'Click': reviewUrl,
-            ...ntfyCallActionHeader(phone)
+            ...ntfyCallActionHeader(phone, closeUrl)
         },
         body: [
             `Lead: ${leadEmail}`,
             `Campaign: ${campaignName || 'Unknown campaign'}`,
             phone?.number ? `Phone: ${formatPhoneLine(phone)}` : null,
+            closeUrl ? `Close: ${closeUrl}` : null,
             isFollowUp ? 'Type: Post-autoresponder follow-up' : null,
             `Review URL: ${reviewUrl}`
         ].filter(Boolean).join('\n')
@@ -2011,9 +2023,18 @@ export async function createInterestedAutoResponderDraftFromEvent({
             }
         }
 
-        // Founder phone (Enrow), in parallel with generation. Never rejects; the
-        // number is stored on the contact whether or not it beats the ntfy below.
+        // Founder phone (Enrow), in parallel with generation, then the Close lead
+        // with whatever number it found. Neither rejects; both are stored on the
+        // contact whether or not they beat the ntfy below.
         const phoneLookup = findPhoneForContact({ agencyId, contactId, clientId, logger });
+        const closeSync = phoneLookup.then(() => syncCloseLeadForContact({
+            agencyId,
+            contactId,
+            clientId,
+            campaignName: promptConfig.campaign_name,
+            replyText: previousLeadMessage,
+            logger
+        }));
 
         let generation;
         try {
@@ -2139,13 +2160,15 @@ export async function createInterestedAutoResponderDraftFromEvent({
             const phone = early?.status === 'found' && early.number
                 ? { number: early.number, country: early.country || null }
                 : null;
+            const earlyClose = early ? await settleWithin(closeSync, CLOSE_NTFY_GRACE_MS) : null;
             try {
                 await sendNtfyNotification(settings.ntfyTopic, {
                     leadEmail: normalizedLeadEmail,
                     campaignName: promptConfig.campaign_name,
                     reviewUrl,
                     isFollowUp,
-                    phone
+                    phone,
+                    closeUrl: earlyClose?.url || null
                 });
             } catch (error) {
                 logger(`[interested-autoresponder] ntfy notification failed for draft=${savedDraft.id}: ${error.message}`);
@@ -2153,10 +2176,12 @@ export async function createInterestedAutoResponderDraftFromEvent({
             if (!early) {
                 phoneLookup.then(async (late) => {
                     if (late?.status !== 'found' || !late.number) return;
+                    const close = await closeSync;
                     await sendNtfyPhoneFoundNotification(settings.ntfyTopic, {
                         leadEmail: normalizedLeadEmail,
                         phone: { number: late.number, country: late.country || null },
-                        reviewUrl
+                        reviewUrl,
+                        closeUrl: close?.url || null
                     });
                 }).catch((error) => {
                     logger(`[interested-autoresponder] phone ntfy failed for draft=${savedDraft.id}: ${error.message}`);
@@ -2261,6 +2286,9 @@ async function loadDraftByReviewToken(token) {
                 ct.phone AS contact_phone,
                 ct.phone_country AS contact_phone_country,
                 ct.phone_status AS contact_phone_status,
+                ct.close_lead_id AS contact_close_lead_id,
+                s.close_key AS agency_close_key,
+                s.features AS agency_features,
                 COALESCE(s.features->>'autoresponderShoppingAudit', 'false') = 'true'
                     AS agency_shopping_audit_reply
          FROM interested_autoresponder_drafts d
@@ -2358,6 +2386,20 @@ export function serializeReviewPhone(draft) {
     };
 }
 
+/**
+ * Close.com lead for the review page: the link once synced; `enabled` lets the
+ * page offer "Add to Close" when the agency uses Close but the lead isn't in yet.
+ */
+export function serializeReviewClose(draft) {
+    const url = closeLeadUrl(draft?.contact_close_lead_id);
+    if (url) return { url, enabled: true };
+    const enabled = closeLeadsEnabled(
+        { close_key: draft?.agency_close_key, features: draft?.agency_features },
+        draft?.client_id ?? null
+    );
+    return enabled ? { url: null, enabled: true } : null;
+}
+
 function serializeReviewDraft(draft) {
     const website = resolveLeadWebsite(draft.company_domain, draft.lead_email);
     return {
@@ -2376,7 +2418,8 @@ function serializeReviewDraft(draft) {
         researchBrief: serializeResearchBriefForReview(draft.research_brief),
         researchCompletedAt: draft.research_completed_at || null,
         agentTrace: serializeAgentTraceForReview(draft.agent_trace),
-        phone: serializeReviewPhone(draft)
+        phone: serializeReviewPhone(draft),
+        close: serializeReviewClose(draft)
     };
 }
 
@@ -2393,6 +2436,42 @@ export async function getInterestedAutoResponderDraftByToken(token) {
             return [];
         });
     return { ...serializeReviewDraft(draft), thread };
+}
+
+/**
+ * "Add to Close" on the review page — for a lead whose automatic sync failed or
+ * that replied before Close was switched on. Same idempotent sync as the reply
+ * path, so a second click just returns the existing lead.
+ */
+export async function addInterestedAutoResponderLeadToCloseByToken({ token }) {
+    const draft = await loadDraftByReviewToken(token);
+    if (draft.status !== 'pending_review' && draft.status !== 'researching') {
+        const error = new Error('Review draft is no longer available.');
+        error.statusCode = 409;
+        throw error;
+    }
+    if (!serializeReviewClose(draft)?.enabled) {
+        const error = new Error('Close is not enabled for this client.');
+        error.statusCode = 400;
+        throw error;
+    }
+    const result = await syncCloseLeadForContact({
+        agencyId: draft.agency_id,
+        contactId: draft.contact_id,
+        clientId: draft.client_id,
+        campaignName: draft.campaign_name,
+        replyText: draft.previous_lead_message
+    });
+    if (!result.url) {
+        const error = new Error(
+            result.status === 'skipped' && result.reason === 'claimed_elsewhere'
+                ? 'Close sync already running for this lead — refresh in a moment.'
+                : `Could not create the Close lead: ${result.reason || result.status}`
+        );
+        error.statusCode = 502;
+        throw error;
+    }
+    return { close: { url: result.url, enabled: true }, status: result.status };
 }
 
 export async function updateInterestedAutoResponderDraftTextByToken({ token, renderedText }) {

@@ -53,6 +53,24 @@ export const FEATURE_FLAGS = [
         description: 'Runs the durable lead-research workflow (web research → brief → draft) before drafting interested replies. Spends Serper + OpenAI per interested lead.'
     },
     {
+        key: 'closeLeads',
+        group: 'product',
+        type: 'boolean',
+        default: false,
+        label: 'Close.com leads on positive replies',
+        description: 'When a lead replies interested, create a lead in Close (company, founder name, title, email, phone from the Enrow lookup, website) or link the existing one with that email, so it can be dialed from Close. The ntfy alert and review page link to it. Needs a Close API key in the API Vault.'
+    },
+    {
+        key: 'closeClients',
+        group: 'product',
+        type: 'object',
+        label: 'Close clients',
+        description: 'Limit Close leads to these client IDs (comma-separated). Leave blank for every client of this agency.',
+        fields: [
+            { key: 'ids', type: 'string', label: 'Client IDs', placeholder: 'all clients' }
+        ]
+    },
+    {
         key: 'trykittPaidAccount',
         group: 'pipeline',
         type: 'boolean',

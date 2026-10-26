@@ -4363,6 +4363,11 @@ select.lead-activity-chip {
   flex-shrink: 0;
 }
 
+.ar-link:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
 .ar-link--static,
 .ar-link--static:hover {
   cursor: default;

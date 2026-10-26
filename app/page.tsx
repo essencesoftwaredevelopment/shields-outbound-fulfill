@@ -46,7 +46,7 @@ type Niche = {
   hint: string;
 };
 
-const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "storeleads"] as const;
+const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "storeleads", "close"] as const;
 type ApiKeyName = (typeof API_KEY_FIELDS)[number];
 const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   openai: "openai_key",
@@ -54,6 +54,7 @@ const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   kitt: "trykitt_key",
   enrow: "enrow_key",
   storeleads: "storeleads_key",
+  close: "close_key",
 };
 const API_KEY_LABELS: Record<ApiKeyName, string> = {
   openai: "OpenAI",
@@ -61,6 +62,7 @@ const API_KEY_LABELS: Record<ApiKeyName, string> = {
   kitt: "TryKitt",
   enrow: "Enrow",
   storeleads: "Store Leads",
+  close: "Close",
 };
 type ApiKeyState = Record<ApiKeyName, string>;
 
@@ -76,6 +78,7 @@ const createEmptyKeys = (): ApiKeyState => ({
   kitt: "",
   enrow: "",
   storeleads: "",
+  close: "",
 });
 
 async function hashKeyValue(value: string) {
@@ -114,6 +117,7 @@ type AgencySettingsPayload = {
   trykitt_key?: string;
   enrow_key?: string;
   storeleads_key?: string;
+  close_key?: string;
   trykitt_paid_account?: boolean;
 };
 
@@ -125,6 +129,7 @@ const readKeysFromAgencySettings = (
   kitt: data?.trykitt_key || "",
   enrow: data?.enrow_key || "",
   storeleads: data?.storeleads_key || "",
+  close: data?.close_key || "",
 });
 
 // Absent flag = paid, matching the server's isTryKittPaidAccount default.
@@ -391,6 +396,7 @@ function HomeContent() {
           trykitt_key: sanitizedKeys.kitt,
           enrow_key: sanitizedKeys.enrow,
           storeleads_key: sanitizedKeys.storeleads,
+          close_key: sanitizedKeys.close,
           trykitt_paid_account: kittPaidAccount,
         }),
       });
@@ -693,6 +699,19 @@ function HomeContent() {
               />
               <p className="text-xs text-muted-foreground">
                 Import stores and backfill monthly sales, country and apps from a client&apos;s Leads tab. Needs an active Store Leads plan with API access.
+              </p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="close-key">Close API Key (optional)</Label>
+              <Input
+                id="close-key"
+                type="text"
+                placeholder="api_..."
+                value={apiKeys.close}
+                onChange={(event) => handleKeyChange(event, "close")}
+              />
+              <p className="text-xs text-muted-foreground">
+                Creates a Close lead with name, email, phone and website for each positive reply, so it can be dialed from Close. Turn it on in Account → Product features.
               </p>
             </div>
             {showVaultStatus && (

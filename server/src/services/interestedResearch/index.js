@@ -50,6 +50,7 @@ import {
 } from './briefUtils.js';
 import { attachWorkflowRunId, stampResearchStep } from './progress.js';
 import { findPhoneForContact } from '../phoneFinder.js';
+import { loadContactCloseUrl, syncCloseLeadForContact } from '../closeLeadSync.js';
 
 export { attachWorkflowRunId, stampResearchStep };
 
@@ -151,10 +152,11 @@ export async function hydrateResearchContext({ draftId, agencyId }) {
 }
 
 /**
- * Founder phone lookup (Enrow), in parallel with the research sources. Gated by
- * features.enrowPhoneLookup inside findPhoneForContact; best-effort and never
- * throws for Enrow/Serper failures. The number lands on the contact row, where
- * finalize (ntfy) and the review page read it.
+ * Founder phone lookup (Enrow), in parallel with the research sources, then the
+ * Close.com lead with whatever number it found. Gated by features.enrowPhoneLookup
+ * / features.closeLeads inside each call; both best-effort and never throw for
+ * provider failures. The number and Close lead land on the contact row, where
+ * finalize (ntfy) and the review page read them.
  */
 export async function runPhoneLookup({ draftId, agencyId }) {
     const draft = await loadResearchingDraft(pool, draftId, agencyId);
@@ -163,7 +165,20 @@ export async function runPhoneLookup({ draftId, agencyId }) {
         contactId: draft.contact_id,
         clientId: draft.client_id
     });
-    return { status: result.status, number: result.number ?? null, country: result.country ?? null };
+    const close = await syncCloseLeadForContact({
+        agencyId,
+        contactId: draft.contact_id,
+        clientId: draft.client_id,
+        campaignName: draft.campaign_name,
+        replyText: draft.previous_lead_message
+    });
+    return {
+        status: result.status,
+        number: result.number ?? null,
+        country: result.country ?? null,
+        closeStatus: close.status,
+        closeUrl: close.url ?? null
+    };
 }
 
 /** Fetch and distill a company homepage. Draft-independent; null on any failure. */
@@ -636,7 +651,8 @@ export async function finalizeResearchDraft({
                 campaignName: promptConfig.campaign_name,
                 reviewUrl,
                 isFollowUp,
-                phone: await loadContactPhone(pool, draft.contact_id)
+                phone: await loadContactPhone(pool, draft.contact_id),
+                closeUrl: await loadContactCloseUrl(pool, draft.contact_id)
             });
         } catch (error) {
             console.error(

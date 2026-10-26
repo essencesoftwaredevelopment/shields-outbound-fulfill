@@ -21,15 +21,16 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
     await pool.query(
         `INSERT INTO agency_settings (
             agency_id, openai_key, serper_key, trykitt_key, openai_founder_model,
-            email_verification_provider, pricing_overrides, features, enrow_key, storeleads_key, vault_updated_at, updated_at
+            email_verification_provider, pricing_overrides, features, enrow_key, storeleads_key, close_key, vault_updated_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb,
-            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), $10, $11, NOW(), NOW())
+            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), $10, $11, $12, NOW(), NOW())
         ON CONFLICT (agency_id) DO UPDATE SET
             openai_key = COALESCE(EXCLUDED.openai_key, agency_settings.openai_key),
             serper_key = COALESCE(EXCLUDED.serper_key, agency_settings.serper_key),
             trykitt_key = COALESCE(EXCLUDED.trykitt_key, agency_settings.trykitt_key),
             enrow_key = COALESCE(EXCLUDED.enrow_key, agency_settings.enrow_key),
             storeleads_key = COALESCE(EXCLUDED.storeleads_key, agency_settings.storeleads_key),
+            close_key = COALESCE(EXCLUDED.close_key, agency_settings.close_key),
             openai_founder_model = COALESCE(EXCLUDED.openai_founder_model, agency_settings.openai_founder_model),
             email_verification_provider = COALESCE(EXCLUDED.email_verification_provider, agency_settings.email_verification_provider),
             pricing_overrides = COALESCE(EXCLUDED.pricing_overrides, agency_settings.pricing_overrides),
@@ -52,7 +53,8 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             featuresJson,
             featuresPatchJson,
             patch.enrow_key ?? null,
-            patch.storeleads_key ?? null
+            patch.storeleads_key ?? null,
+            patch.close_key ?? null
         ]
     );
 }
@@ -222,8 +224,26 @@ export function enrowPhoneLookupEnabled(settings, clientId = null) {
     return hasKey && features.enrowPhoneLookup === true && enrowClientAllowed(features, clientId);
 }
 
+/**
+ * Close.com lead on positive replies (features.closeLeads), with the agency's
+ * own Close key. `features.closeClients.ids` scopes it to those clients.
+ *
+ * @param {object | null} settings
+ * @param {number | string | null} [clientId]
+ */
+export function closeLeadsEnabled(settings, clientId = null) {
+    const hasKey = !!String(settings?.close_key || '').trim();
+    const features = agencyFeaturesFromSettings(settings);
+    return hasKey && features.closeLeads === true && clientIdAllowed(features.closeClients?.ids, clientId);
+}
+
 function enrowClientAllowed(features, clientId) {
-    const allowed = String(features.enrowClients?.ids ?? '')
+    return clientIdAllowed(features.enrowClients?.ids, clientId);
+}
+
+/** Comma-separated client-id allowlist; blank = every client. */
+function clientIdAllowed(ids, clientId) {
+    const allowed = String(ids ?? '')
         .split(',')
         .map((v) => v.trim())
         .filter(Boolean);

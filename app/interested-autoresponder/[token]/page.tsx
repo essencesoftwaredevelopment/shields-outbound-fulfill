@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2, MessageSquare, Phone } from "lucide-react";
+import { ChevronDown, ChevronUp, ExternalLink, Globe, Link2, MessageSquare, Phone, PhoneCall } from "lucide-react";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import {
@@ -59,6 +59,8 @@ type ReviewDraft = {
         links: { facetime: string; sms: string } | null;
         status: "found" | "not_found" | "pending" | "timeout" | "error" | string;
     } | null;
+    /** Close.com lead (dialer); url null = Close is on but the lead isn't in yet. */
+    close?: { url: string | null; enabled: boolean } | null;
 };
 
 /** Pill label for a phone lookup that has no number (null = show nothing). */
@@ -445,6 +447,7 @@ export default function InterestedAutoResponderReviewPage() {
     const [sending, setSending] = useState(false);
     const [regenerating, setRegenerating] = useState(false);
     const [archiving, setArchiving] = useState(false);
+    const [addingToClose, setAddingToClose] = useState(false);
     const [archived, setArchived] = useState(false);
     const [archiveModalOpen, setArchiveModalOpen] = useState(false);
     const [regenerateModalOpen, setRegenerateModalOpen] = useState(false);
@@ -887,6 +890,26 @@ export default function InterestedAutoResponderReviewPage() {
         }
     };
 
+    const handleAddToClose = async () => {
+        setError(null);
+        setAddingToClose(true);
+        try {
+            const response = await fetch(
+                `${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}/close`,
+                { method: "POST" }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `Failed to add to Close (${response.status})`);
+            }
+            setDraft((prev) => (prev ? { ...prev, close: data.close ?? prev.close } : prev));
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to add to Close");
+        } finally {
+            setAddingToClose(false);
+        }
+    };
+
     const handleArchiveDraft = async () => {
         setArchiving(true);
         setError(null);
@@ -1094,6 +1117,31 @@ export default function InterestedAutoResponderReviewPage() {
                                             Text
                                         </a>
                                     </>
+                                )}
+                                {draft.close?.url && (
+                                    <a
+                                        className="ar-link"
+                                        href={draft.close.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        title="Open the lead in Close to dial"
+                                    >
+                                        <PhoneCall size={15} strokeWidth={2} />
+                                        Close
+                                    </a>
+                                )}
+                                {draft.close?.enabled && !draft.close.url && (
+                                    <button
+                                        type="button"
+                                        className="ar-link"
+                                        onClick={handleAddToClose}
+                                        disabled={addingToClose}
+                                        aria-busy={addingToClose}
+                                        title="Create this lead in Close"
+                                    >
+                                        <PhoneCall size={15} strokeWidth={2} />
+                                        {addingToClose ? "Adding…" : "Add to Close"}
+                                    </button>
                                 )}
                                 {!draft.phone?.number && phoneStatusLabel(draft.phone?.status) && (
                                     <span className="ar-link ar-link--static ar-link--muted">

@@ -9,6 +9,7 @@ import {
     generateDraftReply,
     getInterestedAutoResponderDraftByToken,
     sendInterestedAutoResponderDraftByToken,
+    addInterestedAutoResponderLeadToCloseByToken,
     updateInterestedAutoResponderDraftTextByToken,
     cancelInterestedAutoResponderDraftByToken,
     regenerateInterestedAutoResponderDraftByToken,
@@ -499,6 +500,19 @@ router.post('/interested-autoresponder/review/:token/send', async (req, res) => 
     } catch (error) {
         const statusCode = Number(error?.statusCode || 500);
         res.status(statusCode).json({ error: error?.message || 'Failed to send review draft.' });
+    }
+});
+
+router.post('/interested-autoresponder/review/:token/close', async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const result = await addInterestedAutoResponderLeadToCloseByToken({
+            token: String(req.params.token || '')
+        });
+        res.json(result);
+    } catch (error) {
+        const statusCode = Number(error?.statusCode || 500);
+        res.status(statusCode).json({ error: error?.message || 'Failed to add the lead to Close.' });
     }
 });
 
