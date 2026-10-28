@@ -1754,6 +1754,7 @@ function DomainStatDownloadButton({ busy, label, onClick }: DomainStatDownloadBu
 }
 
 type ExistingDomainExportScope = 'founders' | 'emails' | 'personalization';
+type DomainListExportKind = 'new' | 'not-run';
 
 const CLIENT_TABS = ["analytics", "info", "campaigns", "leads", "follow-ups", "deal-flow"] as const;
 type ClientTab = typeof CLIENT_TABS[number];
@@ -1902,7 +1903,7 @@ export default function ClientPage() {
     const [checkingDomains, setCheckingDomains] = useState(false);
     const [domainCheckProgress, setDomainCheckProgress] = useState<{ checked: number; total: number } | null>(null);
     const domainCheckRequestRef = useRef(0);
-    const [downloadingNewDomains, setDownloadingNewDomains] = useState(false);
+    const [downloadingDomainList, setDownloadingDomainList] = useState<DomainListExportKind | null>(null);
     const [downloadingExistingScope, setDownloadingExistingScope] = useState<ExistingDomainExportScope | null>(null);
     const uploadedCsvDomainsRef = useRef<string[]>([]);
 
@@ -5894,27 +5895,32 @@ export default function ClientPage() {
         }
     };
 
-    const handleDownloadNewDomainsCsv = async () => {
-        if (downloadingNewDomains) return;
-        if (!domainCheckStats?.new) {
-            setToastMessage('No new domains to download.');
+    const handleDownloadDomainListCsv = async (kind: DomainListExportKind) => {
+        if (downloadingDomainList) return;
+        const kindMeta: Record<DomainListExportKind, { count: number; noun: string; path: string; suffix: string }> = {
+            new: { count: domainCheckStats?.new ?? 0, noun: 'new domain', path: 'new.csv', suffix: 'new_domains' },
+            'not-run': { count: domainCheckStats?.notRun ?? 0, noun: 'not-run domain', path: 'not-run.csv', suffix: 'not_run_domains' },
+        };
+        const { count, noun, path, suffix } = kindMeta[kind];
+        if (!count) {
+            setToastMessage(`No ${noun}s to download.`);
             setToastVisible(true);
             return;
         }
         if (!user || !clientId) {
-            setToastMessage('You must be signed in to download new domains.');
+            setToastMessage(`You must be signed in to download ${noun}s.`);
             setToastVisible(true);
             return;
         }
 
         const domains = uploadedCsvDomainsRef.current;
         if (!domains.length) {
-            setToastMessage('Re-upload the CSV to download new domains.');
+            setToastMessage(`Re-upload the CSV to download ${noun}s.`);
             setToastVisible(true);
             return;
         }
 
-        setDownloadingNewDomains(true);
+        setDownloadingDomainList(kind);
         try {
             const token = await getAccessToken();
             if (!token) {
@@ -5924,7 +5930,7 @@ export default function ClientPage() {
             }
 
             const response = await fetch(
-                `${getPipelineBaseUrl()}/api/jobs/check-domains/new.csv`,
+                `${getPipelineBaseUrl()}/api/jobs/check-domains/${path}`,
                 {
                     method: 'POST',
                     headers: {
@@ -5939,7 +5945,7 @@ export default function ClientPage() {
             );
 
             if (!response.ok) {
-                throw new Error('Failed to export new domains.');
+                throw new Error(`Failed to export ${noun}s.`);
             }
 
             const blob = await response.blob();
@@ -5947,21 +5953,21 @@ export default function ClientPage() {
             const link = document.createElement('a');
             const sourceName = selectedFile?.name?.replace(/\.csv$/i, '') || 'upload';
             link.href = url;
-            link.download = `${sourceName}_new_domains.csv`;
+            link.download = `${sourceName}_${suffix}.csv`;
             link.style.display = 'none';
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
             URL.revokeObjectURL(url);
 
-            setToastMessage(`Downloaded ${domainCheckStats.new.toLocaleString()} new domain${domainCheckStats.new === 1 ? '' : 's'}`);
+            setToastMessage(`Downloaded ${count.toLocaleString()} ${noun}${count === 1 ? '' : 's'}`);
             setToastVisible(true);
         } catch (error) {
-            console.error('Error downloading new domains:', error);
-            setToastMessage(error instanceof Error ? error.message : 'Failed to download new domains');
+            console.error(`Error downloading ${noun}s:`, error);
+            setToastMessage(error instanceof Error ? error.message : `Failed to download ${noun}s`);
             setToastVisible(true);
         } finally {
-            setDownloadingNewDomains(false);
+            setDownloadingDomainList(null);
         }
     };
 
@@ -13022,9 +13028,9 @@ export default function ClientPage() {
                                                             </span>
                                                             {domainCheckStats.new > 0 && (
                                                                 <DomainStatDownloadButton
-                                                                    busy={downloadingNewDomains}
+                                                                    busy={downloadingDomainList === 'new'}
                                                                     label="Download CSV of new domains"
-                                                                    onClick={handleDownloadNewDomainsCsv}
+                                                                    onClick={() => handleDownloadDomainListCsv('new')}
                                                                 />
                                                             )}
                                                         </span>
@@ -13035,8 +13041,17 @@ export default function ClientPage() {
                                                         <span>
                                                             <strong style={{ color: 'var(--app-success-text)' }}>{domainCheckStats.run.toLocaleString()}</strong> run
                                                         </span>
-                                                        <span>
-                                                            <strong style={{ color: 'var(--app-text-muted)' }}>{domainCheckStats.notRun.toLocaleString()}</strong> not run
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                            <span>
+                                                                <strong style={{ color: 'var(--app-text-muted)' }}>{domainCheckStats.notRun.toLocaleString()}</strong> not run
+                                                            </span>
+                                                            {domainCheckStats.notRun > 0 && (
+                                                                <DomainStatDownloadButton
+                                                                    busy={downloadingDomainList === 'not-run'}
+                                                                    label="Download CSV of existing domains that have not been run"
+                                                                    onClick={() => handleDownloadDomainListCsv('not-run')}
+                                                                />
+                                                            )}
                                                         </span>
                                                     </div>
 

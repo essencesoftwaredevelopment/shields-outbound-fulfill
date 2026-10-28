@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiJson } from "@/lib/api/http";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
 import { DatePicker } from "@/components/date-picker";
@@ -36,8 +36,12 @@ type StatusPayload = {
     hasKey: boolean;
     activeBatchId: string | null;
     backfillCandidates: number | null;
+    importBatches: { value: string; label: string }[];
     maxSegments: number;
 };
+
+/** Backfill scope sentinel: the whole lead bank rather than one import batch. */
+const ALL_BATCHES = "all";
 
 type PreviewPayload = { counts: number[]; labels: string[]; total: number };
 
@@ -125,6 +129,7 @@ export function StoreLeadsImportModal({
     const [segments, setSegments] = useState<Segment[]>(() => [defaultSegment()]);
     const [existingStrategy, setExistingStrategy] = useState<"update" | "skip">("update");
     const [staleDays, setStaleDays] = useState("30");
+    const [backfillBatchId, setBackfillBatchId] = useState(ALL_BATCHES);
     const [status, setStatus] = useState<StatusPayload | null>(null);
     const [preview, setPreview] = useState<PreviewPayload | null>(null);
     const [previewLoading, setPreviewLoading] = useState(false);
@@ -132,10 +137,17 @@ export function StoreLeadsImportModal({
     const [batch, setBatch] = useState<ImportBatch | null>(null);
     const [error, setError] = useState("");
 
-    const loadStatus = useCallback(async (days: string, { resumeActive = false } = {}) => {
+    // Only the latest status request may land; a slow whole-lead-bank count
+    // must not overwrite the count for a batch picked after it.
+    const statusSeqRef = useRef(0);
+
+    const loadStatus = useCallback(async (days: string, batchId: string, { resumeActive = false } = {}) => {
+        const seq = ++statusSeqRef.current;
         try {
             const params = new URLSearchParams({ clientId, staleDays: days });
+            if (batchId !== ALL_BATCHES) params.set("importBatchId", batchId);
             const next = await apiJson<StatusPayload>(`/api/storeleads/status?${params.toString()}`);
+            if (seq !== statusSeqRef.current) return;
             setStatus(next);
             if (resumeActive && next.activeBatchId) {
                 // Reopened while a run continues in the background: show its progress.
@@ -159,7 +171,7 @@ export function StoreLeadsImportModal({
         setBatch(null);
         setPreview(null);
         setError("");
-        void loadStatus(staleDays, { resumeActive: true });
+        void loadStatus(staleDays, backfillBatchId, { resumeActive: true });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [open, loadStatus]);
 
@@ -212,7 +224,12 @@ export function StoreLeadsImportModal({
         setError("");
         try {
             const body = mode === "backfill"
-                ? { clientId, mode, staleDays: Number(staleDays) }
+                ? {
+                    clientId,
+                    mode,
+                    staleDays: Number(staleDays),
+                    ...(backfillBatchId !== ALL_BATCHES ? { importBatchId: backfillBatchId } : {})
+                }
                 : { clientId, mode, segments: requestSegments, existingStrategy };
             const data = await apiJson<{ batch: ImportBatch }>("/api/storeleads/import", {
                 method: "POST",
@@ -462,13 +479,29 @@ export function StoreLeadsImportModal({
                     {!batch && mode === "backfill" && (
                         <div style={{ display: "flex", flexDirection: "column", gap: "0.85rem" }}>
                             <label className="settings-field">
+                                <span className="settings-field__label">Import batch</span>
+                                <AppSelect
+                                    value={backfillBatchId}
+                                    options={[
+                                        { value: ALL_BATCHES, label: "All domains in this lead bank" },
+                                        ...(status?.importBatches ?? [])
+                                    ]}
+                                    onChange={(value) => {
+                                        setBackfillBatchId(value);
+                                        setStatus((prev) => (prev ? { ...prev, backfillCandidates: null } : prev));
+                                        void loadStatus(staleDays, value);
+                                    }}
+                                />
+                            </label>
+                            <label className="settings-field">
                                 <span className="settings-field__label">Which domains</span>
                                 <AppSelect
                                     value={staleDays}
                                     options={STALE_DAY_OPTIONS}
                                     onChange={(value) => {
                                         setStaleDays(value);
-                                        void loadStatus(value);
+                                        setStatus((prev) => (prev ? { ...prev, backfillCandidates: null } : prev));
+                                        void loadStatus(value, backfillBatchId);
                                     }}
                                 />
                             </label>
@@ -476,7 +509,9 @@ export function StoreLeadsImportModal({
                                 {status?.backfillCandidates == null
                                     ? "Counting domains…"
                                     : status.backfillCandidates === 0
-                                        ? "Every domain in this lead bank was synced recently."
+                                        ? backfillBatchId === ALL_BATCHES
+                                            ? "Every domain in this lead bank was synced recently."
+                                            : "Every domain in this import batch was synced recently."
                                         : <>
                                             <strong style={{ color: "var(--app-text)" }}>{status.backfillCandidates.toLocaleString()}</strong> domains will be looked up in Store Leads ({formatBackfillEstimate(status.backfillCandidates)}). Domains Store Leads doesn&apos;t know are marked “Not Found” so they aren&apos;t looked up again.
                                         </>}

@@ -88,6 +88,26 @@ export const DOMAIN_ENRICHMENT_SQL = `
         WHERE ct.company_id = co.id
     ) stats ON true`;
 
+/**
+ * Existing domains with no contact tied to a job — the modal's "not run" set.
+ * Same company lookup as DOMAIN_ENRICHMENT_SQL so the row count matches.
+ */
+export const NOT_RUN_DOMAINS_SQL = `
+    SELECT co.domain_normalized
+    FROM (SELECT DISTINCT domain FROM unnest($2::text[]) AS input(domain)) input
+    JOIN LATERAL (
+        SELECT c.id, c.domain_normalized
+        FROM companies c
+        WHERE c.client_id = $1
+          AND c.domain_normalized = input.domain
+        LIMIT 1
+    ) co ON true
+    WHERE NOT EXISTS (
+        SELECT 1 FROM contacts ct
+        WHERE ct.company_id = co.id
+          AND ct.job_id IS NOT NULL
+    )`;
+
 export function emptyDomainStats() {
     return {
         existing: 0,
@@ -114,6 +134,17 @@ export async function summarizeDomains(query, clientId, uniqueDomains) {
         addDomainStats(totals, result.rows?.[0]);
     }
     return totals;
+}
+
+export async function collectNotRunDomains(query, clientId, uniqueDomains) {
+    const notRun = [];
+    for (const chunk of chunkList(uniqueDomains)) {
+        const result = await query(NOT_RUN_DOMAINS_SQL, [clientId, chunk]);
+        for (const row of result.rows || []) {
+            if (row?.domain_normalized) notRun.push(row.domain_normalized);
+        }
+    }
+    return notRun;
 }
 
 export async function collectExistingDomains(query, clientId, uniqueDomains, { reauditMonths = null } = {}) {

@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import {
     DOMAIN_ENRICHMENT_SQL,
     DOMAIN_LOOKUP_CHUNK,
+    NOT_RUN_DOMAINS_SQL,
     addDomainStats,
     chunkList,
     collectExistingDomains,
+    collectNotRunDomains,
     emptyDomainStats,
     existingDomainsSql,
     summarizeDomains
@@ -72,5 +74,20 @@ describe('domain lookup chunks', () => {
         assert.doesNotMatch(DOMAIN_ENRICHMENT_SQL, /EXISTS/);
         const totals = addDomainStats(emptyDomainStats(), null);
         assert.equal(totals.existing, 0);
+    });
+
+    it('collects not-run domains across chunks with the same company lookup as the stats', async () => {
+        const seen = [];
+        const query = async (sql, params) => {
+            seen.push(params[1].length);
+            return { rows: [{ domain_normalized: params[1][0] }] };
+        };
+        const domains = Array.from({ length: 1001 }, (_, i) => `d${i}.com`);
+        const notRun = await collectNotRunDomains(query, 5, domains);
+        assert.deepEqual(seen, [1000, 1]);
+        assert.deepEqual(notRun, ['d0.com', 'd1000.com']);
+        assert.match(NOT_RUN_DOMAINS_SQL, /JOIN LATERAL/);
+        assert.match(NOT_RUN_DOMAINS_SQL, /LIMIT 1/);
+        assert.match(NOT_RUN_DOMAINS_SQL, /ct\.job_id IS NOT NULL/);
     });
 });

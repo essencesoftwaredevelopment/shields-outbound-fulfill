@@ -715,6 +715,11 @@ export async function getImportBatch(agencyId, clientId, batchId) {
     return result.rows[0] || null;
 }
 
+/** "file.csv — 20/10/2026 (#19)", as shown in the Import Batch filter and backfill picker. */
+export function formatImportBatchLabel(batch) {
+    return `${batch.file_name || 'Import'} — ${batch.created_at ? new Date(batch.created_at).toLocaleDateString('en-GB') : ''} (#${batch.id})`;
+}
+
 export async function listImportBatches(agencyId, clientId, limit = 50) {
     const result = await pool.query(
         `SELECT * FROM lead_import_batches

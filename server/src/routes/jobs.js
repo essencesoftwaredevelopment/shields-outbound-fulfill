@@ -69,7 +69,7 @@ async function enrichJobWithQueueRuntime(jobState, jobId) {
 }
 import { forceTerminateRunner } from '../services/jobRunner.js';
 import { normalizeDomain } from '../utils/domain.js';
-import { chunkList, collectExistingDomains, summarizeDomains } from '../services/domainLookup.js';
+import { chunkList, collectExistingDomains, collectNotRunDomains, summarizeDomains } from '../services/domainLookup.js';
 import OpenAI from 'openai';
 
 const router = express.Router();
@@ -1682,6 +1682,44 @@ router.post('/jobs/check-domains/new.csv', async (req, res) => {
     } catch (error) {
         console.error('Error exporting new domains:', error);
         res.status(500).json({ error: 'Failed to export new domains.' });
+    }
+});
+
+// POST /api/jobs/check-domains/not-run.csv — existing domains no job has processed yet
+router.post('/jobs/check-domains/not-run.csv', async (req, res) => {
+    try {
+        const { domains, clientId: clientSlug } = req.body;
+
+        if (!Array.isArray(domains) || domains.length === 0) {
+            return res.status(400).json({ error: 'domains must be a non-empty array.' });
+        }
+
+        if (!clientSlug) {
+            return res.status(400).json({ error: 'Missing clientId.' });
+        }
+
+        const agencyId = await agencyFromRequest(req);
+        const uniqueDomains = Array.from(new Set(domains.map((d) => normalizeDomain(d)).filter(Boolean)));
+
+        const clientRow = await resolveClientRow(agencyId, String(clientSlug).trim());
+        if (!clientRow?.id) {
+            return res.status(404).json({ error: 'Client not found.' });
+        }
+
+        const notRunDomains = await collectNotRunDomains(
+            (sql, params) => pool.query(sql, params),
+            clientRow.id,
+            uniqueDomains
+        );
+        notRunDomains.sort((a, b) => a.localeCompare(b));
+
+        const csv = ['domain', ...notRunDomains.map((domain) => formatUnifiedCsvLine(['domain'], { domain }))].join('\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="not_run_domains.csv"');
+        return res.send(csv);
+    } catch (error) {
+        console.error('Error exporting not-run domains:', error);
+        res.status(500).json({ error: 'Failed to export not-run domains.' });
     }
 });
 

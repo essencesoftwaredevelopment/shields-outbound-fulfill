@@ -314,41 +314,89 @@ export async function runStoreLeadsExportImport({ batchId, agencyId, clientId, a
 }
 
 /** Domains in this client due a Store Leads refresh. */
-export async function countBackfillCandidates(agencyId, clientId, staleDays) {
+const BACKFILL_STALE_SQL = `(storeleads_synced_at IS NULL OR storeleads_synced_at < NOW() - ($3::int * INTERVAL '1 day'))`;
+
+/**
+ * importBatchId (optional) limits the backfill to companies with a contact
+ * stamped with that batch. Callers check the batch belongs to the agency and client.
+ */
+export async function countBackfillCandidates(agencyId, clientId, staleDays, importBatchId = null) {
+    const params = [agencyId, clientId, staleDays];
+    if (importBatchId) params.push(importBatchId);
     const result = await pool.query(
         `SELECT COUNT(*)::int AS count FROM companies
-         WHERE agency_id = $1 AND client_id = $2
-           AND (storeleads_synced_at IS NULL OR storeleads_synced_at < NOW() - ($3::int * INTERVAL '1 day'))`,
-        [agencyId, clientId, staleDays]
+         WHERE agency_id = $1 AND client_id = $2 AND ${BACKFILL_STALE_SQL}
+           ${importBatchId ? 'AND id IN (SELECT company_id FROM contacts WHERE import_batch_id = $4::bigint)' : ''}`,
+        params
     );
     return result.rows[0]?.count || 0;
 }
 
 /**
- * Backfill mode: Bulk Retrieve this client's stale/unsynced domains 100 at a
- * time. Paged by id, so a re-run after a crash resumes where it stopped (synced
- * rows drop out of the candidate set).
+ * Pages of { id, domain_normalized } still due a lookup, in id order.
+ * A batch-scoped run loads the batch's company ids once and pages through them
+ * by primary key: a join on contacts made Postgres walk the client's companies
+ * from the start on every page (~7 s each for the 680k-domain batch 19).
  */
-export async function runStoreLeadsBackfill({ batchId, agencyId, clientId, apiKey, staleDays }) {
+async function createBackfillPager({ agencyId, clientId, staleDays, importBatchId }) {
+    if (!importBatchId) {
+        let lastId = 0;
+        return async () => {
+            const page = await pool.query(
+                `SELECT id, domain_normalized FROM companies
+                 WHERE agency_id = $1 AND client_id = $2 AND id > $4 AND ${BACKFILL_STALE_SQL}
+                 ORDER BY id
+                 LIMIT $5`,
+                [agencyId, clientId, staleDays, lastId, BACKFILL_PAGE_SIZE]
+            );
+            if (page.rows.length) lastId = page.rows[page.rows.length - 1].id;
+            return page.rows;
+        };
+    }
+
+    const idsResult = await pool.query(
+        `SELECT DISTINCT company_id FROM contacts
+         WHERE import_batch_id = $1 AND client_id = $2
+         ORDER BY company_id`,
+        [importBatchId, clientId]
+    );
+    const companyIds = idsResult.rows.map((row) => row.company_id);
+    let offset = 0;
+    return async () => {
+        // Skip id slices whose companies were all synced recently.
+        while (offset < companyIds.length) {
+            const slice = companyIds.slice(offset, offset + BACKFILL_PAGE_SIZE);
+            offset += slice.length;
+            const page = await pool.query(
+                `SELECT id, domain_normalized FROM companies
+                 WHERE agency_id = $1 AND client_id = $2 AND id = ANY($4::bigint[]) AND ${BACKFILL_STALE_SQL}
+                 ORDER BY id`,
+                [agencyId, clientId, staleDays, slice]
+            );
+            if (page.rows.length) return page.rows;
+        }
+        return [];
+    };
+}
+
+/**
+ * Backfill mode: Bulk Retrieve this client's stale/unsynced domains 100 at a
+ * time, optionally only those from one import batch. Paged by id, so a re-run
+ * after a crash resumes where it stopped (synced rows drop out of the
+ * candidate set).
+ */
+export async function runStoreLeadsBackfill({ batchId, agencyId, clientId, apiKey, staleDays, importBatchId = null }) {
     const counters = { processed_rows: 0, created_count: 0, updated_count: 0, skipped_count: 0 };
-    let lastId = 0;
     let lastRequestAt = 0;
 
     try {
+        const nextPage = await createBackfillPager({ agencyId, clientId, staleDays, importBatchId });
         for (;;) {
-            const page = await pool.query(
-                `SELECT id, domain_normalized FROM companies
-                 WHERE agency_id = $1 AND client_id = $2 AND id > $3
-                   AND (storeleads_synced_at IS NULL OR storeleads_synced_at < NOW() - ($4::int * INTERVAL '1 day'))
-                 ORDER BY id
-                 LIMIT $5`,
-                [agencyId, clientId, lastId, staleDays, BACKFILL_PAGE_SIZE]
-            );
-            if (!page.rows.length) break;
-            lastId = page.rows[page.rows.length - 1].id;
+            const rows = await nextPage();
+            if (!rows.length) break;
 
-            for (let offset = 0; offset < page.rows.length; offset += STORELEADS_BULK_MAX) {
-                const slice = page.rows.slice(offset, offset + STORELEADS_BULK_MAX);
+            for (let offset = 0; offset < rows.length; offset += STORELEADS_BULK_MAX) {
+                const slice = rows.slice(offset, offset + STORELEADS_BULK_MAX);
                 const sinceLast = Date.now() - lastRequestAt;
                 if (sinceLast < BULK_MIN_INTERVAL_MS) await wait(BULK_MIN_INTERVAL_MS - sinceLast);
                 lastRequestAt = Date.now();

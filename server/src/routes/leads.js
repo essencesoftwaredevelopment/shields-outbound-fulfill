@@ -2954,7 +2954,7 @@ router.get('/leads/filter-fields', verifyFirebaseToken, async (req, res) => {
             const batches = await leadImportService.listImportBatches(agencyId, clientId, 100);
             dynamicOptions.import_batch = batches.map((batch) => ({
                 value: String(batch.id),
-                label: `${batch.file_name || 'Import'} — ${batch.created_at ? new Date(batch.created_at).toLocaleDateString('en-GB') : ''} (#${batch.id})`
+                label: leadImportService.formatImportBatchLabel(batch)
             }));
             const lists = await listLeadLists(agencyId, clientId);
             dynamicOptions.list = lists.map((list) => ({

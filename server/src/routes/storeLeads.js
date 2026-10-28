@@ -8,7 +8,12 @@ import express from 'express';
 import { verifyFirebaseToken } from '../middleware/auth.js';
 import * as queries from '../services/db/queries.js';
 import { getAgencySettings } from '../services/db/agencySettings.js';
-import { serializeImportBatch } from '../services/leadImport.js';
+import {
+    formatImportBatchLabel,
+    getImportBatch,
+    listImportBatches,
+    serializeImportBatch
+} from '../services/leadImport.js';
 import {
     STORELEADS_MAX_SEGMENTS,
     countStoreLeadsDomains,
@@ -53,6 +58,18 @@ function parseStaleDays(raw) {
     return Number.isInteger(parsed) && parsed >= 0 && parsed <= 3650 ? parsed : DEFAULT_STALE_DAYS;
 }
 
+/**
+ * Optional backfill scope. Returns { importBatch } (null = whole lead bank) or
+ * { error } when the id isn't one of this client's batches.
+ */
+async function resolveBackfillBatch(agencyId, clientId, raw) {
+    const id = String(raw ?? '').trim();
+    if (!id) return { importBatch: null };
+    if (!/^\d+$/.test(id)) return { error: 'Invalid import batch.' };
+    const importBatch = await getImportBatch(agencyId, clientId, id);
+    return importBatch ? { importBatch } : { error: 'Import batch not found for this client.' };
+}
+
 function formatUsd(value) {
     return value >= 1000 ? `$${Math.round(value / 1000).toLocaleString('en-US')}k` : `$${value}`;
 }
@@ -91,18 +108,26 @@ router.get('/storeleads/status', verifyFirebaseToken, async (req, res) => {
             findActiveStoreLeadsBatch(agencyId)
         ]);
         let backfillCandidates = null;
+        let importBatches = [];
         if (clientSlug) {
             const clientId = await queries.getOrCreateClient(agencyId, clientSlug);
-            backfillCandidates = await countBackfillCandidates(
-                agencyId,
-                clientId,
-                parseStaleDays(req.query.staleDays)
-            );
+            const { importBatch, error } = await resolveBackfillBatch(agencyId, clientId, req.query.importBatchId);
+            if (error) return res.status(400).json({ error });
+            const [count, batches] = await Promise.all([
+                countBackfillCandidates(agencyId, clientId, parseStaleDays(req.query.staleDays), importBatch?.id ?? null),
+                listImportBatches(agencyId, clientId, 100)
+            ]);
+            backfillCandidates = count;
+            // Backfill runs stamp no contacts, so scoping to one would match nothing.
+            importBatches = batches
+                .filter((batch) => batch.options?.mode !== 'backfill')
+                .map((batch) => ({ value: String(batch.id), label: formatImportBatchLabel(batch) }));
         }
         res.json({
             hasKey: Boolean(apiKey),
             activeBatchId: active ? String(active.id) : null,
             backfillCandidates,
+            importBatches,
             maxSegments: STORELEADS_MAX_SEGMENTS
         });
     } catch (error) {
@@ -135,7 +160,7 @@ router.post('/storeleads/preview', verifyFirebaseToken, async (req, res) => {
 });
 
 /**
- * Body: { clientId, mode: 'export' | 'backfill', segments?, existingStrategy?, staleDays? }
+ * Body: { clientId, mode: 'export' | 'backfill', segments?, existingStrategy?, staleDays?, importBatchId? }
  * Returns the batch immediately; the run continues in the background.
  */
 router.post('/storeleads/import', verifyFirebaseToken, async (req, res) => {
@@ -162,20 +187,29 @@ router.post('/storeleads/import', verifyFirebaseToken, async (req, res) => {
 
         if (mode === 'backfill') {
             const staleDays = parseStaleDays(body.staleDays);
-            const candidates = await countBackfillCandidates(agencyId, clientId, staleDays);
+            const { importBatch, error: batchError } = await resolveBackfillBatch(agencyId, clientId, body.importBatchId);
+            if (batchError) return res.status(400).json({ error: batchError });
+            const importBatchId = importBatch?.id ?? null;
+            const candidates = await countBackfillCandidates(agencyId, clientId, staleDays, importBatchId);
             if (!candidates) {
-                return res.status(400).json({ error: 'Every domain in this lead bank was synced recently. Nothing to backfill.' });
+                return res.status(400).json({
+                    error: importBatch
+                        ? 'Every domain in this import batch was synced recently. Nothing to backfill.'
+                        : 'Every domain in this lead bank was synced recently. Nothing to backfill.'
+                });
             }
             const batch = await createStoreLeadsBatch({
                 agencyId,
                 clientId,
-                label: `Store Leads backfill (${dateLabel})`,
+                label: importBatch
+                    ? `Store Leads backfill: ${importBatch.file_name || `batch #${importBatch.id}`} (${dateLabel})`.slice(0, 300)
+                    : `Store Leads backfill (${dateLabel})`,
                 mode,
                 existingStrategy: 'update',
-                options: { staleDays },
+                options: { staleDays, ...(importBatchId ? { importBatchId: String(importBatchId) } : {}) },
                 totalRows: candidates
             });
-            runStoreLeadsBackfill({ batchId: batch.id, agencyId, clientId, apiKey, staleDays });
+            runStoreLeadsBackfill({ batchId: batch.id, agencyId, clientId, apiKey, staleDays, importBatchId });
             return res.status(202).json({ batch: serializeImportBatch(batch) });
         }
 
