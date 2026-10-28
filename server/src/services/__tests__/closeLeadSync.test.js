@@ -46,6 +46,7 @@ function fakeClose(overrides = {}) {
         deps: {
             getAgencySettings: async () => SETTINGS,
             findCloseLeadIdByEmail: record('find', null),
+            findCloseLeadStatusId: record('status', (_key, label) => (label === 'Potential' ? 'stat_potential' : null)),
             getCloseLead: record('getLead', { id: 'lead_x', contacts: [] }),
             createCloseLead: record('createLead', { leadId: 'lead_new', contactId: 'cont_new' }),
             createCloseContact: record('createContact', 'cont_added'),
@@ -97,8 +98,9 @@ describe('syncCloseLeadForContact', () => {
             db, logger: quiet, deps: close.deps
         });
         assert.deepEqual(result, { status: 'created', leadId: 'lead_new', url: closeLeadUrl('lead_new') });
-        assert.deepEqual(close.calls.map((c) => c[0]), ['find', 'createLead', 'note']);
-        assert.match(close.calls[2][2], /Positive reply \(Q4\)\n\nSounds good, call me/);
+        assert.deepEqual(close.calls.map((c) => c[0]), ['find', 'status', 'createLead', 'note']);
+        assert.equal(close.calls[2][1].statusId, 'stat_potential');
+        assert.match(close.calls[3][2], /Positive reply \(Q4\)\n\nSounds good, call me/);
         const stored = db.updates.at(-1);
         assert.match(stored.sql, /close_status = 'synced'/);
         assert.deepEqual(stored.params, [7, 'lead_new', 'cont_new', '+15705551234']);
@@ -114,7 +116,7 @@ describe('syncCloseLeadForContact', () => {
         assert.equal(result.status, 'linked');
         assert.equal(result.leadId, 'lead_old');
         assert.deepEqual(close.calls.find((c) => c[0] === 'addPhone'), ['addPhone', 'cont_old', '+15705551234']);
-        assert.equal(close.calls.some((c) => c[0] === 'createLead'), false);
+        assert.equal(close.calls.some((c) => c[0] === 'createLead' || c[0] === 'status'), false);
         assert.deepEqual(db.updates.at(-1).params.slice(1, 3), ['lead_old', 'cont_old']);
     });
 
@@ -148,6 +150,15 @@ describe('syncCloseLeadForContact', () => {
         });
         assert.deepEqual(result, { status: 'skipped', reason: 'claimed_elsewhere' });
         assert.deepEqual(busy.calls, []);
+    });
+
+    it('uses the configured status, and the org default when Close has no such status', async () => {
+        const custom = fakeClose({
+            getAgencySettings: async () => ({ ...SETTINGS, features: { closeLeads: true, closeLeadStatus: { label: 'Hot' } } })
+        });
+        await syncCloseLeadForContact({ agencyId: 'a1', contactId: 7, db: fakeDb({ ...CONTACT }), logger: quiet, deps: custom.deps });
+        assert.deepEqual(custom.calls.find((c) => c[0] === 'status'), ['status', 'Hot']);
+        assert.equal(custom.calls.find((c) => c[0] === 'createLead')[1].statusId, null);
     });
 
     it('records the error and never throws when Close fails', async () => {

@@ -4457,6 +4457,107 @@ select.lead-activity-chip {
   color: var(--app-success-text);
 }
 
+/* To / Cc / Bcc above the editor. The lead is a fixed chip; extras are
+   comma-separated inputs. */
+.ar-recipients {
+  display: flex;
+  flex-direction: column;
+  padding: 0.35rem 1.1rem;
+  border-radius: 18px;
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-3);
+}
+
+.ar-recipients__row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: 2.5rem;
+}
+
+.ar-recipients__row + .ar-recipients__row {
+  border-top: 1px solid var(--app-border);
+}
+
+.ar-recipients__label {
+  flex: 0 0 2rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--app-text-faint);
+}
+
+.ar-recipients__field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.ar-recipients__chip {
+  max-width: 100%;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  background: var(--app-surface-1);
+  border: 1px solid var(--app-border);
+  color: var(--app-text-high);
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ar-recipients__input {
+  flex: 1;
+  min-width: 10rem;
+  padding: 0.35rem 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--app-text);
+  font-size: 0.88rem;
+}
+
+.ar-recipients__input::placeholder {
+  color: var(--app-text-ghost);
+}
+
+.ar-recipients__input:disabled {
+  opacity: 0.7;
+}
+
+.ar-recipients__toggles {
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.ar-recipients__toggle {
+  padding: 0.25rem 0.5rem;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--app-text-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.ar-recipients__toggle:hover {
+  color: var(--app-text);
+  background: var(--app-surface-1);
+}
+
+.ar-recipients__error {
+  margin: 0;
+  padding: 0.4rem 0 0.5rem;
+  border-top: 1px solid var(--app-border);
+  color: var(--app-error-text);
+  font-size: 0.8rem;
+}
+
 /* Editor is its own panel: same behaviour as the lead-modal composer, with
    the font normalisation the review draft needs because rendered_text
    carries pasted email HTML. */
@@ -5072,7 +5173,8 @@ select.lead-activity-chip {
     padding-right: 1.15rem;
   }
 
-  .ar-editor {
+  .ar-editor,
+  .ar-recipients__input {
     font-size: 16px;
   }
 

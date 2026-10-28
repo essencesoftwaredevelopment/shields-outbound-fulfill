@@ -63,6 +63,17 @@ type ReviewDraft = {
     close?: { url: string | null; enabled: boolean } | null;
 };
 
+const RECIPIENT_EMAIL_RE = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
+
+/** Comma/semicolon/space separated addresses; the server re-validates and dedupes. */
+function splitRecipients(value: string): { emails: string[]; invalid: string[] } {
+    const parts = value.split(/[,;\s]+/).map((part) => part.trim()).filter(Boolean);
+    return {
+        emails: parts.filter((part) => RECIPIENT_EMAIL_RE.test(part)),
+        invalid: parts.filter((part) => !RECIPIENT_EMAIL_RE.test(part)),
+    };
+}
+
 /** Pill label for a phone lookup that has no number (null = show nothing). */
 function phoneStatusLabel(status: string | undefined): string | null {
     if (status === "pending" || status === "timeout") return "Phone lookup running";
@@ -456,6 +467,11 @@ export default function InterestedAutoResponderReviewPage() {
     const [sendSuccess, setSendSuccess] = useState(false);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
     const [threadOpen, setThreadOpen] = useState(false);
+    const [extraTo, setExtraTo] = useState("");
+    const [cc, setCc] = useState("");
+    const [bcc, setBcc] = useState("");
+    const [showCc, setShowCc] = useState(false);
+    const [showBcc, setShowBcc] = useState(false);
 
     const editorRef = useRef<HTMLDivElement>(null);
     const regenerateInstructionsRef = useRef<HTMLTextAreaElement>(null);
@@ -836,7 +852,17 @@ export default function InterestedAutoResponderReviewPage() {
             }
             const response = await fetch(
                 `${getPipelineBaseUrl()}/api/interested-autoresponder/review/${encodeURIComponent(token)}/send`,
-                { method: "POST" }
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        recipients: {
+                            to: splitRecipients(extraTo).emails,
+                            cc: showCc ? splitRecipients(cc).emails : [],
+                            bcc: showBcc ? splitRecipients(bcc).emails : [],
+                        },
+                    }),
+                }
             );
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -939,6 +965,12 @@ export default function InterestedAutoResponderReviewPage() {
     const website = draft ? websiteFromDraft(draft) : null;
     const editorLocked = sendSuccess || regenerating;
     const actionsBusy = sending || regenerating || archiving;
+    const recipientsLocked = sendSuccess || sending;
+    const invalidRecipients = [
+        ...splitRecipients(extraTo).invalid,
+        ...(showCc ? splitRecipients(cc).invalid : []),
+        ...(showBcc ? splitRecipients(bcc).invalid : []),
+    ];
     const hasDraftText = Boolean(String(draft?.renderedText || "").trim());
     // Right column only earns its space when there is (or will be) a brief.
     const showResearch = Boolean(draft && (regenerating || draft.researchBrief || draft.agentTrace));
@@ -1197,6 +1229,81 @@ export default function InterestedAutoResponderReviewPage() {
                                     tone="light"
                                 />
                             )}
+                            {/* Recipients: the lead is always To (Instantly replies can't drop it) */}
+                            <div className="ar-recipients">
+                                <div className="ar-recipients__row">
+                                    <span className="ar-recipients__label">To</span>
+                                    <div className="ar-recipients__field">
+                                        <span className="ar-recipients__chip" title="The lead always receives the reply">
+                                            {draft.leadEmail}
+                                        </span>
+                                        <input
+                                            type="text"
+                                            inputMode="email"
+                                            autoComplete="off"
+                                            className="ar-recipients__input"
+                                            placeholder="Add people, comma separated"
+                                            aria-label="Additional To recipients"
+                                            value={extraTo}
+                                            onChange={(e) => setExtraTo(e.target.value)}
+                                            disabled={recipientsLocked}
+                                        />
+                                    </div>
+                                    {(!showCc || !showBcc) && !recipientsLocked && (
+                                        <div className="ar-recipients__toggles">
+                                            {!showCc && (
+                                                <button type="button" className="ar-recipients__toggle" onClick={() => setShowCc(true)}>Cc</button>
+                                            )}
+                                            {!showBcc && (
+                                                <button type="button" className="ar-recipients__toggle" onClick={() => setShowBcc(true)}>Bcc</button>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                                {showCc && (
+                                    <div className="ar-recipients__row">
+                                        <span className="ar-recipients__label">Cc</span>
+                                        <div className="ar-recipients__field">
+                                            <input
+                                                type="text"
+                                                inputMode="email"
+                                                autoComplete="off"
+                                                className="ar-recipients__input"
+                                                placeholder="Comma separated"
+                                                aria-label="Cc recipients"
+                                                value={cc}
+                                                onChange={(e) => setCc(e.target.value)}
+                                                disabled={recipientsLocked}
+                                                autoFocus={!cc}
+                                            />
+                                        </div>
+                                    </div>
+                                )}
+                                {showBcc && (
+                                    <div className="ar-recipients__row">
+                                        <span className="ar-recipients__label">Bcc</span>
+                                        <div className="ar-recipients__field">
+                                            <input
+                                                type="text"
+                                                inputMode="email"
+                                                autoComplete="off"
+                                                className="ar-recipients__input"
+                                                placeholder="Comma separated"
+                                                aria-label="Bcc recipients"
+                                                value={bcc}
+                                                onChange={(e) => setBcc(e.target.value)}
+                                                disabled={recipientsLocked}
+                                                autoFocus={!bcc}
+                                            />
+                                        </div>
+                                    </div>
+                                )}
+                                {invalidRecipients.length > 0 && (
+                                    <p className="ar-recipients__error" role="alert">
+                                        Not a valid email: {invalidRecipients.join(", ")}
+                                    </p>
+                                )}
+                            </div>
                             {/* Reply editor — rendered HTML, contentEditable */}
                             <div className="ar-editor-frame">
                                 <div
@@ -1244,7 +1351,7 @@ export default function InterestedAutoResponderReviewPage() {
                                     type="button"
                                     className="primary-button"
                                     onClick={handleSendReply}
-                                    disabled={sending || regenerating || !renderedText.trim() || sendSuccess}
+                                    disabled={sending || regenerating || !renderedText.trim() || sendSuccess || invalidRecipients.length > 0}
                                 >
                                     {sending ? "Sending…" : sendSuccess ? "Sent ✓" : "Send reply"}
                                 </button>

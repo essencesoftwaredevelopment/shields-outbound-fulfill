@@ -6,11 +6,13 @@
  * research workflow's phone step. Per contact:
  *   no close_lead_id → find a Close lead that already has this email, else
  *                      create one (company + contact with name / title / email /
- *                      phone) and add the reply as a note
+ *                      phone) in the configured status, and add the reply as a note
  *   close_lead_id    → only add a phone found since the last sync
  *
  * Gated by features.closeLeads + agency_settings.close_key (+ optional
- * features.closeClients.ids). Never throws: Close is a convenience next to the
+ * features.closeClients.ids). New leads get the status named in
+ * features.closeLeadStatus.label (default "Potential"); a linked existing lead
+ * keeps its status. Never throws: Close is a convenience next to the
  * reply, never a blocker.
  */
 import { pool } from '../config/db.js';
@@ -22,21 +24,30 @@ import {
     createCloseLead,
     createCloseNote,
     findCloseLeadIdByEmail,
+    findCloseLeadStatusId,
     getCloseLead
 } from './close.js';
 
 /** A 'pending' claim older than this is a crashed run. */
 const STALE_CLAIM_MS = 5 * 60 * 1000;
+export const DEFAULT_CLOSE_LEAD_STATUS = 'Potential';
 
 const defaultDeps = {
     getAgencySettings,
     findCloseLeadIdByEmail,
+    findCloseLeadStatusId,
     getCloseLead,
     createCloseLead,
     createCloseContact,
     addPhoneToCloseContact,
     createCloseNote
 };
+
+/** Close status label new leads are created in (features.closeLeadStatus.label). */
+export function closeLeadStatusLabel(settings) {
+    const label = String(settings?.features?.closeLeadStatus?.label || '').trim();
+    return label || DEFAULT_CLOSE_LEAD_STATUS;
+}
 
 /** 'founder' → 'Founder', 'head_of_growth' → 'Head Of Growth'. */
 function humanizeRole(role) {
@@ -169,7 +180,7 @@ export async function syncCloseLeadForContact({
 
         try {
             const payload = buildCloseLeadPayload(contact, { campaignName });
-            const result = await linkOrCreate(d, apiKey, payload, log);
+            const result = await linkOrCreate(d, apiKey, payload, closeLeadStatusLabel(settings), log);
             await createNoteQuietly(d, apiKey, result.leadId, replyNote({ campaignName, replyText }), log);
             await db.query(
                 `UPDATE contacts
@@ -202,7 +213,7 @@ export async function syncCloseLeadForContact({
  * Reuse a Close lead that already holds this email (added by hand, or by an
  * earlier sync whose DB write failed); otherwise create one.
  */
-async function linkOrCreate(d, apiKey, payload, log) {
+async function linkOrCreate(d, apiKey, payload, statusLabel, log) {
     const email = payload.contact.email;
     let existingId = null;
     if (email) {
@@ -216,7 +227,15 @@ async function linkOrCreate(d, apiKey, payload, log) {
     }
 
     if (!existingId) {
-        const created = await d.createCloseLead(apiKey, payload);
+        let statusId = null;
+        try {
+            statusId = await d.findCloseLeadStatusId(apiKey, statusLabel);
+            if (!statusId) log(`no Close lead status "${statusLabel}" — using the org default`);
+        } catch (err) {
+            if (err?.code === 'CLOSE_UNAUTHORIZED') throw err;
+            log(`status lookup failed, using the org default: ${err?.message || err}`);
+        }
+        const created = await d.createCloseLead(apiKey, { ...payload, statusId });
         return { status: 'created', leadId: created.leadId, contactId: created.contactId, phoneWritten: !!payload.contact.phone };
     }
 

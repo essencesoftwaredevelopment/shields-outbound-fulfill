@@ -149,11 +149,33 @@ export async function getCloseLead(apiKey, leadId) {
 }
 
 /**
+ * Id of the lead status with this label (case-insensitive), or null. New leads
+ * otherwise land in the org's default status — often something like "Bad Fit".
+ *
+ * @param {string} apiKey
+ * @param {string} label
+ * @returns {Promise<string | null>}
+ */
+export async function findCloseLeadStatusId(apiKey, label) {
+    const wanted = String(label || '').trim().toLowerCase();
+    if (!wanted) return null;
+    const body = await closeRequest('GET', '/status/lead/', apiKey);
+    const match = (body?.data || []).find((s) => String(s.label || '').trim().toLowerCase() === wanted);
+    return match?.id ? String(match.id) : null;
+}
+
+/** Move a lead to another status. */
+export async function setCloseLeadStatus(apiKey, leadId, statusId) {
+    await closeRequest('PUT', `/lead/${encodeURIComponent(leadId)}/`, apiKey, { status_id: statusId });
+}
+
+/**
  * @param {string} apiKey
  * @param {{
  *   name: string,
  *   url?: string | null,
  *   description?: string | null,
+ *   statusId?: string | null,
  *   contact: { name?: string | null, title?: string | null, email?: string | null, phone?: string | null }
  * }} lead
  * @returns {Promise<{ leadId: string, contactId: string | null, url: string | null }>}
@@ -170,6 +192,7 @@ export async function createCloseLead(apiKey, lead) {
         name: lead.name,
         ...(lead.url ? { url: lead.url } : {}),
         ...(lead.description ? { description: lead.description } : {}),
+        ...(lead.statusId ? { status_id: lead.statusId } : {}),
         contacts: [contact]
     });
     if (!body?.id) throw new Error('Close lead create returned no id');

@@ -494,7 +494,8 @@ router.post('/interested-autoresponder/review/:token/send', async (req, res) => 
     try {
         setNoStoreHeaders(res);
         const result = await sendInterestedAutoResponderDraftByToken({
-            token: String(req.params.token || '')
+            token: String(req.params.token || ''),
+            recipients: req.body?.recipients || null
         });
         res.json(result);
     } catch (error) {

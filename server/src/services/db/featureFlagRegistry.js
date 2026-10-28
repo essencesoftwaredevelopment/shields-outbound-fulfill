@@ -71,6 +71,16 @@ export const FEATURE_FLAGS = [
         ]
     },
     {
+        key: 'closeLeadStatus',
+        group: 'product',
+        type: 'object',
+        label: 'Close lead status',
+        description: 'Status new Close leads are created in, by its name in Close (default "Potential"). Leads that already exist in Close keep their status.',
+        fields: [
+            { key: 'label', type: 'string', label: 'Status name', placeholder: 'Potential' }
+        ]
+    },
+    {
         key: 'trykittPaidAccount',
         group: 'pipeline',
         type: 'boolean',

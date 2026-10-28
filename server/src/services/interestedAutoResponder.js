@@ -1531,6 +1531,58 @@ export function resolveInstantlyReplySubject(threadSubject) {
     return asTrimmedText(threadSubject) || 'Re:';
 }
 
+const REPLY_RECIPIENT_LIMIT = 10;
+const REPLY_RECIPIENT_EMAIL_RE = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
+
+function parseRecipientList(value, label) {
+    const raw = Array.isArray(value) ? value : String(value ?? '').split(/[,;\s]+/);
+    const emails = [];
+    for (const item of raw) {
+        const email = String(item ?? '').trim().toLowerCase();
+        if (!email) continue;
+        if (!REPLY_RECIPIENT_EMAIL_RE.test(email)) {
+            const error = new Error(`"${email}" in ${label} is not a valid email address.`);
+            error.statusCode = 400;
+            throw error;
+        }
+        if (!emails.includes(email)) emails.push(email);
+    }
+    if (emails.length > REPLY_RECIPIENT_LIMIT) {
+        const error = new Error(`${label} can have at most ${REPLY_RECIPIENT_LIMIT} addresses.`);
+        error.statusCode = 400;
+        throw error;
+    }
+    return emails;
+}
+
+/**
+ * Extra To / Cc / Bcc addresses from the review page. The lead is always the
+ * reply's To (Instantly has no override), so it and the sending inbox are
+ * dropped, as is any address already used by an earlier list.
+ */
+export function normalizeReplyRecipients({ to, cc, bcc } = {}, { leadEmail = null, eaccount = null } = {}) {
+    const taken = new Set([leadEmail, eaccount].map((e) => String(e || '').trim().toLowerCase()).filter(Boolean));
+    const claim = (emails) => emails.filter((email) => {
+        if (taken.has(email)) return false;
+        taken.add(email);
+        return true;
+    });
+    return {
+        to: claim(parseRecipientList(to, 'To')),
+        cc: claim(parseRecipientList(cc, 'Cc')),
+        bcc: claim(parseRecipientList(bcc, 'Bcc'))
+    };
+}
+
+/** Instantly /emails/reply recipient fields; omitted when empty. */
+export function instantlyReplyRecipientFields({ to = [], cc = [], bcc = [] } = {}) {
+    return {
+        ...(to.length ? { additional_recipients: to } : {}),
+        ...(cc.length ? { cc_address_email_list: cc.join(',') } : {}),
+        ...(bcc.length ? { bcc_address_email_list: bcc.join(',') } : {})
+    };
+}
+
 export async function fetchInstantlyEmailSubject(apiKey, emailId) {
     const id = asTrimmedText(emailId);
     if (!apiKey || !id) return null;
@@ -2511,7 +2563,8 @@ async function persistSentAutoResponderActivity(db, {
     threadSubject,
     sentReplyId,
     parentReplyToUuid,
-    renderedText
+    renderedText,
+    recipients = null
 }) {
     const eventTimestamp = new Date().toISOString();
     const fingerprint = crypto.createHash('sha256').update(`interested-autoresponder-email-sent|${draftId}`).digest('hex');
@@ -2524,7 +2577,10 @@ async function persistSentAutoResponderActivity(db, {
         email_html: plainTextToHtml(renderedText || ''),
         email_id: sentReplyId || null,
         parent_reply_to_uuid: parentReplyToUuid || null,
-        interested_autoresponder_draft_id: draftId
+        interested_autoresponder_draft_id: draftId,
+        ...(recipients?.to?.length ? { additional_recipients: recipients.to } : {}),
+        ...(recipients?.cc?.length ? { cc: recipients.cc } : {}),
+        ...(recipients?.bcc?.length ? { bcc: recipients.bcc } : {})
     };
 
     const result = await db.query(
@@ -2583,7 +2639,7 @@ async function resolveDraftFallbackCtaUrl(draft) {
     }
 }
 
-export async function sendInterestedAutoResponderDraftByToken({ token }) {
+export async function sendInterestedAutoResponderDraftByToken({ token, recipients = null }) {
     const draft = await loadPendingReviewDraft(token);
     const metadata = await fetchLatestThreadMetadata(pool, draft.contact_id, draft.campaign_id);
     const replyToUuid = asTrimmedText(metadata.reply_to_uuid) || asTrimmedText(draft.reply_to_uuid);
@@ -2595,6 +2651,11 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         error.statusCode = 409;
         throw error;
     }
+
+    const extraRecipients = normalizeReplyRecipients(recipients || {}, {
+        leadEmail: draft.lead_email,
+        eaccount
+    });
 
     const clientInstantlyKey = await resolveClientInstantlyKey(
         draft.agency_id,
@@ -2643,7 +2704,8 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
         subject: resolvedSubject,
         body: {
             html: isHtml ? decodeBasicHtmlEntities(renderedHtml) : plainTextToHtml(outgoingText)
-        }
+        },
+        ...instantlyReplyRecipientFields(extraRecipients)
     };
 
     const replyResult = await sendInstantlyReplyDirect(clientInstantlyKey, replyPayload);
@@ -2663,7 +2725,8 @@ export async function sendInterestedAutoResponderDraftByToken({ token }) {
             threadSubject: resolvedSubject,
             sentReplyId: replyResult?.id || replyResult?.email_id || null,
             parentReplyToUuid: replyToUuid,
-            renderedText: outgoingText
+            renderedText: outgoingText,
+            recipients: extraRecipients
         });
         await persistWarmFollowUpAnchorFromAutoresponder(client, {
             draftId: draft.id,
