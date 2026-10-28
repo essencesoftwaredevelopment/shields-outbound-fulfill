@@ -62,6 +62,7 @@ export function normalizeSkipOptions(skipOptions) {
 /**
  * POST one batch (≤100) to Instantly v2 leads/add. Throws on failure; a 401
  * carries code INSTANTLY_UNAUTHORIZED so callers can stop instead of retrying.
+ * Resolves to Instantly's response body (upload counts), or null if unreadable.
  */
 export async function addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions }) {
     const response = await fetch('https://api.instantly.ai/api/v2/leads/add', {
@@ -84,6 +85,7 @@ export async function addLeadsToInstantlyCampaign({ instantlyKey, campaignId, le
         if (status === 401) err.code = 'INSTANTLY_UNAUTHORIZED';
         throw err;
     }
+    return response.json().catch(() => null);
 }
 
 /** SQL id of a synced Instantly campaign, or null when it has not been synced. */

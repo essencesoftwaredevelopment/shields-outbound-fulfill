@@ -267,6 +267,39 @@ async function loadReserve(pool, agencyId, sqlClientId) {
     return { verified: rows[0]?.verified || 0, withFirstLine: rows[0]?.with_first_line || 0 };
 }
 
+/** tag id → emails of the accounts carrying it. */
+async function fetchTaggedEmails(instantlyKey, tagIds) {
+    const taggedEmails = new Map();
+    for (const tagId of tagIds) {
+        const tagged = await fetchInstantlyAccounts(instantlyKey, { tagIds: [tagId] });
+        taggedEmails.set(tagId, tagged.map((account) => account?.email).filter(Boolean));
+    }
+    return taggedEmails;
+}
+
+/**
+ * New prospects/day one campaign can start, counting its inboxes' full limits
+ * (not split with other campaigns: Instantly gives an inbox's unused allowance
+ * to whichever campaign still has leads due). Null when the campaign isn't
+ * active. Used by the lead refill to size the backlog it keeps.
+ */
+export async function loadCampaignNewLeadCapacity({ instantlyKey, instantlyCampaignId }) {
+    const [campaign, accounts] = await Promise.all([
+        instantlyRequest({ apiKey: instantlyKey, path: `/api/v2/campaigns/${encodeURIComponent(instantlyCampaignId)}` }),
+        fetchInstantlyAccounts(instantlyKey)
+    ]);
+    if (Number(campaign?.status) !== 1) return null;
+    const tagIds = (Array.isArray(campaign?.email_tag_list) ? campaign.email_tag_list : []).map(String);
+    const { campaigns: [row] } = computeSendingRunway({
+        campaigns: [campaign],
+        accounts,
+        taggedEmails: await fetchTaggedEmails(instantlyKey, tagIds),
+        backlog: new Map(),
+        reserve: { verified: 0, withFirstLine: 0 }
+    });
+    return row || null;
+}
+
 async function computeForClient({ pool, agencyId, sqlClientId, instantlyKey }) {
     const [listedCampaigns, accounts, { backlog, leadsSyncedAt }, reserve] = await Promise.all([
         fetchInstantlyCampaigns(instantlyKey),
@@ -290,11 +323,7 @@ async function computeForClient({ pool, agencyId, sqlClientId, instantlyKey }) {
     const tagIds = [...new Set(relevant.flatMap((campaign) => (
         Array.isArray(campaign?.email_tag_list) ? campaign.email_tag_list.map(String) : []
     )))];
-    const taggedEmails = new Map();
-    for (const tagId of tagIds) {
-        const tagged = await fetchInstantlyAccounts(instantlyKey, { tagIds: [tagId] });
-        taggedEmails.set(tagId, tagged.map((account) => account?.email).filter(Boolean));
-    }
+    const taggedEmails = await fetchTaggedEmails(instantlyKey, tagIds);
 
     return {
         ...computeSendingRunway({ campaigns, accounts, taggedEmails, backlog, reserve }),

@@ -5729,3 +5729,12 @@ textarea {
   font-size: 0.8125rem;
   color: var(--app-danger-text);
 }
+
+/* Info tab: Instantly lead refill (reuses the cleanup layout) */
+.settings-field .instantly-refill__select {
+  height: 36px;
+  min-height: 36px;
+  max-width: 22rem;
+  border-radius: 10px;
+  padding: 0 0.6rem;
+}

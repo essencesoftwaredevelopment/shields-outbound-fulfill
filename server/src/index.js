@@ -35,6 +35,7 @@ import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobP
 import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/jobRunner.js';
 import { startAnalyticsSnapshotSweep } from './services/analyticsSnapshots.js';
 import { startInstantlyCleanupSweep } from './services/instantlyCleanup.js';
+import { startInstantlyRefillSweep } from './services/instantlyRefill.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
@@ -128,6 +129,7 @@ app.get('/health', (req, res) => {
 
 let stopAnalyticsSnapshotSweep = () => {};
 let stopInstantlyCleanupSweep = () => {};
+let stopInstantlyRefillSweep = () => {};
 
 const server = app.listen(PORT, async () => {
     if (env.DB_WRITE_FREEZE) {
@@ -142,6 +144,7 @@ const server = app.listen(PORT, async () => {
     }
     stopAnalyticsSnapshotSweep = startAnalyticsSnapshotSweep(pool);
     stopInstantlyCleanupSweep = startInstantlyCleanupSweep();
+    stopInstantlyRefillSweep = startInstantlyRefillSweep();
 });
 
 server.on('error', (err) => {
@@ -182,6 +185,7 @@ async function gracefulShutdown(signal) {
     server.close?.();
     stopAnalyticsSnapshotSweep();
     stopInstantlyCleanupSweep();
+    stopInstantlyRefillSweep();
 
     try {
         const cancelled = await cancelActiveJobsOnShutdown('Interrupted (server shutdown)');

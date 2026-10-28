@@ -1199,7 +1199,14 @@ export async function beginInstantlySyncRun({
     return created;
 }
 
-export async function runInstantlySyncJob({ agencyId, clientSlug, instantlyKey, triggerSource = 'scheduled', logger = () => {} }) {
+export async function runInstantlySyncJob({
+    agencyId,
+    clientSlug,
+    instantlyKey,
+    triggerSource = 'scheduled',
+    instantlyCampaignId = null,
+    logger = () => {}
+}) {
     if (triggerSource === 'scheduled' && !isAutomaticInstantlySyncEnabled()) {
         logger('Scheduled Instantly sync skipped (INSTANTLY_SYNC_AUTOMATIC_ENABLED is not true).');
         return { run: null, alreadyRunning: false, summary: null, skipped: true };
@@ -1228,6 +1235,7 @@ export async function runInstantlySyncJob({ agencyId, clientSlug, instantlyKey, 
         agencyId,
         clientSlug,
         instantlyKey,
+        instantlyCampaignId,
         syncRunId: created.run.id,
         logger
     });
@@ -1237,6 +1245,41 @@ export async function runInstantlySyncJob({ agencyId, clientSlug, instantlyKey, 
         alreadyRunning: false,
         summary
     };
+}
+
+const SYNC_WAIT_POLL_MS = 10_000;
+const SYNC_WAIT_MAX_MS = 60 * 60 * 1000;
+
+/**
+ * A manual sync (whole workspace, or one campaign) that finishes before this
+ * returns. If a sync is already running (someone pressed sync on the Info tab),
+ * waits for that one instead of starting a second. Throws unless the sync
+ * completed, so callers never act on stale data.
+ */
+export async function runInstantlySyncAndWait({ agencyId, clientSlug, instantlyKey, instantlyCampaignId = null, logger = () => {} }) {
+    const result = await runInstantlySyncJob({
+        agencyId,
+        clientSlug,
+        instantlyKey,
+        triggerSource: 'manual',
+        instantlyCampaignId,
+        logger: (m) => logger(`[sync] ${m}`)
+    });
+    let run = result.run;
+    if (result.alreadyRunning && run?.id) {
+        logger(`a sync is already running (${run.id}); waiting for it`);
+        const deadline = Date.now() + SYNC_WAIT_MAX_MS;
+        while (Date.now() < deadline) {
+            await sleep(SYNC_WAIT_POLL_MS);
+            run = await getInstantlySyncRun({ agencyId, clientSlug, runId: run.id });
+            if (run && run.status !== 'running' && run.status !== 'queued') break;
+        }
+    }
+    const status = String(run?.status || '');
+    if (status !== 'completed') {
+        throw new Error(`Instantly sync did not complete (${status || 'unknown'}${run?.error ? `: ${run.error}` : ''})`);
+    }
+    return run;
 }
 
 async function updateClientState(clientId, patch = {}) {

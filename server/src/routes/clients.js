@@ -59,6 +59,14 @@ import {
     previewCleanup,
     updateCleanupSettings
 } from '../services/instantlyCleanup.js';
+import {
+    getLatestRefillRun,
+    getRefillSettings,
+    listRefillCampaigns,
+    previewRefill,
+    runInstantlyRefill,
+    updateRefillSettings
+} from '../services/instantlyRefill.js';
 import { shouldUseAiFollowUpCopy } from '../services/warmFollowUpGeneration/prompt.js';
 import {
     getGenerationRun,
@@ -606,6 +614,102 @@ router.put('/clients/:clientId/instantly-cleanup', requireAuth, async (req, res)
     } catch (error) {
         console.error('PUT instantly-cleanup error:', error?.message || error);
         res.status(500).json({ error: 'Failed to save Instantly cleanup settings.' });
+    }
+});
+
+// Automatic Instantly lead refill (Info tab): settings, the campaigns it can
+// target and the latest run. The preview is separate because it scans the lead bank.
+router.get('/clients/:clientId/instantly-refill', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const row = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const [settings, campaigns, lastRun] = await Promise.all([
+            getRefillSettings(row.id),
+            listRefillCampaigns(req.agencyId, row.id),
+            getLatestRefillRun(row.id)
+        ]);
+        res.json({ settings, campaigns, lastRun, hasInstantlyKey: Boolean(String(row.instantly_key || '').trim()) });
+    } catch (error) {
+        console.error('GET instantly-refill error:', error?.message || error);
+        res.status(500).json({ error: 'Failed to load Instantly refill settings.' });
+    }
+});
+
+router.get('/clients/:clientId/instantly-refill/preview', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const { row, instantlyKey } = await requireClientWithInstantly(req.agencyId, req.params.clientId);
+        res.json(await previewRefill({ agencyId: req.agencyId, clientSqlId: Number(row.id), instantlyKey }));
+    } catch (error) {
+        console.error('GET instantly-refill preview error:', error?.message || error);
+        res.status(error?.statusCode || 502).json({ error: error?.message || 'Failed to preview the refill.' });
+    }
+});
+
+// Body: { enabled?: boolean, campaignId?: string | null, cooldownDays?: 30–365, backlogDays?: 1–5 }
+router.put('/clients/:clientId/instantly-refill', requireAuth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+            return res.status(400).json({ error: 'enabled must be a boolean.' });
+        }
+        if (body.cooldownDays !== undefined && (!Number.isInteger(body.cooldownDays) || body.cooldownDays < 30 || body.cooldownDays > 365)) {
+            return res.status(400).json({ error: 'cooldownDays must be a whole number between 30 and 365.' });
+        }
+        if (body.backlogDays !== undefined && (!Number.isInteger(body.backlogDays) || body.backlogDays < 1 || body.backlogDays > 5)) {
+            return res.status(400).json({ error: 'backlogDays must be a whole number between 1 and 5.' });
+        }
+        const row = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        if (body.campaignId !== undefined && body.campaignId !== null) {
+            const campaigns = await listRefillCampaigns(req.agencyId, row.id);
+            if (!campaigns.some((c) => c.id === body.campaignId)) {
+                return res.status(400).json({ error: 'Unknown campaign for this client. Sync Instantly first.' });
+            }
+        }
+        const current = await getRefillSettings(row.id);
+        const campaignAfter = body.campaignId !== undefined ? body.campaignId : current?.campaign_id;
+        if (body.enabled === true && !campaignAfter) {
+            return res.status(400).json({ error: 'Pick a campaign before turning the refill on.' });
+        }
+        const settings = await updateRefillSettings(row.id, {
+            enabled: body.enabled,
+            campaignId: body.campaignId,
+            cooldownDays: body.cooldownDays,
+            backlogDays: body.backlogDays
+        });
+        res.json({ settings });
+    } catch (error) {
+        console.error('PUT instantly-refill error:', error?.message || error);
+        res.status(500).json({ error: 'Failed to save Instantly refill settings.' });
+    }
+});
+
+// Start a run now (in the background; the Info tab polls the latest run).
+router.post('/clients/:clientId/instantly-refill/run', requireAuth, async (req, res) => {
+    try {
+        const { row, instantlyKey } = await requireClientWithInstantly(req.agencyId, req.params.clientId);
+        const lastRun = await getLatestRefillRun(row.id);
+        if (lastRun?.status === 'running' && Date.now() - new Date(lastRun.started_at).getTime() < 6 * 60 * 60 * 1000) {
+            return res.status(409).json({ error: 'A refill is already running.' });
+        }
+        const settings = await getRefillSettings(row.id);
+        if (!settings?.campaign_id) return res.status(400).json({ error: 'Pick a campaign first.' });
+        const label = `${req.agencyId}/${row.slug}`;
+        void runInstantlyRefill({
+            agencyId: req.agencyId,
+            clientSqlId: Number(row.id),
+            clientSlug: row.slug,
+            instantlyKey,
+            triggerSource: 'manual',
+            force: true,
+            logger: (m) => console.log(`[instantly-refill][${label}] ${m}`)
+        }).catch((error) => console.error(`[instantly-refill][${label}] failed:`, error?.message || error));
+        res.status(202).json({ started: true });
+    } catch (error) {
+        console.error('POST instantly-refill run error:', error?.message || error);
+        res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to start the refill.' });
     }
 });
 

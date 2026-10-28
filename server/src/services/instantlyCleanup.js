@@ -27,10 +27,9 @@
 
 import { pool } from '../config/db.js';
 import {
-    getInstantlySyncRun,
     instantlyRequest,
     listInstantlyLeadLabels,
-    runInstantlySyncJob
+    runInstantlySyncAndWait
 } from './instantlyState.js';
 
 export const CLEANUP_CATEGORIES = [
@@ -43,15 +42,10 @@ export const CLEANUP_CATEGORIES = [
     'unsubscribed'
 ];
 
-/** Waiting on a sync someone else already started (e.g. from the Info tab). */
-const SYNC_WAIT_POLL_MS = 10_000;
-const SYNC_WAIT_MAX_MS = 60 * 60 * 1000;
 /** Lead ids per bulk DELETE (Instantly allows up to 10,000). */
 const BULK_DELETE_CHUNK = 500;
 /** Scheduled runs happen at most this often per client. */
 export const CLEANUP_MIN_INTERVAL_MS = 20 * 60 * 60 * 1000;
-
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Interest-status values of the workspace's "Bad Fit" label(s). */
 export function badFitStatusesFromLabels(labels) {
@@ -174,34 +168,13 @@ export async function previewCleanup({ clientSqlId, instantlyKey, days }) {
     };
 }
 
-/**
- * The usual full Instantly sync. If one is already running (someone pressed
- * sync on the Info tab), wait for it instead of starting a second. Throws when
- * the sync didn't complete, so nothing is deleted on stale data.
- */
+/** The usual full Instantly sync; nothing is deleted on stale data. */
 async function syncBeforeCleanup({ agencyId, clientSlug, instantlyKey, logger }) {
-    const result = await runInstantlySyncJob({
-        agencyId,
-        clientSlug,
-        instantlyKey,
-        triggerSource: 'manual',
-        logger: (m) => logger(`[sync] ${m}`)
-    });
-    let run = result.run;
-    if (result.alreadyRunning && run?.id) {
-        logger(`a sync is already running (${run.id}); waiting for it`);
-        const deadline = Date.now() + SYNC_WAIT_MAX_MS;
-        while (Date.now() < deadline) {
-            await wait(SYNC_WAIT_POLL_MS);
-            run = await getInstantlySyncRun({ agencyId, clientSlug, runId: run.id });
-            if (run && run.status !== 'running' && run.status !== 'queued') break;
-        }
+    try {
+        return await runInstantlySyncAndWait({ agencyId, clientSlug, instantlyKey, logger });
+    } catch (error) {
+        throw new Error(`${error?.message || error}; no leads deleted.`);
     }
-    const status = String(run?.status || '');
-    if (status !== 'completed') {
-        throw new Error(`Instantly sync did not complete (${status || 'unknown'}${run?.error ? `: ${run.error}` : ''}); no leads deleted.`);
-    }
-    return run;
 }
 
 /**
