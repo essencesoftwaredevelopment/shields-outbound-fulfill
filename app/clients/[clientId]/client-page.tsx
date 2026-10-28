@@ -80,6 +80,10 @@ import calendlyLogo from "@/app/assets/Calendly.png";
 const ACTIVE_JOB_POLL_MS = 10_000;
 const ACTIVE_JOB_POLL_MIN_GAP_MS = 5_000;
 
+function isAbortError(error: unknown) {
+    return (error as { name?: string } | null)?.name === 'AbortError';
+}
+
 // Helper function to retry fetch on connection errors
 async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
     const startTime = Date.now();
@@ -92,6 +96,8 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 
             console.log(`✅ [FETCH] Success ${url} (${duration}ms, status: ${response.status})`);
             return response;
         } catch (error: any) {
+            // Caller cancelled (superseded or unmounted): never retry, never log.
+            if (isAbortError(error) || options.signal?.aborted) throw error;
             const duration = Date.now() - startTime;
             console.error(`❌ [FETCH] Attempt ${attempt + 1}/${retries + 1} failed for ${url} (${duration}ms):`, {
                 name: error.name,
@@ -2624,6 +2630,15 @@ export default function ClientPage() {
     const [stats, setStats] = useState<{ total: number | null; verified: number; unverified: number }>(() => ({ total: null, verified: 0, unverified: 0 }));
     const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
     const leadDetailRequestSeqRef = useRef(0);
+    // Main lead query pair (rows + filtered count). Each new run aborts the
+    // previous in-flight request and bumps the seq so late responses are dropped.
+    const leadRowsRequestSeqRef = useRef(0);
+    const leadRowsAbortRef = useRef<AbortController | null>(null);
+    const leadTotalRequestSeqRef = useRef(0);
+    const leadTotalAbortRef = useRef<AbortController | null>(null);
+    const [leadTotalStatus, setLeadTotalStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+    const [leadTotalError, setLeadTotalError] = useState<{ message: string; timedOut: boolean } | null>(null);
+    const [leadsLoadError, setLeadsLoadError] = useState<string | null>(null);
     const [leadModalTab, setLeadModalTab] = useState<'detail' | 'insights'>('detail');
     const [emailCopied, setEmailCopied] = useState(false);
     const [phoneCopied, setPhoneCopied] = useState(false);
@@ -3874,9 +3889,26 @@ export default function ClientPage() {
         fetchLeads(true);
         if (!shouldSkipTotalForSingleLeadSearch) {
             fetchLeadTotal();
+        } else {
+            // The rows response supplies the total; drop any count still in flight
+            // from the previous query so it can't overwrite it.
+            leadTotalAbortRef.current?.abort();
+            leadTotalAbortRef.current = null;
+            leadTotalRequestSeqRef.current += 1;
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user?.id, clientId, debouncedLeadSearch, appliedLeadFilters, leadQueryNonce]);
+
+    useEffect(() => {
+        return () => {
+            leadRowsAbortRef.current?.abort();
+            leadRowsAbortRef.current = null;
+            leadRowsRequestSeqRef.current += 1;
+            leadTotalAbortRef.current?.abort();
+            leadTotalAbortRef.current = null;
+            leadTotalRequestSeqRef.current += 1;
+        };
+    }, [clientId]);
 
     // Fetch instantly campaigns for filtering
     useEffect(() => {
@@ -4293,6 +4325,12 @@ export default function ClientPage() {
 
     const fetchLeadTotal = useCallback(async () => {
         if (!user || !clientId) return;
+        leadTotalAbortRef.current?.abort();
+        const controller = new AbortController();
+        leadTotalAbortRef.current = controller;
+        const requestSeq = ++leadTotalRequestSeqRef.current;
+        setLeadTotalStatus('loading');
+        setLeadTotalError(null);
         try {
             const idToken = await getAccessToken();
             if (!idToken) return;
@@ -4305,44 +4343,78 @@ export default function ClientPage() {
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
                 headers: {
                     'Authorization': `Bearer ${idToken}`
-                }
+                },
+                signal: controller.signal
             });
             if (!response.ok) {
-                throw new Error(`Failed to fetch lead total: ${response.statusText}`);
+                const errorData = await response.json().catch(() => ({}));
+                const countError = new Error(errorData?.error || `Failed to fetch lead total: ${response.statusText}`);
+                (countError as Error & { code?: string }).code = errorData?.code;
+                throw countError;
             }
 
             const data = await response.json();
+            if (requestSeq !== leadTotalRequestSeqRef.current) return;
             const total = Number.isFinite(Number(data?.total)) ? Number(data.total) : null;
             setStats((prev) => ({
                 total,
                 verified: prev.verified,
                 unverified: total === null ? 0 : Math.max(0, total - prev.verified),
             }));
+            setLeadTotalStatus(total === null ? 'error' : 'ready');
             if (!debouncedLeadSearch.trim() && appliedLeadFilters.length === 0 && total != null) {
                 setClientTotalLeads(total);
             }
         } catch (error) {
+            if (isAbortError(error) || requestSeq !== leadTotalRequestSeqRef.current) return;
             console.error('Failed to fetch lead total:', error);
             setStats((prev) => ({
                 total: null,
                 verified: prev.verified,
                 unverified: 0,
             }));
+            const failure = error as Error & { code?: string };
+            setLeadTotalError({
+                message: failure?.message || 'Failed to count leads',
+                timedOut: failure?.code === 'QUERY_TIMEOUT',
+            });
+            setLeadTotalStatus('error');
         }
     }, [appliedLeadFilters.length, buildLeadQueryParams, clientId, debouncedLeadSearch, user]);
 
     const fetchLeads = useCallback(async (reset = false) => {
         if (!user || !clientId) return;
+        let controller = leadRowsAbortRef.current;
         if (reset) {
+            // A new run supersedes the previous one's first page and any load-more.
+            controller?.abort();
+            controller = new AbortController();
+            leadRowsAbortRef.current = controller;
+            leadRowsRequestSeqRef.current += 1;
             setStats((prev) => ({
                 total: null,
                 verified: prev.verified,
                 unverified: 0,
             }));
+            setLeadTotalStatus('loading');
+            setLeadsLoadError(null);
+            setLeadsLoadingMore(false);
             setLeadsLoading(true);
         } else {
+            // Load-more shares the current run's controller and seq, so it is
+            // cancelled by the next run but never by itself.
+            if (!controller || controller.signal.aborted) {
+                controller = new AbortController();
+                leadRowsAbortRef.current = controller;
+            }
             setLeadsLoadingMore(true);
         }
+        const requestSeq = leadRowsRequestSeqRef.current;
+        const isStale = () => requestSeq !== leadRowsRequestSeqRef.current;
+        // Single-email lookups take their total from the rows (no count request).
+        const shouldUseResultCountAsTotal = reset
+            && isSingleLeadEmailSearch(debouncedLeadSearch)
+            && appliedLeadFilters.length === 0;
         try {
             // Get Firebase ID token for authentication
             const idToken = await getAccessToken();
@@ -4358,13 +4430,18 @@ export default function ClientPage() {
             const response = await fetchWithRetry(`${getPipelineBaseUrl()}/api/leads?${params.toString()}`, {
                 headers: {
                     'Authorization': `Bearer ${idToken}`
-                }
+                },
+                signal: controller.signal
             });
             if (!response.ok) {
-                throw new Error(`Failed to fetch leads: ${response.statusText}`);
+                const errorData = await response.json().catch(() => ({}));
+                const rowsError = new Error(errorData?.error || `Failed to fetch leads: ${response.statusText}`);
+                (rowsError as Error & { code?: string }).code = errorData?.code;
+                throw rowsError;
             }
 
             const data = await response.json();
+            if (isStale()) return;
             const { leads: apiLeads, hasMore } = data;
 
             const mapped: Lead[] = apiLeads.map(mapApiLeadRow);
@@ -4378,9 +4455,6 @@ export default function ClientPage() {
             
             // Use server-provided total count
             const verifiedCount = apiLeads.filter((r: any) => r.verified).length;
-            const shouldUseResultCountAsTotal = reset
-                && isSingleLeadEmailSearch(debouncedLeadSearch)
-                && appliedLeadFilters.length === 0;
             setStats((prev) => ({
                 total: shouldUseResultCountAsTotal ? mapped.length : prev.total,
                 verified: verifiedCount,
@@ -4388,11 +4462,15 @@ export default function ClientPage() {
                     ? Math.max(0, mapped.length - verifiedCount)
                     : prev.total === null ? 0 : Math.max(0, prev.total - verifiedCount),
             }));
+            if (shouldUseResultCountAsTotal) {
+                setLeadTotalStatus('ready');
+            }
 
             // Set cursor for pagination (use count of loaded items as offset)
             setLeadsCursor(reset ? mapped.length : (leadsCursor || 0) + mapped.length);
             setLeadsHasMore(hasMore || false);
         } catch (error: any) {
+            if (isAbortError(error) || isStale()) return;
             console.error('❌ [LEADS ERROR] Failed to fetch leads:', {
                 message: error.message,
                 code: error.code,
@@ -4407,11 +4485,24 @@ export default function ClientPage() {
             } else {
                 setToastMessage(`Error loading leads: ${error.message}`);
             }
-            
+
+            if (reset) {
+                setLeadsLoadError(error.message || 'Failed to load leads');
+            }
+            if (shouldUseResultCountAsTotal) {
+                setLeadTotalError({
+                    message: error.message || 'Failed to load leads',
+                    timedOut: error.code === 'QUERY_TIMEOUT',
+                });
+                setLeadTotalStatus('error');
+            }
             setLeadsHasMore(false);
         } finally {
-            setLeadsLoading(false);
-            setLeadsLoadingMore(false);
+            // A superseded request leaves the loading flags to the run that replaced it.
+            if (!isStale()) {
+                setLeadsLoading(false);
+                setLeadsLoadingMore(false);
+            }
         }
     }, [
         user,
@@ -4422,6 +4513,13 @@ export default function ClientPage() {
         debouncedLeadSearch,
         appliedLeadFilters.length
     ]);
+
+    // Handlers that refresh after an await call through these, so a closure from
+    // an older render can't supersede a newer run with its stale query.
+    const fetchLeadsRef = useRef(fetchLeads);
+    fetchLeadsRef.current = fetchLeads;
+    const fetchLeadTotalRef = useRef(fetchLeadTotal);
+    fetchLeadTotalRef.current = fetchLeadTotal;
 
     useEffect(() => {
         if (!followUpPreviewModalOpen || !user || !clientId) return;
@@ -4688,10 +4786,15 @@ export default function ClientPage() {
 
     const displayedLeadTotal = displayedStats.total;
     const displayedLeadTotalLabel = displayedLeadTotal === null ? '...' : displayedLeadTotal.toLocaleString();
+    // '...' means still counting; a failed count gets its own state so it can't spin forever.
+    const leadTotalUnavailable = displayedLeadTotal === null && leadTotalStatus === 'error';
     const hasActiveLeadQuery = Boolean(leadSearch.trim() || appliedLeadFilters.length > 0);
     const leadQueryShare = useMemo(() => {
         if (!hasActiveLeadQuery) {
             return { percent: 100, label: '100%' };
+        }
+        if (leadTotalUnavailable) {
+            return { percent: null, label: 'Unavailable' };
         }
         if (displayedLeadTotal === null || clientTotalLeads <= 0) {
             return { percent: null, label: '...' };
@@ -4703,7 +4806,7 @@ export default function ClientPage() {
         else if (percent >= 1) label = `${percent.toFixed(1)}%`;
         else if (percent > 0) label = '<1%';
         return { percent, label };
-    }, [clientTotalLeads, displayedLeadTotal, hasActiveLeadQuery]);
+    }, [clientTotalLeads, displayedLeadTotal, hasActiveLeadQuery, leadTotalUnavailable]);
 
     useEffect(() => {
         return () => {
@@ -8162,7 +8265,8 @@ export default function ClientPage() {
             setVerificationImportResult(data);
             setToastMessage(`Verification import complete: ${data.updated} leads updated.`);
             setToastVisible(true);
-            fetchLeads(true);
+            fetchLeadsRef.current(true);
+            fetchLeadTotalRef.current();
         } catch (error) {
             console.error('Error running verification import:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to import verification CSV');
@@ -8296,8 +8400,8 @@ export default function ClientPage() {
                     setToastMessage(`Import complete: ${data.batch.createdCount} new, ${data.batch.updatedCount} updated, ${data.batch.skippedCount} skipped${data.batch.errorCount ? `, ${data.batch.errorCount} error rows` : ''}.`);
                     setToastVisible(true);
                     setLeadFilterFieldsNonce((prev) => prev + 1);
-                    fetchLeads(true);
-                    fetchLeadTotal();
+                    fetchLeadsRef.current(true);
+                    fetchLeadTotalRef.current();
                 } else if (data.batch.status === 'failed') {
                     setToastMessage(`Import failed: ${data.batch.error || 'Unknown error'}`);
                     setToastVisible(true);
@@ -8533,8 +8637,8 @@ export default function ClientPage() {
             setInstantlyCsvImportResult(data as InstantlyCsvMergeResult);
             setToastMessage(`Imported CSV: ${data?.summary?.linksInserted ?? 0} campaign links added`);
             setToastVisible(true);
-            fetchLeads(true);
-            fetchLeadTotal();
+            fetchLeadsRef.current(true);
+            fetchLeadTotalRef.current();
         } catch (error) {
             console.error('Error importing Instantly CSV merge:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to import Instantly CSV');
@@ -8789,8 +8893,8 @@ export default function ClientPage() {
             }
 
             clearLeadSelection();
-            await fetchLeads(true);
-            await fetchLeadTotal();
+            await fetchLeadsRef.current(true);
+            await fetchLeadTotalRef.current();
             setToastMessage(`Deleted ${deletedCount.toLocaleString()} lead${deletedCount === 1 ? '' : 's'}.`);
             setToastVisible(true);
         } catch (error) {
@@ -8805,8 +8909,6 @@ export default function ClientPage() {
         confirmAction,
         clearLeadSelection,
         clientId,
-        fetchLeadTotal,
-        fetchLeads,
         selectAllMatchingLeadResults,
         selectedLead,
         selectedLeadDeleteCount,
@@ -8924,8 +9026,8 @@ export default function ClientPage() {
                 });
             }
             await refreshLeadLists();
-            await fetchLeads(true);
-            await fetchLeadTotal();
+            await fetchLeadsRef.current(true);
+            await fetchLeadTotalRef.current();
         } catch (error) {
             console.error('Failed to update lead list:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to update list');
@@ -8937,8 +9039,6 @@ export default function ClientPage() {
         buildLeadDeleteQuery,
         clearLeadSelection,
         clientId,
-        fetchLeadTotal,
-        fetchLeads,
         leadListMembershipBody,
         listModalContactId,
         listModalMode,
@@ -8986,8 +9086,8 @@ export default function ClientPage() {
             setToastVisible(true);
             clearLeadSelection();
             await refreshLeadLists();
-            await fetchLeads(true);
-            await fetchLeadTotal();
+            await fetchLeadsRef.current(true);
+            await fetchLeadTotalRef.current();
         } catch (error) {
             console.error('Failed to remove leads from list:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to remove leads from list');
@@ -8999,8 +9099,6 @@ export default function ClientPage() {
         clientId,
         confirmAction,
         clearLeadSelection,
-        fetchLeadTotal,
-        fetchLeads,
         leadListMembershipBody,
         leadLists,
         listFilterId,
@@ -9038,8 +9136,8 @@ export default function ClientPage() {
             setToastMessage(`Deleted list “${list?.name || 'list'}”.`);
             setToastVisible(true);
             await refreshLeadLists();
-            await fetchLeads(true);
-            await fetchLeadTotal();
+            await fetchLeadsRef.current(true);
+            await fetchLeadTotalRef.current();
         } catch (error) {
             console.error('Failed to delete list:', error);
             setToastMessage(error instanceof Error ? error.message : 'Failed to delete list');
@@ -9047,7 +9145,7 @@ export default function ClientPage() {
         } finally {
             setMutatingLists(false);
         }
-    }, [clientId, confirmAction, fetchLeadTotal, fetchLeads, leadLists, listFilterId, refreshLeadLists, user]);
+    }, [clientId, confirmAction, leadLists, listFilterId, refreshLeadLists, user]);
 
     const handleRemoveLeadFromList = useCallback(async (contactId: string, listId: number) => {
         if (!user || !clientId) return;
@@ -9071,7 +9169,8 @@ export default function ClientPage() {
                 throw new Error(data?.error || 'Failed to remove from list');
             }
             await refreshLeadLists();
-            await fetchLeads(true);
+            await fetchLeadsRef.current(true);
+            await fetchLeadTotalRef.current();
             if (selectedLead && String(selectedLead.id) === String(contactId)) {
                 setSelectedLead((prev) => prev
                     ? { ...prev, lists: (prev.lists || []).filter((item) => Number(item.id) !== Number(listId)) }
@@ -9084,7 +9183,7 @@ export default function ClientPage() {
         } finally {
             setMutatingLists(false);
         }
-    }, [clientId, fetchLeads, refreshLeadLists, selectedLead, user]);
+    }, [clientId, refreshLeadLists, selectedLead, user]);
 
     const uploadDisabled = !selectedFile || uploading;
 
@@ -9217,14 +9316,28 @@ export default function ClientPage() {
                         <span className="settings-field__label">
                             {hasActiveLeadQuery ? 'Filtered Total' : 'Total Leads'}
                         </span>
-                        <span className={`lead-query-count__value${leadsLoading ? ' is-loading' : ''}`}>
+                        <span className={`lead-query-count__value${leadsLoading ? ' is-loading' : ''}${leadTotalUnavailable ? ' is-unavailable' : ''}`}>
                             {leadsLoading ? (
                                 <svg className="lead-query-count__spinner spinner" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                                     <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25"/>
                                     <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
                                 </svg>
                             ) : null}
-                            {displayedLeadTotalLabel}
+                            {leadTotalUnavailable ? (
+                                <>
+                                    <span title={leadTotalError?.message}>
+                                        {leadTotalError?.timedOut ? 'Count timed out' : 'Count unavailable'}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <button
+                                        type="button"
+                                        className="pipeline-run__link"
+                                        onClick={() => { void fetchLeadTotal(); }}
+                                    >
+                                        Retry
+                                    </button>
+                                </>
+                            ) : displayedLeadTotalLabel}
                         </span>
                     </div>
                     <div
@@ -9233,7 +9346,7 @@ export default function ClientPage() {
                     >
                         <div className="lead-query-share__meta">
                             <span className="settings-field__label">% of total leads</span>
-                            <span className="lead-query-share__value">{leadsLoading ? '...' : leadQueryShare.label}</span>
+                            <span className={`lead-query-share__value${!leadsLoading && leadTotalUnavailable ? ' is-unavailable' : ''}`}>{leadsLoading ? '...' : leadQueryShare.label}</span>
                         </div>
                         <div
                             className={`lead-query-share__bar${leadsLoading ? ' is-loading' : ''}`}
@@ -9362,6 +9475,11 @@ export default function ClientPage() {
                                 </svg>
                                 <p>Loading leads...</p>
                             </div>
+                        </div>
+                    ) : leadsLoadError && filteredLeads.length === 0 ? (
+                        <div className="pipeline-panel__empty">
+                            <p>Couldn&apos;t load leads.</p>
+                            <p className="pipeline-panel__subtitle">{leadsLoadError}</p>
                         </div>
                     ) : filteredLeads.length === 0 ? (
                         <div className="pipeline-panel__empty">
@@ -14241,8 +14359,8 @@ export default function ClientPage() {
                         if (batch.status === 'completed') {
                             setToastMessage(`Store Leads import complete: ${batch.createdCount.toLocaleString()} new, ${batch.updatedCount.toLocaleString()} updated, ${batch.skippedCount.toLocaleString()} skipped.`);
                             setLeadFilterFieldsNonce((prev) => prev + 1);
-                            fetchLeads(true);
-                            fetchLeadTotal();
+                            fetchLeadsRef.current(true);
+                            fetchLeadTotalRef.current();
                         } else {
                             setToastMessage(`Store Leads import failed: ${batch.error || 'Unknown error'}`);
                         }

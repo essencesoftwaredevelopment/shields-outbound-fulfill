@@ -66,7 +66,7 @@ pool.on('remove', () => {
  * on this path that exceeds the budget should fail loudly instead.
  */
 export const INTERACTIVE_STATEMENT_TIMEOUT_MS = Number(
-    process.env.INTERACTIVE_STATEMENT_TIMEOUT_MS || 20_000
+    process.env.INTERACTIVE_STATEMENT_TIMEOUT_MS || 45_000
 );
 
 /**

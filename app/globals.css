@@ -643,6 +643,13 @@ body {
   color: color-mix(in srgb, var(--app-text) 72%, transparent);
 }
 
+.lead-query-count__value.is-unavailable,
+.lead-query-share__value.is-unavailable {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--app-text-faint);
+}
+
 .lead-query-count__spinner {
   width: 13px;
   height: 13px;

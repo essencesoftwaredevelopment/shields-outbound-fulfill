@@ -28,7 +28,7 @@ import { annotateLeadFilterField } from '../services/leadFilterFieldGroups.js';
 import { isLeadListTableView, mapLeadListRow, leadListNeedsWarmFollowUpConfig } from '../services/leadListView.js';
 import * as queries from '../services/db/queries.js';
 import { pool } from '../lib/db.js';
-import { queryWithStatementTimeout } from '../config/db.js';
+import { INTERACTIVE_STATEMENT_TIMEOUT_MS, queryWithStatementTimeout } from '../config/db.js';
 import { batchDetectKlaviyo } from '../services/detectKlaviyo.js';
 import { normalizeDomain } from '../utils/domain.js';
 import { SIGNAL_TYPES } from '../services/shoppingAudit/constants.js';
@@ -681,6 +681,19 @@ const LEAD_FILTER_FIELDS = [
             { key: 'ends_with', label: 'Ends With' },
             { key: 'is_empty', label: 'Is Empty' },
             { key: 'not_empty', label: 'Is Not Empty' }
+        ]
+    },
+    {
+        // Character count of the normalized domain incl. TLD ("abc.com" = 7).
+        key: 'domain_length',
+        label: 'Domain Length (Characters)',
+        type: 'number',
+        operators: [
+            { key: 'eq', label: 'Equals' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' },
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' }
         ]
     },
     {
@@ -1648,7 +1661,8 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         filterJoins,
         requiresFilterCampaignStats,
         requiresFilterInsights,
-        hasAnyLeadFilters
+        hasAnyLeadFilters,
+        hasDynamicFilters: dynamicFilters.length > 0
     };
 }
 
@@ -1701,7 +1715,7 @@ const DATE_FILTER_FIELDS = new Set([
 ]);
 const NUMERIC_FILTER_FIELDS = new Set([
     'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max',
-    'est_monthly_sales_usd'
+    'est_monthly_sales_usd', 'domain_length'
 ]);
 
 function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
@@ -2093,6 +2107,14 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
             } else if (operatorKey === 'not_empty') {
                 clauses.push(`(co.domain_normalized IS NOT NULL AND BTRIM(co.domain_normalized) <> '')`);
             }
+            continue;
+        }
+
+        // ── domain_length ──────────────────────────────────────────────────
+        if (fieldKey === 'domain_length') {
+            const SQL_OPS = { eq: '=', lt: '<', lte: '<=', gt: '>', gte: '>=' };
+            const ref = bindParam(Math.trunc(Number(normalizedValue)));
+            clauses.push(`co.domain_normalized IS NOT NULL AND CHAR_LENGTH(co.domain_normalized) ${SQL_OPS[operatorKey]} ${ref}`);
             continue;
         }
 
@@ -2589,16 +2611,23 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             baseWithClause,
             requiresFilterCampaignStats,
             requiresFilterInsights,
-            hasAnyLeadFilters
+            hasAnyLeadFilters,
+            hasDynamicFilters
         } = filterContext;
 
         let paramIndex = filterParams.length + 1;
         const params = [...filterParams];
+        // contacts.company_id is NOT NULL with an FK, so the company join only
+        // matters when a filter or search reads co.*. Without one, skip it: the
+        // count then matches the table view (which joins plain companies) and the
+        // unfiltered count, and on a 1.24M-lead client it drops a second
+        // full-client pass (hash join over every company) from each Run Query.
+        const countNeedsCompanies = /\bco\./.test(whereClause);
         const countQuery = `
             ${baseWithClause}
             SELECT COUNT(*) as count
             FROM contacts c
-            JOIN scoped_companies co ON c.company_id = co.id
+            ${countNeedsCompanies ? 'JOIN scoped_companies co ON c.company_id = co.id' : ''}
             ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
             ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
             WHERE ${whereClause}
@@ -2845,10 +2874,13 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         `;
         params.push(parsedLimit + 1, parsedOffset);
 
-        // Table pages are a LIMIT 101 index read (~2ms). Wrapping them in
-        // BEGIN/SET LOCAL/COMMIT costs four round trips to a remote Postgres
-        // (~200ms RTT each from this app). Export still uses the timeout wrapper.
-        const result = isTableView
+        // Unfiltered table pages are a LIMIT 101 index read (~2ms), so they skip
+        // the BEGIN/SET LOCAL/COMMIT wrapper (four round trips to a remote
+        // Postgres, ~200ms RTT each). Filtered pages can scan far past the page
+        // when matches are sparse (seconds on large clients), so they get the
+        // interactive timeout instead of holding a pool slot up to the 120s
+        // cluster ceiling. Export still uses the timeout wrapper.
+        const result = isTableView && !hasDynamicFilters
             ? await pool.query(contactsQuery, params)
             : await queryWithStatementTimeout(contactsQuery, params);
         const hasMore = result.rows.length > parsedLimit;
@@ -2871,9 +2903,45 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
         });
     } catch (error) {
         console.error('Error fetching leads:', error);
+        const friendly = describeLeadListError(error, { countOnly: isCountOnlyRequest(req) });
+        if (friendly) {
+            return res.status(friendly.status).json({ error: friendly.message, code: friendly.code });
+        }
         res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to fetch leads' });
     }
 });
+
+function isCountOnlyRequest(req) {
+    return String(req.query?.countOnly || '').toLowerCase() === 'true';
+}
+
+/**
+ * Plain-language messages for the two failures a slow leads query produces, so
+ * the page explains what happened instead of echoing Postgres. Anything else
+ * keeps its original message.
+ */
+function describeLeadListError(error, { countOnly = false } = {}) {
+    if (error?.code === '57014') {
+        const seconds = Math.round(INTERACTIVE_STATEMENT_TIMEOUT_MS / 1000);
+        const what = countOnly ? 'Counting the leads that match these filters' : 'Loading leads for these filters';
+        return {
+            status: 504,
+            code: 'QUERY_TIMEOUT',
+            message: `${what} took longer than ${seconds} seconds, so it was stopped. `
+                + 'Narrowing the filters (for example a shorter time window, or adding a filter that matches fewer leads) '
+                + 'makes it faster. The database may also just be busy — retrying in a moment often works.'
+        };
+    }
+    if (/timeout exceeded when trying to connect/i.test(String(error?.message || ''))) {
+        return {
+            status: 503,
+            code: 'DB_BUSY',
+            message: 'The database is busy with other queries right now, so this request could not start. '
+                + 'Wait a few seconds and try again.'
+        };
+    }
+    return null;
+}
 
 router.get('/leads/filter-fields', verifyFirebaseToken, async (req, res) => {
     try {
