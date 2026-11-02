@@ -40,6 +40,7 @@ import {
 import { normalizeEmailStatus } from './leads.js';
 import { refreshProviderCreditsAfterBatch } from './providerCredits.js';
 import { loadCampaignNewLeadCapacity } from './sendingRunway.js';
+import { reportRefillRun, runRefillWatchdog } from './instantlyRefillAlerts.js';
 
 /** Emails verified longer ago than this are checked again before re-use. */
 export const REVERIFY_AFTER_DAYS = 90;
@@ -456,6 +457,25 @@ export async function runInstantlyRefill({
             `UPDATE instantly_refill_runs SET status = $2, summary = $3::jsonb, error = $4, completed_at = NOW() WHERE id = $1`,
             [run.id, status, JSON.stringify(summary), error]
         );
+        // ntfy alerts on known failure modes + catch-all; best effort, never throws.
+        await reportRefillRun({ clientSqlId, status, error, summary, logger }).catch((alertError) => {
+            logger(`refill alerting failed: ${alertError?.message || alertError}`);
+        });
+    };
+    // Eligible leads left after this run, for the "lead bank running low" alert.
+    const measurePoolLeft = async (sqlCampaignId) => {
+        try {
+            const poolStats = await selectRefillCandidates(pool, {
+                agencyId,
+                clientSqlId,
+                targetSqlCampaignId: sqlCampaignId,
+                cooldownDays: settings.cooldown_days,
+                countOnly: true
+            });
+            summary.poolLeft = Number(poolStats?.total) || 0;
+        } catch (error) {
+            logger(`pool count failed: ${error?.message || error}`);
+        }
     };
 
     try {
@@ -481,6 +501,7 @@ export async function runInstantlyRefill({
         logger(`capacity ${capacity.newLeadsPerDay} new/day, backlog ${summary.backlog}, target ${summary.target}, adding ${summary.need}`);
         if (!summary.need) {
             summary.added = 0;
+            if (!dryRun) await measurePoolLeft(sqlCampaignId);
             await finish('completed');
             return { runId: run?.id ?? null, summary };
         }
@@ -525,6 +546,7 @@ export async function runInstantlyRefill({
             ? [new Date(Math.min(...touches)).toISOString(), new Date(Math.max(...touches)).toISOString()]
             : null;
         logger(`added ${added.sent}${added.failed ? `, ${added.failed} failed (${added.lastError})` : ''}`);
+        await measurePoolLeft(sqlCampaignId);
 
         await finish(added.failed && !added.sent ? 'failed' : 'completed', added.failed && !added.sent ? added.lastError : null);
         return { runId: run?.id ?? null, summary };
@@ -566,6 +588,8 @@ async function listDueRefillClients() {
 }
 
 export async function runInstantlyRefillSweep() {
+    await runRefillWatchdog({ logger: (m) => console.log(`[instantly-refill][watchdog]${m.startsWith('[') ? '' : ' '}${m}`) })
+        .catch((error) => console.error('[instantly-refill] watchdog failed:', error?.message || error));
     for (const client of await listDueRefillClients()) {
         const label = `${client.agency_id}/${client.slug}`;
         try {
