@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { getAccessToken } from "@/lib/supabase/session";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { useConfirm } from "@/components/confirm-dialog";
 
 type RefillSettings = {
   enabled: boolean;
@@ -79,6 +80,7 @@ export function InstantlyRefillSettings({ clientId }: { clientId: string }) {
   const [cooldownDraft, setCooldownDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirm, confirmDialog] = useConfirm();
 
   const request = useCallback(
     async (method: "GET" | "PUT" | "POST", path = "", body?: Record<string, unknown>) => {
@@ -149,13 +151,23 @@ export function InstantlyRefillSettings({ clientId }: { clientId: string }) {
     }
   };
 
-  const onToggle = (enabled: boolean) => {
-    if (enabled) {
-      const ok = window.confirm(
-        "Turn on automatic refill?\n\nEvery few hours it tops the campaign up with past leads that haven't been emailed in the longest time, re-verifying old emails with TryKitt first. Leads are added to Instantly and will be emailed.",
-      );
-      if (!ok) return;
-    }
+  // Both directions confirmed, as on the cleanup card: a click landing just
+  // as the toggle finishes loading must not switch it off silently.
+  const onToggle = async (enabled: boolean) => {
+    const ok = enabled
+      ? await confirm({
+          title: "Turn on automatic refill?",
+          message:
+            "Every few hours it tops the campaign up with past leads that haven't been emailed in the longest time, re-verifying old emails with TryKitt first. Leads are added to Instantly and will be emailed.",
+          confirmLabel: "Turn on refill",
+          tone: "default",
+        })
+      : await confirm({
+          title: "Turn off automatic refill?",
+          message: "The campaign will stop being topped up, and the inboxes can run out of new prospects.",
+          confirmLabel: "Turn off refill",
+        });
+    if (!ok) return;
     void save({ enabled });
   };
 
@@ -170,7 +182,13 @@ export function InstantlyRefillSettings({ clientId }: { clientId: string }) {
   };
 
   const runNow = async () => {
-    if (!window.confirm("Run the refill now? Leads it adds go into the campaign and will be emailed.")) return;
+    const ok = await confirm({
+      title: "Run the refill now?",
+      message: "Leads it adds go into the campaign and will be emailed.",
+      confirmLabel: "Run refill",
+      tone: "default",
+    });
+    if (!ok) return;
     try {
       await request("POST", "/run");
       window.setTimeout(() => void load(), 2000);
@@ -200,9 +218,9 @@ export function InstantlyRefillSettings({ clientId }: { clientId: string }) {
             type="checkbox"
             checked={settings?.enabled === true}
             disabled={disabled || (!settings?.enabled && !settings?.campaign_id)}
-            onChange={(e) => onToggle(e.target.checked)}
+            onChange={(e) => void onToggle(e.target.checked)}
           />
-          <span>{settings?.enabled ? "On" : "Off"}</span>
+          <span>{!settings ? "Loading…" : settings.enabled ? "On" : "Off"}</span>
         </label>
         <label className="instantly-cleanup__days">
           <span>Campaign</span>
@@ -301,6 +319,7 @@ export function InstantlyRefillSettings({ clientId }: { clientId: string }) {
           Last run {new Date(run.started_at).toLocaleString()}: {describeRun(run)}
         </p>
       )}
+      {confirmDialog}
     </div>
   );
 }

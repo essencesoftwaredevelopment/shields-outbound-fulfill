@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { getAccessToken } from "@/lib/supabase/session";
 import { getPipelineBaseUrl } from "@/lib/pipeline/client";
+import { useConfirm } from "@/components/confirm-dialog";
 
 type CleanupCategory =
   | "no_reply"
@@ -61,6 +62,7 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
   const [daysDraft, setDaysDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirm, confirmDialog] = useConfirm();
 
   const request = useCallback(
     async (method: "GET" | "PUT", body?: Record<string, unknown>) => {
@@ -111,16 +113,27 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
     }
   };
 
-  const onToggle = (enabled: boolean) => {
-    if (enabled) {
-      const total = state?.preview?.total;
-      const ok = window.confirm(
-        `Turn on automatic cleanup?\n\n${
-          typeof total === "number" ? `About ${total.toLocaleString()} lead(s) qualify right now. ` : ""
-        }They are deleted from Instantly (this can't be undone there) right after the usual Instantly sync. Runs about once a day.`,
-      );
-      if (!ok) return;
-    }
+  // Both directions are confirmed: the toggle used to read "Off" while loading
+  // and flip to "On" when the load finished, so a click meant to turn it on
+  // switched it off without a prompt (2026-09-24, 10-20, 10-22).
+  const onToggle = async (enabled: boolean) => {
+    const total = state?.preview?.total;
+    const ok = enabled
+      ? await confirm({
+          title: "Turn on automatic cleanup?",
+          message: `${
+            typeof total === "number" ? `About ${total.toLocaleString()} lead(s) qualify right now. ` : ""
+          }They are deleted from Instantly (this can't be undone there) right after the usual Instantly sync. Runs about once a day.`,
+          confirmLabel: "Turn on cleanup",
+          tone: "default",
+        })
+      : await confirm({
+          title: "Turn off automatic cleanup?",
+          message:
+            "Finished leads will stay in Instantly and keep using the workspace's lead allowance. When the allowance is full, uploads and the automatic refill stop.",
+          confirmLabel: "Turn off cleanup",
+        });
+    if (!ok) return;
     void save({ enabled });
   };
 
@@ -153,9 +166,9 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
             type="checkbox"
             checked={enabled}
             disabled={!state || saving}
-            onChange={(e) => onToggle(e.target.checked)}
+            onChange={(e) => void onToggle(e.target.checked)}
           />
-          <span>{enabled ? "On" : "Off"}</span>
+          <span>{!state ? "Loading…" : enabled ? "On" : "Off"}</span>
         </label>
         <label className="instantly-cleanup__days">
           <span>Delete after</span>
@@ -201,6 +214,7 @@ export function InstantlyCleanupSettings({ clientId }: { clientId: string }) {
                 }.`}
         </p>
       )}
+      {confirmDialog}
     </div>
   );
 }
