@@ -29,10 +29,10 @@ import { normalizeDomain } from "@server/utils/domain.js";
 /** Unique domains per domain-check request. Each call stays well under the proxy timeout. */
 const DOMAIN_CHECK_BATCH = 5000;
 
-// Loaded lazily so dnd-kit and recharts stay out of this route's initial chunk;
-// both only render behind a tab/section, so first paint never needs them.
-const DealFlowBoard = dynamic(
-    () => import("@/components/deal-flow/DealFlowBoard").then((mod) => mod.DealFlowBoard),
+// Loaded lazily so recharts stays out of this route's initial chunk; charts and
+// the Metrics tab only render behind a tab/section, so first paint never needs them.
+const MetricsTab = dynamic(
+    () => import("@/components/metrics/MetricsTab").then((mod) => mod.MetricsTab),
     { ssr: false },
 );
 const InstantlyEventAnalyticsChart = dynamic(
@@ -1757,7 +1757,8 @@ function DomainStatDownloadButton({ busy, label, onClick }: DomainStatDownloadBu
 type ExistingDomainExportScope = 'founders' | 'emails' | 'personalization';
 type DomainListExportKind = 'new' | 'not-run';
 
-const CLIENT_TABS = ["analytics", "info", "campaigns", "leads", "follow-ups", "deal-flow"] as const;
+// Deal Flow (components/deal-flow) is hidden for now; ?tab=deal-flow falls back to Analytics.
+const CLIENT_TABS = ["analytics", "metrics", "info", "campaigns", "leads", "follow-ups"] as const;
 type ClientTab = typeof CLIENT_TABS[number];
 
 function parseClientTab(raw: string | null | undefined): ClientTab {
@@ -1912,7 +1913,6 @@ export default function ClientPage() {
     const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
     const [personalizeFirstLine, setPersonalizeFirstLine] = useState(false);
     const [shoppingAuditEnabled, setShoppingAuditEnabled] = useState(false);
-    const [dealFlowEnabled, setDealFlowEnabled] = useState(false);
     const [useShoppingAuditPipeline, setUseShoppingAuditPipeline] = useState(false);
     const [productPromptUseNew, setProductPromptUseNew] = useState(false);
     const [productPromptUseOld, setProductPromptUseOld] = useState(true);
@@ -3178,7 +3178,6 @@ export default function ClientPage() {
                         features?.shoppingAudit === true
                         || process.env.NEXT_PUBLIC_SHOPPING_AUDIT_ENABLED === 'true'
                     );
-                    setDealFlowEnabled(features?.dealFlow === true);
                 }
             } catch {
                 /* keep default */
@@ -9771,6 +9770,12 @@ export default function ClientPage() {
                             Analytics
                         </button>
                         <button
+                            className={`tab-nav__button ${activeTab === "metrics" ? "tab-nav__button--active" : ""}`}
+                            onClick={() => selectTab("metrics")}
+                        >
+                            Metrics
+                        </button>
+                        <button
                             className={`tab-nav__button ${activeTab === "campaigns" ? "tab-nav__button--active" : ""}`}
                             onClick={() => selectTab("campaigns")}
                         >
@@ -9788,14 +9793,6 @@ export default function ClientPage() {
                         >
                             Follow-Ups
                         </button>
-                        {dealFlowEnabled && (
-                            <button
-                                className={`tab-nav__button ${activeTab === "deal-flow" ? "tab-nav__button--active" : ""}`}
-                                onClick={() => selectTab("deal-flow")}
-                            >
-                                Deal Flow
-                            </button>
-                        )}
                         <button
                             className={`tab-nav__button ${activeTab === "info" ? "tab-nav__button--active" : ""}`}
                             onClick={() => selectTab("info")}
@@ -11652,13 +11649,8 @@ export default function ClientPage() {
                         </div>
                     )}
 
-                    {/* Deal Flow Tab */}
-                    {activeTab === "deal-flow" && dealFlowEnabled && (
-                        <DealFlowBoard
-                            clientId={clientId}
-                            onOpenLead={(contactId, email) => { void openLeadDetail({ contactId: String(contactId), email }); }}
-                        />
-                    )}
+                    {/* Metrics Tab */}
+                    {activeTab === "metrics" && clientId && <MetricsTab clientId={clientId} />}
 
                     {/* Follow-Ups Tab */}
                     {activeTab === "follow-ups" && (

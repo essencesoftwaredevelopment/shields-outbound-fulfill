@@ -26,10 +26,12 @@ import domainsRouter from './routes/domains.js';
 import microserviceRouter from './routes/microservice.js';
 import interestedAutoResponderRouter from './routes/interestedAutoResponder.js';
 import dealFlowRouter from './routes/dealFlow.js';
+import metricsRouter from './routes/metrics.js';
 import leadListsRouter from './routes/leadLists.js';
 import storeLeadsRouter from './routes/storeLeads.js';
 import calendlyWebhookRouter from './routes/calendlyWebhook.js';
 import calendlyRouter from './routes/calendly.js';
+import fathomWebhookRouter from './routes/fathomWebhook.js';
 import resendWebhookRouter from './routes/resendWebhook.js';
 import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobPipeline.js';
 import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/jobRunner.js';
@@ -62,6 +64,8 @@ app.use('/api', (_req, res, next) => {
 // Calendly / Resend webhooks require raw body for signature verification — mount before express.json().
 app.use('/webhooks/calendly', express.raw({ type: 'application/json', limit: '1mb' }), calendlyWebhookRouter);
 app.use('/webhooks/resend', express.raw({ type: 'application/json', limit: '1mb' }), resendWebhookRouter);
+// Fathom payloads carry the full transcript.
+app.use('/webhooks/fathom', express.raw({ type: 'application/json', limit: '10mb' }), fathomWebhookRouter);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -118,6 +122,7 @@ app.use('/api', domainsRouter);
 app.use('/api', microserviceRouter);
 app.use('/api', interestedAutoResponderRouter);
 app.use('/api', dealFlowRouter);
+app.use('/api', metricsRouter);
 app.use('/api', leadListsRouter);
 app.use('/api', storeLeadsRouter);
 app.use('/api', calendlyRouter);

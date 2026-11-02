@@ -21,9 +21,9 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
     await pool.query(
         `INSERT INTO agency_settings (
             agency_id, openai_key, serper_key, trykitt_key, openai_founder_model,
-            email_verification_provider, pricing_overrides, features, enrow_key, storeleads_key, close_key, vault_updated_at, updated_at
+            email_verification_provider, pricing_overrides, features, enrow_key, storeleads_key, close_key, fathom_key, vault_updated_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb,
-            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), $10, $11, $12, NOW(), NOW())
+            COALESCE($8::jsonb, $9::jsonb, '{}'::jsonb), $10, $11, $12, $13, NOW(), NOW())
         ON CONFLICT (agency_id) DO UPDATE SET
             openai_key = COALESCE(EXCLUDED.openai_key, agency_settings.openai_key),
             serper_key = COALESCE(EXCLUDED.serper_key, agency_settings.serper_key),
@@ -31,6 +31,7 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             enrow_key = COALESCE(EXCLUDED.enrow_key, agency_settings.enrow_key),
             storeleads_key = COALESCE(EXCLUDED.storeleads_key, agency_settings.storeleads_key),
             close_key = COALESCE(EXCLUDED.close_key, agency_settings.close_key),
+            fathom_key = COALESCE(EXCLUDED.fathom_key, agency_settings.fathom_key),
             openai_founder_model = COALESCE(EXCLUDED.openai_founder_model, agency_settings.openai_founder_model),
             email_verification_provider = COALESCE(EXCLUDED.email_verification_provider, agency_settings.email_verification_provider),
             pricing_overrides = COALESCE(EXCLUDED.pricing_overrides, agency_settings.pricing_overrides),
@@ -54,7 +55,8 @@ export async function upsertAgencySettings(agencyId, patch = {}) {
             featuresPatchJson,
             patch.enrow_key ?? null,
             patch.storeleads_key ?? null,
-            patch.close_key ?? null
+            patch.close_key ?? null,
+            patch.fathom_key ?? null
         ]
     );
 }

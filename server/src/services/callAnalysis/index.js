@@ -1,0 +1,412 @@
+/**
+ * Fathom recordings → sales log. One call_recordings row per recording moves
+ * received → matched | unmatched → analyzed → applied (or failed).
+ *
+ * The steps are idempotent and called one by one from the call-analysis
+ * Vercel Workflow (workflows/call-analysis.ts), or inline when workflows
+ * aren't configured (local dev). See migration 0076.
+ */
+import { OpenAI } from 'openai';
+import { pool } from '../../config/db.js';
+import { getAgencySettings, apiKeysFromSettings } from '../db/agencySettings.js';
+import { SALES_CALL_SELECT } from '../db/funnelInputs.js';
+import { resolveWorkflowStartBaseUrl } from '../interestedResearch/trigger.js';
+import {
+    createFathomWebhook,
+    deleteFathomWebhook,
+    listFathomMeetings
+} from '../fathom.js';
+import {
+    CALL_ANALYSIS_INSTRUCTIONS,
+    CALL_ANALYSIS_MODEL,
+    CALL_ANALYSIS_SCHEMA,
+    buildAnalysisInput,
+    formatTranscript,
+    normalizeAnalysis,
+    planSalesCallUpdate
+} from './extract.js';
+
+const FREE_EMAIL_DOMAINS = new Set([
+    'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'live.nl', 'msn.com', 'yahoo.com',
+    'icloud.com', 'me.com', 'mac.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com', 'hey.com'
+]);
+
+const POSITIVE_EVENT_TYPES = ['lead_interested', 'lead_meeting_booked', 'interested_reply_sent'];
+
+function notFound(message) {
+    const error = new Error(message);
+    error.statusCode = 404;
+    return error;
+}
+
+async function loadRecording(recordingId, agencyId, db = pool) {
+    const { rows: [row] } = await db.query(
+        'SELECT * FROM call_recordings WHERE id = $1 AND agency_id = $2',
+        [recordingId, agencyId]
+    );
+    if (!row) throw notFound(`call recording ${recordingId} not found`);
+    return row;
+}
+
+async function setRecording(recordingId, agencyId, fields, db = pool) {
+    const keys = Object.keys(fields);
+    await db.query(
+        `UPDATE call_recordings
+         SET ${keys.map((key, i) => `${key} = $${i + 3}`).join(', ')}, updated_at = NOW()
+         WHERE id = $1 AND agency_id = $2`,
+        [recordingId, agencyId, ...keys.map((key) => fields[key])]
+    );
+}
+
+/**
+ * A recording that belongs to no prospect (team meeting, client call, partner)
+ * keeps only its title, date and attendees: the transcript and summary are
+ * dropped so non-sales conversations aren't stored.
+ */
+async function markUnmatched(recordingId, agencyId, reason, db = pool) {
+    await setRecording(recordingId, agencyId, {
+        status: 'unmatched',
+        match_reason: reason,
+        transcript: null,
+        provider_summary: null,
+        analysis: null,
+        sales_call_id: null
+    }, db);
+}
+
+/** The latest positive reply (Instantly) from one of these emails, if any. */
+async function findPositiveReplyLead(agencyId, emails, db = pool) {
+    const { rows: [lead] } = await db.query(
+        `SELECT e.client_id, e.contact_id, e.lead_email, c.full_name, co.domain_normalized
+         FROM contact_instantly_events e
+         LEFT JOIN contacts c ON c.id = e.contact_id
+         LEFT JOIN companies co ON co.id = c.company_id
+         WHERE e.agency_id = $1
+           AND e.lead_email = ANY($2::text[])
+           AND e.event_type = ANY($3::text[])
+         ORDER BY e.event_timestamp DESC
+         LIMIT 1`,
+        [agencyId, emails, POSITIVE_EVENT_TYPES]
+    );
+    return lead || null;
+}
+
+/** External attendee emails, lowercased, from Fathom calendar invitees. */
+export function externalEmails(invitees) {
+    return [...new Set((invitees || [])
+        .filter((i) => i?.is_external && typeof i?.email === 'string' && i.email.includes('@'))
+        .map((i) => i.email.trim().toLowerCase()))];
+}
+
+export function businessDomains(emails) {
+    return [...new Set(emails
+        .map((email) => email.split('@')[1])
+        .filter((domain) => domain && !FREE_EMAIL_DOMAINS.has(domain)))];
+}
+
+/**
+ * Stores (or refreshes) a Fathom meeting. Returns the row id and whether it
+ * still needs analysis; a recording already applied or unmatched isn't redone.
+ */
+export async function ingestFathomMeeting(agencyId, meeting) {
+    const externalId = String(meeting?.recording_id ?? '').trim();
+    if (!externalId) throw new Error('Fathom meeting has no recording_id');
+    const invitees = Array.isArray(meeting.calendar_invitees) ? meeting.calendar_invitees : [];
+    const { rows: [row] } = await pool.query(
+        `INSERT INTO call_recordings (
+             agency_id, provider, external_id, title, url, share_url, recorded_at, recording_end_at,
+             recorded_by_email, external_emails, invitees, transcript, provider_summary
+         ) VALUES ($1, 'fathom', $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
+         ON CONFLICT (agency_id, provider, external_id) DO UPDATE SET
+             title = EXCLUDED.title,
+             url = EXCLUDED.url,
+             share_url = EXCLUDED.share_url,
+             -- an unmatched (non-sales) recording never gets its transcript back
+             transcript = CASE WHEN call_recordings.status = 'unmatched' THEN NULL
+                               ELSE COALESCE(EXCLUDED.transcript, call_recordings.transcript) END,
+             provider_summary = CASE WHEN call_recordings.status = 'unmatched' THEN NULL
+                                     ELSE COALESCE(EXCLUDED.provider_summary, call_recordings.provider_summary) END,
+             updated_at = NOW()
+         RETURNING id, status`,
+        [
+            agencyId,
+            externalId,
+            meeting.meeting_title || meeting.title || null,
+            meeting.url || null,
+            meeting.share_url || null,
+            meeting.recording_start_time || meeting.scheduled_start_time || meeting.created_at || null,
+            meeting.recording_end_time || null,
+            meeting.recorded_by?.email || null,
+            externalEmails(invitees),
+            JSON.stringify(invitees),
+            Array.isArray(meeting.transcript) && meeting.transcript.length ? formatTranscript(meeting.transcript, invitees) : null,
+            meeting.default_summary?.markdown_formatted || null
+        ]
+    );
+    return { recordingId: Number(row.id), needsAnalysis: ['received', 'matched', 'analyzed', 'failed'].includes(row.status) };
+}
+
+/** Step 1: find the sales call this recording belongs to. */
+export async function matchRecording({ recordingId, agencyId }) {
+    const recording = await loadRecording(recordingId, agencyId);
+    if (recording.sales_call_id) return { status: 'matched', salesCallId: Number(recording.sales_call_id) };
+
+    const emails = recording.external_emails || [];
+    if (!emails.length) {
+        await markUnmatched(recordingId, agencyId, 'no_external_attendees');
+        return { status: 'unmatched' };
+    }
+
+    // 1. A sales call with this person (email on the call, or its contact).
+    const { rows: byEmail } = await pool.query(
+        `SELECT s.id, s.client_id
+         FROM sales_calls s
+         LEFT JOIN contacts c ON c.id = s.contact_id
+         WHERE s.agency_id = $1
+           AND (LOWER(s.contact_email) = ANY($2::text[]) OR LOWER(c.email) = ANY($2::text[]))
+         ORDER BY (s.call_status = 'canceled'), ABS(EXTRACT(EPOCH FROM (COALESCE(s.call_at, s.booked_at, s.created_at) - $3::timestamptz)))
+         LIMIT 1`,
+        [agencyId, emails, recording.recorded_at || new Date().toISOString()]
+    );
+    let match = byEmail[0] ? { ...byEmail[0], reason: 'email' } : null;
+
+    // 2. Same company domain (skips gmail and other free mailboxes).
+    const domains = businessDomains(emails);
+    if (!match && domains.length) {
+        const { rows } = await pool.query(
+            `SELECT id, client_id FROM sales_calls
+             WHERE agency_id = $1 AND LOWER(company) = ANY($2::text[])
+             ORDER BY (call_status = 'canceled'), ABS(EXTRACT(EPOCH FROM (COALESCE(call_at, booked_at, created_at) - $3::timestamptz)))
+             LIMIT 1`,
+            [agencyId, domains, recording.recorded_at || new Date().toISOString()]
+        );
+        if (rows[0]) match = { ...rows[0], reason: 'domain' };
+    }
+
+    // 3. A lead who replied positively but booked outside Calendly. The sales
+    //    call is only created after the analysis confirms a sales conversation
+    //    (applyRecordingAnalysis), so a delivery call with an existing client
+    //    never shows up as a new booked call.
+    if (!match) {
+        const lead = await findPositiveReplyLead(agencyId, emails);
+        if (lead) {
+            await setRecording(recordingId, agencyId, {
+                status: 'matched',
+                match_reason: 'positive_reply',
+                client_id: lead.client_id
+            });
+            return { status: 'matched', salesCallId: null };
+        }
+    }
+
+    if (!match) {
+        await markUnmatched(recordingId, agencyId, 'no_prospect_match');
+        return { status: 'unmatched' };
+    }
+    await setRecording(recordingId, agencyId, {
+        status: 'matched',
+        match_reason: match.reason,
+        sales_call_id: match.id,
+        client_id: match.client_id
+    });
+    return { status: 'matched', salesCallId: Number(match.id) };
+}
+
+/** Step 2: one model call on the transcript. */
+export async function analyzeRecording({ recordingId, agencyId }) {
+    const recording = await loadRecording(recordingId, agencyId);
+    if (recording.analysis && ['analyzed', 'applied'].includes(recording.status)) {
+        return { status: 'analyzed', cached: true };
+    }
+    if (!recording.transcript) {
+        throw new Error('Recording has no transcript yet');
+    }
+    const settings = await getAgencySettings(agencyId);
+    const openaiKey = apiKeysFromSettings(settings).openai || process.env.OPENAI_API_KEY || '';
+    if (!openaiKey) throw new Error('missing_openai_key');
+
+    const openai = new OpenAI({ apiKey: openaiKey });
+    const response = await openai.responses.create({
+        model: CALL_ANALYSIS_MODEL,
+        instructions: CALL_ANALYSIS_INSTRUCTIONS,
+        input: buildAnalysisInput(recording),
+        text: { format: { type: 'json_schema', name: 'call_analysis', strict: true, schema: CALL_ANALYSIS_SCHEMA } }
+    });
+    const analysis = normalizeAnalysis(JSON.parse(response.output_text || '{}'));
+    await setRecording(recordingId, agencyId, {
+        status: 'analyzed',
+        analysis: JSON.stringify(analysis),
+        analyzed_at: new Date().toISOString(),
+        error: null
+    });
+    return { status: 'analyzed', cached: false };
+}
+
+/** Step 3: write the analysis into the sales call (never over a manual edit). */
+export async function applyRecordingAnalysis({ recordingId, agencyId }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const recording = await loadRecording(recordingId, agencyId, client);
+        if (recording.status === 'applied') {
+            await client.query('COMMIT');
+            return { status: 'applied', changed: recording.applied_fields || [] };
+        }
+        if (!recording.analysis) throw new Error('Recording is not analysed');
+
+        if (!recording.sales_call_id) {
+            if (recording.match_reason !== 'positive_reply') throw new Error('Recording is not matched');
+            if (!recording.analysis.is_sales_conversation) {
+                await markUnmatched(recordingId, agencyId, 'positive_reply_not_sales', client);
+                await client.query('COMMIT');
+                return { status: 'unmatched', changed: [] };
+            }
+            const lead = await findPositiveReplyLead(agencyId, recording.external_emails || [], client);
+            if (!lead) throw new Error('Positive-reply lead no longer found');
+            const { rows: [created] } = await client.query(
+                `INSERT INTO sales_calls (
+                     agency_id, client_id, contact_id, company, contact_name, contact_email,
+                     booked_at, call_at, call_status, ai_filled_fields
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'held', ARRAY['call_status', 'call_at']::text[])
+                 RETURNING id`,
+                [agencyId, lead.client_id, lead.contact_id, lead.domain_normalized, lead.full_name, lead.lead_email, recording.recorded_at]
+            );
+            await setRecording(recordingId, agencyId, { sales_call_id: created.id, client_id: lead.client_id }, client);
+            recording.sales_call_id = created.id;
+        }
+
+        const { rows: [call] } = await client.query(
+            `SELECT ${SALES_CALL_SELECT} FROM sales_calls WHERE id = $1 AND agency_id = $2 FOR UPDATE`,
+            [recording.sales_call_id, agencyId]
+        );
+        if (!call) throw notFound(`sales call ${recording.sales_call_id} not found`);
+
+        const { changes, filledFields } = planSalesCallUpdate(call, recording.analysis, recording);
+        const recordedAt = recording.recorded_at ? new Date(recording.recorded_at) : null;
+        const newest = !call.ai_source_recorded_at || (recordedAt && recordedAt >= new Date(call.ai_source_recorded_at));
+        const meta = {
+            ai_filled_fields: [...new Set([...(call.ai_filled_fields || []), ...filledFields])],
+            ai_updated_at: new Date().toISOString(),
+            ...(newest ? {
+                ai_summary: recording.analysis.summary || call.ai_summary,
+                recording_url: recording.share_url || recording.url || call.recording_url,
+                ai_source_recorded_at: recordedAt ? recordedAt.toISOString() : call.ai_source_recorded_at
+            } : {})
+        };
+        const fields = { ...changes, ...meta };
+        const keys = Object.keys(fields);
+        await client.query(
+            `UPDATE sales_calls
+             SET ${keys.map((key, i) => `${key} = $${i + 3}`).join(', ')}, updated_at = NOW()
+             WHERE id = $1 AND agency_id = $2`,
+            [call.id, agencyId, ...keys.map((key) => fields[key])]
+        );
+        await setRecording(recordingId, agencyId, { status: 'applied', applied_fields: Object.keys(changes) }, client);
+        await client.query('COMMIT');
+        return { status: 'applied', changed: Object.keys(changes) };
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function markRecordingFailed({ recordingId, agencyId, message }) {
+    await setRecording(recordingId, agencyId, { status: 'failed', error: String(message || 'unknown error').slice(0, 2000) });
+}
+
+export async function attachCallAnalysisRunId({ recordingId, agencyId, workflowRunId }) {
+    await setRecording(recordingId, agencyId, { workflow_run_id: workflowRunId });
+}
+
+/** match → analyze → apply in-process (local dev, or when workflows are off). */
+export async function runCallAnalysisInline({ recordingId, agencyId }) {
+    try {
+        const match = await matchRecording({ recordingId, agencyId });
+        if (match.status !== 'matched') return match;
+        await analyzeRecording({ recordingId, agencyId });
+        return await applyRecordingAnalysis({ recordingId, agencyId });
+    } catch (error) {
+        await markRecordingFailed({ recordingId, agencyId, message: error?.message || error });
+        throw error;
+    }
+}
+
+function isCallAnalysisWorkflowConfigured() {
+    if (String(process.env.CALL_ANALYSIS_WORKFLOW_DISABLED || '').toLowerCase() === 'true') return false;
+    return Boolean(String(process.env.WORKFLOW_TRIGGER_SECRET || '').trim());
+}
+
+/** Starts the Vercel workflow for one recording, or runs it inline. */
+export async function triggerCallAnalysis({ recordingId, agencyId }) {
+    if (!isCallAnalysisWorkflowConfigured()) {
+        return runCallAnalysisInline({ recordingId, agencyId });
+    }
+    const headers = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.WORKFLOW_TRIGGER_SECRET}`
+    };
+    if (process.env.VERCEL_PROTECTION_BYPASS) headers['x-vercel-protection-bypass'] = process.env.VERCEL_PROTECTION_BYPASS;
+    const res = await fetch(`${resolveWorkflowStartBaseUrl()}/internal/call-analysis/start`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ recordingId, agencyId })
+    });
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Call-analysis workflow trigger failed (${res.status}): ${text || res.statusText}`);
+    }
+    return res.json();
+}
+
+/** Ingests recent Fathom recordings and analyses the new ones. */
+export async function backfillFathomRecordings({ agencyId, days = 90, logger = console.info }) {
+    const settings = await getAgencySettings(agencyId);
+    const apiKey = String(settings?.fathom_key || '').trim();
+    if (!apiKey) throw new Error('No Fathom API key saved for this agency.');
+    const createdAfter = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const meetings = await listFathomMeetings({ apiKey, createdAfter });
+    const summary = { meetings: meetings.length, triggered: 0, skipped: 0, failed: 0 };
+    for (const meeting of meetings) {
+        try {
+            const { recordingId, needsAnalysis } = await ingestFathomMeeting(agencyId, meeting);
+            if (!needsAnalysis) {
+                summary.skipped += 1;
+                continue;
+            }
+            await triggerCallAnalysis({ recordingId, agencyId });
+            summary.triggered += 1;
+        } catch (error) {
+            summary.failed += 1;
+            logger(`[call-analysis] backfill failed for recording ${meeting?.recording_id}: ${error?.message || error}`);
+        }
+    }
+    logger(`[call-analysis] backfill agency=${agencyId}: ${JSON.stringify(summary)}`);
+    return summary;
+}
+
+/**
+ * Registers (or re-registers) the agency's Fathom webhook after the key is
+ * saved. Never points the webhook at a non-public URL, because local dev
+ * shares the production database.
+ */
+export async function connectFathom({ agencyId, webhookBaseUrl }) {
+    const settings = await getAgencySettings(agencyId);
+    const apiKey = String(settings?.fathom_key || '').trim();
+    if (!apiKey) return { connected: false, reason: 'no_key' };
+    const base = String(process.env.FATHOM_WEBHOOK_BASE_URL || webhookBaseUrl || '').replace(/\/$/, '');
+    if (!/^https:\/\//.test(base) || /localhost|127\.0\.0\.1/.test(base)) {
+        return { connected: false, reason: 'no_public_url' };
+    }
+    if (settings.fathom_webhook_id) {
+        await deleteFathomWebhook({ apiKey, webhookId: settings.fathom_webhook_id }).catch(() => {});
+    }
+    const webhook = await createFathomWebhook({ apiKey, destinationUrl: `${base}/webhooks/fathom/${encodeURIComponent(agencyId)}` });
+    await pool.query(
+        `UPDATE agency_settings SET fathom_webhook_id = $2, fathom_webhook_secret = $3, updated_at = NOW()
+         WHERE agency_id = $1`,
+        [agencyId, webhook.id, webhook.secret]
+    );
+    return { connected: true, webhookId: webhook.id };
+}

@@ -6,6 +6,14 @@ import {
     agencyFeaturesFromSettings,
     isTryKittPaidAccount, mergeAgencyFeatures } from '../services/db/agencySettings.js';
 import { validateFeaturesPatch, featureFlagRegistryForClient } from '../services/db/featureFlagRegistry.js';
+import { connectFathom, backfillFathomRecordings } from '../services/callAnalysis/index.js';
+
+/** Public base URL of this Express host, as Fathom should call it. */
+function publicBaseUrl(req) {
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    return host ? `${proto}://${host}` : '';
+}
 
 const router = express.Router();
 
@@ -31,6 +39,8 @@ router.get('/agency/settings', verifySupabaseToken, async (req, res) => {
             enrow_key: settings?.enrow_key || '',
             storeleads_key: settings?.storeleads_key || '',
             close_key: settings?.close_key || '',
+            fathom_key: settings?.fathom_key || '',
+            fathom_connected: Boolean(settings?.fathom_webhook_id),
             openai_founder_model: settings?.openai_founder_model || '',
             email_verification_provider: settings?.email_verification_provider || 'trykitt',
             trykitt_paid_account: isTryKittPaidAccount(settings),
@@ -81,6 +91,7 @@ router.patch('/agency/settings', verifySupabaseToken, async (req, res) => {
             ? { trykittPaidAccount: body.trykitt_paid_account }
             : null;
 
+        const before = typeof body.fathom_key === 'string' ? await getAgencySettings(req.agencyId) : null;
         await upsertAgencySettings(req.agencyId, {
             openai_key: body.openai_key,
             serper_key: body.serper_key,
@@ -88,12 +99,30 @@ router.patch('/agency/settings', verifySupabaseToken, async (req, res) => {
             enrow_key: body.enrow_key,
             storeleads_key: body.storeleads_key,
             close_key: body.close_key,
+            fathom_key: body.fathom_key,
             openai_founder_model: body.openai_founder_model,
             email_verification_provider: body.email_verification_provider,
             ...(body.features != null ? { features: body.features } : {}),
             ...(featuresPatch ? { featuresPatch } : {})
         });
-        res.json({ ok: true });
+
+        // A new Fathom key: register the webhook, then analyse recent recordings.
+        let fathom = null;
+        const newFathomKey = typeof body.fathom_key === 'string' ? body.fathom_key.trim() : '';
+        if (newFathomKey && newFathomKey !== String(before?.fathom_key || '').trim()) {
+            try {
+                fathom = await connectFathom({ agencyId: req.agencyId, webhookBaseUrl: publicBaseUrl(req) });
+                if (fathom.connected) {
+                    backfillFathomRecordings({ agencyId: req.agencyId }).catch((error) => {
+                        console.error('[call-analysis] backfill error:', error?.message || error);
+                    });
+                }
+            } catch (error) {
+                console.error('[call-analysis] Fathom connect error:', error?.message || error);
+                fathom = { connected: false, reason: error?.message || 'connect_failed' };
+            }
+        }
+        res.json({ ok: true, ...(fathom ? { fathom } : {}) });
     } catch (error) {
         console.error('PATCH agency settings error:', error);
         res.status(500).json({ error: 'Failed to save settings' });

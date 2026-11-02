@@ -46,7 +46,7 @@ type Niche = {
   hint: string;
 };
 
-const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "storeleads", "close"] as const;
+const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "storeleads", "close", "fathom"] as const;
 type ApiKeyName = (typeof API_KEY_FIELDS)[number];
 const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   openai: "openai_key",
@@ -55,6 +55,7 @@ const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   enrow: "enrow_key",
   storeleads: "storeleads_key",
   close: "close_key",
+  fathom: "fathom_key",
 };
 const API_KEY_LABELS: Record<ApiKeyName, string> = {
   openai: "OpenAI",
@@ -63,6 +64,7 @@ const API_KEY_LABELS: Record<ApiKeyName, string> = {
   enrow: "Enrow",
   storeleads: "Store Leads",
   close: "Close",
+  fathom: "Fathom",
 };
 type ApiKeyState = Record<ApiKeyName, string>;
 
@@ -79,6 +81,7 @@ const createEmptyKeys = (): ApiKeyState => ({
   enrow: "",
   storeleads: "",
   close: "",
+  fathom: "",
 });
 
 async function hashKeyValue(value: string) {
@@ -118,6 +121,7 @@ type AgencySettingsPayload = {
   enrow_key?: string;
   storeleads_key?: string;
   close_key?: string;
+  fathom_key?: string;
   trykitt_paid_account?: boolean;
 };
 
@@ -130,6 +134,7 @@ const readKeysFromAgencySettings = (
   enrow: data?.enrow_key || "",
   storeleads: data?.storeleads_key || "",
   close: data?.close_key || "",
+  fathom: data?.fathom_key || "",
 });
 
 // Absent flag = paid, matching the server's isTryKittPaidAccount default.
@@ -397,6 +402,7 @@ function HomeContent() {
           enrow_key: sanitizedKeys.enrow,
           storeleads_key: sanitizedKeys.storeleads,
           close_key: sanitizedKeys.close,
+          fathom_key: sanitizedKeys.fathom,
           trykitt_paid_account: kittPaidAccount,
         }),
       });
@@ -405,10 +411,24 @@ function HomeContent() {
         throw new Error((payload?.error as string) || "Unable to save API keys.");
       }
 
+      const saved = (await response.json().catch(() => null)) as
+        | { fathom?: { connected: boolean; reason?: string } }
+        | null;
       setApiKeys(sanitizedKeys);
       setLastSavedKeys(sanitizedKeys);
       setLastSavedKittPaidAccount(kittPaidAccount);
-      setVaultMessage({ tone: "success", text: "Keys saved to your vault." });
+      if (saved?.fathom && !saved.fathom.connected) {
+        setVaultMessage({
+          tone: "error",
+          text: saved.fathom.reason === "no_public_url"
+            ? "Keys saved, but Fathom wasn't connected: this server has no public HTTPS address. Save the key from the live app."
+            : `Keys saved, but Fathom couldn't be connected: ${saved.fathom.reason || "unknown error"}`,
+        });
+      } else if (saved?.fathom?.connected) {
+        setVaultMessage({ tone: "success", text: "Keys saved. Fathom is connected and your last 90 days of calls are being analysed." });
+      } else {
+        setVaultMessage({ tone: "success", text: "Keys saved to your vault." });
+      }
     } catch (error) {
       setVaultMessage({
         tone: "error",
@@ -712,6 +732,19 @@ function HomeContent() {
               />
               <p className="text-xs text-muted-foreground">
                 Creates a Close lead with name, email, phone and website for each positive reply, so it can be dialed from Close. Turn it on in Account → Product features.
+              </p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="fathom-key">Fathom API Key (optional)</Label>
+              <Input
+                id="fathom-key"
+                type="text"
+                placeholder="Fathom → Settings → API Access"
+                value={apiKeys.fathom}
+                onChange={(event) => handleKeyChange(event, "fathom")}
+              />
+              <p className="text-xs text-muted-foreground">
+                AI reads your recorded sales calls and fills in the Metrics sales log: held, good fit, prices, proposal, won or lost. Use the key of the person who records the calls.
               </p>
             </div>
             {showVaultStatus && (

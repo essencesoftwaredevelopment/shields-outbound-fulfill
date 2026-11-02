@@ -7,7 +7,8 @@ import {
     parseWebhookPayload,
     resolveTimelineEventTimestamp,
     resolveLatestCampaignForContact,
-    LATEST_CAMPAIGN_FOR_CONTACT_SQL
+    LATEST_CAMPAIGN_FOR_CONTACT_SQL,
+    extractNoShowInviteeUri
 } from '../calendlyWebhook.js';
 
 test('verifyCalendlySignature: valid signature passes', () => {
@@ -181,4 +182,17 @@ test('resolveLatestCampaignForContact: skips lookup without a contact id', async
     const db = { query: async () => { called = true; return { rows: [] }; } };
     assert.equal(await resolveLatestCampaignForContact(null, { db }), null);
     assert.equal(called, false);
+});
+
+test('extractNoShowInviteeUri: no-show resource and invitee resource payloads', () => {
+    const inviteeUri = 'https://api.calendly.com/scheduled_events/E1/invitees/I1';
+    assert.equal(extractNoShowInviteeUri({
+        event: 'invitee_no_show.created',
+        payload: { uri: 'https://api.calendly.com/invitee_no_shows/N1', invitee: inviteeUri }
+    }), inviteeUri);
+    assert.equal(extractNoShowInviteeUri({
+        event: 'invitee_no_show.deleted',
+        payload: { uri: inviteeUri, no_show: null }
+    }), inviteeUri);
+    assert.equal(extractNoShowInviteeUri({ event: 'invitee_no_show.created', payload: {} }), null);
 });

@@ -3,6 +3,7 @@ import axios from 'axios';
 import { pool } from '../lib/db.js';
 import { getOrCreateClient } from '../services/db/queries.js';
 import { notifyEssenceAiDemoBooked } from './discoveryCallResend.js';
+import { applyCalendlyNoShow } from './db/funnelInputs.js';
 import { resolveCaseStudyIndustry } from './discoveryCallCaseStudy.js';
 import {
     ESSENCE_RETENTION_AGENCY_ID,
@@ -441,6 +442,20 @@ async function upsertCalendlyBooking({
     return result.rows[0] || null;
 }
 
+/**
+ * The invitee a no-show event refers to. Calendly sends either the invitee
+ * resource itself (uri .../invitees/...) or a no-show resource whose `invitee`
+ * is the invitee URI.
+ */
+export function extractNoShowInviteeUri(body) {
+    const payload = (typeof body?.payload === 'object' && body.payload) ? body.payload : {};
+    return [
+        payload.uri,
+        typeof payload.invitee === 'string' ? payload.invitee : payload.invitee?.uri,
+        payload.no_show?.invitee
+    ].find((v) => typeof v === 'string' && v.includes('/invitees/')) || null;
+}
+
 function resolveEventTimestamp(value) {
     if (!value) return new Date();
     const parsed = new Date(value);
@@ -506,6 +521,24 @@ export async function processCalendlyWebhook({
 
     if (!eventType) {
         return { ...logBase, success: false, skipped: true, reason: 'missing_event_type', duration_ms: Date.now() - startMs };
+    }
+
+    // No-shows only update the Metrics sales log; the booking flow below would
+    // otherwise record them as a new "meeting booked".
+    if (eventType === 'invitee_no_show.created' || eventType === 'invitee_no_show.deleted') {
+        const noShowInviteeUri = extractNoShowInviteeUri(body);
+        if (!noShowInviteeUri) {
+            return { ...logBase, success: false, skipped: true, reason: 'missing_invitee_uri', duration_ms: Date.now() - startMs };
+        }
+        const result = await applyCalendlyNoShow({
+            inviteeUri: noShowInviteeUri,
+            noShow: eventType === 'invitee_no_show.created'
+        });
+        return { ...logBase, success: true, invitee_uri: noShowInviteeUri, ...result, duration_ms: Date.now() - startMs };
+    }
+
+    if (!['invitee.created', 'invitee.canceled'].includes(eventType)) {
+        return { ...logBase, success: true, skipped: true, reason: 'unsupported_event_type', duration_ms: Date.now() - startMs };
     }
 
     const webhookDeliveryId = deliveryId
