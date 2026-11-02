@@ -8,7 +8,7 @@
  */
 import { OpenAI } from 'openai';
 import { pool } from '../../config/db.js';
-import { getAgencySettings, apiKeysFromSettings } from '../db/agencySettings.js';
+import { getAgencySettings, apiKeysFromSettings, agencyFeaturesFromSettings } from '../db/agencySettings.js';
 import { SALES_CALL_SELECT } from '../db/funnelInputs.js';
 import { resolveWorkflowStartBaseUrl } from '../interestedResearch/trigger.js';
 import {
@@ -98,6 +98,38 @@ export function externalEmails(invitees) {
         .map((i) => i.email.trim().toLowerCase()))];
 }
 
+export function parseDomainList(value) {
+    return String(value || '')
+        .split(/[,\s]+/)
+        .map((d) => d.trim().toLowerCase().replace(/^@/, '').replace(/^https?:\/\//, '').replace(/\/.*$/, ''))
+        .filter(Boolean);
+}
+
+/**
+ * Email domains that belong to the agency's own team: the recorder's domain,
+ * any domain Fathom ever marked internal, and features.callAnalysisInternalDomains.
+ * Fathom only treats the recorder's domain as internal, so a second company
+ * domain (e.g. essenceretention.com) would otherwise look like a prospect.
+ */
+async function loadOwnDomains(agencyId, db = pool) {
+    const [{ rows }, settings] = await Promise.all([
+        db.query(
+            `SELECT DISTINCT d FROM (
+                 SELECT SPLIT_PART(LOWER(recorded_by_email), '@', 2) AS d
+                 FROM call_recordings WHERE agency_id = $1 AND recorded_by_email IS NOT NULL
+                 UNION
+                 SELECT SPLIT_PART(LOWER(inv->>'email'), '@', 2)
+                 FROM call_recordings r, JSONB_ARRAY_ELEMENTS(r.invitees) inv
+                 WHERE r.agency_id = $1 AND (inv->>'is_external') = 'false'
+             ) x WHERE d <> ''`,
+            [agencyId]
+        ),
+        getAgencySettings(agencyId)
+    ]);
+    const configured = parseDomainList(agencyFeaturesFromSettings(settings).callAnalysisInternalDomains?.domains);
+    return new Set([...rows.map((row) => row.d), ...configured]);
+}
+
 export function businessDomains(emails) {
     return [...new Set(emails
         .map((email) => email.split('@')[1])
@@ -151,7 +183,8 @@ export async function matchRecording({ recordingId, agencyId }) {
     const recording = await loadRecording(recordingId, agencyId);
     if (recording.sales_call_id) return { status: 'matched', salesCallId: Number(recording.sales_call_id) };
 
-    const emails = recording.external_emails || [];
+    const ownDomains = await loadOwnDomains(agencyId);
+    const emails = (recording.external_emails || []).filter((email) => !ownDomains.has(email.split('@')[1]));
     if (!emails.length) {
         await markUnmatched(recordingId, agencyId, 'no_external_attendees');
         return { status: 'unmatched' };

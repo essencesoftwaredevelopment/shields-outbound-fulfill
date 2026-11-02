@@ -71,6 +71,16 @@ export const FEATURE_FLAGS = [
         ]
     },
     {
+        key: 'callAnalysisInternalDomains',
+        group: 'product',
+        type: 'object',
+        label: 'Call analysis: your own email domains',
+        description: 'Email domains your team uses (comma-separated, e.g. essenceretention.com). Fathom recordings with only these attendees are treated as internal meetings and never analysed. The recorder\'s own domain is always included.',
+        fields: [
+            { key: 'domains', type: 'string', label: 'Domains', placeholder: 'yourcompany.com' }
+        ]
+    },
+    {
         key: 'closeLeadStatus',
         group: 'product',
         type: 'object',

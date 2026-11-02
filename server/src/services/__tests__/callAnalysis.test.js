@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { verifyFathomSignature } from '../fathom.js';
 import { formatTranscript, normalizeAnalysis, planSalesCallUpdate } from '../callAnalysis/extract.js';
-import { businessDomains, externalEmails } from '../callAnalysis/index.js';
+import { businessDomains, externalEmails, parseDomainList } from '../callAnalysis/index.js';
 
 const SECRET = `whsec_${Buffer.from('fathom-test-secret').toString('base64')}`;
 
@@ -127,4 +127,12 @@ test('planSalesCallUpdate: non-sales recordings only mark the call held', () => 
     const delivery = normalizeAnalysis({ is_sales_conversation: false, call_type: 'onboarding_or_delivery', good_fit: true, retainer_monthly_price: 999 });
     const { changes } = planSalesCallUpdate(baseCall, delivery, { recorded_at: '2026-11-01T10:00:00Z' });
     assert.deepEqual(changes, { call_status: 'held', last_contact_on: '2026-11-01' });
+});
+
+test('parseDomainList accepts commas, spaces, @ and URLs', () => {
+    assert.deepEqual(
+        parseDomainList(' essenceretention.com, @Other.io  https://third.co/path '),
+        ['essenceretention.com', 'other.io', 'third.co']
+    );
+    assert.deepEqual(parseDomainList(undefined), []);
 });
