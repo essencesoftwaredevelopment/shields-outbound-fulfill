@@ -206,3 +206,42 @@ test('normalizeSalesCall closes, clears lost reason and starts retainers', () =>
     assert.equal(reopened.lost_reason, null);
     assert.throws(() => normalizeSalesCall({ outcome: 'open', retainer_start: '2026-10-02', retainer_end: '2026-10-01' }));
 });
+
+test('computeSalesMetrics: lists the people behind each sales card', () => {
+    const { start, end } = resolvePeriod('7d', NOW);
+    const calls = [
+        call({ id: 1, contact_id: '11', company: 'won.com', booked_at: '2026-10-27T10:00:00Z', call_at: '2026-10-28T15:00:00Z', call_status: 'held', qualified: true, proposal_sent_on: '2026-10-29', outcome: 'won', closed_on: '2026-10-31' }),
+        call({ id: 2, contact_id: '11', company: 'won.com', booked_at: '2026-10-28T10:00:00Z', call_status: 'canceled' }),
+        call({ id: 3, company: 'ghost.com', booked_at: '2026-10-29T10:00:00Z', call_status: 'canceled' }),
+        call({ id: 4, company: 'past.com', booked_at: '2026-10-29T11:00:00Z', call_at: '2026-10-30T15:00:00Z' })
+    ];
+    const { sales } = computeSalesMetrics(calls, {
+        start, end, now: NOW, positives: 10,
+        bookedContactIds: [{ contact_id: '11' }, { contact_id: '77', name: 'Ivy', company: 'instantly.com', booked_at: '2026-10-30T09:00:00Z' }]
+    });
+    const { lists } = sales;
+    assert.equal(lists.callsBooked.length, sales.callsBooked);
+    assert.deepEqual(lists.callsBooked.map((e) => `${e.company}:${e.detail}`).sort(), [
+        'ghost.com:Canceled', 'instantly.com:Marked "meeting booked" in Instantly', 'past.com:Booked', 'won.com:Held'
+    ]);
+    assert.deepEqual(lists.showRate.map((e) => `${e.company}:${e.detail}`).sort(), [
+        'past.com:Held (assumed)', 'won.com:Held'
+    ]);
+    assert.deepEqual(lists.qualified.map((e) => e.detail).sort(), ['Good fit', 'Not decided']);
+    assert.deepEqual(lists.closes.map((e) => e.detail), ['Won']);
+});
+
+test('computeSalesMetrics: a person with two held calls counts once', () => {
+    const { start, end } = resolvePeriod('30d', NOW);
+    const calls = [
+        call({ id: 1, contact_id: '5', company: 'tara.com', booked_at: '2026-10-04T10:00:00Z', call_at: '2026-10-05T19:00:00Z', call_status: 'held', qualified: true }),
+        call({ id: 2, contact_id: '5', company: 'tara.com', booked_at: '2026-10-10T10:00:00Z', call_at: '2026-10-14T18:00:00Z', call_status: 'held', qualified: null }),
+        call({ id: 3, contact_id: '6', company: 'other.com', booked_at: '2026-10-10T10:00:00Z', call_at: '2026-10-15T18:00:00Z', call_status: 'held', qualified: false })
+    ];
+    const { sales } = computeSalesMetrics(calls, { start, end, now: NOW, positives: 10 });
+    assert.equal(sales.callsBooked, 2);
+    assert.equal(sales.callsHeld, 2);
+    assert.equal(sales.qualifiedRate, 1 / 2);
+    assert.deepEqual(sales.lists.qualified.map((e) => `${e.company}:${e.detail}`).sort(), ['other.com:Not a fit', 'tara.com:Good fit']);
+    assert.equal(sales.lists.showRate.length, 2);
+});

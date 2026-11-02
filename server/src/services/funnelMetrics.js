@@ -136,6 +136,108 @@ function personKey(call) {
     return email ? `email:${email}` : `call:${call.id}`;
 }
 
+const CALL_STATUS_TEXT = { booked: 'Booked', held: 'Held', no_show: 'No-show', canceled: 'Canceled' };
+const LOST_REASON_TEXT = {
+    price: 'price', timing: 'timing', competitor: 'went with someone else',
+    no_budget: 'no budget', ghosted: 'ghosted', not_a_fit: 'not a fit'
+};
+
+function isoDate(value) {
+    const time = toTime(value);
+    return time === null ? null : new Date(time).toISOString();
+}
+
+function listEntry(call, detail, date) {
+    return {
+        salesCallId: call.id ?? null,
+        name: call.contact_name || null,
+        company: call.company || null,
+        email: call.contact_email || null,
+        date: isoDate(date),
+        detail
+    };
+}
+
+function byDateDesc(a, b) {
+    return (b.date || '').localeCompare(a.date || '');
+}
+
+/**
+ * One call per person: their latest by `dateOf`. `merge` can derive fields
+ * from all of that person's calls (e.g. good fit if any call said so).
+ */
+function onePerPerson(calls, dateOf, merge = null) {
+    const groups = new Map();
+    for (const call of calls) {
+        const key = personKey(call);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(call);
+    }
+    return [...groups.values()].map((group) => {
+        const latest = group.reduce((a, b) => ((toTime(dateOf(b)) ?? 0) > (toTime(dateOf(a)) ?? 0) ? b : a));
+        return merge ? { ...latest, ...merge(group) } : latest;
+    });
+}
+
+/** The people behind each Sales card, for the card's list popup. */
+function buildSalesLists({ bookedInPeriod, instantlyBooked, held, proposals, won, lost }) {
+    // Calls booked: one row per person; their latest live booking, else their canceled one.
+    const byPerson = new Map();
+    for (const call of bookedInPeriod) {
+        const key = personKey(call);
+        const current = byPerson.get(key);
+        const better = !current
+            || (current.call_status === 'canceled' && call.call_status !== 'canceled')
+            || ((current.call_status === 'canceled') === (call.call_status === 'canceled') && toTime(call.booked_at) > toTime(current.booked_at));
+        if (better) byPerson.set(key, call);
+    }
+    const callsBooked = [...byPerson.values()].map((call) => listEntry(call, CALL_STATUS_TEXT[call.call_status] || call.call_status, call.booked_at));
+    for (const entry of instantlyBooked) {
+        if (byPerson.has(`contact:${entry.contact_id}`)) continue;
+        callsBooked.push({
+            salesCallId: null,
+            name: entry.name || null,
+            company: entry.company || null,
+            email: entry.email || null,
+            date: isoDate(entry.booked_at),
+            detail: 'Marked "meeting booked" in Instantly'
+        });
+    }
+
+    // Calls held only (marked held, or past and not marked a no-show).
+    const showRate = held.map((call) => listEntry(
+        call,
+        call.call_status === 'booked' ? 'Held (assumed)' : 'Held',
+        call.call_at
+    ));
+
+    const qualified = held.map((call) => listEntry(
+        call,
+        call.qualified === true ? 'Good fit' : call.qualified === false ? 'Not a fit' : 'Not decided',
+        call.call_at
+    ));
+
+    const proposalRows = proposals.map((call) => listEntry(call, 'Proposal sent', call.proposal_sent_on));
+
+    const closeCalls = new Map();
+    for (const call of [...proposals, ...won, ...lost]) closeCalls.set(String(call.id), call);
+    const closes = [...closeCalls.values()].map((call) => {
+        if (call.outcome === 'won' && won.includes(call)) return listEntry(call, 'Won', call.closed_on);
+        if (call.outcome === 'lost' && lost.includes(call)) {
+            return listEntry(call, `Lost${call.lost_reason ? ` · ${LOST_REASON_TEXT[call.lost_reason] || call.lost_reason}` : ''}`, call.closed_on);
+        }
+        return listEntry(call, 'Proposal sent, still open', call.proposal_sent_on);
+    });
+
+    return {
+        callsBooked: callsBooked.sort(byDateDesc),
+        showRate: showRate.sort(byDateDesc),
+        qualified: qualified.sort(byDateDesc),
+        proposals: proposalRows.sort(byDateDesc),
+        closes: closes.sort(byDateDesc)
+    };
+}
+
 /**
  * `bookedContactIds`: contacts Instantly marked "meeting booked" in the period;
  * merged with the sales log so calls booked = unique people who booked,
@@ -150,21 +252,44 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
     const bookedPeople = new Set(bookedInPeriod.map(personKey));
     const activePeople = new Set(bookedInPeriod.filter((c) => c.call_status !== 'canceled').map(personKey));
     const canceledPeople = [...bookedPeople].filter((key) => !activePeople.has(key)).length;
-    for (const contactId of bookedContactIds) bookedPeople.add(`contact:${contactId}`);
+    // Instantly "meeting booked" contacts: ids, or { contact_id, name, email, company, booked_at }.
+    const instantlyBooked = bookedContactIds.map((entry) => (
+        entry && typeof entry === 'object' ? entry : { contact_id: entry }
+    ));
+    for (const entry of instantlyBooked) bookedPeople.add(`contact:${entry.contact_id}`);
     const callsBooked = bookedPeople.size;
     const callsDue = calls.filter((c) => inPeriod(c.call_at) && toTime(c.call_at) <= nowTime && c.call_status !== 'canceled');
     // A past call that wasn't canceled counts as held unless it was marked a
     // no-show (in Calendly, via the invitee_no_show webhook, or in the sales log).
-    const noShows = callsDue.filter((c) => c.call_status === 'no_show');
-    const assumedHeld = callsDue.filter((c) => c.call_status === 'booked');
-    const held = callsDue.filter((c) => c.call_status === 'held' || c.call_status === 'booked');
+    // Every sales card counts people, not sales-log rows: someone who booked
+    // twice (two rows) counts once, so each rate matches its list.
+    // A person counts as held if any of their past calls was held.
+    const held = onePerPerson(
+        callsDue.filter((c) => c.call_status === 'held' || c.call_status === 'booked'),
+        (c) => c.call_at,
+        (group) => ({
+            // Good fit if any held call said so; not a fit if any said no; else undecided.
+            qualified: group.some((c) => c.qualified === true) ? true
+                : group.some((c) => c.qualified === false) ? false : null,
+            call_status: group.some((c) => c.call_status === 'held') ? 'held' : 'booked'
+        })
+    );
+    const heldKeys = new Set(held.map(personKey));
+    const noShows = onePerPerson(callsDue.filter((c) => c.call_status === 'no_show'), (c) => c.call_at)
+        .filter((c) => !heldKeys.has(personKey(c)));
+    const assumedHeld = held.filter((c) => c.call_status === 'booked');
     const qualified = held.filter((c) => c.qualified === true);
     // Until a step has been recorded at least once, its rate is "not tracked" (null), not 0%.
     const tracksQualified = calls.some((c) => c.qualified !== null && c.qualified !== undefined);
     const tracksDeals = calls.some((c) => c.proposal_sent_on || c.outcome !== 'open');
-    const proposals = calls.filter((c) => inPeriod(c.proposal_sent_on));
-    const won = calls.filter((c) => c.outcome === 'won' && inPeriod(c.closed_on));
-    const lost = calls.filter((c) => c.outcome === 'lost' && inPeriod(c.closed_on));
+    const proposals = onePerPerson(calls.filter((c) => inPeriod(c.proposal_sent_on)), (c) => c.proposal_sent_on);
+    const won = onePerPerson(calls.filter((c) => c.outcome === 'won' && inPeriod(c.closed_on)), (c) => c.closed_on);
+    const lost = onePerPerson(calls.filter((c) => c.outcome === 'lost' && inPeriod(c.closed_on)), (c) => c.closed_on)
+        .filter((c) => !won.some((w) => personKey(w) === personKey(c)));
+
+    const lists = buildSalesLists({
+        bookedInPeriod, instantlyBooked, held, proposals, won, lost
+    });
 
     const closeDurations = won
         .filter((c) => toTime(c.call_at) !== null)
@@ -246,7 +371,8 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
             overallCloseRate: tracksDeals ? ratio(won.length, held.length) : null,
             avgDaysToClose: closeDurations.length ? round(closeDurations.reduce((a, b) => a + b, 0) / closeDurations.length) : null,
             stalledDeals: stalled,
-            lostReasons
+            lostReasons,
+            lists
         },
         money: {
             newRevenue: round(newRevenue, 2),
@@ -316,15 +442,20 @@ async function loadCampaigns(agencyId, sqlClientId) {
 
 async function loadMeetingBookedContacts(agencyId, sqlClientId, start, end) {
     const { rows } = await pool.query(
-        `SELECT DISTINCT contact_id
-         FROM contact_instantly_events
-         WHERE agency_id = $1 AND client_id = $2
-           AND event_type = 'lead_meeting_booked'
-           AND event_timestamp >= $3 AND event_timestamp < $4
-           AND contact_id IS NOT NULL`,
+        `SELECT DISTINCT ON (e.contact_id)
+                e.contact_id, e.event_timestamp AS booked_at, c.full_name AS name,
+                COALESCE(c.email, e.lead_email) AS email, co.domain_normalized AS company
+         FROM contact_instantly_events e
+         LEFT JOIN contacts c ON c.id = e.contact_id
+         LEFT JOIN companies co ON co.id = c.company_id
+         WHERE e.agency_id = $1 AND e.client_id = $2
+           AND e.event_type = 'lead_meeting_booked'
+           AND e.event_timestamp >= $3 AND e.event_timestamp < $4
+           AND e.contact_id IS NOT NULL
+         ORDER BY e.contact_id, e.event_timestamp ASC`,
         [agencyId, sqlClientId, start.toISOString(), end.toISOString()]
     );
-    return rows.map((row) => row.contact_id);
+    return rows;
 }
 
 async function loadEnrichmentSpend(agencyId, sqlClientId, start, end) {

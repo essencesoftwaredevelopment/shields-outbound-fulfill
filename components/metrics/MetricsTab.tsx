@@ -2,11 +2,11 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
-    BadgeCheck,
     Banknote,
     CalendarCheck,
     FileText,
     Gem,
+    List,
     MessageCircleCheck,
     RefreshCw,
     Scale,
@@ -21,8 +21,8 @@ import {
 import { apiJson } from "@/lib/api/http";
 import { SalesLog } from "./SalesLog";
 import { OutreachCosts } from "./OutreachCosts";
-import { formatMoney, formatNumber, formatPercent } from "./format";
-import type { MetricsPayload } from "./types";
+import { formatDate, formatMoney, formatNumber, formatPercent } from "./format";
+import type { MetricsPayload, SalesListEntry, SalesListKey } from "./types";
 
 type Status = "good" | "warn" | "bad" | null;
 
@@ -44,18 +44,20 @@ const ICON_PROPS = { width: 18, height: 18, strokeWidth: 1.8 };
  * Same layout as the Analytics tab stat cards: big number, optional secondary
  * value + label, then icon + label. `hint` (formula, target) shows on hover.
  */
-function MetricCard({ label, value, secondary, icon, status, hint }: {
+function MetricCard({ label, value, secondary, icon, status, hint, onShowList }: {
     label: string;
     value: string;
     secondary?: { value: string; label: string };
     icon: ReactNode;
     status?: Status;
     hint?: string;
+    onShowList?: () => void;
 }) {
     return (
         <div
             title={hint}
             style={{
+                position: "relative",
                 padding: "1.35rem 1.2rem",
                 borderRadius: "16px",
                 border: "1px solid var(--app-border-mid)",
@@ -64,6 +66,18 @@ function MetricCard({ label, value, secondary, icon, status, hint }: {
                 minWidth: 0
             }}
         >
+            {onShowList && (
+                <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={onShowList}
+                    aria-label={`Show who makes up ${label}`}
+                    title="Show the list"
+                    style={{ position: "absolute", top: "0.75rem", right: "0.75rem", padding: "0.3rem 0.45rem", display: "inline-flex", alignItems: "center" }}
+                >
+                    <List size={14} />
+                </button>
+            )}
             <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>{value}</p>
             <div style={{ margin: "0.45rem 0 0", minHeight: "1.32rem", lineHeight: 1.1 }}>
                 {secondary && (
@@ -84,6 +98,51 @@ function MetricCard({ label, value, secondary, icon, status, hint }: {
                         aria-label={status === "good" ? "On target" : status === "warn" ? "Below target" : "Off target"}
                         style={{ marginLeft: "auto", width: "8px", height: "8px", borderRadius: "999px", background: STATUS_COLOR[status], flexShrink: 0 }}
                     />
+                )}
+            </div>
+        </div>
+    );
+}
+
+function PeopleListModal({ title, entries, onClose }: { title: string; entries: SalesListEntry[]; onClose: () => void }) {
+    return (
+        <div className="modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+            <div className="modal" role="dialog" aria-modal="true" aria-labelledby="metric-list-title" style={{ maxWidth: "720px", maxHeight: "85vh", overflowY: "auto", padding: "2rem" }}>
+                <div className="modal__header" style={{ alignItems: "flex-start" }}>
+                    <div>
+                        <h2 id="metric-list-title" className="modal__title" style={{ fontSize: "1.4rem" }}>{title}</h2>
+                        <p className="modal__description">{entries.length} {entries.length === 1 ? "person" : "people"} in this period</p>
+                    </div>
+                    <button type="button" className="secondary-button" onClick={onClose}>Close</button>
+                </div>
+                {entries.length === 0 ? (
+                    <p style={{ marginTop: "1.25rem", fontSize: "0.9rem", color: "var(--app-text-faint)" }}>Nobody in this period.</p>
+                ) : (
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem", marginTop: "1.25rem" }}>
+                        <thead>
+                            <tr>
+                                {["Who", "Date", "Status"].map((head) => (
+                                    <th key={head} style={{ padding: "0.45rem 0.6rem", textAlign: "left", fontSize: "0.72rem", fontWeight: 600, color: "var(--app-text-faint)" }}>{head}</th>
+                                ))}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {entries.map((entry, index) => (
+                                <tr key={`${entry.salesCallId ?? entry.email ?? "row"}-${index}`}>
+                                    <td style={{ padding: "0.5rem 0.6rem", borderTop: "1px solid var(--app-border)" }}>
+                                        <div>{entry.company || entry.name || entry.email || "Unnamed"}</div>
+                                        {(entry.company && (entry.name || entry.email)) && (
+                                            <div style={{ fontSize: "0.75rem", color: "var(--app-text-faint)" }}>
+                                                {[entry.name, entry.email].filter(Boolean).join(" · ")}
+                                            </div>
+                                        )}
+                                    </td>
+                                    <td style={{ padding: "0.5rem 0.6rem", borderTop: "1px solid var(--app-border)", whiteSpace: "nowrap" }}>{formatDate(entry.date)}</td>
+                                    <td style={{ padding: "0.5rem 0.6rem", borderTop: "1px solid var(--app-border)" }}>{entry.detail}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
                 )}
             </div>
         </div>
@@ -153,6 +212,8 @@ export function MetricsTab({ clientId }: { clientId: string }) {
     }, [load, inputsVersion]);
 
     const onInputsChanged = useCallback(() => setInputsVersion((v) => v + 1), []);
+    const [openList, setOpenList] = useState<{ key: SalesListKey; title: string } | null>(null);
+    const showList = (key: SalesListKey, title: string) => () => setOpenList({ key, title });
 
     const sending = data?.sending;
     const replies = data?.replies;
@@ -246,6 +307,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                         <Grid>
                             <MetricCard
                                 label="Calls booked"
+                                onShowList={showList("callsBooked", "Calls booked")}
                                 value={formatNumber(sales?.callsBooked)}
                                 secondary={{ value: formatPercent(sales?.bookingRate, 0), label: "Booking rate" }}
                                 icon={<CalendarCheck {...ICON_PROPS} />}
@@ -254,6 +316,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                             />
                             <MetricCard
                                 label="Show rate"
+                                onShowList={showList("showRate", "Calls held")}
                                 value={formatPercent(sales?.showRate, 0)}
                                 secondary={{ value: formatNumber(sales?.callsHeld), label: "Calls held" }}
                                 icon={<UserCheck {...ICON_PROPS} />}
@@ -261,14 +324,8 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                                 hint={`Calls held ÷ (held + no-shows + people who canceled). Past Calendly calls count as held unless marked a no-show in Calendly. Target: 70%+.`}
                             />
                             <MetricCard
-                                label="Qualified rate"
-                                value={formatPercent(sales?.qualifiedRate, 0)}
-                                secondary={{ value: formatNumber(sales?.qualified), label: "Good fit" }}
-                                icon={<BadgeCheck {...ICON_PROPS} />}
-                                hint="Good-fit calls ÷ calls held. Shows lead quality."
-                            />
-                            <MetricCard
                                 label="Proposal rate"
+                                onShowList={showList("proposals", "Proposals sent")}
                                 value={formatPercent(sales?.proposalRate, 0)}
                                 secondary={{ value: formatNumber(sales?.proposalsSent), label: "Proposals" }}
                                 icon={<FileText {...ICON_PROPS} />}
@@ -277,6 +334,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                             />
                             <MetricCard
                                 label="Close rate"
+                                onShowList={showList("closes", "Proposals and closed deals")}
                                 value={formatPercent(sales?.closeRate, 0)}
                                 secondary={{ value: formatPercent(sales?.overallCloseRate, 0), label: "Of calls held" }}
                                 icon={<Trophy {...ICON_PROPS} />}
@@ -336,6 +394,13 @@ export function MetricsTab({ clientId }: { clientId: string }) {
             )}
 
             <SalesLog clientId={clientId} onChanged={onInputsChanged} />
+            {openList && data && (
+                <PeopleListModal
+                    title={`${openList.title} · ${data.period.label}`}
+                    entries={data.sales.lists?.[openList.key] ?? []}
+                    onClose={() => setOpenList(null)}
+                />
+            )}
             <OutreachCosts clientId={clientId} onChanged={onInputsChanged} />
         </div>
     );

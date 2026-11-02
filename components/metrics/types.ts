@@ -21,6 +21,17 @@ export type CostBreakdownLine = {
     automatic?: boolean;
 };
 
+export type SalesListKey = "callsBooked" | "showRate" | "qualified" | "proposals" | "closes";
+
+export type SalesListEntry = {
+    salesCallId: number | string | null;
+    name: string | null;
+    company: string | null;
+    email: string | null;
+    date: string | null;
+    detail: string;
+};
+
 export type MetricsPayload = {
     period: { key: string; label: string; start: string; end: string; days: number; workingDays: number };
     periods: { key: string; label: string }[];
@@ -66,6 +77,7 @@ export type MetricsPayload = {
         avgDaysToClose: number | null;
         stalledDeals: { id: number; name: string | null; daysQuiet: number }[];
         lostReasons: Record<string, number>;
+        lists: Record<SalesListKey, SalesListEntry[]>;
     };
     money: {
         newRevenue: number;
