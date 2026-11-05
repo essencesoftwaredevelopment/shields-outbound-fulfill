@@ -18,6 +18,7 @@ import { buildAgentLeadProfile, runReplyAgent } from '../interestedReplyAgent.js
 import {
     assembleFollowUpAgentInput,
     assembleFollowUpAgentInstructions,
+    formatThreadState,
     FOLLOW_UP_AGENT_MAX_CHARS,
     isFollowUpCopyTooLong
 } from './prompt.js';
@@ -66,7 +67,10 @@ export async function runFollowUpAgent({
     model,
     reasoningEffort
 }) {
-    const history = await loadTouchHistory(ctx.contactId, ctx.campaignId);
+    const [history, threadMessages] = await Promise.all([
+        loadTouchHistory(ctx.contactId, ctx.campaignId),
+        fetchThreadMessagesForReview(pool, ctx.contactId, ctx.campaignId, ctx.email)
+    ]);
     const domain = normalizeAuditDomain(vars.company_domain) || domainFromLeadEmail(ctx.email);
 
     // Same rule as the interested reply: the preview tool is only offered on
@@ -91,11 +95,11 @@ export async function runFollowUpAgent({
             website: domain ? `https://${domain}` : '',
             threadSubject: thread.threadSubject,
             researchBrief,
-            previousLeadMessage: thread.previousLeadMessage,
+            threadState: formatThreadState(threadMessages),
             priorNotes: history.priorNotes
         }),
         serperKey: settings.serperKey || null,
-        loadThread: () => fetchThreadMessagesForReview(pool, ctx.contactId, ctx.campaignId, ctx.email),
+        loadThread: async () => threadMessages,
         leadProfile: buildAgentLeadProfile(vars),
         generateStorePreview: canGeneratePreview
             ? () => callPopupFormGenerate(ctx.email, popupOptionsFromResearchBrief(researchBrief, domain))

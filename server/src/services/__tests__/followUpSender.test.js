@@ -686,3 +686,9 @@ test('removeContactFromWarmFollowUps: writes a manual blocker on the active camp
     // The manual event must never carry a reply_to_uuid (it is not a thread anchor).
     assert.doesNotMatch(insert.sql, /reply_to_uuid/);
 });
+
+test('htmlToPlainText keeps signature lines from divs apart', () => {
+    const text = htmlToPlainText('<div>Thanks,</div><div><br /></div><div>Emily</div><div>Partner @ ESSENCE Retention</div>');
+    assert.match(text, /Emily\nPartner @ ESSENCE Retention/);
+    assert.doesNotMatch(text, /EmilyPartner/);
+});
