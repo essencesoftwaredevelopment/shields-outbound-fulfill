@@ -23,7 +23,7 @@ import { AnimatedNumber } from "@/components/animated-number";
 import { InterestedResearchProgress } from "@/components/interested-research-progress";
 import { WarmFollowUpProgress } from "@/components/warm-follow-up-progress";
 import { LeadReplyEditor, type LeadReplyEditorHandle, type LeadReplyEditorState } from "@/components/lead-reply-editor";
-import { FOLLOW_UP_CODE_CONTRACT, FOLLOW_UP_MAX_CHARS, formatBriefForFollowUpPrompt } from "@server/services/warmFollowUpGeneration/prompt.js";
+import { FOLLOW_UP_AGENT_GUIDANCE, FOLLOW_UP_CODE_CONTRACT, FOLLOW_UP_MAX_CHARS, formatBriefForFollowUpPrompt } from "@server/services/warmFollowUpGeneration/prompt.js";
 import { normalizeDomain } from "@server/utils/domain.js";
 
 /** Unique domains per domain-check request. Each call stays well under the proxy timeout. */
@@ -1247,6 +1247,27 @@ type FollowUpPreviewPayload = {
     usedResearchBrief?: boolean;
     usedTemplateFallback?: boolean;
     researchBrief?: Record<string, unknown> | null;
+    agentOutcome?: FollowUpAgentOutcome | null;
+    agentTrace?: FollowUpAgentTrace | null;
+    runMode?: "preview" | "send";
+    sentSendId?: number | null;
+    notSentReason?: string | null;
+};
+
+type FollowUpAgentOutcome = "send" | "skip" | "end" | "blocked";
+
+type FollowUpAgentTrace = {
+    notes?: string | null;
+    steps?: Array<{ tool: string; input?: string | null; ok?: boolean; error?: string | null }>;
+    turns?: number;
+    elapsedMs?: number;
+};
+
+const FOLLOW_UP_AGENT_OUTCOME_LABELS: Record<FollowUpAgentOutcome, string> = {
+    send: "Would send this email",
+    skip: "Chose to skip this touch",
+    end: "Chose to end the sequence",
+    blocked: "Agent not run",
 };
 
 type FollowUpGenerationRun = {
@@ -1259,6 +1280,9 @@ type FollowUpGenerationRun = {
     used_research_brief?: boolean;
     used_template_fallback?: boolean;
     research_brief?: Record<string, unknown> | null;
+    agent_outcome?: FollowUpAgentOutcome | null;
+    agent_trace?: FollowUpAgentTrace | null;
+    follow_up_send_id?: number | null;
     error_message?: string | null;
 };
 
@@ -1827,6 +1851,10 @@ export default function ClientPage() {
     const [followUpPreviewRun, setFollowUpPreviewRun] = useState<FollowUpGenerationRun | null>(null);
     const [followUpSystemPrompt, setFollowUpSystemPrompt] = useState('');
     const [followUpAiEnabled, setFollowUpAiEnabled] = useState(false);
+    const [followUpAgentEnabled, setFollowUpAgentEnabled] = useState(false);
+    const [followUpAgentMaxTouches, setFollowUpAgentMaxTouches] = useState('12');
+    const [followUpAgentMinGapDays, setFollowUpAgentMinGapDays] = useState('2');
+    const [savingFollowUpAgent, setSavingFollowUpAgent] = useState(false);
     const [followUpEditorMode, setFollowUpEditorMode] = useState<'static' | 'ai'>('static');
     const followUpEditorClientRef = useRef<string | null>(null);
     const [savingFollowUpPrompt, setSavingFollowUpPrompt] = useState(false);
@@ -4591,7 +4619,7 @@ export default function ClientPage() {
                 const run = data.run as FollowUpGenerationRun | undefined;
                 if (cancelled || !run) return;
                 setFollowUpPreviewRun(run);
-                if (run.status === 'completed' && (run.rendered_html || run.rendered_text)) {
+                if (run.status === 'completed' && (run.rendered_html || run.rendered_text || run.agent_outcome)) {
                     setFollowUpPreviewResult({
                         contactId: followUpPreviewSelectedLead?.id ? Number(followUpPreviewSelectedLead.id) || 0 : 0,
                         contactEmail: followUpPreviewSelectedLead?.email || '',
@@ -4603,6 +4631,11 @@ export default function ClientPage() {
                         researchBrief: run.research_brief && typeof run.research_brief === 'object'
                             ? run.research_brief as Record<string, unknown>
                             : null,
+                        agentOutcome: run.agent_outcome ?? null,
+                        agentTrace: run.agent_trace ?? null,
+                        runMode: run.mode,
+                        sentSendId: run.follow_up_send_id ?? null,
+                        notSentReason: run.error_message ?? null,
                     });
                     setFollowUpPreviewLoading(false);
                 } else if (run.status === 'failed') {
@@ -5592,6 +5625,9 @@ export default function ClientPage() {
                         : '');
                     const liveAi = scriptData.follow_up_ai_enabled === true;
                     setFollowUpAiEnabled(liveAi);
+                    setFollowUpAgentEnabled(scriptData.follow_up_agent_enabled === true);
+                    setFollowUpAgentMaxTouches(String(scriptData.follow_up_agent_max_touches ?? 12));
+                    setFollowUpAgentMinGapDays(String(scriptData.follow_up_agent_min_gap_days ?? 2));
                     if (followUpEditorClientRef.current !== clientId) {
                         followUpEditorClientRef.current = clientId;
                         if (liveAi) setFollowUpEditorMode('ai');
@@ -7447,7 +7483,7 @@ export default function ClientPage() {
         setFollowUpScriptModalOpen(true);
     };
 
-    const openFollowUpPreviewModal = (script: FollowUpScript) => {
+    const openFollowUpPreviewModal = (script: FollowUpScript | null) => {
         setPreviewingFollowUpScript(script);
         setFollowUpPreviewLeadSearch('');
         setDebouncedFollowUpPreviewLeadSearch('');
@@ -7482,12 +7518,22 @@ export default function ClientPage() {
                 {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-                    body: JSON.stringify({ system_prompt: followUpSystemPrompt })
+                    body: JSON.stringify({
+                        system_prompt: followUpSystemPrompt,
+                        ...(followUpAgentEnabled
+                            ? {
+                                agent_max_touches: Number(followUpAgentMaxTouches),
+                                agent_min_gap_days: Number(followUpAgentMinGapDays),
+                            }
+                            : {}),
+                    })
                 }
             );
             const data = await response.json().catch(() => ({}));
             if (!response.ok) throw new Error(data.error || 'Failed to save follow-up prompt');
             setFollowUpSystemPrompt(data.follow_up_system_prompt || '');
+            setFollowUpAgentMaxTouches(String(data.follow_up_agent_max_touches ?? followUpAgentMaxTouches));
+            setFollowUpAgentMinGapDays(String(data.follow_up_agent_min_gap_days ?? followUpAgentMinGapDays));
             if (typeof data.follow_up_ai_enabled === 'boolean') {
                 setFollowUpAiEnabled(data.follow_up_ai_enabled);
             }
@@ -7501,6 +7547,40 @@ export default function ClientPage() {
         }
     };
 
+    const handleSaveFollowUpAgentEnabled = async (enabled: boolean) => {
+        if (!user || !clientId) return;
+        if (enabled && followUpAiEnabled) {
+            const confirmed = await confirmAction({
+                title: 'Turn on the follow-up agent for live sends?',
+                message: 'Live AI is already on, so the next scheduled pass will email leads with no human review.',
+                confirmLabel: 'Turn on agent',
+                tone: 'default',
+            });
+            if (!confirmed) return;
+        }
+        setSavingFollowUpAgent(true);
+        try {
+            const idToken = await getAccessToken();
+            if (!idToken) return;
+            const response = await fetchWithRetry(
+                `${getPipelineBaseUrl()}/api/clients/${encodeURIComponent(clientId)}/follow-up-prompt`,
+                {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ agent_enabled: enabled })
+                }
+            );
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || 'Failed to save the follow-up agent setting');
+            setFollowUpAgentEnabled(data.follow_up_agent_enabled === true);
+        } catch (error) {
+            setToastMessage(error instanceof Error ? error.message : 'Failed to save the follow-up agent setting');
+            setToastVisible(true);
+        } finally {
+            setSavingFollowUpAgent(false);
+        }
+    };
+
     const handleSaveFollowUpAiEnabled = async (enabled: boolean) => {
         if (!user || !clientId) return;
         const aiReady = Boolean(
@@ -7510,7 +7590,9 @@ export default function ClientPage() {
         if (enabled) {
             const confirmed = await confirmAction({
                 title: 'Switch live follow-ups to AI?',
-                message: aiReady
+                message: followUpAgentEnabled && followUpSystemPrompt.trim()
+                    ? `The agent takes over from the next scheduled pass: up to ${followUpAgentMaxTouches} touches, emailed with no human review. If it fails on a lead, nothing is sent to them.`
+                    : aiReady
                     ? 'New sends for this client will generate their copy. Static scripts stay as the fallback if generation fails.'
                     : 'There’s no system prompt or step instruction yet, so live sends keep using the static templates until you add one.',
                 confirmLabel: 'Switch to AI',
@@ -7630,8 +7712,19 @@ export default function ClientPage() {
         }
     };
 
-    const handleRunFollowUpPreview = async (lead: Lead) => {
-        if (!user || !clientId || !previewingFollowUpScript || !lead.email) return;
+    const followUpAgentTesting = followUpEditorMode === 'ai' && followUpAgentEnabled;
+
+    const handleRunFollowUpPreview = async (lead: Lead, options: { sendNow?: boolean } = {}) => {
+        if (!user || !clientId || !lead.email) return;
+        if (!previewingFollowUpScript && !followUpAgentTesting) return;
+        if (options.sendNow) {
+            const confirmed = await confirmAction({
+                title: `Send a real follow-up to ${lead.email}?`,
+                message: 'The agent writes a fresh email and sends it to this lead right away, with no review. This can’t be undone. Use a lead you own.',
+                confirmLabel: 'Send real email',
+            });
+            if (!confirmed) return;
+        }
         setFollowUpPreviewSelectedLead(lead);
         setFollowUpPreviewLoading(true);
         setFollowUpPreviewResult(null);
@@ -7647,8 +7740,9 @@ export default function ClientPage() {
                 },
                 body: JSON.stringify({
                     contactEmail: lead.email,
-                    scriptId: previewingFollowUpScript.id,
-                    mode: followUpEditorMode
+                    ...(previewingFollowUpScript ? { scriptId: previewingFollowUpScript.id } : {}),
+                    mode: followUpEditorMode,
+                    ...(options.sendNow ? { sendNow: true } : {})
                 })
             });
             if (!response.ok) {
@@ -7661,7 +7755,7 @@ export default function ClientPage() {
                     id: data.run.id,
                     status: data.run.status || 'running',
                     generation_step: data.run.generation_step || 'hydrate',
-                    mode: 'preview',
+                    mode: data.run.mode === 'send' ? 'send' : 'preview',
                 });
                 return;
             }
@@ -11873,10 +11967,61 @@ export default function ClientPage() {
                                         </p>
                                     )}
                                     <div className="settings-field">
-                                        <span className="settings-field__label">System instructions</span>
-                                        <pre className="follow-up-contract">{FOLLOW_UP_CODE_CONTRACT}</pre>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600 }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={followUpAgentEnabled}
+                                                disabled={savingFollowUpAgent}
+                                                onChange={(event) => handleSaveFollowUpAgentEnabled(event.target.checked)}
+                                            />
+                                            Follow-up agent
+                                        </label>
                                         <span className="settings-field__hint">
-                                            Always applied, and they win if they conflict with the prompt below. Drafts over {FOLLOW_UP_MAX_CHARS} characters are retried shorter, then trimmed. Not editable here.
+                                            Each touch reads the full thread, can research the store, and decides whether to send, skip or end the sequence. Emails go out with no review once live AI is on. Leads who already finished the static scripts are left alone, and so are leads whose latest autoresponder draft wasn&rsquo;t sent (archived, for example). The agent replaces step instructions and static fallbacks.
+                                        </span>
+                                    </div>
+                                    {followUpAgentEnabled ? (
+                                        <>
+                                            <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                                                <label className="settings-field">
+                                                    <span className="settings-field__label">Touches per lead</span>
+                                                    <input
+                                                        type="number"
+                                                        min={1}
+                                                        max={30}
+                                                        value={followUpAgentMaxTouches}
+                                                        onChange={(event) => setFollowUpAgentMaxTouches(event.target.value)}
+                                                    />
+                                                </label>
+                                                <label className="settings-field">
+                                                    <span className="settings-field__label">Days between touches</span>
+                                                    <input
+                                                        type="number"
+                                                        min={1}
+                                                        max={14}
+                                                        value={followUpAgentMinGapDays}
+                                                        onChange={(event) => setFollowUpAgentMinGapDays(event.target.value)}
+                                                    />
+                                                </label>
+                                            </div>
+                                            <div className="modal__actions" style={{ justifyContent: 'flex-start', marginTop: '-0.25rem' }}>
+                                                <button
+                                                    type="button"
+                                                    className="secondary-button"
+                                                    onClick={() => openFollowUpPreviewModal(null)}
+                                                >
+                                                    Test agent on a lead
+                                                </button>
+                                            </div>
+                                        </>
+                                    ) : null}
+                                    <div className="settings-field">
+                                        <span className="settings-field__label">{followUpAgentEnabled ? 'Agent instructions' : 'System instructions'}</span>
+                                        <pre className="follow-up-contract">{followUpAgentEnabled ? FOLLOW_UP_AGENT_GUIDANCE : FOLLOW_UP_CODE_CONTRACT}</pre>
+                                        <span className="settings-field__hint">
+                                            {followUpAgentEnabled
+                                                ? 'Always applied after the prompt below. Not editable here.'
+                                                : `Always applied, and they win if they conflict with the prompt below. Drafts over ${FOLLOW_UP_MAX_CHARS} characters are retried shorter, then trimmed. Not editable here.`}
                                         </span>
                                     </div>
                                     <label className="settings-field">
@@ -12672,7 +12817,7 @@ export default function ClientPage() {
                 </div>
             )}
 
-            {followUpPreviewModalOpen && previewingFollowUpScript && (
+            {followUpPreviewModalOpen && (previewingFollowUpScript || followUpAgentTesting) && (
                 <div
                     className="modal-overlay"
                     role="dialog"
@@ -12683,9 +12828,13 @@ export default function ClientPage() {
                         <div className="modal__header">
                             <div>
                                 <p className="eyebrow eyebrow--muted">Follow-Up Preview</p>
-                                <h2 className="modal__title">Script #{previewingFollowUpScript.script_order}</h2>
+                                <h2 className="modal__title">
+                                    {followUpAgentTesting ? 'Test the follow-up agent' : `Script #${previewingFollowUpScript?.script_order}`}
+                                </h2>
                                 <p className="modal__description">
-                                    {followUpEditorMode === 'ai'
+                                    {followUpAgentTesting
+                                        ? 'Search for a lead and the agent works its next touch through the same workflow live sends use. Nothing is sent unless you press the send button afterwards.'
+                                        : followUpEditorMode === 'ai'
                                         ? (followUpAiEnabled
                                             ? 'Search for a lead, then generate this step through the same Vercel workflow the scheduled send uses. Nothing is sent.'
                                             : 'Search for a lead, then generate this step through the same workflow live sends will use. Nothing is sent, and live sends stay on static scripts until you switch over.')
@@ -12763,7 +12912,7 @@ export default function ClientPage() {
                                 <WarmFollowUpProgress
                                     status={followUpPreviewRun.status}
                                     stepId={followUpPreviewRun.generation_step}
-                                    mode="preview"
+                                    mode={followUpPreviewRun.mode}
                                     tone="light"
                                 />
                             )}
@@ -12798,6 +12947,35 @@ export default function ClientPage() {
                                         </div>
                                     </div>
 
+                                    {followUpPreviewResult.agentOutcome ? (
+                                        <div>
+                                            <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
+                                                Agent
+                                            </div>
+                                            <div style={{ fontWeight: 600, color: 'var(--app-text)', marginBottom: '0.35rem' }}>
+                                                {followUpPreviewResult.runMode === 'send' && followUpPreviewResult.agentOutcome === 'send'
+                                                    ? (followUpPreviewResult.sentSendId && !followUpPreviewResult.notSentReason
+                                                        ? 'Sent this email'
+                                                        : (followUpPreviewResult.notSentReason || 'Not sent'))
+                                                    : (followUpPreviewResult.runMode === 'send' && followUpPreviewResult.notSentReason) || FOLLOW_UP_AGENT_OUTCOME_LABELS[followUpPreviewResult.agentOutcome]}
+                                            </div>
+                                            {followUpPreviewResult.agentTrace?.notes ? (
+                                                <p style={{ margin: '0 0 0.5rem', fontSize: '0.875rem', color: 'var(--app-text-mid)' }}>
+                                                    {followUpPreviewResult.agentTrace.notes}
+                                                </p>
+                                            ) : null}
+                                            {(followUpPreviewResult.agentTrace?.steps || []).length ? (
+                                                <ul style={{ margin: 0, paddingLeft: '1.1rem', fontSize: '0.8rem', color: 'var(--app-text-muted)' }}>
+                                                    {(followUpPreviewResult.agentTrace?.steps || []).map((step, index) => (
+                                                        <li key={`${step.tool}-${index}`}>
+                                                            {step.tool}{step.input ? `: ${step.input}` : ''}{step.ok === false && step.error ? ` (failed: ${step.error})` : ''}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            ) : null}
+                                        </div>
+                                    ) : null}
+
                                     {followUpEditorMode === 'ai' && followUpPreviewResult.researchBrief ? (
                                         <div>
                                             <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
@@ -12809,6 +12987,7 @@ export default function ClientPage() {
                                         </div>
                                     ) : null}
 
+                                    {followUpPreviewResult.renderedText || !followUpPreviewResult.agentOutcome ? (
                                     <div>
                                         <div style={{ fontSize: '0.78rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-text-faint)', marginBottom: '0.5rem' }}>
                                             {followUpEditorMode === 'ai' ? 'Generated copy' : 'Rendered body'}
@@ -12827,6 +13006,27 @@ export default function ClientPage() {
                                             {followUpPreviewResult.renderedText || ''}
                                         </div>
                                     </div>
+                                    ) : null}
+
+                                    {followUpAgentTesting
+                                        && followUpPreviewResult.runMode === 'preview'
+                                        && followUpPreviewResult.agentOutcome === 'send'
+                                        && followUpPreviewSelectedLead ? (
+                                        <div className="modal__actions" style={{ justifyContent: 'flex-start' }}>
+                                            <button
+                                                type="button"
+                                                className="secondary-button"
+                                                onClick={() => {
+                                                    if (followUpPreviewSelectedLead) {
+                                                        void handleRunFollowUpPreview(followUpPreviewSelectedLead, { sendNow: true });
+                                                    }
+                                                }}
+                                                disabled={followUpPreviewLoading}
+                                            >
+                                                Send one real email to this lead
+                                            </button>
+                                        </div>
+                                    ) : null}
 
                                     {followUpPreviewResult.renderedHtml ? (
                                     <div>

@@ -472,7 +472,7 @@ export function resolveReplyPreviewBehavior({ settings, campaignName, systemProm
     };
 }
 
-function popupOptionsFromResearchBrief(researchBrief, domain) {
+export function popupOptionsFromResearchBrief(researchBrief, domain) {
     const brief = researchBrief && typeof researchBrief === 'object' ? researchBrief : null;
     const estimatedVisitors = Number(brief?.estimatedVisitors);
     const reviewCount = Number(brief?.reviewCount);
@@ -853,7 +853,7 @@ async function resolvePreviousLeadMessageForDraft(db, {
  * Pulls the event rows that can carry a body and lets buildThreadMessages
  * classify/dedupe them (Instantly emits several events per email).
  */
-async function fetchThreadMessagesForReview(db, contactId, campaignId, leadEmail) {
+export async function fetchThreadMessagesForReview(db, contactId, campaignId, leadEmail) {
     if (!contactId || !campaignId) return [];
     const result = await db.query(
         `SELECT id, event_type, event_timestamp, lead_email, email_account,

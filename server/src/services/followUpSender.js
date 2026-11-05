@@ -463,6 +463,123 @@ async function getNextScriptForProspect(db, clientId, contactId, campaignId) {
 }
 
 /**
+ * SQL form of draftAllowsFollowUpAgent: no autoresponder draft for the contact,
+ * or the latest one was sent.
+ */
+function latestDraftAllowsAgentSql(contactIdSql) {
+    return `COALESCE((
+        SELECT d.status
+        FROM interested_autoresponder_drafts d
+        WHERE d.contact_id = ${contactIdSql}
+        ORDER BY d.created_at DESC, d.id DESC
+        LIMIT 1
+    ), 'sent') = 'sent'`;
+}
+
+/** Latest autoresponder draft status for a contact, or null when there is none. */
+export async function fetchLatestDraftStatus(db, contactId) {
+    const result = await db.query(
+        `SELECT status
+         FROM interested_autoresponder_drafts
+         WHERE contact_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`,
+        [contactId]
+    );
+    return result.rows[0]?.status || null;
+}
+
+/** A lead's agent runs that keep failing stop being retried after this many in a week. */
+const AGENT_MAX_FAILED_RUNS_PER_WEEK = 3;
+
+/**
+ * Eligibility clauses for agent mode, replacing "sends < active scripts".
+ * $1 client, $4 send date, $5 max touches, $6 min gap in days.
+ *
+ * - Touches are sends + agent skips, so a skip can't loop forever.
+ * - Spacing runs from the last send, skip or enrollment, by UTC calendar day.
+ * - A lead who already got every static script and no agent send is finished:
+ *   raising the touch limit must not restart those leads out of the blue.
+ */
+export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignIdSql = 'cic.campaign_id') {
+    const sent = `(
+               SELECT COUNT(*)::int
+               FROM follow_up_sends fus_seq
+               WHERE fus_seq.client_id = $1
+                 AND fus_seq.contact_id = ${contactIdSql}
+                 AND fus_seq.campaign_id = ${campaignIdSql}
+                 AND fus_seq.status = 'sent'
+           )`;
+    const skipped = `(
+               SELECT COUNT(*)::int
+               FROM follow_up_generation_runs gen_skip
+               WHERE gen_skip.contact_id = ${contactIdSql}
+                 AND gen_skip.campaign_id = ${campaignIdSql}
+                 AND gen_skip.mode = 'send'
+                 AND gen_skip.agent_outcome = 'skip'
+           )`;
+    return `-- Touch limit
+           AND ${sent} + ${skipped} < $5::int
+           -- Finished the static sequence before the agent took over: leave them
+           AND (
+               ${sent} = 0
+               OR ${sent} < (
+                   SELECT COUNT(*)::int
+                   FROM follow_up_scripts fsc
+                   WHERE fsc.client_id = $1
+                     AND fsc.active = TRUE
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM follow_up_generation_runs gen_sent
+                   WHERE gen_sent.contact_id = ${contactIdSql}
+                     AND gen_sent.campaign_id = ${campaignIdSql}
+                     AND gen_sent.mode = 'send'
+                     AND gen_sent.status = 'completed'
+                     AND gen_sent.agent_outcome = 'send'
+                     AND gen_sent.follow_up_send_id IS NOT NULL
+               )
+           )
+           -- Spacing: enough send days since the last touch of any kind
+           AND NOT EXISTS (
+               SELECT 1
+               FROM (
+                   SELECT fus_gap.created_at AS touched_at
+                   FROM follow_up_sends fus_gap
+                   WHERE fus_gap.contact_id = ${contactIdSql}
+                     AND fus_gap.campaign_id = ${campaignIdSql}
+                     AND fus_gap.status = 'sent'
+                   UNION ALL
+                   SELECT gen_gap.created_at
+                   FROM follow_up_generation_runs gen_gap
+                   WHERE gen_gap.contact_id = ${contactIdSql}
+                     AND gen_gap.campaign_id = ${campaignIdSql}
+                     AND gen_gap.mode = 'send'
+                     AND gen_gap.agent_outcome = 'skip'
+                   UNION ALL
+                   SELECT anchor_gap.event_timestamp
+                   FROM contact_instantly_events anchor_gap
+                   WHERE anchor_gap.contact_id = ${contactIdSql}
+                     AND anchor_gap.campaign_id = ${campaignIdSql}
+                     AND anchor_gap.event_type = $2
+               ) touches
+               WHERE (touches.touched_at AT TIME ZONE 'UTC')::date > $4::date - $6::int
+           )
+           -- Archived, unsent or still-in-review autoresponder draft: no agent
+           AND ${latestDraftAllowsAgentSql(contactIdSql)}
+           -- Stop retrying a lead whose agent runs keep failing
+           AND (
+               SELECT COUNT(*)::int
+               FROM follow_up_generation_runs gen_failed
+               WHERE gen_failed.contact_id = ${contactIdSql}
+                 AND gen_failed.campaign_id = ${campaignIdSql}
+                 AND gen_failed.mode = 'send'
+                 AND gen_failed.status = 'failed'
+                 AND gen_failed.created_at > NOW() - INTERVAL '7 days'
+           ) < ${AGENT_MAX_FAILED_RUNS_PER_WEEK}`;
+}
+
+/**
  * Fetch eligible contact+campaign rows for a client+date.
  *
  * Eligibility requires:
@@ -475,7 +592,23 @@ async function getNextScriptForProspect(db, clientId, contactId, campaignId) {
  *   5. At least one active follow_up_script remains in the sequence
  *      (sent count < active script count).
  */
-async function getEligibleProspects(db, clientId, sentForDate) {
+async function getEligibleProspects(db, clientId, sentForDate, agentConfig = null) {
+    const sequenceClauses = agentConfig
+        ? agentSequenceClauses()
+        : `-- Sequence not exhausted: fewer successful sends than active scripts
+           AND (
+               SELECT COUNT(*)::int
+               FROM follow_up_sends fus_seq
+               WHERE fus_seq.client_id = $1
+                 AND fus_seq.contact_id = cic.contact_id
+                 AND fus_seq.campaign_id = cic.campaign_id
+                 AND fus_seq.status = 'sent'
+           ) < (
+               SELECT COUNT(*)::int
+               FROM follow_up_scripts fsc
+               WHERE fsc.client_id = $1
+                 AND fsc.active = TRUE
+           )`;
     const result = await db.query(
         `SELECT
             cic.contact_id,
@@ -554,21 +687,10 @@ async function getEligibleProspects(db, clientId, sentForDate) {
                  AND gen.status = 'running'
                  AND gen.sent_for_date = $4::date
            )
-           -- Sequence not exhausted: fewer successful sends than active scripts
-           AND (
-               SELECT COUNT(*)::int
-               FROM follow_up_sends fus_seq
-               WHERE fus_seq.client_id = $1
-                 AND fus_seq.contact_id = cic.contact_id
-                 AND fus_seq.campaign_id = cic.campaign_id
-                 AND fus_seq.status = 'sent'
-           ) < (
-               SELECT COUNT(*)::int
-               FROM follow_up_scripts fsc
-               WHERE fsc.client_id = $1
-                 AND fsc.active = TRUE
-           )`,
-        [clientId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES, sentForDate]
+           ${sequenceClauses}`,
+        agentConfig
+            ? [clientId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES, sentForDate, agentConfig.maxTouches, agentConfig.minGapDays]
+            : [clientId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES, sentForDate]
     );
     return result.rows;
 }
@@ -580,7 +702,7 @@ async function getEligibleProspects(db, clientId, sentForDate) {
  * This prevents stale queued work from sending after a reply or status change
  * arrives between eligibility scan and the actual API call.
  */
-async function recheckProspect(db, contactId, campaignId, sentForDate) {
+export async function recheckProspect(db, contactId, campaignId, sentForDate) {
     // Contact-scoped blocker check after latest Warm Follow Up for this campaign
     // (no blocker.campaign_id filter — Calendly / null-campaign events still block)
     const blockerResult = await db.query(
@@ -813,7 +935,8 @@ export async function removeContactFromWarmFollowUps(db, {
     clientId,
     contactId,
     leadEmail = null,
-    removedBy = null
+    removedBy = null,
+    reason = null
 }) {
     const state = await getWarmFollowUpState(db, contactId);
     const target = state.campaigns.find((campaign) => campaign.active);
@@ -836,6 +959,7 @@ export async function removeContactFromWarmFollowUps(db, {
         event_type: WARM_FOLLOW_UP_REMOVED_EVENT,
         source: 'manual',
         removed_by: removedBy,
+        ...(reason ? { reason } : {}),
         previous_anchor_at: target.anchor_at,
         sent_count_at_removal: target.sent_count
     };
@@ -1087,11 +1211,22 @@ export async function runFollowUpsForClient({
 
     // Enforce client-configured send-day schedule (DOW: 0=Sun … 6=Sat, matching Date.getUTCDay())
     const clientRow = await pool.query(
-        'SELECT follow_up_send_days, follow_up_system_prompt, follow_up_ai_enabled FROM clients WHERE id = $1',
+        `SELECT follow_up_send_days, follow_up_system_prompt, follow_up_ai_enabled,
+                follow_up_agent_enabled, follow_up_agent_max_touches, follow_up_agent_min_gap_days
+         FROM clients WHERE id = $1`,
         [clientId]
     );
     const systemPrompt = clientRow.rows[0]?.follow_up_system_prompt || '';
     const aiEnabled = clientRow.rows[0]?.follow_up_ai_enabled === true;
+    // Live only when AI is live AND the agent is on AND it has a prompt to work from.
+    const agentConfig = aiEnabled
+        && clientRow.rows[0]?.follow_up_agent_enabled === true
+        && systemPrompt.trim()
+        ? {
+            maxTouches: clientRow.rows[0].follow_up_agent_max_touches,
+            minGapDays: clientRow.rows[0].follow_up_agent_min_gap_days
+        }
+        : null;
     const sendDays = clientRow.rows[0]?.follow_up_send_days ?? [1, 2, 3, 4, 5];
     const todayDow = new Date().getUTCDay();
     if (!sendDays.includes(todayDow)) {
@@ -1099,11 +1234,52 @@ export async function runFollowUpsForClient({
         return summary;
     }
 
-    const prospects = await getEligibleProspects(pool, clientId, sentForDate);
+    const prospects = await getEligibleProspects(pool, clientId, sentForDate, agentConfig);
     summary.eligible = prospects.length;
     logger(`[follow-up] ${prospects.length} eligible prospect(s) for client=${clientId} date=${sentForDate}`);
 
     const batch = prospects.slice(0, batchSize);
+
+    const queueAiRun = async (prospect, scriptId) => {
+        let queuedRunId = null;
+        try {
+            const { startFollowUpGeneration } = await import('./warmFollowUpGeneration/index.js');
+            const { isWarmFollowUpWorkflowConfigured, triggerWarmFollowUpWorkflow } = await import('./warmFollowUpGeneration/trigger.js');
+            if (!isWarmFollowUpWorkflowConfigured()) {
+                throw new Error('Warm-follow-up workflow is not configured (WORKFLOW_TRIGGER_SECRET).');
+            }
+            const runMode = dryRun ? 'preview' : 'send';
+            const run = await startFollowUpGeneration({
+                agencyId,
+                clientId,
+                contactId: prospect.contact_id,
+                campaignId: prospect.campaign_id,
+                scriptId,
+                mode: runMode,
+                sentForDate
+            });
+            queuedRunId = run.id;
+            await triggerWarmFollowUpWorkflow({ runId: run.id, agencyId });
+            logger(`[follow-up] queued AI ${runMode} run=${run.id} contact=${prospect.contact_id}`);
+            if (dryRun) summary.dryRun += 1;
+            else summary.queued += 1;
+        } catch (err) {
+            logger(`[follow-up] Failed to queue AI follow-up for contact=${prospect.contact_id}: ${err.message}`);
+            if (queuedRunId) {
+                try {
+                    const { failGenerationRun } = await import('./warmFollowUpGeneration/index.js');
+                    await failGenerationRun({
+                        runId: queuedRunId,
+                        agencyId,
+                        errorInfo: { message: err.message }
+                    });
+                } catch {
+                    // Keep the original queue failure as the worker outcome.
+                }
+            }
+            summary.failed += 1;
+        }
+    };
 
     for (const prospect of batch) {
         // Race-safe recheck immediately before sending
@@ -1111,6 +1287,18 @@ export async function runFollowUpsForClient({
         if (recheck.blocked) {
             logger(`[follow-up] Recheck blocked contact=${prospect.contact_id}: ${recheck.reason}`);
             summary.skipped += 1;
+            continue;
+        }
+
+        if (agentConfig) {
+            // No script row: the agent decides the angle. Don't spend a run on a
+            // lead we could never reply to.
+            if (!prospect.reply_to_uuid || !prospect.eaccount) {
+                logger(`[follow-up] Agent skipped contact=${prospect.contact_id}: missing thread metadata`);
+                summary.blocked += 1;
+                continue;
+            }
+            await queueAiRun(prospect, null);
             continue;
         }
 
@@ -1129,44 +1317,7 @@ export async function runFollowUpsForClient({
             systemPrompt,
             stepInstruction: script.step_instruction
         })) {
-            let queuedRunId = null;
-            try {
-                const { startFollowUpGeneration } = await import('./warmFollowUpGeneration/index.js');
-                const { isWarmFollowUpWorkflowConfigured, triggerWarmFollowUpWorkflow } = await import('./warmFollowUpGeneration/trigger.js');
-                if (!isWarmFollowUpWorkflowConfigured()) {
-                    throw new Error('Warm-follow-up workflow is not configured (WORKFLOW_TRIGGER_SECRET).');
-                }
-                const runMode = dryRun ? 'preview' : 'send';
-                const run = await startFollowUpGeneration({
-                    agencyId,
-                    clientId,
-                    contactId: prospect.contact_id,
-                    campaignId: prospect.campaign_id,
-                    scriptId: script.id,
-                    mode: runMode,
-                    sentForDate
-                });
-                queuedRunId = run.id;
-                await triggerWarmFollowUpWorkflow({ runId: run.id, agencyId });
-                logger(`[follow-up] queued AI ${runMode} run=${run.id} contact=${prospect.contact_id}`);
-                if (dryRun) summary.dryRun += 1;
-                else summary.queued += 1;
-            } catch (err) {
-                logger(`[follow-up] Failed to queue AI follow-up for contact=${prospect.contact_id}: ${err.message}`);
-                if (queuedRunId) {
-                    try {
-                        const { failGenerationRun } = await import('./warmFollowUpGeneration/index.js');
-                        await failGenerationRun({
-                            runId: queuedRunId,
-                            agencyId,
-                            errorInfo: { message: err.message }
-                        });
-                    } catch {
-                        // Keep the original queue failure as the worker outcome.
-                    }
-                }
-                summary.failed += 1;
-            }
+            await queueAiRun(prospect, script.id);
             continue;
         }
 

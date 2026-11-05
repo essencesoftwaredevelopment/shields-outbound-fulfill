@@ -40,6 +40,8 @@ const TOOL_OUTPUT_LIMIT = 12_000;
 const PROFILE_VALUE_LIMIT = 500;
 
 export const SUBMIT_DRAFT_TOOL_NAME = 'submit_draft';
+export const SKIP_TOUCH_TOOL_NAME = 'skip_touch';
+export const END_SEQUENCE_TOOL_NAME = 'end_sequence';
 
 export const REPLY_AGENT_GUIDANCE = [
     'HOW YOU WORK ON THIS REPLY',
@@ -74,7 +76,8 @@ export function buildReplyAgentTools({
     webSearch = false,
     thread = false,
     leadProfile = false,
-    storePreview = false
+    storePreview = false,
+    followUp = false
 } = {}) {
     const tools = [];
     if (webSearch) {
@@ -107,6 +110,27 @@ export function buildReplyAgentTools({
             'Generate a live, on-brand list-growth popup preview for this prospect\'s store and return its URL. Takes up to a couple of minutes. Useful when showing them something concrete would move the conversation forward; the campaign prompt describes when it fits. Never invent a preview URL — only use one this tool returns.',
             { reason: { type: 'string', description: 'Why this reply benefits from the preview.' } }
         ));
+    }
+    if (followUp) {
+        tools.push(functionTool(
+            SUBMIT_DRAFT_TOOL_NAME,
+            'Send this follow-up. It goes to the lead immediately, with no human review, and ends your work on this touch.',
+            {
+                reply: { type: 'string', description: 'The email body exactly as it should be sent: plain text, no sign-off.' },
+                notes_for_next_touch: { type: 'string', description: 'One to three short sentences for your next touch: the angle you used, what you learned about them, what you would try next.' }
+            }
+        ));
+        tools.push(functionTool(
+            SKIP_TOUCH_TOOL_NAME,
+            'Send nothing now. Use it when you have nothing worth their time today. It still uses up one of the touches in this sequence.',
+            { reason: { type: 'string', description: 'Why this touch should not go out.' } }
+        ));
+        tools.push(functionTool(
+            END_SEQUENCE_TOOL_NAME,
+            'Stop following up with this lead for good: they said no, asked to stop, are the wrong person, or more email would only annoy them.',
+            { reason: { type: 'string', description: 'Why the sequence should end.' } }
+        ));
+        return tools;
     }
     tools.push(functionTool(
         SUBMIT_DRAFT_TOOL_NAME,
@@ -147,13 +171,21 @@ export function addAllowedLinks(allowed, text) {
     }
 }
 
-/** Links in the reply that never appeared in the prompt, the input or a tool result. */
-export function findUnapprovedLinks(reply, allowed) {
+function isAllowedHost(key, hosts) {
+    const host = key.split('/')[0];
+    return hosts.some((allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`));
+}
+
+/**
+ * Links in the reply that are not on the allowed list. `allowedHosts` approves a
+ * whole site (the lead's own store) instead of exact pages.
+ */
+export function findUnapprovedLinks(reply, allowed, allowedHosts = []) {
     const seen = new Set();
     const unapproved = [];
     for (const link of extractLinks(reply)) {
         const key = linkKey(link);
-        if (!key || allowed.has(key) || seen.has(key)) continue;
+        if (!key || allowed.has(key) || seen.has(key) || isAllowedHost(key, allowedHosts)) continue;
         seen.add(key);
         unapproved.push(link);
     }
@@ -307,6 +339,26 @@ function truncateOutput(text) {
 }
 
 /**
+ * The get_thread payload, dropping the oldest messages to fit the tool output
+ * limit. Generic truncation cuts the end of the JSON, which on an oldest-first
+ * thread would lose the newest messages: the ones that matter most.
+ */
+export function fitThreadToOutputLimit(messages, limit = TOOL_OUTPUT_LIMIT) {
+    const kept = messages.map((message) => ({
+        direction: message.direction,
+        from: message.from,
+        sentAt: message.sentAt,
+        subject: message.subject,
+        text: message.text
+    }));
+    const payload = () => (kept.length < messages.length
+        ? { omittedOlderMessages: messages.length - kept.length, messages: kept }
+        : { messages: kept });
+    while (kept.length > 1 && JSON.stringify(payload()).length > limit) kept.shift();
+    return payload();
+}
+
+/**
  * Run the reply agent. Returns the submitted reply, the reviewer notes, any
  * store preview URL it generated, and a compact trace for the review page.
  *
@@ -322,8 +374,19 @@ function truncateOutput(text) {
  *   allowedUrls?: string[],
  *   model?: string,
  *   maxTurns?: number,
- *   budgetMs?: number
+ *   budgetMs?: number,
+ *   reasoningEffort?: string,
+ *   followUp?: boolean,
+ *   allowedHosts?: string[],
+ *   validateReply?: ((reply: string) => string | null) | null
  * }} args
+ *
+ * `followUp` is for sends with no human review, so it is stricter than a reviewed
+ * draft: links must come from the prompt, allowedUrls, allowedHosts or a generated
+ * preview (a web page or an email can't approve a link), every turn must call a
+ * tool (reasoning prose can't become the email), and a reply that fails a check is
+ * never accepted, even on the forced final turn. It also adds skip_touch and
+ * end_sequence; result.outcome says which one ended the run.
  */
 export async function runReplyAgent({
     openaiKey,
@@ -337,7 +400,11 @@ export async function runReplyAgent({
     allowedUrls = [],
     model = REPLY_AGENT_MODEL,
     maxTurns = REPLY_AGENT_MAX_TURNS,
-    budgetMs = REPLY_AGENT_BUDGET_MS
+    budgetMs = REPLY_AGENT_BUDGET_MS,
+    reasoningEffort = REPLY_AGENT_REASONING_EFFORT,
+    followUp = false,
+    allowedHosts = [],
+    validateReply = null
 }) {
     const openai = client || new OpenAI({ apiKey: openaiKey });
     const startedAt = Date.now();
@@ -345,12 +412,13 @@ export async function runReplyAgent({
         webSearch: Boolean(serperKey),
         thread: Boolean(loadThread),
         leadProfile: Boolean(leadProfile),
-        storePreview: Boolean(generateStorePreview)
+        storePreview: Boolean(generateStorePreview),
+        followUp
     });
 
     const allowed = new Set();
     addAllowedLinks(allowed, instructions);
-    addAllowedLinks(allowed, input);
+    if (!followUp) addAllowedLinks(allowed, input);
     for (const url of allowedUrls) addAllowedLinks(allowed, url);
 
     let previewUrl = null;
@@ -359,15 +427,7 @@ export async function runReplyAgent({
         web_search: serperKey ? (args) => serperSearch(String(args.query || '').trim(), serperKey) : null,
         fetch_page: (args) => fetchPublicPage(args.url),
         get_thread: loadThread
-            ? async () => ({
-                messages: (await loadThread()).map((message) => ({
-                    direction: message.direction,
-                    from: message.from,
-                    sentAt: message.sentAt,
-                    subject: message.subject,
-                    text: message.text
-                }))
-            })
+            ? async () => fitThreadToOutputLimit(await loadThread())
             : null,
         get_lead_profile: leadProfile ? async () => leadProfile : null,
         generate_store_preview: generateStorePreview
@@ -377,6 +437,7 @@ export async function runReplyAgent({
                 const url = await previewPromise;
                 if (!url) return { error: 'Preview generation failed. Do not invent a preview URL.' };
                 previewUrl = url;
+                addAllowedLinks(allowed, url);
                 return { previewUrl: url };
             }
             : null
@@ -395,7 +456,7 @@ export async function runReplyAgent({
             result = { error: error?.message || 'Tool failed' };
         }
         const output = truncateOutput(JSON.stringify(result ?? null));
-        addAllowedLinks(allowed, output);
+        if (!followUp) addAllowedLinks(allowed, output);
         steps.push({
             tool: call.name,
             input: summarizeToolInput(call.name, args),
@@ -411,8 +472,10 @@ export async function runReplyAgent({
         instructions,
         tools,
         parallel_tool_calls: true,
-        ...(REPLY_AGENT_REASONING_EFFORT ? { reasoning: { effort: REPLY_AGENT_REASONING_EFFORT } } : {}),
-        tool_choice: forceSubmit ? { type: 'function', name: SUBMIT_DRAFT_TOOL_NAME } : 'auto',
+        ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+        tool_choice: forceSubmit
+            ? { type: 'function', name: SUBMIT_DRAFT_TOOL_NAME }
+            : (followUp ? 'required' : 'auto'),
         ...body
     });
 
@@ -430,11 +493,25 @@ export async function runReplyAgent({
         if (!calls.length) {
             // Answered in plain text instead of submitting — take it as the draft.
             const text = String(response.output_text || '').trim();
-            if (text) draft = { reply: text, notes: null, submitted: false };
+            if (text && !followUp) draft = { reply: text, notes: null, submitted: false };
             break;
         }
 
         const submitCall = calls.find((call) => call.name === SUBMIT_DRAFT_TOOL_NAME);
+        const stopCall = submitCall ? null : calls.find(
+            (call) => call.name === SKIP_TOUCH_TOOL_NAME || call.name === END_SEQUENCE_TOOL_NAME
+        );
+        if (stopCall) {
+            const reason = String(parseArguments(stopCall.arguments).reason || '').trim() || null;
+            steps.push({ tool: stopCall.name, input: reason ? reason.slice(0, 200) : null, ok: true, ms: 0 });
+            draft = {
+                outcome: stopCall.name === END_SEQUENCE_TOOL_NAME ? 'end' : 'skip',
+                reply: null,
+                notes: reason,
+                submitted: true
+            };
+            break;
+        }
         const outputs = await Promise.all(
             calls.filter((call) => call !== submitCall).map(runTool)
         );
@@ -442,31 +519,38 @@ export async function runReplyAgent({
         if (submitCall) {
             const args = parseArguments(submitCall.arguments);
             const reply = String(args.reply || '').trim();
-            const unapproved = reply ? findUnapprovedLinks(reply, allowed) : [];
-            if (reply && (!unapproved.length || forced)) {
+            const unapproved = reply ? findUnapprovedLinks(reply, allowed, allowedHosts) : [];
+            const invalidReason = reply && validateReply ? validateReply(reply) : null;
+            if (reply && !invalidReason && (!unapproved.length || (forced && !followUp))) {
                 steps.push({ tool: SUBMIT_DRAFT_TOOL_NAME, input: null, ok: true, ms: 0 });
                 draft = {
                     reply,
-                    notes: String(args.notes_for_reviewer || '').trim() || null,
+                    notes: String(args.notes_for_reviewer ?? args.notes_for_next_touch ?? '').trim() || null,
                     submitted: true,
                     unapprovedLinks: unapproved
                 };
                 break;
             }
+            const stepError = !reply
+                ? 'Empty reply'
+                : (invalidReason || `Unverified links: ${unapproved.join(', ')}`);
             steps.push({
                 tool: SUBMIT_DRAFT_TOOL_NAME,
                 input: null,
                 ok: false,
-                error: reply ? `Unverified links: ${unapproved.join(', ')}`.slice(0, 200) : 'Empty reply',
+                error: stepError.slice(0, 200),
                 ms: 0
             });
+            const linkError = followUp
+                ? `These links are not allowed: ${unapproved.join(', ')}. Only use links from your instructions, the lead's own site, or a preview you generated, then call ${SUBMIT_DRAFT_TOOL_NAME} again.`
+                : `These links did not come from the campaign prompt or a tool result: ${unapproved.join(', ')}. Remove them or replace them with a link you got from a tool, then call ${SUBMIT_DRAFT_TOOL_NAME} again.`;
             outputs.push({
                 type: 'function_call_output',
                 call_id: submitCall.call_id,
                 output: JSON.stringify({
-                    error: reply
-                        ? `These links did not come from the campaign prompt or a tool result: ${unapproved.join(', ')}. Remove them or replace them with a link you got from a tool, then call ${SUBMIT_DRAFT_TOOL_NAME} again.`
-                        : 'The reply was empty.'
+                    error: !reply
+                        ? 'The reply was empty.'
+                        : (invalidReason || linkError)
                 })
             });
         }
@@ -487,11 +571,13 @@ export async function runReplyAgent({
     );
     return {
         model: response.model || model,
+        outcome: draft.outcome || 'send',
         reply: draft.reply,
         notes: draft.notes,
         previewUrl,
         trace: {
             mode: 'agent',
+            outcome: draft.outcome || 'send',
             notes: draft.notes,
             submitted: draft.submitted,
             unapprovedLinks: draft.unapprovedLinks || [],

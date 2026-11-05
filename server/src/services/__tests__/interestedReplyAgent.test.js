@@ -5,6 +5,7 @@ import {
     buildAgentLeadProfile,
     buildReplyAgentTools,
     findUnapprovedLinks,
+    fitThreadToOutputLimit,
     isPrivateAddress,
     linkKey,
     runReplyAgent,
@@ -182,5 +183,97 @@ describe('serializeAgentTraceForReview', () => {
         });
         assert.deepEqual(view.steps, [{ tool: 'web_search', input: 'q', ok: true, error: null }]);
         assert.equal(view.notes, 'n');
+    });
+});
+
+describe('runReplyAgent follow-up mode (no human review)', () => {
+    const submit = (reply) => ({ output: [call('submit_draft', { reply, notes_for_next_touch: 'used the bundle angle' }, reply.length)] });
+    const followUpArgs = {
+        openaiKey: 'x',
+        instructions: 'Book here: https://cal.example/book',
+        input: 'Lead pasted https://evil.example/x in an email.',
+        followUp: true,
+        allowedHosts: ['store.com'],
+        maxTurns: 3
+    };
+
+    it('offers skip and end tools only in follow-up mode', () => {
+        const names = (opts) => buildReplyAgentTools(opts).map((tool) => tool.name);
+        assert.ok(names({ followUp: true }).includes('skip_touch'));
+        assert.ok(names({ followUp: true }).includes('end_sequence'));
+        assert.ok(!names({}).includes('skip_touch'));
+    });
+
+    it('accepts prompt links and the lead\'s own site, and requires a tool call', async () => {
+        const client = fakeClient([submit('See https://www.store.com/products/a and https://cal.example/book')]);
+        const result = await runReplyAgent({ ...followUpArgs, client });
+        assert.equal(result.outcome, 'send');
+        assert.equal(result.notes, 'used the bundle angle');
+        assert.equal(client.requests[0].tool_choice, 'required');
+    });
+
+    it('never approves a link just because a page or email contained it', async () => {
+        const client = fakeClient([
+            { output: [call('fetch_page', { url: 'http://127.0.0.1/' })] },
+            submit('Go to https://evil.example/x'),
+            submit('Book at https://cal.example/book')
+        ]);
+        const result = await runReplyAgent({ ...followUpArgs, client });
+        assert.equal(result.reply, 'Book at https://cal.example/book');
+        assert.deepEqual(result.trace.unapprovedLinks, []);
+    });
+
+    it('fails rather than send an unapproved link on the forced final turn', async () => {
+        const client = fakeClient([submit('Go to https://evil.example/x'), submit('Go to https://evil.example/x')]);
+        await assert.rejects(runReplyAgent({ ...followUpArgs, client, maxTurns: 2 }), /reply_agent_no_draft/);
+    });
+
+    it('still lets a reviewed draft keep links from tool output', async () => {
+        const client = fakeClient([submit('Go to https://evil.example/x')]);
+        const result = await runReplyAgent({ openaiKey: 'x', client, instructions: 'i', input: 'https://evil.example/x', maxTurns: 3 });
+        assert.equal(result.reply, 'Go to https://evil.example/x');
+    });
+
+    it('sends the agent back to rewrite when validateReply rejects', async () => {
+        const client = fakeClient([submit('way too long'), submit('short')]);
+        const result = await runReplyAgent({
+            ...followUpArgs,
+            client,
+            validateReply: (reply) => (reply.length > 6 ? 'Too long' : null)
+        });
+        assert.equal(result.reply, 'short');
+        assert.equal(result.trace.steps[0].ok, false);
+    });
+
+    it('reports skip and end decisions with no email', async () => {
+        for (const [tool, outcome] of [['skip_touch', 'skip'], ['end_sequence', 'end']]) {
+            const client = fakeClient([{ output: [call(tool, { reason: 'asked to wait until January' })] }]);
+            const result = await runReplyAgent({ ...followUpArgs, client });
+            assert.equal(result.outcome, outcome);
+            assert.equal(result.reply, null);
+            assert.equal(result.notes, 'asked to wait until January');
+        }
+    });
+
+    it('does not take plain text as the email', async () => {
+        const client = fakeClient([{ output: [], output_text: 'Let me think about this lead...' }]);
+        await assert.rejects(runReplyAgent({ ...followUpArgs, client }), /reply_agent_no_draft/);
+    });
+});
+
+describe('fitThreadToOutputLimit', () => {
+    const message = (text) => ({ direction: 'outbound', from: 'a', sentAt: 't', subject: 's', text, ignored: 'x' });
+
+    it('returns short threads whole, without extra fields', () => {
+        assert.deepEqual(fitThreadToOutputLimit([message('hi')]), {
+            messages: [{ direction: 'outbound', from: 'a', sentAt: 't', subject: 's', text: 'hi' }]
+        });
+    });
+
+    it('drops the oldest messages, keeping the newest', () => {
+        const fitted = fitThreadToOutputLimit([message('old'.repeat(100)), message('mid'.repeat(100)), message('new')], 400);
+        assert.equal(fitted.messages.at(-1).text, 'new');
+        assert.ok(fitted.omittedOlderMessages >= 1);
+        assert.ok(!JSON.stringify(fitted).includes('oldold'));
     });
 });

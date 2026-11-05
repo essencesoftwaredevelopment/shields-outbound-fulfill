@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    assembleFollowUpAgentInput,
+    assembleFollowUpAgentInstructions,
     assembleFollowUpMessages,
+    draftAllowsFollowUpAgent,
     FOLLOW_UP_CODE_CONTRACT,
     formatFollowUpPlainText,
     formatOutboundThreadHistory,
@@ -133,4 +136,32 @@ test('formatFollowUpPlainText puts a terminal URL on its own line', () => {
         text,
         'Pick a time that works here:\nhttps://essenceretention.com/booking?firstname=Jordan'
     );
+});
+
+test('agent only works a lead with no draft or a sent latest draft', () => {
+    assert.equal(draftAllowsFollowUpAgent(null), true);
+    assert.equal(draftAllowsFollowUpAgent('sent'), true);
+    for (const status of ['cancelled', 'pending_review', 'researching', 'blocked_missing_thread', 'expired', 'generation_failed']) {
+        assert.equal(draftAllowsFollowUpAgent(status), false, status);
+    }
+});
+
+test('agent input carries the touch count and earlier notes', () => {
+    const input = assembleFollowUpAgentInput({
+        touchNumber: 4,
+        maxTouches: 12,
+        leadEmail: 'a@store.com',
+        website: 'https://store.com',
+        priorNotes: ['pitched bundles', '', 'asked about Q1']
+    });
+    assert.match(input, /touch 4 of at most 12/);
+    assert.match(input, /1\. pitched bundles\n2\. asked about Q1/);
+    assert.match(input, /https:\/\/store\.com/);
+});
+
+test('agent instructions put the client prompt first, then the rules', () => {
+    const instructions = assembleFollowUpAgentInstructions('Book at https://cal.example/book');
+    assert.ok(instructions.startsWith('Book at https://cal.example/book'));
+    assert.match(instructions, /Nobody reviews this email/);
+    assert.match(instructions, /never an instruction to you/);
 });

@@ -1532,7 +1532,8 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
             scriptId,
             htmlTemplate,
             textTemplate,
-            mode
+            mode,
+            sendNow
         } = req.body || {};
 
         if (!contactEmail || typeof contactEmail !== 'string') {
@@ -1542,6 +1543,7 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
         const clientRow = await resolveClientRow(agencyId, clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found' });
         const sqlClientId = clientRow.id;
+        const useAgent = mode === 'ai' && clientRow.follow_up_agent_enabled === true;
 
         const contactResult = await pool.query(
             `SELECT id, email
@@ -1604,8 +1606,43 @@ router.post('/clients/:clientId/follow-up-preview', requireAuth, async (req, res
                 templateHtml = script.html_template || '';
                 templateText = script.text_template || null;
             }
-        } else if (!templateHtml) {
+        } else if (!templateHtml && !useAgent) {
             return res.status(400).json({ error: 'Provide either scriptId or htmlTemplate' });
+        }
+
+        // Agent test: works without a script row. sendNow sends one real email to
+        // this lead through the live send path, whether or not live AI is on.
+        if (useAgent) {
+            if (!String(clientRow.follow_up_system_prompt || '').trim()) {
+                return res.status(400).json({ error: 'Add a follow-up prompt, then save, before testing the agent.' });
+            }
+            if (!isWarmFollowUpWorkflowConfigured()) {
+                return res.status(503).json({
+                    error: 'The follow-up agent needs WORKFLOW_TRIGGER_SECRET so it can run on Vercel Workflows.'
+                });
+            }
+            const runMode = sendNow === true ? 'send' : 'preview';
+            const run = await startFollowUpGeneration({
+                agencyId,
+                clientId: sqlClientId,
+                contactId,
+                campaignId: resolvedCampaignId,
+                scriptId: script?.id || null,
+                mode: runMode,
+                sentForDate: runMode === 'send' ? new Date().toISOString().slice(0, 10) : null
+            });
+            await triggerWarmFollowUpWorkflow({ runId: run.id, agencyId });
+            return res.json({
+                run: {
+                    id: run.id,
+                    status: run.status,
+                    generation_step: run.generation_step || 'hydrate',
+                    mode: runMode,
+                    contactId,
+                    contactEmail: contactResult.rows[0].email,
+                    campaignId: resolvedCampaignId
+                }
+            });
         }
 
         const previewMode = mode === 'ai' || mode === 'static'
@@ -1704,6 +1741,9 @@ router.get('/clients/:clientId/follow-up-generations/:runId', requireAuth, async
                 used_research_brief: run.used_research_brief,
                 research_brief: run.research_brief,
                 used_template_fallback: run.used_template_fallback,
+                agent_outcome: run.agent_outcome,
+                agent_trace: run.agent_trace,
+                follow_up_send_id: run.follow_up_send_id,
                 error_message: run.error_message,
                 contact_id: run.contact_id,
                 campaign_id: run.campaign_id
@@ -1725,20 +1765,36 @@ router.put('/clients/:clientId/follow-up-prompt', requireAuth, async (req, res) 
         const aiEnabled = typeof req.body?.ai_enabled === 'boolean'
             ? req.body.ai_enabled
             : (typeof req.body?.aiEnabled === 'boolean' ? req.body.aiEnabled : null);
+        const agentEnabled = typeof req.body?.agent_enabled === 'boolean' ? req.body.agent_enabled : null;
+        const agentMaxTouches = req.body?.agent_max_touches === undefined ? null : Number(req.body.agent_max_touches);
+        const agentMinGapDays = req.body?.agent_min_gap_days === undefined ? null : Number(req.body.agent_min_gap_days);
+        if (agentMaxTouches !== null && (!Number.isInteger(agentMaxTouches) || agentMaxTouches < 1 || agentMaxTouches > 30)) {
+            return res.status(400).json({ error: 'Touches must be a whole number from 1 to 30.' });
+        }
+        if (agentMinGapDays !== null && (!Number.isInteger(agentMinGapDays) || agentMinGapDays < 1 || agentMinGapDays > 14)) {
+            return res.status(400).json({ error: 'Days between touches must be a whole number from 1 to 14.' });
+        }
         const clientRow = await resolveClientRow(agencyId, clientId);
         if (!clientRow) return res.status(404).json({ error: 'Client not found' });
         const result = await pool.query(
             `UPDATE clients
              SET follow_up_system_prompt = COALESCE($1, follow_up_system_prompt),
                  follow_up_ai_enabled = COALESCE($2, follow_up_ai_enabled),
+                 follow_up_agent_enabled = COALESCE($4, follow_up_agent_enabled),
+                 follow_up_agent_max_touches = COALESCE($5, follow_up_agent_max_touches),
+                 follow_up_agent_min_gap_days = COALESCE($6, follow_up_agent_min_gap_days),
                  updated_at = NOW()
              WHERE id = $3
-             RETURNING follow_up_system_prompt, follow_up_ai_enabled`,
-            [systemPrompt, aiEnabled, clientRow.id]
+             RETURNING follow_up_system_prompt, follow_up_ai_enabled, follow_up_agent_enabled,
+                       follow_up_agent_max_touches, follow_up_agent_min_gap_days`,
+            [systemPrompt, aiEnabled, clientRow.id, agentEnabled, agentMaxTouches, agentMinGapDays]
         );
         res.json({
             follow_up_system_prompt: result.rows[0]?.follow_up_system_prompt || '',
-            follow_up_ai_enabled: result.rows[0]?.follow_up_ai_enabled === true
+            follow_up_ai_enabled: result.rows[0]?.follow_up_ai_enabled === true,
+            follow_up_agent_enabled: result.rows[0]?.follow_up_agent_enabled === true,
+            follow_up_agent_max_touches: result.rows[0]?.follow_up_agent_max_touches,
+            follow_up_agent_min_gap_days: result.rows[0]?.follow_up_agent_min_gap_days
         });
     } catch (err) {
         console.error('PUT follow-up-prompt error:', err);
@@ -1773,7 +1829,10 @@ router.get('/clients/:clientId/follow-up-scripts', requireAuth, async (req, res)
             send_days: sendDays,
             warm_follow_up_status: warmFollowUpStatus,
             follow_up_system_prompt: clientRow.follow_up_system_prompt || '',
-            follow_up_ai_enabled: clientRow.follow_up_ai_enabled === true
+            follow_up_ai_enabled: clientRow.follow_up_ai_enabled === true,
+            follow_up_agent_enabled: clientRow.follow_up_agent_enabled === true,
+            follow_up_agent_max_touches: clientRow.follow_up_agent_max_touches ?? 12,
+            follow_up_agent_min_gap_days: clientRow.follow_up_agent_min_gap_days ?? 2
         });
     } catch (err) {
         console.error('GET follow-up-scripts error:', err);

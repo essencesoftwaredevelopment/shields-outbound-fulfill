@@ -9,15 +9,20 @@ import OpenAI from 'openai';
 import { pool } from '../../config/db.js';
 import { fetchAgencyAndClientSettings } from '../interestedAutoResponder.js';
 import {
+    fetchLatestDraftStatus,
     htmlToPlainText,
+    recheckProspect,
+    removeContactFromWarmFollowUps,
     renderTemplate,
     resolveTemplateVars,
     sanitizeHtml,
     sendRenderedFollowUp,
     fetchThreadReplyMetadata
 } from '../followUpSender.js';
+import { runFollowUpAgent } from './agent.js';
 import {
     assembleFollowUpMessages,
+    draftAllowsFollowUpAgent,
     FOLLOW_UP_MAX_CHARS,
     formatFollowUpPlainText,
     formatOutboundThreadHistory,
@@ -138,7 +143,8 @@ async function loadRunInputs(runId, agencyId) {
             )
             : Promise.resolve({ rows: [] }),
         pool.query(
-            `SELECT id, follow_up_system_prompt, instantly_key
+            `SELECT id, follow_up_system_prompt, instantly_key,
+                    follow_up_agent_enabled, follow_up_agent_max_touches
              FROM clients
              WHERE id = $1
              LIMIT 1`,
@@ -172,6 +178,8 @@ async function loadRunInputs(runId, agencyId) {
         campaignName: campaign.name || contact.campaign_name || '',
         systemPrompt: client.follow_up_system_prompt || '',
         instantlyKey: client.instantly_key || null,
+        agentEnabled: client.follow_up_agent_enabled === true,
+        agentMaxTouches: Number(client.follow_up_agent_max_touches) || 0,
         script
     };
 }
@@ -299,6 +307,106 @@ function fallbackFromTemplate(script, vars) {
     return { renderedHtml, renderedText, usedTemplateFallback: true };
 }
 
+/** Generated plain text → the html + text pair we send, signature appended. */
+function renderGeneratedCopy(generatedText, vars) {
+    let renderedText = generatedText ? formatFollowUpPlainText(generatedText) : '';
+    let renderedHtml = generatedText ? sanitizeHtml(plainTextToFollowUpHtml(generatedText)) : '';
+
+    const signatureHtml = String(vars.instantly_signature || '').trim();
+    if (renderedHtml && signatureHtml) {
+        const safeSignature = sanitizeHtml(signatureHtml);
+        if (safeSignature) {
+            renderedHtml = `${renderedHtml}${safeSignature}`;
+            const signatureText = htmlToPlainText(safeSignature);
+            if (signatureText && !renderedText.includes(signatureText)) {
+                renderedText = `${renderedText}\n\n${signatureText}`;
+            }
+        }
+    }
+    return { renderedText, renderedHtml };
+}
+
+async function saveAgentRun({ runId, agencyId, outcome, trace, renderedSubject = null, renderedHtml = null, renderedText = null }) {
+    await pool.query(
+        `UPDATE follow_up_generation_runs
+         SET agent_outcome = $3,
+             agent_trace = $4::jsonb,
+             rendered_subject = $5,
+             rendered_html = $6,
+             rendered_text = $7,
+             updated_at = NOW()
+         WHERE id = $1 AND agency_id = $2 AND status = 'running'`,
+        [runId, agencyId, outcome, JSON.stringify(trace), renderedSubject, renderedHtml, renderedText]
+    );
+}
+
+/**
+ * Agent path of generateFollowUpCopy. Never falls back to a static template: if
+ * the agent can't produce a clean email the run fails, nothing is sent, and the
+ * next pass tries again.
+ */
+async function generateFollowUpWithAgent({ runId, agencyId, ctx, settings, researchBrief }) {
+    const latestDraftStatus = await fetchLatestDraftStatus(pool, ctx.contactId);
+    if (!draftAllowsFollowUpAgent(latestDraftStatus)) {
+        await saveAgentRun({
+            runId,
+            agencyId,
+            outcome: 'blocked',
+            trace: {
+                mode: 'agent',
+                outcome: 'blocked',
+                notes: `Agent not run: the latest autoresponder draft for this lead is ${latestDraftStatus}, not sent.`,
+                steps: []
+            }
+        });
+        return { agentOutcome: 'blocked', usedResearchBrief: false, usedTemplateFallback: false };
+    }
+
+    if (!settings.openaiKey) {
+        throw new Error('No OpenAI API key configured for this agency.');
+    }
+    const threadMeta = await fetchThreadReplyMetadata(pool, ctx.contactId, ctx.campaignId);
+    const vars = await resolveTemplateVars(pool, ctx.contactId, ctx.campaignId, {
+        clientId: ctx.clientId,
+        emailAccount: threadMeta.eaccount
+    });
+    const thread = await loadThreadContext(ctx.contactId, ctx.campaignId);
+    const result = await runFollowUpAgent({
+        ctx,
+        settings,
+        vars,
+        thread,
+        researchBrief,
+        systemPrompt: renderTemplate(ctx.systemPrompt || '', vars),
+        model: FOLLOW_UP_MODEL,
+        reasoningEffort: FOLLOW_UP_REASONING_EFFORT
+    });
+
+    if (result.outcome !== 'send') {
+        await saveAgentRun({ runId, agencyId, outcome: result.outcome, trace: result.trace });
+        return { agentOutcome: result.outcome, usedResearchBrief: Boolean(researchBrief), usedTemplateFallback: false };
+    }
+
+    const { renderedText, renderedHtml } = renderGeneratedCopy(result.reply, vars);
+    await saveAgentRun({
+        runId,
+        agencyId,
+        outcome: 'send',
+        trace: result.trace,
+        renderedSubject: thread.threadSubject,
+        renderedHtml,
+        renderedText
+    });
+    return {
+        agentOutcome: 'send',
+        renderedSubject: thread.threadSubject,
+        renderedHtml,
+        renderedText,
+        usedResearchBrief: Boolean(researchBrief),
+        usedTemplateFallback: false
+    };
+}
+
 async function callFollowUpModel({ openaiKey, messages }) {
     const client = new OpenAI({ apiKey: openaiKey });
     const response = await client.chat.completions.create({
@@ -322,6 +430,15 @@ export async function generateFollowUpCopy({ runId, agencyId, researchBrief = nu
     await stampGenerationStep(runId, agencyId, 'generate');
     const ctx = await loadRunInputs(runId, agencyId);
     const settings = await fetchAgencyAndClientSettings(agencyId, ctx.clientId);
+    if (ctx.agentEnabled) {
+        return generateFollowUpWithAgent({
+            runId,
+            agencyId,
+            ctx,
+            settings,
+            researchBrief: researchBrief && typeof researchBrief === 'object' ? researchBrief : null
+        });
+    }
     const threadMeta = await fetchThreadReplyMetadata(pool, ctx.contactId, ctx.campaignId);
     const vars = await resolveTemplateVars(pool, ctx.contactId, ctx.campaignId, {
         clientId: ctx.clientId,
@@ -374,20 +491,7 @@ export async function generateFollowUpCopy({ runId, agencyId, researchBrief = nu
         generatedText = generatedText.slice(0, FOLLOW_UP_MAX_CHARS).trim();
     }
 
-    let renderedText = generatedText ? formatFollowUpPlainText(generatedText) : '';
-    let renderedHtml = generatedText ? sanitizeHtml(plainTextToFollowUpHtml(generatedText)) : '';
-
-    const signatureHtml = String(vars.instantly_signature || '').trim();
-    if (renderedHtml && signatureHtml) {
-        const safeSignature = sanitizeHtml(signatureHtml);
-        if (safeSignature) {
-            renderedHtml = `${renderedHtml}${safeSignature}`;
-            const signatureText = htmlToPlainText(safeSignature);
-            if (signatureText && !renderedText.includes(signatureText)) {
-                renderedText = `${renderedText}\n\n${signatureText}`;
-            }
-        }
-    }
+    let { renderedText, renderedHtml } = renderGeneratedCopy(generatedText, vars);
 
     if (!renderedText) {
         const fallback = fallbackFromTemplate(ctx.script, vars);
@@ -435,6 +539,20 @@ export async function finalizePreviewRun({ runId, agencyId }) {
     return { runId: run.id, status: 'completed' };
 }
 
+/** Close a send run that ends without an email, recording why. */
+async function completeRunWithoutSend(run, agencyId, { note = null, agentOutcome = null } = {}) {
+    await pool.query(
+        `UPDATE follow_up_generation_runs
+         SET status = 'completed',
+             error_message = COALESCE($3, error_message),
+             agent_outcome = COALESCE($4, agent_outcome),
+             updated_at = NOW()
+         WHERE id = $1 AND agency_id = $2 AND status = 'running'`,
+        [run.id, agencyId, note, agentOutcome]
+    );
+    return { runId: run.id, status: 'completed', sendId: null };
+}
+
 export async function sendGeneratedFollowUp({ runId, agencyId }) {
     const run = await requireRunningRun(runId, agencyId);
     if (run.mode !== 'send') {
@@ -443,6 +561,40 @@ export async function sendGeneratedFollowUp({ runId, agencyId }) {
 
     await stampGenerationStep(runId, agencyId, 'send');
     const ctx = await loadRunInputs(runId, agencyId);
+
+    if (run.agent_outcome === 'end') {
+        await removeContactFromWarmFollowUps(pool, {
+            agencyId,
+            clientId: ctx.clientId,
+            contactId: ctx.contactId,
+            leadEmail: ctx.email,
+            removedBy: 'follow_up_agent',
+            reason: run.agent_trace?.notes || null
+        });
+        return completeRunWithoutSend(run, agencyId);
+    }
+    if (run.agent_outcome === 'skip' || run.agent_outcome === 'blocked') {
+        return completeRunWithoutSend(run, agencyId);
+    }
+
+    // Generation takes a while: the lead may have replied, booked or been archived since.
+    const recheck = await recheckProspect(pool, ctx.contactId, ctx.campaignId, run.sent_for_date);
+    if (recheck.blocked) {
+        return completeRunWithoutSend(run, agencyId, {
+            note: `Not sent: ${recheck.reason}`,
+            agentOutcome: run.agent_outcome ? 'blocked' : null
+        });
+    }
+    if (run.agent_outcome === 'send') {
+        const latestDraftStatus = await fetchLatestDraftStatus(pool, ctx.contactId);
+        if (!draftAllowsFollowUpAgent(latestDraftStatus)) {
+            return completeRunWithoutSend(run, agencyId, {
+                note: `Not sent: latest autoresponder draft is ${latestDraftStatus}`,
+                agentOutcome: 'blocked'
+            });
+        }
+    }
+
     const settings = await fetchAgencyAndClientSettings(agencyId, ctx.clientId);
     const apiKey = settings.instantlyKey || ctx.instantlyKey;
     if (!apiKey) {
@@ -482,7 +634,7 @@ export async function sendGeneratedFollowUp({ runId, agencyId }) {
             agencyId,
             result.failed ? 'failed' : 'completed',
             result.sendId || null,
-            result.errorMessage || null
+            result.errorMessage || (result.sent ? null : `Not sent: ${result.reason || 'unknown'}`)
         ]
     );
 
