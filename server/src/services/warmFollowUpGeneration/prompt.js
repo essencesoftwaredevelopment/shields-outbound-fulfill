@@ -40,7 +40,8 @@ export function draftAllowsFollowUpAgent(latestDraftStatus) {
     return !latestDraftStatus || latestDraftStatus === 'sent';
 }
 
-const THREAD_STATE_QUOTE_MAX_CHARS = 400;
+const THREAD_STATE_RECENT_MESSAGES = 6;
+const THREAD_STATE_MESSAGE_MAX_CHARS = 700;
 
 function describeAge(sentAt, now) {
     const sent = new Date(sentAt);
@@ -48,49 +49,51 @@ function describeAge(sentAt, now) {
     const dayMs = 86_400_000;
     const days = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / dayMs)
         - Math.floor(Date.UTC(sent.getUTCFullYear(), sent.getUTCMonth(), sent.getUTCDate()) / dayMs);
-    const age = days <= 0 ? 'today' : (days === 1 ? '1 day ago' : `${days} days ago`);
-    return `${age} (${sent.toISOString().slice(0, 10)})`;
+    return days <= 0 ? 'today' : (days === 1 ? '1 day ago' : `${days} days ago`);
 }
 
-function quoteForState(text) {
-    const trimmed = asTrimmedText(text).replace(/\s+/g, ' ');
-    return trimmed.length > THREAD_STATE_QUOTE_MAX_CHARS
-        ? `${trimmed.slice(0, THREAD_STATE_QUOTE_MAX_CHARS).trim()}…`
-        : trimmed;
+function transcriptLine(message) {
+    const sent = new Date(message.sentAt);
+    const date = Number.isNaN(sent.getTime()) ? 'unknown date' : sent.toISOString().slice(0, 10);
+    const who = message.direction === 'outbound'
+        ? 'Us'
+        : (message.kind === 'auto_reply' ? 'Them (auto-reply)' : 'Them');
+    const text = asTrimmedText(message.text);
+    const clipped = text.length > THREAD_STATE_MESSAGE_MAX_CHARS
+        ? `${text.slice(0, THREAD_STATE_MESSAGE_MAX_CHARS).trim()}…`
+        : text;
+    return `[${date}] ${who}:\n${clipped}`;
 }
 
 /**
- * Where the thread stands, worked out from the messages themselves (oldest
- * first), so the agent can't mistake a message we already answered for one it
- * still has to answer. Auto-replies are not treated as the lead answering.
+ * The conversation itself, oldest first, ending on whoever spoke last, so the
+ * agent reads our last email as the last word instead of treating an earlier
+ * question of theirs as the thing to respond to. Auto-replies don't count as the
+ * lead answering.
  */
 export function formatThreadState(messages = [], now = new Date()) {
     const list = Array.isArray(messages) ? messages : [];
-    const replies = list.filter((message) => message.direction === 'inbound' && message.kind !== 'auto_reply');
-    const lastReply = replies.at(-1) || null;
-    const outbound = list.filter((message) => message.direction === 'outbound');
-    const lastOutbound = outbound.at(-1) || null;
-    const replyAt = lastReply ? String(lastReply.sentAt || '') : '';
-    const sentSinceReply = lastReply
-        ? outbound.filter((message) => String(message.sentAt || '') > replyAt)
-        : outbound;
-
-    const lines = ['Where this thread stands:'];
-    if (lastReply) {
-        lines.push(`- Their last reply came ${describeAge(lastReply.sentAt, now)}: "${quoteForState(lastReply.text)}"`);
-    } else {
-        lines.push('- They have not replied in this thread.');
+    if (!list.length) return '';
+    const recent = list.slice(-THREAD_STATE_RECENT_MESSAGES);
+    const omitted = list.length - recent.length;
+    const lines = [
+        omitted
+            ? `The conversation so far, oldest first (${omitted} older in get_thread):`
+            : 'The conversation so far, oldest first:',
+        ...recent.map(transcriptLine)
+    ];
+    const lastSpoken = [...list].reverse().find((message) => message.kind !== 'auto_reply');
+    if (lastSpoken?.direction === 'outbound') {
+        const approved = lastSpoken.kind === 'autoresponder' || lastSpoken.kind === 'manual';
+        lines.push([
+            `That last email from us went out ${describeAge(lastSpoken.sentAt, now)} and they have not replied to it.`,
+            approved ? 'A person on our team approved it as our answer to their message, so that answer stands.' : '',
+            'Your email is the next one from us, coming after it.'
+        ].filter(Boolean).join(' '));
+    } else if (lastSpoken) {
+        lines.push('Their last message has not had an answer from us yet.');
     }
-    if (lastReply && !sentSinceReply.length) {
-        lines.push('- We have not responded to that reply yet, so it is still open.');
-        return lines.join('\n');
-    }
-    if (lastOutbound) {
-        const count = sentSinceReply.length === 1 ? '1 email' : `${sentSinceReply.length} emails`;
-        lines.push(`- We have sent ${count} ${lastReply ? 'since then' : 'so far'}. The latest went out ${describeAge(lastOutbound.sentAt, now)}: "${quoteForState(lastOutbound.text)}"`);
-        lines.push(`- They have not answered ${sentSinceReply.length === 1 ? 'it' : 'any of them'}. You are following up on that silence.`);
-    }
-    return lines.join('\n');
+    return lines.join('\n\n');
 }
 
 export function assembleFollowUpAgentInstructions(clientPrompt = '') {
@@ -125,12 +128,10 @@ export function assembleFollowUpAgentInput({
         briefBlock
             ? `Earlier research on their company (automated, may be incomplete or out of date):\n${briefBlock}`
             : '',
-        asTrimmedText(threadState)
-            ? `${asTrimmedText(threadState)}\n\nget_thread has the full history.`
-            : '',
         notes.length
             ? `Your notes from earlier touches, oldest first:\n${notes.map((note, index) => `${index + 1}. ${note}`).join('\n')}`
-            : 'You have no notes from earlier touches.'
+            : 'You have no notes from earlier touches.',
+        asTrimmedText(threadState)
     ].filter(Boolean).join('\n\n');
 }
 export const OUTBOUND_HISTORY_ITEM_MAX_CHARS = 900;

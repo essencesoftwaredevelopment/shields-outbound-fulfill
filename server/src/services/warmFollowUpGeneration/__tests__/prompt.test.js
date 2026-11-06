@@ -172,39 +172,45 @@ const cold = { direction: 'outbound', kind: 'campaign', text: 'Cold email', sent
 const reply = { direction: 'inbound', kind: 'reply', text: 'Okay show me the video', sentAt: '2026-11-04T20:20:00Z' };
 const answer = { direction: 'outbound', kind: 'autoresponder', text: 'Here is the page with the video', sentAt: '2026-11-05T17:00:00Z' };
 
-test('thread state says their reply was already answered', () => {
+test('thread state ends on our email when we spoke last', () => {
     const state = formatThreadState([cold, reply, answer], NOW);
-    assert.match(state, /last reply came 3 days ago \(2026-11-04\): "Okay show me the video"/);
-    assert.match(state, /sent 1 email since then\./);
-    assert.match(state, /latest went out 2 days ago \(2026-11-05\): "Here is the page with the video"/);
-    assert.match(state, /following up on that silence/);
-});
-
-test('thread state counts every follow-up since their reply', () => {
-    const later = { direction: 'outbound', kind: 'follow_up', text: 'New idea', sentAt: '2026-11-07T09:00:00Z' };
-    const state = formatThreadState([cold, reply, answer, later], NOW);
-    assert.match(state, /sent 2 emails since then/);
-    assert.match(state, /latest went out today/);
-    assert.match(state, /not answered any of them/);
+    assert.match(state, /\[2026-11-04\] Them:\nOkay show me the video/);
+    assert.match(state, /\[2026-11-05\] Us:\nHere is the page with the video/);
+    assert.ok(state.indexOf('Okay show me the video') < state.indexOf('Here is the page with the video'));
+    assert.match(state, /went out 2 days ago and they have not replied to it/);
 });
 
 test('thread state marks a reply we have not answered as open', () => {
     const state = formatThreadState([cold, reply], NOW);
-    assert.match(state, /not responded to that reply yet/);
-    assert.doesNotMatch(state, /following up on that silence/);
+    assert.match(state, /Their last message has not had an answer from us yet/);
+    assert.doesNotMatch(state, /have not replied to it/);
 });
 
 test('thread state does not treat an auto-reply as the lead answering', () => {
     const ooo = { direction: 'inbound', kind: 'auto_reply', text: 'Out of office', sentAt: '2026-11-06T09:00:00Z' };
     const state = formatThreadState([cold, reply, answer, ooo], NOW);
-    assert.match(state, /"Okay show me the video"/);
-    assert.doesNotMatch(state, /Out of office/);
+    assert.match(state, /Them \(auto-reply\):\nOut of office/);
+    assert.match(state, /went out 2 days ago and they have not replied to it/);
 });
 
-test('thread state handles a lead who never replied', () => {
-    const state = formatThreadState([cold], NOW);
-    assert.match(state, /have not replied in this thread/);
-    assert.match(state, /sent 1 email so far/);
+test('thread state keeps the newest messages and points to get_thread for the rest', () => {
+    const many = Array.from({ length: 9 }, (_, index) => ({
+        direction: 'outbound', kind: 'follow_up', text: `Touch ${index + 1}`, sentAt: `2026-10-0${index + 1}T09:00:00Z`
+    }));
+    const state = formatThreadState(many, NOW);
+    assert.match(state, /3 older in get_thread/);
+    assert.doesNotMatch(state, /Touch 3\b/);
+    assert.match(state, /Touch 9/);
+});
+
+test('thread state is empty with no messages', () => {
+    assert.equal(formatThreadState([], NOW), '');
+});
+
+test('agent input ends on the conversation', () => {
+    const input = assembleFollowUpAgentInput({ priorNotes: ['a note'], threadState: 'The conversation so far' });
+    assert.ok(input.indexOf('a note') < input.indexOf('The conversation so far'));
+    assert.ok(input.endsWith('The conversation so far'));
 });
 
 test('agent instructions stay short', () => {
