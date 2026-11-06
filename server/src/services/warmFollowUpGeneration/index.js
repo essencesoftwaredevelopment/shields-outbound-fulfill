@@ -34,8 +34,8 @@ import { attachWorkflowRunId, stampGenerationStep } from './progress.js';
 
 export { attachWorkflowRunId, stampGenerationStep, shouldUseAiFollowUpCopy };
 
-const FOLLOW_UP_MODEL = String(process.env.FOLLOWUP_MODEL || 'gpt-5.6').trim() || 'gpt-5.6';
-const FOLLOW_UP_REASONING_EFFORT = 'high';
+const FOLLOW_UP_MODEL = String(process.env.FOLLOWUP_MODEL || 'gpt-6.1-terra').trim() || 'gpt-6.1-terra';
+const FOLLOW_UP_REASONING_EFFORT = 'medium';
 
 export class WarmFollowUpRunCancelledError extends Error {
     constructor(message) {

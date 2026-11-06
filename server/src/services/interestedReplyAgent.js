@@ -376,6 +376,7 @@ export function fitThreadToOutputLimit(messages, limit = TOOL_OUTPUT_LIMIT) {
  *   maxTurns?: number,
  *   budgetMs?: number,
  *   reasoningEffort?: string,
+ *   maxTotalTokens?: number | null,
  *   followUp?: boolean,
  *   allowedHosts?: string[],
  *   validateReply?: ((reply: string) => string | null) | null
@@ -402,6 +403,7 @@ export async function runReplyAgent({
     maxTurns = REPLY_AGENT_MAX_TURNS,
     budgetMs = REPLY_AGENT_BUDGET_MS,
     reasoningEffort = REPLY_AGENT_REASONING_EFFORT,
+    maxTotalTokens = null,
     followUp = false,
     allowedHosts = [],
     validateReply = null
@@ -556,7 +558,8 @@ export async function runReplyAgent({
         }
 
         if (turn === maxTurns) break;
-        forced = turn + 1 >= maxTurns || Date.now() - startedAt >= budgetMs;
+        const overTokenCap = maxTotalTokens !== null && usage.inputTokens + usage.outputTokens >= maxTotalTokens;
+        forced = turn + 1 >= maxTurns || Date.now() - startedAt >= budgetMs || overTokenCap;
         response = await request({ previous_response_id: response.id, input: outputs }, forced);
     }
 
@@ -577,6 +580,7 @@ export async function runReplyAgent({
         previewUrl,
         trace: {
             mode: 'agent',
+            model: response.model || model,
             outcome: draft.outcome || 'send',
             notes: draft.notes,
             submitted: draft.submitted,

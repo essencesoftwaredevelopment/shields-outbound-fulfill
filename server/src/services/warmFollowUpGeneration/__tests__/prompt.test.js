@@ -216,3 +216,8 @@ test('agent input ends on the conversation', () => {
 test('agent instructions stay short', () => {
     assert.ok(assembleFollowUpAgentInstructions('').length < 600);
 });
+
+test('agent input says re-engagement is deliberate only when it is', () => {
+    assert.match(assembleFollowUpAgentInput({ reengaging: true }), /deliberately coming back/);
+    assert.doesNotMatch(assembleFollowUpAgentInput({}), /deliberately coming back/);
+});

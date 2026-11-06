@@ -111,7 +111,8 @@ export function assembleFollowUpAgentInput({
     threadSubject = '',
     researchBrief = null,
     threadState = '',
-    priorNotes = []
+    priorNotes = [],
+    reengaging = false
 } = {}) {
     const briefBlock = formatBriefForFollowUpPrompt(researchBrief);
     const notes = (Array.isArray(priorNotes) ? priorNotes : [])
@@ -120,6 +121,9 @@ export function assembleFollowUpAgentInput({
     return [
         `Today: ${asTrimmedText(today) || 'unknown'}`,
         `This is touch ${touchNumber} of at most ${maxTouches} in this follow-up sequence.`,
+        reengaging
+            ? 'We are deliberately coming back to this lead after their earlier follow-ups ended. If an earlier email called itself the last one, that does not rule this one out. Only a no from them does.'
+            : '',
         `Campaign: ${asTrimmedText(campaignName) || 'unknown'}`,
         `Lead email: ${asTrimmedText(leadEmail) || 'unknown'}`,
         `First name: ${asTrimmedText(firstName) || '(unknown)'}`,

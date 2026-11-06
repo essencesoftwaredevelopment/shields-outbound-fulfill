@@ -277,3 +277,29 @@ describe('fitThreadToOutputLimit', () => {
         assert.ok(!JSON.stringify(fitted).includes('oldold'));
     });
 });
+
+describe('runReplyAgent token cap', () => {
+    const lookup = { output: [call('fetch_page', { url: 'http://127.0.0.1/' })] };
+    const heavy = (body) => ({ ...body, usage: { input_tokens: 20_000, output_tokens: 6_000 } });
+    const finish = { output: [call('submit_draft', { reply: 'Done', notes_for_next_touch: 'n' })] };
+    const args = { openaiKey: 'x', instructions: 'i', input: 'in', followUp: true, maxTurns: 5 };
+
+    it('forces the agent to finish once the run passes the cap', async () => {
+        const client = fakeClient([heavy(lookup), finish]);
+        const result = await runReplyAgent({ ...args, client, maxTotalTokens: 25_000 });
+        assert.equal(result.reply, 'Done');
+        assert.deepEqual(client.requests[1].tool_choice, { type: 'function', name: 'submit_draft' });
+    });
+
+    it('leaves the agent free while it is under the cap', async () => {
+        const client = fakeClient([lookup, finish]);
+        await runReplyAgent({ ...args, client, maxTotalTokens: 25_000 });
+        assert.equal(client.requests[1].tool_choice, 'required');
+    });
+
+    it('records the model that ran', async () => {
+        const client = fakeClient([finish]);
+        const result = await runReplyAgent({ ...args, client, maxTotalTokens: 25_000 });
+        assert.equal(result.trace.model, 'gpt-test');
+    });
+});

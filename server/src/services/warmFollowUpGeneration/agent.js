@@ -23,9 +23,18 @@ import {
     isFollowUpCopyTooLong
 } from './prompt.js';
 
+// Once a run passes the cap the agent gets one last call to finish, so a run can
+// end slightly above it. Every run so far has stayed under.
+const FOLLOW_UP_AGENT_MAX_TOTAL_TOKENS = 25_000;
+const FOLLOW_UP_AGENT_MAX_TURNS = 5;
+
 /** Sends and skips with this person, plus the notes the agent left itself on earlier touches. */
-async function loadTouchHistory(contactId) {
-    const [sends, runs] = await Promise.all([
+async function loadTouchHistory(contactId, clientId) {
+    const [scripts, sends, runs] = await Promise.all([
+        pool.query(
+            `SELECT COUNT(*)::int AS count FROM follow_up_scripts WHERE client_id = $1 AND active = TRUE`,
+            [clientId]
+        ),
         pool.query(
             `SELECT COUNT(*)::int AS sent
              FROM follow_up_sends
@@ -43,6 +52,7 @@ async function loadTouchHistory(contactId) {
         )
     ]);
     return {
+        scriptCount: scripts.rows[0]?.count || 0,
         sent: sends.rows[0]?.sent || 0,
         skipped: runs.rows.filter((row) => row.agent_outcome === 'skip').length,
         priorNotes: runs.rows
@@ -68,7 +78,7 @@ export async function runFollowUpAgent({
     reasoningEffort
 }) {
     const [history, threadMessages] = await Promise.all([
-        loadTouchHistory(ctx.contactId),
+        loadTouchHistory(ctx.contactId, ctx.clientId),
         fetchContactHistoryMessages(pool, ctx.contactId, ctx.email)
     ]);
     const domain = normalizeAuditDomain(vars.company_domain) || domainFromLeadEmail(ctx.email);
@@ -96,7 +106,8 @@ export async function runFollowUpAgent({
             threadSubject: thread.threadSubject,
             researchBrief,
             threadState: formatThreadState(threadMessages),
-            priorNotes: history.priorNotes
+            priorNotes: history.priorNotes,
+            reengaging: history.scriptCount > 0 && history.sent >= history.scriptCount
         }),
         serperKey: settings.serperKey || null,
         loadThread: async () => threadMessages,
@@ -107,6 +118,8 @@ export async function runFollowUpAgent({
         allowedHosts: domain ? [domain.replace(/^www\./, '')] : [],
         model,
         reasoningEffort,
+        maxTurns: FOLLOW_UP_AGENT_MAX_TURNS,
+        maxTotalTokens: FOLLOW_UP_AGENT_MAX_TOTAL_TOKENS,
         followUp: true,
         validateReply: validateFollowUpAgentReply
     });
