@@ -8,8 +8,8 @@ import { pool } from '../../config/db.js';
 import {
     callPopupFormGenerate,
     domainFromLeadEmail,
+    fetchContactHistoryMessages,
     fetchPromptConfig,
-    fetchThreadMessagesForReview,
     normalizeAuditDomain,
     popupOptionsFromResearchBrief,
     resolveReplyPreviewBehavior
@@ -23,23 +23,23 @@ import {
     isFollowUpCopyTooLong
 } from './prompt.js';
 
-/** Sends and skips so far, plus the notes the agent left itself on earlier touches. */
-async function loadTouchHistory(contactId, campaignId) {
+/** Sends and skips with this person, plus the notes the agent left itself on earlier touches. */
+async function loadTouchHistory(contactId) {
     const [sends, runs] = await Promise.all([
         pool.query(
             `SELECT COUNT(*)::int AS sent
              FROM follow_up_sends
-             WHERE contact_id = $1 AND campaign_id = $2 AND status = 'sent'`,
-            [contactId, campaignId]
+             WHERE contact_id = $1 AND status = 'sent'`,
+            [contactId]
         ),
         pool.query(
             `SELECT agent_outcome, agent_trace->>'notes' AS notes
              FROM follow_up_generation_runs
-             WHERE contact_id = $1 AND campaign_id = $2
+             WHERE contact_id = $1
                AND mode = 'send' AND status = 'completed'
                AND agent_outcome IN ('send', 'skip')
              ORDER BY created_at ASC, id ASC`,
-            [contactId, campaignId]
+            [contactId]
         )
     ]);
     return {
@@ -68,8 +68,8 @@ export async function runFollowUpAgent({
     reasoningEffort
 }) {
     const [history, threadMessages] = await Promise.all([
-        loadTouchHistory(ctx.contactId, ctx.campaignId),
-        fetchThreadMessagesForReview(pool, ctx.contactId, ctx.campaignId, ctx.email)
+        loadTouchHistory(ctx.contactId),
+        fetchContactHistoryMessages(pool, ctx.contactId, ctx.email)
     ]);
     const domain = normalizeAuditDomain(vars.company_domain) || domainFromLeadEmail(ctx.email);
 

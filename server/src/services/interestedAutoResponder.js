@@ -873,6 +873,26 @@ export async function fetchThreadMessagesForReview(db, contactId, campaignId, le
     return buildThreadMessages(result.rows, { leadEmail });
 }
 
+/** Every email with this person across all campaigns, oldest first. */
+export async function fetchContactHistoryMessages(db, contactId, leadEmail) {
+    if (!contactId) return [];
+    const result = await db.query(
+        `SELECT id, event_type, event_timestamp, lead_email, email_account,
+                message_text, reply_text_snippet, payload
+         FROM contact_instantly_events
+         WHERE contact_id = $1
+           AND (
+               message_text IS NOT NULL
+               OR reply_text_snippet IS NOT NULL
+               OR payload ?| ARRAY['email_text', 'email_html', 'reply_text', 'reply_html', 'reply_text_snippet']
+           )
+         ORDER BY event_timestamp DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT $2`,
+        [contactId, THREAD_MESSAGE_LIMIT * 3]
+    );
+    return buildThreadMessages(result.rows, { leadEmail });
+}
+
 export async function fetchLatestThreadMetadata(db, contactId, campaignId) {
     const [subjectResult, threadReply] = await Promise.all([
         db.query(

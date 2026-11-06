@@ -495,34 +495,35 @@ const AGENT_MAX_FAILED_RUNS_PER_WEEK = 3;
 
 /**
  * Eligibility clauses for agent mode, replacing "sends < active scripts".
- * $1 client, $4 send date, $5 max touches, $6 min gap in days.
+ * $1 client, $2 Warm Follow Up event, $4 send date, $5 max touches, $6 min gap in days.
  *
+ * Everything is judged per person across all their campaigns, because Instantly
+ * can stamp the same reply onto an older campaign. That leaves a duplicate row
+ * with no sends and a dead inbox for someone who already finished the sequence.
+ *
+ * - Only the campaign we last emailed them from counts as their live thread.
  * - Touches are sends + agent skips, so a skip can't loop forever.
- * - Spacing runs from the last send, skip or enrollment, by UTC calendar day.
+ * - Spacing runs from the last send, skip, reply or enrollment, by UTC calendar day.
  * - A lead who already got every static script and no agent send is finished:
- *   raising the touch limit must not restart those leads out of the blue.
+ *   raising the touch limit must not restart those leads out of the blue. With
+ *   finishedOnly the rule flips, for a deliberate re-engagement send.
  */
-export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignIdSql = 'cic.campaign_id') {
+export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignIdSql = 'cic.campaign_id', { finishedOnly = false } = {}) {
     const sent = `(
                SELECT COUNT(*)::int
                FROM follow_up_sends fus_seq
                WHERE fus_seq.client_id = $1
                  AND fus_seq.contact_id = ${contactIdSql}
-                 AND fus_seq.campaign_id = ${campaignIdSql}
                  AND fus_seq.status = 'sent'
            )`;
     const skipped = `(
                SELECT COUNT(*)::int
                FROM follow_up_generation_runs gen_skip
                WHERE gen_skip.contact_id = ${contactIdSql}
-                 AND gen_skip.campaign_id = ${campaignIdSql}
                  AND gen_skip.mode = 'send'
                  AND gen_skip.agent_outcome = 'skip'
            )`;
-    return `-- Touch limit
-           AND ${sent} + ${skipped} < $5::int
-           -- Finished the static sequence before the agent took over: leave them
-           AND (
+    const stillInSequence = `(
                ${sent} = 0
                OR ${sent} < (
                    SELECT COUNT(*)::int
@@ -534,13 +535,26 @@ export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignId
                    SELECT 1
                    FROM follow_up_generation_runs gen_sent
                    WHERE gen_sent.contact_id = ${contactIdSql}
-                     AND gen_sent.campaign_id = ${campaignIdSql}
                      AND gen_sent.mode = 'send'
                      AND gen_sent.status = 'completed'
                      AND gen_sent.agent_outcome = 'send'
                      AND gen_sent.follow_up_send_id IS NOT NULL
                )
-           )
+           )`;
+    return `-- Their live thread: the campaign we last emailed them from
+           AND ${campaignIdSql} = COALESCE((
+               SELECT e_last.campaign_id
+               FROM contact_instantly_events e_last
+               WHERE e_last.contact_id = ${contactIdSql}
+                 AND e_last.campaign_id IS NOT NULL
+                 AND e_last.event_type IN ('email_sent', 'interested_reply_sent', 'manual_reply_sent')
+               ORDER BY e_last.event_timestamp DESC
+               LIMIT 1
+           ), ${campaignIdSql})
+           -- Touch limit
+           AND ${sent} + ${skipped} < $5::int
+           -- Finished the static sequence before the agent took over
+           AND ${finishedOnly ? `NOT ${stillInSequence}` : stillInSequence}
            -- Spacing: enough send days since the last touch of any kind
            AND NOT EXISTS (
                SELECT 1
@@ -548,21 +562,18 @@ export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignId
                    SELECT fus_gap.created_at AS touched_at
                    FROM follow_up_sends fus_gap
                    WHERE fus_gap.contact_id = ${contactIdSql}
-                     AND fus_gap.campaign_id = ${campaignIdSql}
                      AND fus_gap.status = 'sent'
                    UNION ALL
                    SELECT gen_gap.created_at
                    FROM follow_up_generation_runs gen_gap
                    WHERE gen_gap.contact_id = ${contactIdSql}
-                     AND gen_gap.campaign_id = ${campaignIdSql}
                      AND gen_gap.mode = 'send'
                      AND gen_gap.agent_outcome = 'skip'
                    UNION ALL
                    SELECT anchor_gap.event_timestamp
                    FROM contact_instantly_events anchor_gap
                    WHERE anchor_gap.contact_id = ${contactIdSql}
-                     AND anchor_gap.campaign_id = ${campaignIdSql}
-                     AND anchor_gap.event_type = $2
+                     AND anchor_gap.event_type IN ($2, 'interested_reply_sent', 'manual_reply_sent')
                ) touches
                WHERE (touches.touched_at AT TIME ZONE 'UTC')::date > $4::date - $6::int
            )
@@ -573,7 +584,6 @@ export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignId
                SELECT COUNT(*)::int
                FROM follow_up_generation_runs gen_failed
                WHERE gen_failed.contact_id = ${contactIdSql}
-                 AND gen_failed.campaign_id = ${campaignIdSql}
                  AND gen_failed.mode = 'send'
                  AND gen_failed.status = 'failed'
                  AND gen_failed.created_at > NOW() - INTERVAL '7 days'
@@ -593,9 +603,9 @@ export function agentSequenceClauses(contactIdSql = 'cic.contact_id', campaignId
  *   5. At least one active follow_up_script remains in the sequence
  *      (sent count < active script count).
  */
-async function getEligibleProspects(db, clientId, sentForDate, agentConfig = null) {
+export async function getEligibleProspects(db, clientId, sentForDate, agentConfig = null) {
     const sequenceClauses = agentConfig
-        ? agentSequenceClauses()
+        ? agentSequenceClauses('cic.contact_id', 'cic.campaign_id', { finishedOnly: agentConfig.finishedOnly === true })
         : `-- Sequence not exhausted: fewer successful sends than active scripts
            AND (
                SELECT COUNT(*)::int
@@ -688,7 +698,15 @@ async function getEligibleProspects(db, clientId, sentForDate, agentConfig = nul
                  AND gen.status = 'running'
                  AND gen.sent_for_date = $4::date
            )
-           ${sequenceClauses}`,
+           ${sequenceClauses}
+           ${agentConfig?.finishedOnly === true
+               ? `-- Warmest first: most recent reply from them
+           ORDER BY (
+               SELECT MAX(r.event_timestamp)
+               FROM contact_instantly_events r
+               WHERE r.contact_id = cic.contact_id AND r.event_type = 'reply_received'
+           ) DESC NULLS LAST`
+               : ''}`,
         agentConfig
             ? [clientId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES, sentForDate, agentConfig.maxTouches, agentConfig.minGapDays]
             : [clientId, WARM_FOLLOW_UP_EVENT, BLOCKER_EVENT_TYPES, sentForDate]

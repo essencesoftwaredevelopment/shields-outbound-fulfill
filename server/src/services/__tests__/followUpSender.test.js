@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import {
     renderTemplate,
     sanitizeHtml,
+    agentSequenceClauses,
     htmlToPlainText,
     resolveThreadReplyAnchor,
     buildEssenceBookingUrl,
@@ -691,4 +692,21 @@ test('htmlToPlainText keeps signature lines from divs apart', () => {
     const text = htmlToPlainText('<div>Thanks,</div><div><br /></div><div>Emily</div><div>Partner @ ESSENCE Retention</div>');
     assert.match(text, /Emily\nPartner @ ESSENCE Retention/);
     assert.doesNotMatch(text, /EmilyPartner/);
+});
+
+test('agent eligibility judges the person across campaigns, not one campaign row', () => {
+    const sql = agentSequenceClauses();
+    assert.doesNotMatch(sql, /fus_seq\.campaign_id/);
+    assert.doesNotMatch(sql, /gen_skip\.campaign_id/);
+    assert.doesNotMatch(sql, /gen_sent\.campaign_id/);
+    assert.doesNotMatch(sql, /fus_gap\.campaign_id/);
+    assert.match(sql, /cic\.campaign_id = COALESCE\(/);
+});
+
+test('finishedOnly flips the finished-lead rule and nothing else', () => {
+    const normal = agentSequenceClauses();
+    const finished = agentSequenceClauses('cic.contact_id', 'cic.campaign_id', { finishedOnly: true });
+    assert.doesNotMatch(normal, /AND NOT \(\s*\(\s*SELECT COUNT/);
+    assert.match(finished, /AND NOT \(\s*\(\s*SELECT COUNT/);
+    assert.equal(finished.replace(/AND NOT \(/, 'AND ('), normal);
 });
