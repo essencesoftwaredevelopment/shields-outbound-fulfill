@@ -172,6 +172,25 @@ test('computeSalesMetrics: stalled deals respect scheduled follow-ups', () => {
     assert.equal(sales.bookingRate, null);
 });
 
+test('computeSalesMetrics: retainer cash counts when the retainer starts, builds when the deal closes', () => {
+    const { start, end } = resolvePeriod('last_month', NOW);
+    const calls = [
+        // closed in October, retainer starts in November: build now, retainer next month
+        call({ id: 1, outcome: 'won', closed_on: '2026-10-20', build_value: 2250, retainer_monthly: 1500, retainer_start: '2026-11-06' }),
+        // closed in September, retainer starts in October: only the retainer counts now
+        call({ id: 2, outcome: 'won', closed_on: '2026-09-25', retainer_monthly: 600, retainer_start: '2026-10-01' }),
+        // closed in October, no start date: retainer counts on the close date
+        call({ id: 3, outcome: 'won', closed_on: '2026-10-10', retainer_monthly: 800, retainer_start: null })
+    ];
+    const { money, sales } = computeSalesMetrics(calls, { start, end, now: NOW });
+    assert.equal(sales.dealsWon, 2);
+    assert.equal(money.buildRevenue, 2250);
+    assert.equal(money.retainerRevenue, 1400);
+    assert.equal(money.newRevenue, 3650);
+    // average deal cash: deals won in the period, build + first month, (3750 + 800) / 2
+    assert.equal(money.avgDealValue, 2275);
+});
+
 test('computeSalesMetrics: churn, tenure and lifetime value', () => {
     const { start, end } = resolvePeriod('last_month', NOW);
     const calls = [

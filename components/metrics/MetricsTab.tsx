@@ -348,16 +348,16 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                             <MetricCard
                                 label="New cash collected"
                                 value={formatMoney(money?.newRevenue)}
-                                secondary={{ value: `${formatMoney(money?.retainerRevenue)}/mo`, label: "New retainers" }}
+                                secondary={{ value: `${formatMoney(money?.retainerRevenue)}/mo`, label: "Retainers starting" }}
                                 icon={<Banknote {...ICON_PROPS} />}
-                                hint={money ? `Deals won in the period: ${formatMoney(money.buildRevenue)} flow builds + ${formatMoney(money.retainerRevenue)} first month of new retainers. From the sales log.` : undefined}
+                                hint={money ? `${formatMoney(money.buildRevenue)} flow builds from deals closed in the period + ${formatMoney(money.retainerRevenue)}, the first month of retainers that start in the period. From the sales log.` : undefined}
                             />
                             <MetricCard
                                 label="Average deal cash"
                                 value={formatMoney(money?.avgDealValue)}
                                 secondary={{ value: formatNumber(sales?.dealsWon), label: "Deals won" }}
                                 icon={<Scale {...ICON_PROPS} />}
-                                hint="New cash collected ÷ deals won."
+                                hint="Per deal won in the period: build fee + first month of retainer, whenever the retainer starts."
                             />
                             <MetricCard
                                 label="Cost per call"

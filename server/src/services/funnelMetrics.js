@@ -362,9 +362,18 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
     }
 
     // Money
+    // Cash timing: a build fee counts when the deal closes; a retainer's first
+    // month counts when the retainer starts (close date if no start is set).
+    const retainerStartOf = (c) => c.retainer_start || c.closed_on;
+    const retainersStarting = onePerPerson(
+        calls.filter((c) => c.outcome === 'won' && Number(c.retainer_monthly) > 0 && inPeriod(retainerStartOf(c))),
+        retainerStartOf
+    );
     const buildRevenue = won.reduce((sum, c) => sum + (Number(c.build_value) || 0), 0);
-    const retainerRevenue = won.reduce((sum, c) => sum + (Number(c.retainer_monthly) || 0), 0);
+    const retainerRevenue = retainersStarting.reduce((sum, c) => sum + (Number(c.retainer_monthly) || 0), 0);
     const newRevenue = buildRevenue + retainerRevenue;
+    // Per deal won in the period: its build plus first retainer month, whenever that lands.
+    const wonDealCash = won.reduce((sum, c) => sum + (Number(c.build_value) || 0) + (Number(c.retainer_monthly) || 0), 0);
     const wonRetainers = won.map((c) => Number(c.retainer_monthly) || 0).filter((v) => v > 0);
 
     const retainerClients = calls.filter((c) => Number(c.retainer_monthly) > 0 && c.retainer_start);
@@ -417,7 +426,7 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
             newRevenue: round(newRevenue, 2),
             buildRevenue: round(buildRevenue, 2),
             retainerRevenue: round(retainerRevenue, 2),
-            avgDealValue: round(ratio(newRevenue, won.length), 2),
+            avgDealValue: round(ratio(wonDealCash, won.length), 2),
             outreachCost: round(outreachCost, 2),
             costPerBookedCall: round(ratio(outreachCost, callsBooked), 2),
             costPerProposal: round(ratio(outreachCost, proposals.length), 2),
