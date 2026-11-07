@@ -5,7 +5,6 @@ import {
     Banknote,
     CalendarCheck,
     FileText,
-    Gem,
     List,
     MessageCircleCheck,
     RefreshCw,
@@ -14,7 +13,6 @@ import {
     Target,
     Trophy,
     UserCheck,
-    UserMinus,
     UserPlus,
     Wallet
 } from "lucide-react";
@@ -347,46 +345,39 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                     <Section title="3. Money">
                         <Grid>
                             <MetricCard
-                                label="New revenue"
+                                label="New cash collected"
                                 value={formatMoney(money?.newRevenue)}
-                                secondary={{ value: `${formatMoney(money?.retainerRevenue)}/mo`, label: "Retainers" }}
+                                secondary={{ value: `${formatMoney(money?.retainerRevenue)}/mo`, label: "New retainers" }}
                                 icon={<Banknote {...ICON_PROPS} />}
-                                hint={money ? `${formatMoney(money.buildRevenue)} flow builds + ${formatMoney(money.retainerRevenue)}/mo new retainers.` : undefined}
+                                hint={money ? `Deals won in the period: ${formatMoney(money.buildRevenue)} flow builds + ${formatMoney(money.retainerRevenue)} first month of new retainers. From the sales log.` : undefined}
                             />
                             <MetricCard
-                                label="Average deal value"
+                                label="Average deal cash"
                                 value={formatMoney(money?.avgDealValue)}
                                 secondary={{ value: formatNumber(sales?.dealsWon), label: "Deals won" }}
                                 icon={<Scale {...ICON_PROPS} />}
-                                hint="New revenue ÷ deals won (build + first month of retainer)."
+                                hint="New cash collected ÷ deals won."
                             />
                             <MetricCard
-                                label="Outreach cost"
-                                value={formatMoney(money?.outreachCost)}
-                                secondary={{ value: formatMoney(money?.costPerBookedCall), label: "Per booked call" }}
+                                label="Cost per call"
+                                value={formatMoney(money?.costPerBookedCall)}
+                                secondary={{ value: formatMoney(money?.outreachCost), label: "Outreach cost" }}
                                 icon={<Wallet {...ICON_PROPS} />}
-                                hint={money?.costBreakdown.map((line) => `${line.label} ${formatMoney(line.amount)}`).join(" · ")}
+                                hint={money ? `Outreach cost ÷ ${formatNumber(sales?.callsBooked)} calls booked. ${money.costBreakdown.map((line) => `${line.label} ${formatMoney(line.amount)}`).join(" · ")}` : undefined}
                             />
                             <MetricCard
-                                label="Cost to win a client"
+                                label="Cost per proposal"
+                                value={formatMoney(money?.costPerProposal)}
+                                secondary={{ value: formatNumber(sales?.proposalsSent), label: "Proposals" }}
+                                icon={<FileText {...ICON_PROPS} />}
+                                hint="Outreach cost ÷ proposals sent."
+                            />
+                            <MetricCard
+                                label="CAC"
                                 value={formatMoney(money?.costPerClient)}
-                                secondary={{ value: money?.paybackMonths === null || money?.paybackMonths === undefined ? "—" : `${formatNumber(money.paybackMonths, 1)} mo`, label: "Payback" }}
+                                secondary={{ value: formatNumber(sales?.dealsWon), label: "Clients signed" }}
                                 icon={<Target {...ICON_PROPS} />}
-                                hint="Outreach cost ÷ deals won. Payback = cost to win a client ÷ monthly retainer."
-                            />
-                            <MetricCard
-                                label="Monthly churn"
-                                value={formatPercent(money?.monthlyChurn, 1)}
-                                secondary={{ value: formatNumber(money?.activeRetainers), label: "Active clients" }}
-                                icon={<UserMinus {...ICON_PROPS} />}
-                                hint={money ? `${money.churnedInPeriod} ended of ${money.activeAtPeriodStart} active at the start of the period. MRR ${formatMoney(money.mrr)}/mo.` : undefined}
-                            />
-                            <MetricCard
-                                label="Lifetime value"
-                                value={formatMoney(money?.lifetimeValue)}
-                                secondary={{ value: formatNumber(money?.avgTenureMonths, 1), label: "Avg months" }}
-                                icon={<Gem {...ICON_PROPS} />}
-                                hint="Average months a client stays × average retainer. Active clients count their time so far."
+                                hint="Customer acquisition cost: outreach cost ÷ clients signed."
                             />
                         </Grid>
                     </Section>

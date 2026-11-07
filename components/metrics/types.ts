@@ -86,6 +86,7 @@ export type MetricsPayload = {
         avgDealValue: number | null;
         outreachCost: number;
         costPerBookedCall: number | null;
+        costPerProposal: number | null;
         costPerClient: number | null;
         paybackMonths: number | null;
         activeRetainers: number;

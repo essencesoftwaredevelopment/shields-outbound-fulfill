@@ -381,6 +381,7 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
             avgDealValue: round(ratio(newRevenue, won.length), 2),
             outreachCost: round(outreachCost, 2),
             costPerBookedCall: round(ratio(outreachCost, callsBooked), 2),
+            costPerProposal: round(ratio(outreachCost, proposals.length), 2),
             costPerClient: round(costPerClient, 2),
             paybackMonths: costPerClient === null || !avgWonRetainer ? null : round(costPerClient / avgWonRetainer),
             activeRetainers: activeNow.length,
