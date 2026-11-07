@@ -42,13 +42,19 @@ export function buildCampaignIdFilterClause(campaignId, tableAlias = 'cie', plac
     return ` AND ${tableAlias}.campaign_id = ${placeholder}`;
 }
 
-export function buildInstantlyEventPeriodFilterSql(eventFloorSql, tableAlias = 'cie') {
+/** Upper bound for a custom range; presets run up to now and pass none. */
+function ceilingSql(column, eventCeilSql) {
+    return eventCeilSql ? `
+          AND ${column} < ${eventCeilSql}` : '';
+}
+
+export function buildInstantlyEventPeriodFilterSql(eventFloorSql, tableAlias = 'cie', eventCeilSql = null) {
     return `${tableAlias}.client_id = $2
-          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}
+          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}${ceilingSql(`${tableAlias}.event_timestamp`, eventCeilSql)}
           AND ${tableAlias}.agency_id = $1`;
 }
 
-export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType, tableAlias = 'cie', extraClause = '') {
+export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType, tableAlias = 'cie', extraClause = '', eventCeilSql = null) {
     if (!TYPED_EVENT_TYPES.has(eventType)) {
         throw new Error(`Unsupported typed analytics event_type: ${eventType}`);
     }
@@ -56,7 +62,7 @@ export function buildTypedInstantlyEventPeriodFilterSql(eventFloorSql, eventType
     return `${tableAlias}.agency_id = $1
           AND ${tableAlias}.client_id = $2
           AND ${tableAlias}.event_type = '${eventType}'
-          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}${extraClause}`;
+          AND ${tableAlias}.event_timestamp >= ${eventFloorSql}${ceilingSql(`${tableAlias}.event_timestamp`, eventCeilSql)}${extraClause}`;
 }
 
 export function buildInstantlyEventSummaryQuery(periodFilterSql, eventTypeFilterClause) {
@@ -100,7 +106,8 @@ export function buildMeetingsBookedByBucketQuery(periodConfig, extraClause = '')
         periodConfig.eventFloorSql,
         'lead_meeting_booked',
         'cie',
-        extraClause
+        extraClause,
+        periodConfig.eventCeilSql
     );
 
     return `
@@ -128,7 +135,8 @@ export function buildMeetingsBookedCoreSql(periodConfig, extraClause = '') {
         periodConfig.eventFloorSql,
         'lead_meeting_booked',
         'cie',
-        extraClause
+        extraClause,
+        periodConfig.eventCeilSql
     );
 
     return `
@@ -161,7 +169,8 @@ export function buildEmailsSentByBucketQuery(periodConfig, extraClause = '') {
         periodConfig.eventFloorSql,
         'email_sent',
         'cie',
-        extraClause
+        extraClause,
+        periodConfig.eventCeilSql
     );
     const bucketTruncSql = periodConfig.bucketTruncSql;
 
@@ -181,7 +190,8 @@ export function buildEmailsSentCoreSql(periodConfig, extraClause = '') {
         periodConfig.eventFloorSql,
         'email_sent',
         'cie',
-        extraClause
+        extraClause,
+        periodConfig.eventCeilSql
     );
     const bucketUnit = periodConfig.bucketUnit === 'hour' ? 'hour' : 'day';
 
@@ -229,7 +239,7 @@ export function buildInstantlyEventBucketCountsQuery(periodConfig, periodFilterS
  * type (~25) instead of grouping every event row in the window (7s → 20ms on
  * 200k events).
  */
-export function buildInstantlyEventTypesQuery(eventFloorSql, eventTypeFilterClause) {
+export function buildInstantlyEventTypesQuery(eventFloorSql, eventTypeFilterClause, eventCeilSql = null) {
     return `
         WITH RECURSIVE client_event_types AS (
             SELECT MIN(cie.event_type) AS event_type
@@ -256,24 +266,24 @@ export function buildInstantlyEventTypesQuery(eventFloorSql, eventTypeFilterClau
               WHERE cie.agency_id = $1
                 AND cie.client_id = $2
                 AND cie.event_type = cet.event_type
-                AND cie.event_timestamp >= ${eventFloorSql}${eventTypeFilterClause}
+                AND cie.event_timestamp >= ${eventFloorSql}${ceilingSql('cie.event_timestamp', eventCeilSql)}${eventTypeFilterClause}
           )
         ORDER BY 1 ASC
     `;
 }
 
-export function buildFollowUpStatsQuery(eventFloorSql, extraClause = '') {
+export function buildFollowUpStatsQuery(eventFloorSql, extraClause = '', eventCeilSql = null) {
     return `
         SELECT COUNT(*)::int AS follow_up_sent
         FROM follow_up_sends fus
         WHERE fus.client_id = $1
           AND fus.status = 'sent'
-          AND fus.updated_at >= ${eventFloorSql}${extraClause}
+          AND fus.updated_at >= ${eventFloorSql}${ceilingSql('fus.updated_at', eventCeilSql)}${extraClause}
     `;
 }
 
-export function buildInstantlyRecentEventsQuery(eventFloorSql, eventTypeFilterClause) {
-    const periodFilterSql = buildInstantlyEventPeriodFilterSql(eventFloorSql);
+export function buildInstantlyRecentEventsQuery(eventFloorSql, eventTypeFilterClause, eventCeilSql = null) {
+    const periodFilterSql = buildInstantlyEventPeriodFilterSql(eventFloorSql, 'cie', eventCeilSql);
 
     return `
         SELECT
@@ -329,6 +339,20 @@ function formatBucketLabel(date, bucketUnit) {
 export function generateBucketSeries(periodConfig, now = new Date()) {
     const { period, bucketUnit } = periodConfig;
     const buckets = [];
+
+    if (periodConfig.rangeStart && periodConfig.rangeEnd) {
+        const step = bucketUnit === 'hour'
+            ? (date) => date.setUTCHours(date.getUTCHours() + 1)
+            : (date) => date.setUTCDate(date.getUTCDate() + 1);
+        for (let cursor = new Date(periodConfig.rangeStart); cursor < periodConfig.rangeEnd; step(cursor)) {
+            const bucketDate = new Date(cursor);
+            buckets.push({
+                bucket: formatBucketKey(bucketDate),
+                label: formatBucketLabel(bucketDate, bucketUnit)
+            });
+        }
+        return buckets;
+    }
 
     if (bucketUnit === 'hour') {
         const end = truncateToUtcHour(now);
@@ -466,7 +490,7 @@ export async function loadInstantlyEventAnalyticsCore({
         const [emailsResult, positiveResult, meetingsResult] = await Promise.all([
             pool.query(buildEmailsSentCoreSql(periodConfig, extraClause), lifecycleParams),
             pool.query(
-                buildPositiveRepliesCoreSql(periodConfig.eventFloorSql, periodConfig.bucketUnit, extraClause),
+                buildPositiveRepliesCoreSql(periodConfig.eventFloorSql, periodConfig.bucketUnit, extraClause, periodConfig.eventCeilSql),
                 lifecycleParams
             ),
             pool.query(buildMeetingsBookedCoreSql(periodConfig, extraClause), lifecycleParams)
@@ -517,7 +541,7 @@ export async function loadInstantlyEventAnalyticsDetails({
     const analyticsParams = campaignId
         ? [agencyId, sqlClientId, ...eventTypeFilter.params, campaignId]
         : [agencyId, sqlClientId, ...eventTypeFilter.params];
-    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql);
+    const periodFilterSql = buildInstantlyEventPeriodFilterSql(periodConfig.eventFloorSql, 'cie', periodConfig.eventCeilSql);
     const followUpClause = buildCampaignIdFilterClause(campaignId, 'fus', '$2');
     const followUpParams = campaignId ? [sqlClientId, campaignId] : [sqlClientId];
 
@@ -552,15 +576,15 @@ export async function loadInstantlyEventAnalyticsDetails({
                 )
                 : emptyResult,
             pool.query(
-                buildInstantlyEventTypesQuery(periodConfig.eventFloorSql, extraClause),
+                buildInstantlyEventTypesQuery(periodConfig.eventFloorSql, extraClause, periodConfig.eventCeilSql),
                 analyticsParams
             ),
             pool.query(
-                buildInstantlyRecentEventsQuery(periodConfig.eventFloorSql, extraClause),
+                buildInstantlyRecentEventsQuery(periodConfig.eventFloorSql, extraClause, periodConfig.eventCeilSql),
                 analyticsParams
             ),
             pool.query(
-                buildFollowUpStatsQuery(periodConfig.eventFloorSql, followUpClause),
+                buildFollowUpStatsQuery(periodConfig.eventFloorSql, followUpClause, periodConfig.eventCeilSql),
                 followUpParams
             )
         ]);

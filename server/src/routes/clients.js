@@ -82,7 +82,7 @@ import {
     loadInstantlyEventAnalyticsDetails,
     parseAnalyticsCampaignId
 } from '../utils/instantlyEventAnalytics.js';
-import { INSTANTLY_ANALYTICS_PERIODS } from '../utils/instantlyAnalyticsPeriods.js';
+import { resolveInstantlyAnalyticsPeriod } from '../utils/instantlyAnalyticsPeriods.js';
 import { loadCoreAnalyticsWithSnapshot } from '../services/analyticsSnapshots.js';
 import { loadSendingRunway } from '../services/sendingRunway.js';
 
@@ -953,8 +953,12 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
         const { clientId } = req.params;
         const agencyId = await verifyAgencyIdFromRequest(req);
         const sqlClientId = await getOrCreateClient(agencyId, clientId);
-        const requestedPeriod = String(req.query?.period || '24h').trim().toLowerCase();
-        const periodConfig = INSTANTLY_ANALYTICS_PERIODS[requestedPeriod] || INSTANTLY_ANALYTICS_PERIODS['24h'];
+        let periodConfig;
+        try {
+            periodConfig = resolveInstantlyAnalyticsPeriod(req.query?.period || '24h');
+        } catch (error) {
+            return res.status(error?.statusCode || 400).json({ error: error.message });
+        }
         const requestedEventType = String(req.query?.eventType || 'all').trim().toLowerCase();
         const eventTypeFilter = buildInstantlyEventTypeFilterClause(requestedEventType, 'cie', '$3');
         const campaignId = parseAnalyticsCampaignId(req.query?.campaignId);
@@ -971,9 +975,9 @@ router.get('/clients/:clientId/analytics/instantly-events', async (req, res) => 
         };
 
         if (scope === 'core') {
-            // All-campaigns view reads the precomputed snapshot (refreshed every ~10 min);
-            // a campaign filter computes live.
-            const { analytics, computedAt } = campaignId
+            // All-campaigns presets read the precomputed snapshot (refreshed every ~10 min);
+            // a campaign filter or a custom range computes live.
+            const { analytics, computedAt } = campaignId || periodConfig.custom
                 ? { analytics: await loadInstantlyEventAnalyticsCore(loadArgs), computedAt: new Date() }
                 : await loadCoreAnalyticsWithSnapshot({ pool, agencyId, sqlClientId, periodConfig });
             return res.json({

@@ -119,7 +119,7 @@ export function countQualifiedInterestedContacts(events, { periodStart, periodEn
     return qualifiedCount;
 }
 
-export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql, extraClause = '') {
+export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql, extraClause = '', periodCeilSql = null) {
     const qualifyingEventTypesSql = Array.from(QUALIFYING_EVENT_TYPES)
         .map((eventType) => `'${eventType}'`)
         .join(',\n                        ');
@@ -147,7 +147,8 @@ export function buildPositiveRepliesLifecycleCtesSql(periodFloorSql, extraClause
             WHERE cie.agency_id = $1
               AND cie.client_id = $2
               AND cie.event_type = '${INTERESTED_EVENT_TYPE}'
-              AND cie.event_timestamp >= ${periodFloorSql}
+              AND cie.event_timestamp >= ${periodFloorSql}${periodCeilSql ? `
+              AND cie.event_timestamp < ${periodCeilSql}` : ''}
               AND cie.contact_id IS NOT NULL${extraClause}
             ORDER BY cie.contact_id, cie.event_timestamp ASC, cie.id ASC
         ),
@@ -219,10 +220,10 @@ export function buildPositiveRepliesByBucketSql(periodFloorSql, bucketUnit, extr
     `;
 }
 
-export function buildPositiveRepliesCoreSql(periodFloorSql, bucketUnit, extraClause = '') {
+export function buildPositiveRepliesCoreSql(periodFloorSql, bucketUnit, extraClause = '', periodCeilSql = null) {
     const unit = bucketUnit === 'hour' ? 'hour' : 'day';
     return `
-        WITH ${buildPositiveRepliesLifecycleCtesSql(periodFloorSql, extraClause)}
+        WITH ${buildPositiveRepliesLifecycleCtesSql(periodFloorSql, extraClause, periodCeilSql)}
         SELECT
             (SELECT COUNT(*)::int FROM qualified_contacts) AS positive_replies,
             COALESCE((

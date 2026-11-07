@@ -408,10 +408,11 @@ type InstantlyEventAnalyticsByHourRow = {
     meetings_booked?: number;
 };
 
-type InstantlyEventAnalyticsPeriod = "24h" | "7d" | "30d" | "90d";
+type InstantlyEventAnalyticsPeriod = "24h" | "7d" | "30d" | "90d" | "custom";
 
 type InstantlyEventAnalyticsWindow = {
-    period: InstantlyEventAnalyticsPeriod;
+    // A preset, or "custom:YYYY-MM-DD:YYYY-MM-DD" for a custom range.
+    period: string;
     label: string;
     bucketUnit: "hour" | "day";
     startAt: string;
@@ -462,11 +463,12 @@ function analyticsCampaignKey(payload: InstantlyEventAnalyticsPayload | null) {
 
 function analyticsFiltersMatch(
     payload: InstantlyEventAnalyticsPayload | null,
-    period: InstantlyEventAnalyticsPeriod,
+    period: string | null,
     eventType: string,
     campaignId = ""
 ) {
-    return payload?.window?.period === period
+    return period !== null
+        && payload?.window?.period === period
         && payload?.eventType?.value === eventType
         && analyticsCampaignKey(payload) === (campaignId || "");
 }
@@ -545,8 +547,29 @@ const INSTANTLY_ANALYTICS_PERIOD_OPTIONS: Array<{ value: InstantlyEventAnalytics
     { value: "24h", label: "Last 24 hours" },
     { value: "7d", label: "Last 7 days" },
     { value: "30d", label: "Last 30 days" },
-    { value: "90d", label: "Last 90 days" }
+    { value: "90d", label: "Last 90 days" },
+    { value: "custom", label: "Custom range" }
 ];
+
+const ANALYTICS_MAX_CUSTOM_RANGE_DAYS = 366;
+
+/** Local calendar date, `daysAgo` days back, as YYYY-MM-DD for a date input. */
+function localIsoDate(daysAgo = 0) {
+    const date = new Date();
+    date.setDate(date.getDate() - daysAgo);
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function customAnalyticsRangeError(from: string, to: string) {
+    if (!from || !to) return "Pick a start and end date.";
+    if (from > to) return "The start date must be on or before the end date.";
+    if (to > localIsoDate(0)) return "The end date can’t be in the future.";
+    const days = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1;
+    if (days > ANALYTICS_MAX_CUSTOM_RANGE_DAYS) return `Pick a range of ${ANALYTICS_MAX_CUSTOM_RANGE_DAYS} days or less.`;
+    return null;
+}
 
 const INTEREST_ACTIVITY_TYPES = new Set([
     "lead_interested",
@@ -2053,6 +2076,16 @@ export default function ClientPage() {
     const previousInstantlySyncStatusRef = useRef<string | null>(null);
     const [instantlyEventAnalytics, setInstantlyEventAnalytics] = useState<InstantlyEventAnalyticsPayload | null>(null);
     const [instantlyEventAnalyticsPeriod, setInstantlyEventAnalyticsPeriod] = useState<InstantlyEventAnalyticsPeriod>("24h");
+    const [analyticsCustomFrom, setAnalyticsCustomFrom] = useState(() => localIsoDate(6));
+    const [analyticsCustomTo, setAnalyticsCustomTo] = useState(() => localIsoDate(0));
+    const analyticsCustomRangeProblem = instantlyEventAnalyticsPeriod === "custom"
+        ? customAnalyticsRangeError(analyticsCustomFrom, analyticsCustomTo)
+        : null;
+    // What the server and every filter comparison use: a preset key, or a custom
+    // range key once both dates are valid (null while they aren't, so nothing loads).
+    const analyticsPeriodKey: string | null = instantlyEventAnalyticsPeriod !== "custom"
+        ? instantlyEventAnalyticsPeriod
+        : (analyticsCustomRangeProblem ? null : `custom:${analyticsCustomFrom}:${analyticsCustomTo}`);
     const [instantlyEventAnalyticsEventType, setInstantlyEventAnalyticsEventType] = useState<string>("all");
     const [instantlyEventAnalyticsCampaignId, setInstantlyEventAnalyticsCampaignId] = useState<string>("");
     const [animatedRecentEventIds, setAnimatedRecentEventIds] = useState<Set<string>>(new Set());
@@ -5291,7 +5324,8 @@ export default function ClientPage() {
         // in-flight core load; details get their own id so the newest one wins.
         const requestId = detailsOnly ? analyticsRequestIdRef.current : ++analyticsRequestIdRef.current;
         const detailsRequestId = ++analyticsDetailsRequestIdRef.current;
-        const period = instantlyEventAnalyticsPeriod;
+        const period = analyticsPeriodKey;
+        if (!period) return;
         const eventType = instantlyEventAnalyticsEventType;
         const campaignId = instantlyEventAnalyticsCampaignId;
         const loadCore = eventType === "all" && !detailsOnly;
@@ -5407,7 +5441,7 @@ export default function ClientPage() {
                 setInstantlyEventAnalyticsLoading(false);
             }
         }
-    }, [user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+    }, [user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, analyticsPeriodKey]);
 
     const fetchPendingReviewDrafts = useCallback(async (showLoading = true) => {
         if (!user || !clientId) return;
@@ -5565,7 +5599,7 @@ export default function ClientPage() {
         }
 
         fetchInstantlyEventAnalytics(true);
-    }, [activeTab, user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod, fetchInstantlyEventAnalytics]);
+    }, [activeTab, user, clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, analyticsPeriodKey, fetchInstantlyEventAnalytics]);
 
     useEffect(() => {
         if (activeTab !== "analytics" || !user || !clientId) {
@@ -5679,7 +5713,7 @@ export default function ClientPage() {
             clearTimeout(pendingDraftAnimationTimeoutRef.current);
             pendingDraftAnimationTimeoutRef.current = null;
         }
-    }, [clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, instantlyEventAnalyticsPeriod]);
+    }, [clientId, instantlyEventAnalyticsCampaignId, instantlyEventAnalyticsEventType, analyticsPeriodKey]);
 
     useEffect(() => {
         setInstantlyEventAnalyticsCampaignId("");
@@ -9918,7 +9952,7 @@ export default function ClientPage() {
                                     {(() => {
                                         const updatedAgo = analyticsFiltersMatch(
                                             instantlyEventAnalytics,
-                                            instantlyEventAnalyticsPeriod,
+                                            analyticsPeriodKey,
                                             instantlyEventAnalyticsEventType,
                                             instantlyEventAnalyticsCampaignId
                                         )
@@ -9967,6 +10001,34 @@ export default function ClientPage() {
                                                 onChange={(value) => setInstantlyEventAnalyticsPeriod(value as InstantlyEventAnalyticsPeriod)}
                                             />
                                         </label>
+                                        {instantlyEventAnalyticsPeriod === "custom" ? (
+                                            <>
+                                                <label className="settings-field" style={{ minWidth: "150px" }}>
+                                                    <span className="settings-field__label">From</span>
+                                                    <input
+                                                        type="date"
+                                                        value={analyticsCustomFrom}
+                                                        max={analyticsCustomTo || localIsoDate(0)}
+                                                        onChange={(event) => setAnalyticsCustomFrom(event.target.value)}
+                                                    />
+                                                </label>
+                                                <label className="settings-field" style={{ minWidth: "150px" }}>
+                                                    <span className="settings-field__label">To</span>
+                                                    <input
+                                                        type="date"
+                                                        value={analyticsCustomTo}
+                                                        min={analyticsCustomFrom || undefined}
+                                                        max={localIsoDate(0)}
+                                                        onChange={(event) => setAnalyticsCustomTo(event.target.value)}
+                                                    />
+                                                </label>
+                                                {analyticsCustomRangeProblem ? (
+                                                    <span role="alert" style={{ alignSelf: "flex-end", paddingBottom: "0.55rem", fontSize: "0.8rem", color: "var(--app-danger-text)" }}>
+                                                        {analyticsCustomRangeProblem}
+                                                    </span>
+                                                ) : null}
+                                            </>
+                                        ) : null}
                                     </div>
                                 </div>
                             </div>
@@ -10010,7 +10072,7 @@ export default function ClientPage() {
 
                                 const analyticsMatchesFilters = analyticsFiltersMatch(
                                     instantlyEventAnalytics,
-                                    instantlyEventAnalyticsPeriod,
+                                    analyticsPeriodKey,
                                     instantlyEventAnalyticsEventType,
                                     instantlyEventAnalyticsCampaignId
                                 );
@@ -10213,7 +10275,7 @@ export default function ClientPage() {
                                 rows={
                                     analyticsFiltersMatch(
                                         instantlyEventAnalytics,
-                                        instantlyEventAnalyticsPeriod,
+                                        analyticsPeriodKey,
                                         instantlyEventAnalyticsEventType,
                                         instantlyEventAnalyticsCampaignId
                                     ) && (instantlyEventAnalyticsEventType !== "all" || instantlyEventAnalytics?.scope !== "details")
@@ -10222,7 +10284,11 @@ export default function ClientPage() {
                                 }
                                 bucketUnit={instantlyEventAnalytics?.window.bucketUnit || "hour"}
                                 windowLabel={
-                                    INSTANTLY_ANALYTICS_PERIOD_OPTIONS.find((option) => option.value === instantlyEventAnalyticsPeriod)?.label
+                                    (instantlyEventAnalyticsPeriod === "custom"
+                                        ? (analyticsFiltersMatch(instantlyEventAnalytics, analyticsPeriodKey, instantlyEventAnalyticsEventType, instantlyEventAnalyticsCampaignId)
+                                            ? instantlyEventAnalytics?.window.label
+                                            : null)
+                                        : INSTANTLY_ANALYTICS_PERIOD_OPTIONS.find((option) => option.value === instantlyEventAnalyticsPeriod)?.label)
                                     || instantlyEventAnalytics?.window.label
                                     || "Last 24 hours"
                                 }
@@ -10237,13 +10303,13 @@ export default function ClientPage() {
                                     instantlyEventAnalyticsEventType === "all"
                                         ? (instantlyEventAnalyticsCoreLoading || !analyticsFiltersMatch(
                                             instantlyEventAnalytics,
-                                            instantlyEventAnalyticsPeriod,
+                                            analyticsPeriodKey,
                                             instantlyEventAnalyticsEventType,
                                             instantlyEventAnalyticsCampaignId
                                         ))
                                         : (instantlyEventAnalyticsDetailsLoading || !analyticsFiltersMatch(
                                             instantlyEventAnalytics,
-                                            instantlyEventAnalyticsPeriod,
+                                            analyticsPeriodKey,
                                             instantlyEventAnalyticsEventType,
                                             instantlyEventAnalyticsCampaignId
                                         ))
@@ -10269,7 +10335,7 @@ export default function ClientPage() {
                                         || instantlyEventAnalytics?.scope === "core"
                                         || !analyticsFiltersMatch(
                                             instantlyEventAnalytics,
-                                            instantlyEventAnalyticsPeriod,
+                                            analyticsPeriodKey,
                                             instantlyEventAnalyticsEventType,
                                             instantlyEventAnalyticsCampaignId
                                         );
