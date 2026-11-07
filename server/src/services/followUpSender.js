@@ -15,7 +15,7 @@
 
 import { pool } from '../config/db.js';
 import { sendInstantlyReply } from './instantlyState.js';
-import { everWonSql, isContactEverWon } from './wonLeads.js';
+import { doNotEmailSql, isContactDoNotEmail } from './doNotEmail.js';
 import crypto from 'crypto';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -657,8 +657,8 @@ export async function getEligibleProspects(db, clientId, sentForDate, agentConfi
          WHERE ic.client_id = $1
            AND cic.active = TRUE
            AND c.email IS NOT NULL
-           -- Never email anyone who was ever marked won
-           AND NOT ${everWonSql('cic.contact_id')}
+           -- Never email anyone who was ever won or is on the domain blocklist
+           AND NOT ${doNotEmailSql('cic.contact_id')}
            -- Must have at least one Warm Follow Up event
            AND EXISTS (
                SELECT 1
@@ -725,8 +725,8 @@ export async function getEligibleProspects(db, clientId, sentForDate, agentConfi
  * arrives between eligibility scan and the actual API call.
  */
 export async function recheckProspect(db, contactId, campaignId, sentForDate) {
-    if (await isContactEverWon(db, contactId)) {
-        return { blocked: true, reason: 'ever_won' };
+    if (await isContactDoNotEmail(db, contactId)) {
+        return { blocked: true, reason: 'do_not_email' };
     }
 
     // Contact-scoped blocker check after latest Warm Follow Up for this campaign
@@ -1135,9 +1135,9 @@ export async function sendRenderedFollowUp({
             instantly_lead_id: instantlyLeadId, email, instantly_campaign_id: instantlyCampaignId } = prospect;
 
     // Last line of defence for every follow-up send, static or AI.
-    if (await isContactEverWon(pool, contactId)) {
-        logger(`[follow-up] Not sending to ${email} (contact=${contactId}): lead was marked won`);
-        return { skipped: true, reason: 'ever_won' };
+    if (await isContactDoNotEmail(pool, contactId)) {
+        logger(`[follow-up] Not sending to ${email} (contact=${contactId}): lead is on the do-not-email list (won or blocked domain)`);
+        return { skipped: true, reason: 'do_not_email' };
     }
 
     let replyToUuid = prospect.reply_to_uuid || null;

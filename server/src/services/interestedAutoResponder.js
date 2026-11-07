@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { isContactEverWon } from './wonLeads.js';
+import { isContactDoNotEmail } from './doNotEmail.js';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
 import {
@@ -1934,9 +1934,9 @@ export async function createInterestedAutoResponderDraftFromEvent({
     if (!campaignId || !contactId || !sourceEventId) {
         return { created: false, reason: 'missing_required_context' };
     }
-    if (await isContactEverWon(pool, contactId)) {
-        logger(`[interested-autoresponder] no draft for contact=${contactId}: lead was marked won`);
-        return { created: false, reason: 'ever_won' };
+    if (await isContactDoNotEmail(pool, contactId)) {
+        logger(`[interested-autoresponder] no draft for contact=${contactId}: lead is do-not-email (won or blocked domain)`);
+        return { created: false, reason: 'do_not_email' };
     }
 
     const client = await pool.connect();
@@ -2666,8 +2666,8 @@ async function resolveDraftFallbackCtaUrl(draft) {
 
 export async function sendInterestedAutoResponderDraftByToken({ token, recipients = null }) {
     const draft = await loadPendingReviewDraft(token);
-    if (await isContactEverWon(pool, draft.contact_id)) {
-        const error = new Error('This lead was marked won, and won leads are never emailed from here.');
+    if (await isContactDoNotEmail(pool, draft.contact_id)) {
+        const error = new Error('This lead is on the do-not-email list (marked won, or a blocked domain), so it can’t be emailed from here.');
         error.statusCode = 409;
         throw error;
     }

@@ -4,7 +4,7 @@
  * (enrichment/stages/instantlyBatch.js) build and send leads the same way.
  */
 import { pool } from '../config/db.js';
-import { findEverWonEmails } from './wonLeads.js';
+import { findDoNotEmailEmails } from './doNotEmail.js';
 
 export const INSTANTLY_UPLOAD_BATCH_SIZE = 100;
 
@@ -66,14 +66,14 @@ export function normalizeSkipOptions(skipOptions) {
  * Resolves to Instantly's response body (upload counts), or null if unreadable.
  */
 export async function addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions, clientId }) {
-    // Never add a lead who was ever marked won: being in a campaign means being emailed.
-    if (!clientId) throw new Error('addLeadsToInstantlyCampaign needs clientId to exclude won leads.');
-    const wonEmails = await findEverWonEmails(pool, clientId, (leads || []).map((lead) => lead?.email));
+    // Never add a do-not-email lead (won, or blocked domain): being in a campaign means being emailed.
+    if (!clientId) throw new Error('addLeadsToInstantlyCampaign needs clientId to exclude do-not-email leads.');
+    const wonEmails = await findDoNotEmailEmails(pool, clientId, (leads || []).map((lead) => lead?.email));
     const sendable = wonEmails.size
         ? leads.filter((lead) => !wonEmails.has(String(lead?.email || '').trim().toLowerCase()))
         : leads;
     if (wonEmails.size) {
-        console.log(`[instantly-upload] left out ${leads.length - sendable.length} lead(s) marked won`);
+        console.log(`[instantly-upload] left out ${leads.length - sendable.length} do-not-email lead(s) (won or blocked domain)`);
     }
     if (!sendable.length) return { leads_uploaded: 0, skipped_won: leads.length };
     leads = sendable;
