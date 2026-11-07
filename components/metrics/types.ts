@@ -136,13 +136,22 @@ export type SalesCall = {
     recording_url: string | null;
 };
 
+export type CostCadence = "monthly" | "one_time";
+
 export type OutreachCost = {
     id: number;
     label: string;
     category: string;
+    cadence: CostCadence;
+    /** Per month for a monthly cost; the total for a one-time cost. */
     monthly_amount: number;
-    starts_on: string;
-    ends_on: string | null;
+    /** First day of the month a one-time cost belongs to (YYYY-MM-DD); null when monthly. */
+    cost_month: string | null;
+};
+
+export const COST_CADENCE_LABEL: Record<CostCadence, string> = {
+    monthly: "Monthly",
+    one_time: "One-time"
 };
 
 export const CALL_STATUS_LABEL: Record<CallStatus, string> = {

@@ -3,26 +3,34 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiJson } from "@/lib/api/http";
 import { useConfirm } from "@/components/confirm-dialog";
-import { formatDate, formatMoney } from "./format";
-import { COST_CATEGORY_LABEL, type OutreachCost } from "./types";
+import { formatMoney } from "./format";
+import { COST_CADENCE_LABEL, COST_CATEGORY_LABEL, type CostCadence, type OutreachCost } from "./types";
 
 const cellStyle = { padding: "0.4rem 0.6rem", borderTop: "1px solid var(--app-border)", whiteSpace: "nowrap" as const };
 const headStyle = { ...cellStyle, borderTop: "none", fontWeight: 600, fontSize: "0.72rem", color: "var(--app-text-faint)", textAlign: "left" as const };
 const inputStyle = { padding: "0.4rem 0.6rem", fontSize: "0.82rem", borderRadius: "10px" };
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-type Draft = { label: string; category: string; monthly_amount: string; starts_on: string; ends_on: string };
+/** `month` is YYYY-MM, the value of a month input. */
+type Draft = { label: string; category: string; cadence: CostCadence; amount: string; month: string };
 
-const today = () => new Date().toISOString().slice(0, 10);
-const emptyDraft = (): Draft => ({ label: "", category: "inboxes", monthly_amount: "", starts_on: today(), ends_on: "" });
+const thisMonth = () => new Date().toISOString().slice(0, 7);
+const emptyDraft = (): Draft => ({ label: "", category: "inboxes", cadence: "monthly", amount: "", month: thisMonth() });
 
 function toDraft(cost: OutreachCost): Draft {
     return {
         label: cost.label,
         category: cost.category,
-        monthly_amount: String(cost.monthly_amount),
-        starts_on: cost.starts_on,
-        ends_on: cost.ends_on ?? ""
+        cadence: cost.cadence,
+        amount: String(cost.monthly_amount),
+        month: cost.cost_month ? cost.cost_month.slice(0, 7) : thisMonth()
     };
+}
+
+function formatMonth(costMonth: string | null) {
+    if (!costMonth) return "—";
+    const [year, month] = costMonth.split("-");
+    return `${MONTH_NAMES[Number(month) - 1] ?? month} ${year}`;
 }
 
 function DraftCells({ draft, onChange }: { draft: Draft; onChange: (draft: Draft) => void }) {
@@ -37,13 +45,19 @@ function DraftCells({ draft, onChange }: { draft: Draft; onChange: (draft: Draft
                 </select>
             </td>
             <td style={cellStyle}>
-                <input className="input" style={{ ...inputStyle, width: "110px" }} type="number" min={0} step="any" placeholder="0" value={draft.monthly_amount} onChange={(e) => onChange({ ...draft, monthly_amount: e.target.value })} />
+                <select className="select" style={inputStyle} value={draft.cadence} onChange={(e) => onChange({ ...draft, cadence: e.target.value as CostCadence })}>
+                    {Object.entries(COST_CADENCE_LABEL).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
             </td>
             <td style={cellStyle}>
-                <input className="input" style={inputStyle} type="date" value={draft.starts_on} onChange={(e) => onChange({ ...draft, starts_on: e.target.value })} />
+                <input className="input" style={{ ...inputStyle, width: "110px" }} type="number" min={0} step="any" placeholder="0" value={draft.amount} onChange={(e) => onChange({ ...draft, amount: e.target.value })} />
             </td>
             <td style={cellStyle}>
-                <input className="input" style={inputStyle} type="date" value={draft.ends_on} onChange={(e) => onChange({ ...draft, ends_on: e.target.value })} />
+                {draft.cadence === "one_time" ? (
+                    <input className="input" style={inputStyle} type="month" value={draft.month} onChange={(e) => onChange({ ...draft, month: e.target.value })} />
+                ) : (
+                    <span style={{ color: "var(--app-text-faint)" }}>Every month</span>
+                )}
             </td>
         </>
     );
@@ -75,10 +89,12 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
     const payload = (draft: Draft) => ({
         label: draft.label,
         category: draft.category,
-        monthly_amount: draft.monthly_amount,
-        starts_on: draft.starts_on || null,
-        ends_on: draft.ends_on || null
+        cadence: draft.cadence,
+        monthly_amount: draft.amount,
+        cost_month: draft.cadence === "one_time" && draft.month ? `${draft.month}-01` : null
     });
+
+    const draftReady = (draft: Draft) => Boolean(draft.label.trim()) && draft.amount !== "" && (draft.cadence === "monthly" || Boolean(draft.month));
 
     const run = async (action: () => Promise<unknown>, after: () => void) => {
         setSaving(true);
@@ -108,7 +124,7 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
     const remove = async (cost: OutreachCost) => {
         const ok = await confirm({
             title: `Delete "${cost.label}"?`,
-            message: "Past periods will no longer include this cost. To stop a cost from today on, set an end date instead.",
+            message: "This cost will no longer count in any period, past or future.",
             confirmLabel: "Delete cost"
         });
         if (!ok) return;
@@ -116,7 +132,7 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
     };
 
     const monthlyTotal = (costs ?? [])
-        .filter((c) => !c.ends_on || c.ends_on >= today())
+        .filter((c) => c.cadence === "monthly")
         .reduce((sum, c) => sum + c.monthly_amount, 0);
 
     return (
@@ -124,9 +140,10 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
             <div>
                 <h3 style={{ margin: 0, fontSize: "1.15rem", fontWeight: 650 }}>Outreach costs</h3>
                 <p style={{ margin: "0.15rem 0 0", fontSize: "0.82rem", color: "var(--app-text-faint)" }}>
-                    Recurring monthly costs (inboxes, domains, tools, lead data). Each period is charged for the days it overlaps.
+                    Monthly costs (inboxes, domains, tools) count every month: in full for This month and Last month, and as a share for the rolling 7, 30 and 90 days.
+                    One-time costs (a lead list purchase, say) count toward the month you pick.
                     Enrichment spend from pipeline jobs is added automatically, so don&apos;t enter it here.
-                    {costs && costs.length > 0 && ` Current total: ${formatMoney(monthlyTotal)}/mo.`}
+                    {costs && costs.length > 0 && ` Monthly total: ${formatMoney(monthlyTotal)}/mo.`}
                 </p>
             </div>
 
@@ -138,9 +155,9 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
                         <tr>
                             <th style={headStyle}>Cost</th>
                             <th style={headStyle}>Category</th>
-                            <th style={headStyle}>Per month ($)</th>
-                            <th style={headStyle}>From</th>
-                            <th style={headStyle}>Until</th>
+                            <th style={headStyle}>Type</th>
+                            <th style={headStyle}>Amount ($)</th>
+                            <th style={headStyle}>Month</th>
                             <th style={headStyle} />
                         </tr>
                     </thead>
@@ -152,17 +169,17 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
                                     <td style={{ ...cellStyle, textAlign: "right" }}>
                                         <div style={{ display: "inline-flex", gap: "0.4rem" }}>
                                             <button type="button" className="secondary-button" style={{ padding: "0.25rem 0.7rem", fontSize: "0.78rem" }} onClick={() => setEditingId(null)} disabled={saving}>Cancel</button>
-                                            <button type="button" className="primary-button" style={{ padding: "0.25rem 0.7rem", fontSize: "0.78rem" }} onClick={() => void saveEdit(cost.id)} disabled={saving}>Save</button>
+                                            <button type="button" className="primary-button" style={{ padding: "0.25rem 0.7rem", fontSize: "0.78rem" }} onClick={() => void saveEdit(cost.id)} disabled={saving || !draftReady(editDraft)}>Save</button>
                                         </div>
                                     </td>
                                 </tr>
                             ) : (
-                                <tr key={cost.id} style={{ opacity: cost.ends_on && cost.ends_on < today() ? 0.55 : 1 }}>
+                                <tr key={cost.id}>
                                     <td style={cellStyle}>{cost.label}</td>
                                     <td style={cellStyle}>{COST_CATEGORY_LABEL[cost.category] ?? cost.category}</td>
-                                    <td style={cellStyle}>{formatMoney(cost.monthly_amount)}</td>
-                                    <td style={cellStyle}>{formatDate(cost.starts_on)}</td>
-                                    <td style={cellStyle}>{cost.ends_on ? formatDate(cost.ends_on) : "Ongoing"}</td>
+                                    <td style={cellStyle}>{COST_CADENCE_LABEL[cost.cadence] ?? cost.cadence}</td>
+                                    <td style={cellStyle}>{formatMoney(cost.monthly_amount)}{cost.cadence === "monthly" ? "/mo" : ""}</td>
+                                    <td style={cellStyle}>{cost.cadence === "one_time" ? formatMonth(cost.cost_month) : "Every month"}</td>
                                     <td style={{ ...cellStyle, textAlign: "right" }}>
                                         <div style={{ display: "inline-flex", gap: "0.4rem" }}>
                                             <button
@@ -195,7 +212,7 @@ export function OutreachCosts({ clientId, onChanged }: { clientId: string; onCha
                                     className="primary-button"
                                     style={{ padding: "0.25rem 0.8rem", fontSize: "0.78rem" }}
                                     onClick={() => void add()}
-                                    disabled={saving || !newDraft.label.trim() || newDraft.monthly_amount === ""}
+                                    disabled={saving || !draftReady(newDraft)}
                                 >
                                     Add
                                 </button>

@@ -108,28 +108,58 @@ function within(value, start, end) {
     return time !== null && time >= start.getTime() && time < end.getTime();
 }
 
-function formatCostLineDates(row) {
-    const day = (value) => (value ? isoDay(new Date(toTime(value))) : null);
-    const from = day(row.starts_on);
-    const to = day(row.ends_on);
-    if (from && to) return `${from} to ${to}`;
-    if (from) return `from ${from}`;
-    return to ? `until ${to}` : 'no dates';
+function isMonthStart(date) {
+    return date.getUTCDate() === 1 && date.getTime() === utcMidnight(date).getTime();
 }
 
-/** Monthly cost lines prorated by the days each one overlaps [start, end). */
-export function proratedCostLines(lines, start, end) {
-    return lines.map((line) => {
-        const lineStart = Math.max(toTime(line.starts_on) ?? start.getTime(), start.getTime());
-        // ends_on is inclusive
-        const lineEnd = Math.min(line.ends_on ? toTime(line.ends_on) + DAY_MS : end.getTime(), end.getTime());
-        const days = Math.max(0, (lineEnd - lineStart) / DAY_MS);
+/** Calendar months in [start, end) when both ends fall on a 1st, else null. */
+function wholeMonthsBetween(start, end) {
+    if (!isMonthStart(start) || !isMonthStart(end)) return null;
+    return (end.getUTCFullYear() - start.getUTCFullYear()) * 12 + (end.getUTCMonth() - start.getUTCMonth());
+}
+
+/**
+ * The window costs are charged over. "This month" takes the whole calendar
+ * month, so a monthly cost counts in full mid-month instead of by days so far.
+ */
+export function costWindowForPeriod(period) {
+    if (period.key === 'this_month') {
+        const start = period.start;
+        return { start, end: new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1)) };
+    }
+    return { start: period.start, end: period.end };
+}
+
+/**
+ * What each cost line charges a window. Monthly costs count every month: once
+ * per calendar month for whole-month windows, else days ÷ average month. A
+ * one-time cost belongs to its month: in full when the window covers that
+ * month, else the share of the month's days the window overlaps.
+ */
+export function costLinesForPeriod(lines, start, end) {
+    const wholeMonths = wholeMonthsBetween(start, end);
+    const windowMonths = wholeMonths ?? (end - start) / DAY_MS / DAYS_PER_MONTH;
+    return (lines || []).map((line) => {
+        const amount = Number(line.monthly_amount) || 0;
+        let charged = 0;
+        if (line.cadence === 'one_time') {
+            const monthTime = toTime(line.cost_month);
+            if (monthTime !== null) {
+                const monthStart = new Date(monthTime);
+                const monthEnd = Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 1);
+                const overlap = Math.max(0, Math.min(end.getTime(), monthEnd) - Math.max(start.getTime(), monthTime));
+                charged = amount * overlap / (monthEnd - monthTime);
+            }
+        } else {
+            charged = amount * windowMonths;
+        }
         return {
             id: line.id,
             label: line.label,
             category: line.category,
-            monthlyAmount: Number(line.monthly_amount) || 0,
-            amount: round((Number(line.monthly_amount) || 0) * days / DAYS_PER_MONTH, 2)
+            cadence: line.cadence === 'one_time' ? 'one_time' : 'monthly',
+            monthlyAmount: amount,
+            amount: round(charged, 2)
         };
     }).filter((line) => line.amount > 0);
 }
@@ -609,13 +639,11 @@ export async function loadFunnelMetrics({ clientRow, periodKey, now = new Date()
     };
 
     // Costs
-    const costLines = proratedCostLines(costRows, start, end);
+    const costWindow = costWindowForPeriod(period);
+    const costLines = costLinesForPeriod(costRows, costWindow.start, costWindow.end);
     const fixedCost = costLines.reduce((sum, line) => sum + line.amount, 0);
-    const uncountedCostLines = (costRows || []).filter((row) => !costLines.some((line) => String(line.id) === String(row.id)));
     if (costRows && !costRows.length) {
         warnings.push('No outreach costs are entered, so cost per call, cost per proposal, CAC and ROAS only count lead enrichment.');
-    } else if (uncountedCostLines.length) {
-        warnings.push(`Not counted in this period because of their dates: ${uncountedCostLines.map((row) => `${row.label} (${formatCostLineDates(row)})`).join(', ')}. Check the start and end dates in Outreach costs below.`);
     }
     const outreachCost = fixedCost + (enrichmentSpend || 0);
 

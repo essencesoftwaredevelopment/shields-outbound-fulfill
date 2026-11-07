@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {
     resolvePeriod,
     countWorkingDays,
-    proratedCostLines,
+    costLinesForPeriod,
+    costWindowForPeriod,
     computeSalesMetrics,
     buildScriptRows,
     DAYS_PER_MONTH
@@ -41,20 +42,34 @@ test('countWorkingDays skips weekends', () => {
     assert.equal(countWorkingDays(new Date('2026-10-26T00:00:00Z'), new Date('2026-11-09T00:00:00Z')), 10);
 });
 
-test('proratedCostLines prorates by overlap and honours inclusive end dates', () => {
-    const start = new Date('2026-10-01T00:00:00Z');
-    const end = new Date('2026-11-01T00:00:00Z');
-    const lines = proratedCostLines([
-        { id: 1, label: 'Inboxes', category: 'inboxes', monthly_amount: '1000', starts_on: '2026-01-01', ends_on: null },
-        { id: 2, label: 'Domains', category: 'domains', monthly_amount: 300, starts_on: '2026-10-16', ends_on: null },
-        { id: 3, label: 'Old tool', category: 'tools', monthly_amount: 500, starts_on: '2026-01-01', ends_on: '2026-09-30' },
-        { id: 4, label: 'One day', category: 'tools', monthly_amount: DAYS_PER_MONTH, starts_on: '2026-10-01', ends_on: '2026-10-01' }
-    ], start, end);
-    assert.deepEqual(lines.map((l) => [l.id, l.amount]), [
-        [1, Math.round(1000 * 31 / DAYS_PER_MONTH * 100) / 100],
-        [2, Math.round(300 * 16 / DAYS_PER_MONTH * 100) / 100],
-        [4, 1]
-    ]);
+const INBOXES = { id: 1, label: 'Inboxes', category: 'inboxes', cadence: 'monthly', monthly_amount: '1000', cost_month: null };
+const LEADS_OCT = { id: 2, label: 'Store leads', category: 'leads', cadence: 'one_time', monthly_amount: 600, cost_month: '2026-10-01' };
+
+test('a monthly cost counts in full for a calendar month, even mid-month', () => {
+    const period = resolvePeriod('this_month', new Date('2026-11-15T12:00:00Z'));
+    const window = costWindowForPeriod(period);
+    assert.equal(window.start.toISOString(), '2026-11-01T00:00:00.000Z');
+    assert.equal(window.end.toISOString(), '2026-12-01T00:00:00.000Z');
+    assert.deepEqual(costLinesForPeriod([INBOXES], window.start, window.end).map((l) => l.amount), [1000]);
+});
+
+test('a monthly cost blends by days over rolling windows', () => {
+    const start = new Date('2026-10-10T00:00:00Z');
+    const end = new Date('2026-10-17T00:00:00Z');
+    assert.deepEqual(costLinesForPeriod([INBOXES], start, end).map((l) => l.amount), [Math.round(1000 * 7 / DAYS_PER_MONTH * 100) / 100]);
+});
+
+test('a one-time cost counts in full for its month and not in other months', () => {
+    const oct = costWindowForPeriod(resolvePeriod('last_month', new Date('2026-11-08T12:00:00Z')));
+    assert.deepEqual(costLinesForPeriod([LEADS_OCT], oct.start, oct.end).map((l) => [l.cadence, l.amount]), [['one_time', 600]]);
+    const nov = costWindowForPeriod(resolvePeriod('this_month', new Date('2026-11-08T12:00:00Z')));
+    assert.deepEqual(costLinesForPeriod([LEADS_OCT], nov.start, nov.end), []);
+});
+
+test('a one-time cost counts its share when a rolling window covers part of its month', () => {
+    const start = new Date('2026-10-17T00:00:00Z');
+    const end = new Date('2026-11-16T00:00:00Z');
+    assert.deepEqual(costLinesForPeriod([LEADS_OCT], start, end).map((l) => l.amount), [Math.round(600 * 15 / 31 * 100) / 100]);
 });
 
 function call(overrides) {

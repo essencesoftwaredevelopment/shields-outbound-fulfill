@@ -12,6 +12,7 @@ export const CALL_STATUSES = ['booked', 'held', 'no_show', 'canceled'];
 export const OUTCOMES = ['open', 'won', 'lost'];
 export const LOST_REASONS = ['price', 'timing', 'competitor', 'no_budget', 'ghosted', 'not_a_fit'];
 export const COST_CATEGORIES = ['inboxes', 'domains', 'tools', 'leads', 'other'];
+export const COST_CADENCES = ['monthly', 'one_time'];
 
 function badRequest(message) {
     const error = new Error(message);
@@ -85,9 +86,10 @@ const SALES_CALL_FIELDS = {
 const COST_FIELDS = {
     label: (v) => text(v, 'Label', 200),
     category: (v) => oneOf(v, COST_CATEGORIES, 'Category'),
-    monthly_amount: (v) => money(v, 'Monthly amount'),
-    starts_on: (v) => date(v, 'Starts on'),
-    ends_on: (v) => date(v, 'Ends on')
+    cadence: (v) => oneOf(v, COST_CADENCES, 'Type'),
+    // The amount: per month for monthly costs, the total for a one-time cost.
+    monthly_amount: (v) => money(v, 'Amount'),
+    cost_month: (v) => date(v, 'Month')
 };
 
 const SALES_CALL_DATE_COLUMNS = ['proposal_sent_on', 'closed_on', 'retainer_start', 'retainer_end', 'last_contact_on', 'next_follow_up_on'];
@@ -102,8 +104,8 @@ export const SALES_CALL_SELECT = `
     ai_filled_fields, ai_summary, ai_updated_at, ai_source_recorded_at, recording_url`;
 
 const COST_SELECT = `
-    id, agency_id, client_id, label, category, monthly_amount::float8 AS monthly_amount,
-    starts_on::text AS starts_on, ends_on::text AS ends_on, created_at, updated_at`;
+    id, agency_id, client_id, label, category, cadence, monthly_amount::float8 AS monthly_amount,
+    cost_month::text AS cost_month, created_at, updated_at`;
 
 /** Equality across the shapes a field arrives in (Date vs ISO string, number vs string). */
 function sameValue(a, b) {
@@ -281,24 +283,28 @@ export async function listOutreachCosts(clientRow, db = pool) {
     const { rows } = await db.query(
         `SELECT ${COST_SELECT} FROM outreach_costs
          WHERE agency_id = $1 AND client_id = $2
-         ORDER BY ends_on IS NOT NULL, category, label, id`,
+         ORDER BY cadence, cost_month DESC NULLS FIRST, category, label, id`,
         [clientRow.agency_id, clientRow.id]
     );
     return rows;
 }
 
-function validateCost(values) {
+/** Monthly costs carry no month; a one-time cost needs one, stored as the 1st. */
+function normalizeCost(values) {
     if (!values.label) throw badRequest('Label is required.');
-    if (values.monthly_amount === null || values.monthly_amount === undefined) throw badRequest('Monthly amount is required.');
-    if (values.ends_on && values.starts_on && values.ends_on < values.starts_on) {
-        throw badRequest('End date must be on or after the start date.');
+    if (values.monthly_amount === null || values.monthly_amount === undefined) throw badRequest('Amount is required.');
+    if (values.cadence === 'one_time') {
+        if (!values.cost_month) throw badRequest('Pick the month for a one-time cost.');
+        values.cost_month = `${String(values.cost_month).slice(0, 7)}-01`;
+    } else {
+        values.cadence = 'monthly';
+        values.cost_month = null;
     }
+    return values;
 }
 
 export async function createOutreachCost(clientRow, input) {
-    const values = { category: 'other', starts_on: todayIso(), ...pickFields(input, COST_FIELDS) };
-    if (!values.starts_on) values.starts_on = todayIso();
-    validateCost(values);
+    const values = normalizeCost({ category: 'other', cadence: 'monthly', ...pickFields(input, COST_FIELDS) });
     const columns = Object.keys(values);
     const { rows: [row] } = await pool.query(
         `INSERT INTO outreach_costs (agency_id, client_id, ${columns.join(', ')})
@@ -318,13 +324,12 @@ export async function updateOutreachCost(clientRow, id, input) {
     const merged = {
         label: existing.label,
         category: existing.category,
+        cadence: existing.cadence,
         monthly_amount: existing.monthly_amount,
-        starts_on: existing.starts_on,
-        ends_on: existing.ends_on,
+        cost_month: existing.cost_month,
         ...pickFields(input, COST_FIELDS)
     };
-    if (!merged.starts_on) merged.starts_on = todayIso();
-    validateCost(merged);
+    normalizeCost(merged);
     const columns = Object.keys(COST_FIELDS);
     const { rows: [row] } = await pool.query(
         `UPDATE outreach_costs
