@@ -15,6 +15,7 @@
 
 import { pool } from '../config/db.js';
 import { sendInstantlyReply } from './instantlyState.js';
+import { everWonSql, isContactEverWon } from './wonLeads.js';
 import crypto from 'crypto';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -656,6 +657,8 @@ export async function getEligibleProspects(db, clientId, sentForDate, agentConfi
          WHERE ic.client_id = $1
            AND cic.active = TRUE
            AND c.email IS NOT NULL
+           -- Never email anyone who was ever marked won
+           AND NOT ${everWonSql('cic.contact_id')}
            -- Must have at least one Warm Follow Up event
            AND EXISTS (
                SELECT 1
@@ -722,6 +725,10 @@ export async function getEligibleProspects(db, clientId, sentForDate, agentConfi
  * arrives between eligibility scan and the actual API call.
  */
 export async function recheckProspect(db, contactId, campaignId, sentForDate) {
+    if (await isContactEverWon(db, contactId)) {
+        return { blocked: true, reason: 'ever_won' };
+    }
+
     // Contact-scoped blocker check after latest Warm Follow Up for this campaign
     // (no blocker.campaign_id filter — Calendly / null-campaign events still block)
     const blockerResult = await db.query(
@@ -1126,6 +1133,12 @@ export async function sendRenderedFollowUp({
 }) {
     const { contact_id: contactId, campaign_id: campaignId, company_id: companyId,
             instantly_lead_id: instantlyLeadId, email, instantly_campaign_id: instantlyCampaignId } = prospect;
+
+    // Last line of defence for every follow-up send, static or AI.
+    if (await isContactEverWon(pool, contactId)) {
+        logger(`[follow-up] Not sending to ${email} (contact=${contactId}): lead was marked won`);
+        return { skipped: true, reason: 'ever_won' };
+    }
 
     let replyToUuid = prospect.reply_to_uuid || null;
     let eaccount = prospect.eaccount || null;

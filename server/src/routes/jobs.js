@@ -1214,7 +1214,7 @@ router.post('/jobs/:id/upload-to-instantly', async (req, res) => {
             }
 
             try {
-                await addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions });
+                await addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions, clientId: clientRow.id });
                 uploaded += leads.length;
                 console.log(`Successfully uploaded batch ${i / batchSize + 1}: ${leads.length} leads (total: ${uploaded}/${verified.length})`);
             } catch (error) {

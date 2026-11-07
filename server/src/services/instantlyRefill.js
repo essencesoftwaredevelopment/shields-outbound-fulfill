@@ -381,7 +381,7 @@ async function reverifyEmails({ agencyId, rows, logger }) {
 }
 
 /** Add in batches of 100; every lead sent is recorded, so it isn't picked again. */
-async function addToInstantly({ instantlyKey, instantlyCampaignId, sqlCampaignId, leads, logger }) {
+async function addToInstantly({ instantlyKey, instantlyCampaignId, sqlCampaignId, clientSqlId, leads, logger }) {
     const result = { sent: 0, uploaded: 0, uploadedKnown: false, failed: 0, lastError: null };
     for (let i = 0; i < leads.length; i += INSTANTLY_UPLOAD_BATCH_SIZE) {
         const chunk = leads.slice(i, i + INSTANTLY_UPLOAD_BATCH_SIZE);
@@ -390,7 +390,8 @@ async function addToInstantly({ instantlyKey, instantlyCampaignId, sqlCampaignId
                 instantlyKey,
                 campaignId: instantlyCampaignId,
                 leads: chunk.map(buildRefillLead),
-                skipOptions: { skip_if_in_campaign: true }
+                skipOptions: { skip_if_in_campaign: true },
+                clientId: clientSqlId
             });
             result.sent += chunk.length;
             if (Number.isFinite(Number(body?.leads_uploaded))) {
@@ -535,7 +536,7 @@ export async function runInstantlyRefill({
         const leads = pickLeadsToAdd(candidates, verdicts, summary.need, now);
 
         // 5. Add.
-        const added = await addToInstantly({ instantlyKey, instantlyCampaignId, sqlCampaignId, leads, logger });
+        const added = await addToInstantly({ instantlyKey, instantlyCampaignId, sqlCampaignId, clientSqlId, leads, logger });
         summary.added = added.sent;
         summary.instantlyUploaded = added.uploadedKnown ? added.uploaded : null;
         summary.failed = added.failed;

@@ -4,6 +4,7 @@
  * (enrichment/stages/instantlyBatch.js) build and send leads the same way.
  */
 import { pool } from '../config/db.js';
+import { findEverWonEmails } from './wonLeads.js';
 
 export const INSTANTLY_UPLOAD_BATCH_SIZE = 100;
 
@@ -64,7 +65,18 @@ export function normalizeSkipOptions(skipOptions) {
  * carries code INSTANTLY_UNAUTHORIZED so callers can stop instead of retrying.
  * Resolves to Instantly's response body (upload counts), or null if unreadable.
  */
-export async function addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions }) {
+export async function addLeadsToInstantlyCampaign({ instantlyKey, campaignId, leads, skipOptions, clientId }) {
+    // Never add a lead who was ever marked won: being in a campaign means being emailed.
+    if (!clientId) throw new Error('addLeadsToInstantlyCampaign needs clientId to exclude won leads.');
+    const wonEmails = await findEverWonEmails(pool, clientId, (leads || []).map((lead) => lead?.email));
+    const sendable = wonEmails.size
+        ? leads.filter((lead) => !wonEmails.has(String(lead?.email || '').trim().toLowerCase()))
+        : leads;
+    if (wonEmails.size) {
+        console.log(`[instantly-upload] left out ${leads.length - sendable.length} lead(s) marked won`);
+    }
+    if (!sendable.length) return { leads_uploaded: 0, skipped_won: leads.length };
+    leads = sendable;
     const response = await fetch('https://api.instantly.ai/api/v2/leads/add', {
         method: 'POST',
         headers: {

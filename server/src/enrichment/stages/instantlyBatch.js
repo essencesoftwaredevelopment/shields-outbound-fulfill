@@ -116,7 +116,8 @@ export async function runInstantlyAutoAddBatch(ctx, batchDomains, { finalSweep =
                 instantlyKey,
                 campaignId: config.campaignId,
                 leads,
-                skipOptions: config.skipOptions
+                skipOptions: config.skipOptions,
+                clientId: ctx.clientId
             });
             added += chunk.length;
             if (sqlCampaignId) {

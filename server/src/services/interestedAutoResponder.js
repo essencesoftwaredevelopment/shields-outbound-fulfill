@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { isContactEverWon } from './wonLeads.js';
 import OpenAI from 'openai';
 import { pool } from '../config/db.js';
 import {
@@ -1933,6 +1934,10 @@ export async function createInterestedAutoResponderDraftFromEvent({
     if (!campaignId || !contactId || !sourceEventId) {
         return { created: false, reason: 'missing_required_context' };
     }
+    if (await isContactEverWon(pool, contactId)) {
+        logger(`[interested-autoresponder] no draft for contact=${contactId}: lead was marked won`);
+        return { created: false, reason: 'ever_won' };
+    }
 
     const client = await pool.connect();
     try {
@@ -2661,6 +2666,11 @@ async function resolveDraftFallbackCtaUrl(draft) {
 
 export async function sendInterestedAutoResponderDraftByToken({ token, recipients = null }) {
     const draft = await loadPendingReviewDraft(token);
+    if (await isContactEverWon(pool, draft.contact_id)) {
+        const error = new Error('This lead was marked won, and won leads are never emailed from here.');
+        error.statusCode = 409;
+        throw error;
+    }
     const metadata = await fetchLatestThreadMetadata(pool, draft.contact_id, draft.campaign_id);
     const replyToUuid = asTrimmedText(metadata.reply_to_uuid) || asTrimmedText(draft.reply_to_uuid);
     const eaccount = asTrimmedText(metadata.eaccount) || asTrimmedText(draft.eaccount);
