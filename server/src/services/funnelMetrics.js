@@ -108,6 +108,15 @@ function within(value, start, end) {
     return time !== null && time >= start.getTime() && time < end.getTime();
 }
 
+function formatCostLineDates(row) {
+    const day = (value) => (value ? isoDay(new Date(toTime(value))) : null);
+    const from = day(row.starts_on);
+    const to = day(row.ends_on);
+    if (from && to) return `${from} to ${to}`;
+    if (from) return `from ${from}`;
+    return to ? `until ${to}` : 'no dates';
+}
+
 /** Monthly cost lines prorated by the days each one overlaps [start, end). */
 export function proratedCostLines(lines, start, end) {
     return lines.map((line) => {
@@ -382,6 +391,8 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
             outreachCost: round(outreachCost, 2),
             costPerBookedCall: round(ratio(outreachCost, callsBooked), 2),
             costPerProposal: round(ratio(outreachCost, proposals.length), 2),
+            // Upfront cash (builds + first retainer month) ÷ marketing spend.
+            roas: round(ratio(newRevenue, outreachCost), 2),
             costPerClient: round(costPerClient, 2),
             paybackMonths: costPerClient === null || !avgWonRetainer ? null : round(costPerClient / avgWonRetainer),
             activeRetainers: activeNow.length,
@@ -600,6 +611,12 @@ export async function loadFunnelMetrics({ clientRow, periodKey, now = new Date()
     // Costs
     const costLines = proratedCostLines(costRows, start, end);
     const fixedCost = costLines.reduce((sum, line) => sum + line.amount, 0);
+    const uncountedCostLines = (costRows || []).filter((row) => !costLines.some((line) => String(line.id) === String(row.id)));
+    if (costRows && !costRows.length) {
+        warnings.push('No outreach costs are entered, so cost per call, cost per proposal, CAC and ROAS only count lead enrichment.');
+    } else if (uncountedCostLines.length) {
+        warnings.push(`Not counted in this period because of their dates: ${uncountedCostLines.map((row) => `${row.label} (${formatCostLineDates(row)})`).join(', ')}. Check the start and end dates in Outreach costs below.`);
+    }
     const outreachCost = fixedCost + (enrichmentSpend || 0);
 
     const { sales, money } = computeSalesMetrics(calls, {

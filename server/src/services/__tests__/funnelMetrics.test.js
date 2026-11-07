@@ -120,6 +120,7 @@ test('computeSalesMetrics: funnel ratios inside the period', () => {
     assert.equal(money.avgDealValue, 5000);
     assert.equal(money.costPerBookedCall, Math.round(4000 / 6 * 100) / 100);
     assert.equal(money.costPerProposal, 2000);
+    assert.equal(money.roas, 1.25);
     assert.equal(money.costPerClient, 4000);
     assert.equal(money.paybackMonths, 2);
     assert.equal(money.activeRetainers, 1);

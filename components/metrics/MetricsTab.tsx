@@ -11,6 +11,7 @@ import {
     Scale,
     SendHorizontal,
     Target,
+    TrendingUp,
     Trophy,
     UserCheck,
     UserPlus,
@@ -378,6 +379,13 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                                 secondary={{ value: formatNumber(sales?.dealsWon), label: "Clients signed" }}
                                 icon={<Target {...ICON_PROPS} />}
                                 hint="Customer acquisition cost: outreach cost ÷ clients signed."
+                            />
+                            <MetricCard
+                                label="ROAS"
+                                value={money?.roas === null || money?.roas === undefined ? "—" : `${formatNumber(money.roas, 1)}x`}
+                                secondary={{ value: formatMoney(money?.outreachCost), label: "Marketing spend" }}
+                                icon={<TrendingUp {...ICON_PROPS} />}
+                                hint="Upfront cash (new cash collected: builds + first month of retainers) ÷ marketing spend (outreach cost)."
                             />
                         </Grid>
                     </Section>

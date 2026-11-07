@@ -87,6 +87,7 @@ export type MetricsPayload = {
         outreachCost: number;
         costPerBookedCall: number | null;
         costPerProposal: number | null;
+        roas: number | null;
         costPerClient: number | null;
         paybackMonths: number | null;
         activeRetainers: number;
