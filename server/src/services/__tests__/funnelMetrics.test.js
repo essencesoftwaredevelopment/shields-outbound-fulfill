@@ -131,11 +131,12 @@ test('computeSalesMetrics: funnel ratios inside the period', () => {
 
     assert.equal(money.buildRevenue, 3000);
     assert.equal(money.retainerRevenue, 2000);
-    assert.equal(money.newRevenue, 5000);
-    assert.equal(money.avgDealValue, 5000);
+    // 30-day cash is upfront fees only
+    assert.equal(money.newRevenue, 3000);
+    assert.equal(money.avgDealValue, 3000);
     assert.equal(money.costPerBookedCall, Math.round(4000 / 6 * 100) / 100);
     assert.equal(money.costPerProposal, 2000);
-    assert.equal(money.roas, 1.25);
+    assert.equal(money.roas, 0.75);
     assert.equal(money.costPerClient, 4000);
     assert.equal(money.paybackMonths, 2);
     assert.equal(money.activeRetainers, 1);
@@ -186,9 +187,9 @@ test('computeSalesMetrics: retainer cash counts when the retainer starts, builds
     assert.equal(sales.dealsWon, 2);
     assert.equal(money.buildRevenue, 2250);
     assert.equal(money.retainerRevenue, 1400);
-    assert.equal(money.newRevenue, 3650);
+    assert.equal(money.newRevenue, 2250);
     // average deal cash = new cash collected ÷ deals won
-    assert.equal(money.avgDealValue, 3650 / 2);
+    assert.equal(money.avgDealValue, 2250 / 2);
 });
 
 test('computeSalesMetrics: churn, tenure and lifetime value', () => {

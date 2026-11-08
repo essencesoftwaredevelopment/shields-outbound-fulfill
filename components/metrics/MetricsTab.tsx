@@ -350,18 +350,17 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                     <Section title="3. Money">
                         <Grid>
                             <MetricCard
-                                label="New cash collected"
+                                label="30-day cash"
                                 value={formatMoney(money?.newRevenue)}
-                                secondary={{ value: `${formatMoney(money?.retainerRevenue)}/mo`, label: "Retainers starting" }}
                                 icon={<Banknote {...ICON_PROPS} />}
-                                hint={money ? `${formatMoney(money.buildRevenue)} flow builds from deals closed in the period + ${formatMoney(money.retainerRevenue)}, the first month of retainers that start in the period. From the sales log.` : undefined}
+                                hint="Upfront cash: the flow build fees of deals closed in the period. Retainers aren't included. From the sales log."
                             />
                             <MetricCard
                                 label="Average deal cash"
                                 value={formatMoney(money?.avgDealValue)}
                                 secondary={{ value: formatNumber(sales?.dealsWon), label: "Deals won" }}
                                 icon={<Scale {...ICON_PROPS} />}
-                                hint="New cash collected ÷ deals won in the period."
+                                hint="30-day cash ÷ deals won in the period."
                             />
                             <MetricCard
                                 label="Cost per call"
@@ -389,7 +388,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                                 value={money?.roas === null || money?.roas === undefined ? "—" : `${formatNumber(money.roas, 1)}x`}
                                 secondary={{ value: formatMoney(money?.outreachCost), label: "Marketing spend" }}
                                 icon={<TrendingUp {...ICON_PROPS} />}
-                                hint="Upfront cash (new cash collected: builds + first month of retainers) ÷ marketing spend (outreach cost)."
+                                hint="30-day cash (upfront build fees) ÷ marketing spend (outreach cost)."
                             />
                         </Grid>
                     </Section>

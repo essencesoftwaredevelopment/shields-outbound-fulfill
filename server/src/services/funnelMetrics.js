@@ -371,7 +371,9 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
     );
     const buildRevenue = won.reduce((sum, c) => sum + (Number(c.build_value) || 0), 0);
     const retainerRevenue = retainersStarting.reduce((sum, c) => sum + (Number(c.retainer_monthly) || 0), 0);
-    const newRevenue = buildRevenue + retainerRevenue;
+    // 30-day cash: upfront fees only (flow builds of deals closed in the period).
+    // Retainers are tracked separately and never counted as new cash.
+    const newRevenue = buildRevenue;
     const wonRetainers = won.map((c) => Number(c.retainer_monthly) || 0).filter((v) => v > 0);
 
     const retainerClients = calls.filter((c) => Number(c.retainer_monthly) > 0 && c.retainer_start);
