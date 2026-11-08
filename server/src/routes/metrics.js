@@ -24,6 +24,7 @@ import {
     updateOutreachCost,
     deleteOutreachCost
 } from '../services/db/funnelInputs.js';
+import { getCallRecordingStatus, linkFathomCall } from '../services/callAnalysis/index.js';
 
 const router = express.Router();
 
@@ -110,6 +111,41 @@ router.delete('/clients/:clientId/metrics/sales-calls/:id', requireAuth, async (
         res.json({ ok: true });
     } catch (error) {
         sendError(res, error, 'Failed to delete the call.');
+    }
+});
+
+/** Add a Fathom call by its link; body { url, salesCallId? } (no salesCallId = match or create). */
+router.post('/clients/:clientId/metrics/fathom-calls', requireAuth, async (req, res) => {
+    try {
+        const clientRow = await requireClient(req, res);
+        if (!clientRow) return;
+        const salesCallId = req.body?.salesCallId === undefined || req.body?.salesCallId === null
+            ? null
+            : parseId(req.body.salesCallId);
+        if (req.body?.salesCallId != null && !salesCallId) return res.status(400).json({ error: 'Valid salesCallId is required.' });
+        res.status(202).json(await linkFathomCall({
+            agencyId: req.agencyId,
+            clientRow,
+            url: req.body?.url,
+            salesCallId
+        }));
+    } catch (error) {
+        sendError(res, error, 'Failed to add the Fathom call.');
+    }
+});
+
+router.get('/clients/:clientId/metrics/fathom-calls/:recordingId', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const clientRow = await requireClient(req, res);
+        if (!clientRow) return;
+        const recordingId = parseId(req.params.recordingId);
+        if (!recordingId) return res.status(400).json({ error: 'Valid recording id is required.' });
+        const recording = await getCallRecordingStatus({ agencyId: req.agencyId, clientId: clientRow.id, recordingId });
+        if (!recording) return res.status(404).json({ error: 'Recording not found.' });
+        res.json({ recording });
+    } catch (error) {
+        sendError(res, error, 'Failed to load the call status.');
     }
 });
 

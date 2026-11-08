@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, Sparkles, Video } from "lucide-react";
 import { apiJson } from "@/lib/api/http";
 import { useConfirm } from "@/components/confirm-dialog";
@@ -122,6 +122,123 @@ function FieldGroup({ title, children }: { title: string; children: ReactNode })
     );
 }
 
+type LinkPhase = "idle" | "linking" | "analysing" | "done" | "error";
+type RecordingStatus = { status: string; error: string | null; applied_fields: string[] | null };
+
+const FIELD_NAMES: Record<string, string> = {
+    call_status: "status", call_at: "call time", qualified: "good fit", proposal_sent_on: "proposal date",
+    outcome: "outcome", closed_on: "close date", lost_reason: "lost reason", build_value: "build value",
+    retainer_monthly: "retainer", retainer_start: "retainer start", last_contact_on: "last contact",
+    next_follow_up_on: "next follow-up"
+};
+
+/**
+ * Paste a Fathom link → the call is fetched, attached (to `salesCallId`, or to
+ * whoever the outside attendee is in the sales log, or a new entry) and run
+ * through the AI. Polls until the analysis lands, then calls onDone.
+ */
+function FathomLinkForm({ clientId, salesCallId, onDone }: {
+    clientId: string;
+    salesCallId: number | null;
+    onDone: (message: string) => void;
+}) {
+    const [url, setUrl] = useState("");
+    const [phase, setPhase] = useState<LinkPhase>("idle");
+    const [message, setMessage] = useState("");
+    const cancelled = useRef(false);
+    const base = `/api/clients/${encodeURIComponent(clientId)}/metrics/fathom-calls`;
+
+    useEffect(() => () => { cancelled.current = true; }, []);
+
+    const submit = async () => {
+        setPhase("linking");
+        setMessage("Finding the call in Fathom…");
+        try {
+            const linked = await apiJson<{ recordingId: number; createdSalesCall: boolean; title: string | null }>(base, {
+                method: "POST",
+                body: JSON.stringify({ url, ...(salesCallId ? { salesCallId } : {}) })
+            });
+            setPhase("analysing");
+            setMessage(`${linked.title ? `“${linked.title}”` : "Call"} found${linked.createdSalesCall ? ", added as a new entry" : ""}. The AI is reading it…`);
+            const deadline = Date.now() + 3 * 60_000;
+            while (!cancelled.current && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 3000));
+                const { recording } = await apiJson<{ recording: RecordingStatus }>(`${base}/${linked.recordingId}`);
+                if (recording.status === "applied") {
+                    const fields = (recording.applied_fields ?? []).map((field) => FIELD_NAMES[field] ?? field);
+                    const done = fields.length
+                        ? `Done. The AI filled in: ${fields.join(", ")}.`
+                        : "Done. Nothing new to fill in: the entry already had these details, or you'd entered them by hand.";
+                    setPhase("done");
+                    setMessage(done);
+                    onDone(done);
+                    return;
+                }
+                if (recording.status === "failed" || recording.status === "unmatched") {
+                    throw new Error(recording.error || "The AI couldn't use this call.");
+                }
+            }
+            if (!cancelled.current) {
+                setPhase("done");
+                setMessage("Still processing. It'll show up in the sales log when it's done.");
+                onDone("");
+            }
+        } catch (linkError) {
+            setPhase("error");
+            setMessage(linkError instanceof Error ? linkError.message : "Failed to add the Fathom call.");
+        }
+    };
+
+    const busy = phase === "linking" || phase === "analysing";
+    return (
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+            <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                <input
+                    className="input"
+                    style={{ ...inputStyle, flex: "1 1 280px" }}
+                    placeholder="https://fathom.video/calls/… or /share/…"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    disabled={busy}
+                    aria-label="Fathom call link"
+                />
+                <button type="button" className="primary-button" onClick={() => void submit()} disabled={busy || !url.trim()}>
+                    {busy ? "Working…" : "Add and analyse"}
+                </button>
+            </div>
+            {message && (
+                <p role={phase === "error" ? "alert" : "status"} className={phase === "error" ? "form-error" : undefined} style={{ margin: 0, fontSize: "0.82rem", color: phase === "error" ? undefined : "var(--app-text-muted)" }}>
+                    {message}
+                </p>
+            )}
+        </div>
+    );
+}
+
+function FathomAddDialog({ clientId, onClose, onAdded }: { clientId: string; onClose: () => void; onAdded: () => void }) {
+    return (
+        <div className="modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+            <div className="modal" role="dialog" aria-modal="true" aria-labelledby="fathom-add-title" style={{ maxWidth: "620px", padding: "2rem" }}>
+                <div className="modal__header">
+                    <div>
+                        <h2 id="fathom-add-title" className="modal__title" style={{ fontSize: "1.4rem" }}>Add a Fathom call</h2>
+                        <p className="modal__description">
+                            Paste the call&apos;s Fathom link. It&apos;s added to whoever the outside attendee is in the sales log, or as a new
+                            entry, and the AI fills in what happened. To attach it to a specific entry, use Edit on that row instead.
+                        </p>
+                    </div>
+                </div>
+                <div className="modal__body" style={{ gap: "1rem" }}>
+                    <FathomLinkForm clientId={clientId} salesCallId={null} onDone={() => onAdded()} />
+                    <div className="modal__actions">
+                        <button type="button" className="secondary-button" onClick={onClose}>Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function SalesCallDialog({ clientId, call, onClose, onSaved }: {
     clientId: string;
     call: SalesCall | null;
@@ -197,6 +314,17 @@ function SalesCallDialog({ clientId, call, onClose, onSaved }: {
                 )}
 
                 <div className="modal__body" style={{ gap: "1.25rem" }}>
+                    {call && (
+                        <FieldGroup title="Fathom call">
+                            <div style={{ gridColumn: "1 / -1" }}>
+                                <FathomLinkForm
+                                    clientId={clientId}
+                                    salesCallId={call.id}
+                                    onDone={(message) => { if (message) setTimeout(onSaved, 1500); }}
+                                />
+                            </div>
+                        </FieldGroup>
+                    )}
                     <FieldGroup title="Who">
                         <Field label="Company"><input className="input" style={inputStyle} value={draft.company} onChange={(e) => set("company", e.target.value)} /></Field>
                         <Field label="Contact name"><input className="input" style={inputStyle} value={draft.contact_name} onChange={(e) => set("contact_name", e.target.value)} /></Field>
@@ -289,6 +417,7 @@ export function SalesLog({ clientId, onChanged }: { clientId: string; onChanged:
     const [log, setLog] = useState<{ calls: SalesCall[]; loadedAt: number } | null>(null);
     const [error, setError] = useState("");
     const [editing, setEditing] = useState<SalesCall | "new" | null>(null);
+    const [addingFathom, setAddingFathom] = useState(false);
     const [shown, setShown] = useState(PAGE_SIZE);
     const [reloadKey, setReloadKey] = useState(0);
 
@@ -336,7 +465,14 @@ export function SalesLog({ clientId, onChanged }: { clientId: string; onChanged:
                     <span style={{ fontSize: "1.15rem", fontWeight: 650 }}>Sales log</span>
                     {calls && <span style={{ fontSize: "0.85rem", color: "var(--app-text-ghost)" }}>{calls.length} calls</span>}
                 </button>
-                {open && <button type="button" className="primary-button" onClick={() => setEditing("new")}>Add call</button>}
+                {open && (
+                    <div style={{ display: "flex", gap: "0.5rem" }}>
+                        <button type="button" className="secondary-button" onClick={() => setAddingFathom(true)} style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
+                            <Video size={14} /> Add from Fathom
+                        </button>
+                        <button type="button" className="primary-button" onClick={() => setEditing("new")}>Add call</button>
+                    </div>
+                )}
             </div>
 
             {error && <p className="form-error" role="alert" style={{ margin: 0 }}>{error}</p>}
@@ -424,6 +560,14 @@ export function SalesLog({ clientId, onChanged }: { clientId: string; onChanged:
                 </button>
             )}
             </>
+            )}
+
+            {addingFathom && (
+                <FathomAddDialog
+                    clientId={clientId}
+                    onClose={() => setAddingFathom(false)}
+                    onAdded={() => { setReloadKey((k) => k + 1); onChanged(); }}
+                />
             )}
 
             {editing && (

@@ -136,3 +136,13 @@ test('parseDomainList accepts commas, spaces, @ and URLs', () => {
     );
     assert.deepEqual(parseDomainList(undefined), []);
 });
+
+test('Fathom call links normalize to one comparable form', async () => {
+    const { normalizeFathomUrl } = await import('../fathom.js');
+    assert.equal(normalizeFathomUrl('https://fathom.video/calls/890038861?timestamp=12'), 'https://fathom.video/calls/890038861');
+    assert.equal(normalizeFathomUrl('www.fathom.video/share/abc_DEF/'), 'https://fathom.video/share/abc_DEF');
+    assert.equal(normalizeFathomUrl('http://fathom.video/calls/1#t'), 'https://fathom.video/calls/1');
+    assert.equal(normalizeFathomUrl('https://example.com/calls/1'), null);
+    assert.equal(normalizeFathomUrl('https://fathom.video/home'), null);
+    assert.equal(normalizeFathomUrl(''), null);
+});

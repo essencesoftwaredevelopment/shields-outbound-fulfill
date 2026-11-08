@@ -35,20 +35,48 @@ export async function fathomRequest({ apiKey, path, method = 'GET', body }) {
     return data;
 }
 
-/** All meetings created since `createdAfter` (ISO), with transcript and summary. */
-export async function listFathomMeetings({ apiKey, createdAfter, maxPages = 20 }) {
+/**
+ * Meetings created in [createdAfter, createdBefore) (ISO), with transcript and
+ * summary unless `withContent` is false. `stopWhen(meeting)` ends paging early
+ * once it returns true for a meeting on the page just read.
+ */
+export async function listFathomMeetings({ apiKey, createdAfter, createdBefore = null, withContent = true, maxPages = 20, stopWhen = null }) {
     const meetings = [];
     let cursor = null;
     for (let page = 0; page < maxPages; page += 1) {
-        const params = new URLSearchParams({ include_transcript: 'true', include_summary: 'true' });
+        const params = new URLSearchParams(withContent ? { include_transcript: 'true', include_summary: 'true' } : {});
         if (createdAfter) params.set('created_after', createdAfter);
+        if (createdBefore) params.set('created_before', createdBefore);
         if (cursor) params.set('cursor', cursor);
         const data = await fathomRequest({ apiKey, path: `/meetings?${params}` });
-        meetings.push(...(Array.isArray(data?.items) ? data.items : []));
+        const items = Array.isArray(data?.items) ? data.items : [];
+        meetings.push(...items);
+        if (stopWhen && items.some(stopWhen)) break;
         cursor = data?.next_cursor || null;
         if (!cursor) break;
     }
     return meetings;
+}
+
+/**
+ * A Fathom call link in one comparable form: https, no www, no query or hash,
+ * no trailing slash. Returns null for anything that isn't a fathom.video call
+ * or share link.
+ */
+export function normalizeFathomUrl(raw) {
+    let url;
+    let text = String(raw || '').trim();
+    if (text && !/^[a-z]+:\/\//i.test(text)) text = `https://${text}`;
+    try {
+        url = new URL(text);
+    } catch {
+        return null;
+    }
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+    if (host !== 'fathom.video') return null;
+    const path = url.pathname.replace(/\/+$/, '');
+    if (!/^\/(calls|share)\/[^/]+/.test(path)) return null;
+    return `https://fathom.video${path}`;
 }
 
 export async function createFathomWebhook({ apiKey, destinationUrl }) {

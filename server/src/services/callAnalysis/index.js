@@ -14,7 +14,8 @@ import { resolveWorkflowStartBaseUrl } from '../interestedResearch/trigger.js';
 import {
     createFathomWebhook,
     deleteFathomWebhook,
-    listFathomMeetings
+    listFathomMeetings,
+    normalizeFathomUrl
 } from '../fathom.js';
 import {
     CALL_ANALYSIS_INSTRUCTIONS,
@@ -442,4 +443,166 @@ export async function connectFathom({ agencyId, webhookBaseUrl }) {
         [agencyId, webhook.id, webhook.secret]
     );
     return { connected: true, webhookId: webhook.id };
+}
+
+function badRequest(message, statusCode = 400) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const LINK_SEARCH_DAYS = 180;
+
+/**
+ * Finds a Fathom meeting by its call or share link. A recording we already
+ * stored narrows the search to a few days around it; otherwise the last
+ * LINK_SEARCH_DAYS are scanned without content, then the match is fetched
+ * again with its transcript and summary.
+ */
+async function findFathomMeetingByUrl({ apiKey, url, known }) {
+    const matches = (meeting) => normalizeFathomUrl(meeting?.url) === url
+        || normalizeFathomUrl(meeting?.share_url) === url
+        || (known && String(meeting?.recording_id) === String(known.external_id));
+    const around = (iso) => ({
+        createdAfter: new Date(new Date(iso).getTime() - 3 * DAY_MS).toISOString(),
+        createdBefore: new Date(new Date(iso).getTime() + 3 * DAY_MS).toISOString()
+    });
+
+    if (known?.recorded_at) {
+        const meetings = await listFathomMeetings({ apiKey, ...around(known.recorded_at), stopWhen: matches });
+        const found = meetings.find(matches);
+        if (found) return found;
+    }
+    const scan = await listFathomMeetings({
+        apiKey,
+        createdAfter: new Date(Date.now() - LINK_SEARCH_DAYS * DAY_MS).toISOString(),
+        withContent: false,
+        maxPages: 60,
+        stopWhen: matches
+    });
+    const hit = scan.find(matches);
+    if (!hit) return null;
+    const full = await listFathomMeetings({ apiKey, ...around(hit.created_at || hit.recording_start_time), stopWhen: matches });
+    return full.find((meeting) => String(meeting.recording_id) === String(hit.recording_id)) || null;
+}
+
+/** The sales call to attach to: one chosen by hand, or a match by attendee email, or a new one. */
+async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCallId }) {
+    if (salesCallId) {
+        const { rows: [call] } = await pool.query(
+            'SELECT id FROM sales_calls WHERE id = $1 AND agency_id = $2 AND client_id = $3',
+            [salesCallId, agencyId, clientRow.id]
+        );
+        if (!call) throw notFound('That sales log entry was not found for this client.');
+        return { salesCallId: Number(call.id), created: false };
+    }
+
+    const ownDomains = await loadOwnDomains(agencyId);
+    const invitees = Array.isArray(recording.invitees) ? recording.invitees : [];
+    const emails = (recording.external_emails || []).filter((email) => !ownDomains.has(email.split('@')[1]));
+    if (!emails.length) {
+        throw badRequest('This call has no outside attendee to match. Open the person in the sales log and link the call from there.');
+    }
+
+    const { rows: [existing] } = await pool.query(
+        `SELECT s.id
+         FROM sales_calls s
+         LEFT JOIN contacts c ON c.id = s.contact_id
+         WHERE s.agency_id = $1 AND s.client_id = $2
+           AND (LOWER(s.contact_email) = ANY($3::text[]) OR LOWER(c.email) = ANY($3::text[]))
+         ORDER BY (s.call_status = 'canceled'), ABS(EXTRACT(EPOCH FROM (COALESCE(s.call_at, s.booked_at, s.created_at) - $4::timestamptz)))
+         LIMIT 1`,
+        [agencyId, clientRow.id, emails, recording.recorded_at || new Date().toISOString()]
+    );
+    if (existing) return { salesCallId: Number(existing.id), created: false };
+
+    const email = emails[0];
+    const invitee = invitees.find((i) => String(i?.email || '').toLowerCase() === email) || {};
+    const { rows: [contact] } = await pool.query(
+        'SELECT id FROM contacts WHERE client_id = $1 AND LOWER(email) = $2 LIMIT 1',
+        [clientRow.id, email]
+    );
+    const { rows: [created] } = await pool.query(
+        `INSERT INTO sales_calls (
+             agency_id, client_id, contact_id, company, contact_name, contact_email,
+             booked_at, call_at, call_status, ai_filled_fields
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'held', ARRAY['call_status', 'call_at']::text[])
+         RETURNING id`,
+        [
+            agencyId,
+            clientRow.id,
+            contact?.id || null,
+            businessDomains([email])[0] || null,
+            invitee.name || null,
+            email,
+            recording.recorded_at || new Date().toISOString()
+        ]
+    );
+    return { salesCallId: Number(created.id), created: true };
+}
+
+/**
+ * Adds a Fathom call by its link and runs the AI analysis on it. It's attached
+ * to the sales log entry picked by hand (salesCallId), else to whoever in this
+ * client's sales log the outside attendee is, else to a new entry. A call that
+ * was skipped before (its transcript discarded) is fetched again from Fathom.
+ */
+export async function linkFathomCall({ agencyId, clientRow, url: rawUrl, salesCallId = null }) {
+    const url = normalizeFathomUrl(rawUrl);
+    if (!url) throw badRequest('Paste a Fathom call link, like https://fathom.video/calls/123… or https://fathom.video/share/….');
+    const settings = await getAgencySettings(agencyId);
+    const apiKey = String(settings?.fathom_key || '').trim();
+    if (!apiKey) throw badRequest('Connect Fathom first: save the Fathom API key in the API vault.');
+
+    const { rows: [known] } = await pool.query(
+        `SELECT external_id, recorded_at FROM call_recordings
+         WHERE agency_id = $1 AND provider = 'fathom'
+           AND (RTRIM(SPLIT_PART(url, '?', 1), '/') = $2 OR RTRIM(SPLIT_PART(share_url, '?', 1), '/') = $2)
+         LIMIT 1`,
+        [agencyId, url]
+    );
+    const meeting = await findFathomMeetingByUrl({ apiKey, url, known });
+    if (!meeting) {
+        throw badRequest('Fathom didn’t return that call. The saved Fathom key only sees calls recorded by, or shared with, its owner in the last six months.', 404);
+    }
+    if (!Array.isArray(meeting.transcript) || !meeting.transcript.length) {
+        throw badRequest('Fathom hasn’t finished the transcript for this call yet. Try again in a few minutes.', 409);
+    }
+
+    // Start the recording over, so a previously skipped call keeps its
+    // transcript and gets analysed again.
+    await pool.query(
+        `UPDATE call_recordings
+         SET status = 'received', match_reason = NULL, analysis = NULL, applied_fields = '{}', error = NULL, updated_at = NOW()
+         WHERE agency_id = $1 AND provider = 'fathom' AND external_id = $2`,
+        [agencyId, String(meeting.recording_id)]
+    );
+    const { recordingId } = await ingestFathomMeeting(agencyId, meeting);
+    const recording = await loadRecording(recordingId, agencyId);
+    const target = await resolveSalesCallForLink({ agencyId, clientRow, recording, salesCallId });
+
+    await setRecording(recordingId, agencyId, {
+        status: 'matched',
+        match_reason: salesCallId ? 'manual' : (target.created ? 'manual_new' : 'manual_email'),
+        sales_call_id: target.salesCallId,
+        client_id: clientRow.id
+    });
+    await triggerCallAnalysis({ recordingId, agencyId });
+    return {
+        recordingId,
+        salesCallId: target.salesCallId,
+        createdSalesCall: target.created,
+        title: recording.title || null
+    };
+}
+
+/** Progress of one linked call, for the sales log to poll. */
+export async function getCallRecordingStatus({ agencyId, clientId, recordingId }) {
+    const { rows: [row] } = await pool.query(
+        `SELECT id, status, error, sales_call_id, applied_fields, title
+         FROM call_recordings WHERE id = $1 AND agency_id = $2 AND client_id = $3`,
+        [recordingId, agencyId, clientId]
+    );
+    return row || null;
 }
