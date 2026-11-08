@@ -14,13 +14,32 @@
  *   the campaign's daily_max_leads.
  * Backlog = active campaign leads Shields has synced that were never contacted.
  *
- * Results are cached in memory per client (the API host is a single process);
- * a cold load costs one campaigns call plus a few paged account calls.
+ * Results are cached in memory per client (the API host is a single process).
+ * After CACHE_TTL_MS a cached result is still served while a refresh runs in
+ * the background, up to MAX_STALE_MS; a cold load costs one campaigns call plus
+ * paged account calls, run a few at a time.
  */
 
-import { fetchInstantlyAccounts, fetchInstantlyCampaigns, instantlyRequest } from './instantlyState.js';
+import { fetchInstantlyAccounts, fetchInstantlyCampaigns, instantlyRequest, listInstantlySyncClients } from './instantlyState.js';
 
 const CACHE_TTL_MS = 15 * 60 * 1000;
+const MAX_STALE_MS = 6 * 60 * 60 * 1000;
+const INSTANTLY_CONCURRENCY = 4;
+
+/** `fn` over every item, at most `limit` at a time, results in input order. */
+async function mapLimited(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+            const index = next;
+            next += 1;
+            results[index] = await fn(items[index], index);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
 const DEFAULT_STEPS = 3;
 const DEFAULT_SCHEDULE_DAYS = [1, 2, 3, 4, 5];
 const MAX_RUNWAY_WALK_DAYS = 3 * 365;
@@ -269,12 +288,8 @@ async function loadReserve(pool, agencyId, sqlClientId) {
 
 /** tag id → emails of the accounts carrying it. */
 async function fetchTaggedEmails(instantlyKey, tagIds) {
-    const taggedEmails = new Map();
-    for (const tagId of tagIds) {
-        const tagged = await fetchInstantlyAccounts(instantlyKey, { tagIds: [tagId] });
-        taggedEmails.set(tagId, tagged.map((account) => account?.email).filter(Boolean));
-    }
-    return taggedEmails;
+    const lists = await mapLimited(tagIds, INSTANTLY_CONCURRENCY, (tagId) => fetchInstantlyAccounts(instantlyKey, { tagIds: [tagId] }));
+    return new Map(tagIds.map((tagId, i) => [tagId, lists[i].map((account) => account?.email).filter(Boolean)]));
 }
 
 /**
@@ -310,13 +325,12 @@ async function computeForClient({ pool, agencyId, sqlClientId, instantlyKey }) {
 
     // Some campaigns come back without their settings (stored payloads show the
     // same stub); fetch those one by one so capacity isn't silently zero.
-    const campaigns = [];
-    for (const campaign of listedCampaigns) {
+    const campaigns = await mapLimited(listedCampaigns, INSTANTLY_CONCURRENCY, (campaign) => {
         const needsDetail = Number(campaign?.status) === 1 && campaign?.id && !Array.isArray(campaign?.sequences);
-        campaigns.push(needsDetail
-            ? await instantlyRequest({ apiKey: instantlyKey, path: `/api/v2/campaigns/${encodeURIComponent(campaign.id)}` })
-            : campaign);
-    }
+        return needsDetail
+            ? instantlyRequest({ apiKey: instantlyKey, path: `/api/v2/campaigns/${encodeURIComponent(campaign.id)}` })
+            : campaign;
+    });
 
     // Resolve tags only for campaigns that matter (running, or still holding leads).
     const relevant = campaigns.filter((campaign) => Number(campaign?.status) === 1 || backlog.has(String(campaign?.id)));
@@ -332,17 +346,9 @@ async function computeForClient({ pool, agencyId, sqlClientId, instantlyKey }) {
     };
 }
 
-/**
- * Cached runway for one client. `refresh` bypasses the cache; concurrent
- * callers share one computation.
- */
-export async function loadSendingRunway({ pool, agencyId, sqlClientId, instantlyKey, refresh = false }) {
-    const key = `${agencyId}:${sqlClientId}`;
-    const cached = cache.get(key);
-    if (!refresh && cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
-
+function computeShared(key, args) {
     if (inFlight.has(key)) return inFlight.get(key);
-    const promise = computeForClient({ pool, agencyId, sqlClientId, instantlyKey })
+    const promise = computeForClient(args)
         .then((value) => {
             cache.set(key, { at: Date.now(), value });
             return value;
@@ -350,4 +356,42 @@ export async function loadSendingRunway({ pool, agencyId, sqlClientId, instantly
         .finally(() => inFlight.delete(key));
     inFlight.set(key, promise);
     return promise;
+}
+
+/**
+ * Cached runway for one client. Fresh for CACHE_TTL_MS; after that the cached
+ * result is returned at once while a background refresh runs, up to
+ * MAX_STALE_MS. `refresh` waits for a new computation. Concurrent callers
+ * share one computation.
+ */
+export async function loadSendingRunway({ pool, agencyId, sqlClientId, instantlyKey, refresh = false }) {
+    const key = `${agencyId}:${sqlClientId}`;
+    const args = { pool, agencyId, sqlClientId, instantlyKey };
+    const cached = cache.get(key);
+    const age = cached ? Date.now() - cached.at : Infinity;
+    if (!refresh && age < CACHE_TTL_MS) return cached.value;
+    if (!refresh && age < MAX_STALE_MS) {
+        computeShared(key, args).catch((error) => {
+            console.warn(`[sending-runway] background refresh failed for ${key}: ${error?.message || error}`);
+        });
+        return cached.value;
+    }
+    return computeShared(key, args);
+}
+
+/** Fills the cache for every client with an Instantly key, one at a time (server start). */
+export async function warmSendingRunways({ pool, logger = console.log } = {}) {
+    const started = Date.now();
+    let warmed = 0;
+    for (const client of await listInstantlySyncClients()) {
+        const sqlClientId = Number(client.clientId);
+        if (!sqlClientId) continue;
+        try {
+            await loadSendingRunway({ pool, agencyId: client.agencyId, sqlClientId, instantlyKey: client.instantlyKey, refresh: true });
+            warmed += 1;
+        } catch (error) {
+            logger(`[sending-runway] warm-up failed for ${client.agencyId}/${client.clientSlug}: ${error?.message || error}`);
+        }
+    }
+    logger(`[sending-runway] warmed ${warmed} client(s) in ${Date.now() - started}ms`);
 }

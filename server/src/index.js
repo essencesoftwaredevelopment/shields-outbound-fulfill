@@ -38,6 +38,7 @@ import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/job
 import { startAnalyticsSnapshotSweep } from './services/analyticsSnapshots.js';
 import { startInstantlyCleanupSweep } from './services/instantlyCleanup.js';
 import { startInstantlyRefillSweep } from './services/instantlyRefill.js';
+import { warmSendingRunways } from './services/sendingRunway.js';
 
 const app = express();
 const PORT = env.PORT || 4000;
@@ -150,6 +151,13 @@ const server = app.listen(PORT, async () => {
     stopAnalyticsSnapshotSweep = startAnalyticsSnapshotSweep(pool);
     stopInstantlyCleanupSweep = startInstantlyCleanupSweep();
     stopInstantlyRefillSweep = startInstantlyRefillSweep();
+    // Warm the sending-runway cache so the first Metrics/Analytics view after a
+    // deploy doesn't wait on Instantly. Production only: local dev shares the DB.
+    if (process.env.NODE_ENV === 'production') {
+        setTimeout(() => {
+            warmSendingRunways({ pool }).catch((error) => console.warn('[sending-runway] warm-up failed:', error?.message || error));
+        }, 15_000).unref();
+    }
 });
 
 server.on('error', (err) => {
