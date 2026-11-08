@@ -725,6 +725,54 @@ export async function processCalendlyWebhook({
 }
 
 /**
+ * Adds the "Meeting Booked" timeline event for a stored Calendly booking that
+ * was linked to a lead by hand (e.g. the lead booked with a personal email).
+ * Same fingerprint as the webhook, so it never duplicates one already there.
+ */
+export async function recordLinkedBookingTimeline({ booking, contact }) {
+    const rawInvitee = booking.raw_invitee || {};
+    const eventTimestamp = resolveEventTimestamp(rawInvitee.created_at || booking.created_at);
+    const startTime = booking.raw_scheduled_event?.start_time
+        || (booking.start_time ? new Date(booking.start_time).toISOString() : null);
+    const email = normalizeEmail(booking.invitee_email);
+    const campaign = await resolveLatestCampaignForContact(contact.id, { at: eventTimestamp });
+    await insertTimelineEvent({
+        agencyId: contact.agency_id,
+        clientId: contact.client_id,
+        contactId: contact.id,
+        campaignId: campaign?.campaign_id || null,
+        instantlyCampaignId: campaign?.instantly_campaign_id || null,
+        timelineEventType: 'lead_meeting_booked',
+        email,
+        messageText: buildTimelineMessage({
+            inviteeName: booking.invitee_name,
+            eventName: booking.event_name,
+            timelineEventType: 'lead_meeting_booked'
+        }),
+        eventTimestamp,
+        fingerprint: buildTimelineFingerprint({
+            inviteeUri: booking.invitee_uri,
+            email,
+            startTime,
+            timelineEventType: 'lead_meeting_booked'
+        }),
+        storedPayload: {
+            calendly_event: 'invitee.created',
+            linked_manually: true,
+            invitee_uri: booking.invitee_uri,
+            scheduled_event_uri: booking.scheduled_event_uri,
+            meeting_name: booking.event_name,
+            start_time: startTime,
+            end_time: booking.end_time,
+            timezone: booking.timezone,
+            location: booking.location,
+            contact_id: contact.id,
+            campaign_id: campaign?.campaign_id || null
+        }
+    });
+}
+
+/**
  * Legacy per-client webhook handler — scopes contact lookup to agency + client.
  */
 export async function processCalendlyWebhookForClient({ body, agencyId, clientId, deliveryId = null }) {

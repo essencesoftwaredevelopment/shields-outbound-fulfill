@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, Sparkles, Video } from "lucide-react";
+import { CalendarPlus, ChevronDown, ChevronRight, Sparkles, Video } from "lucide-react";
 import { apiJson } from "@/lib/api/http";
 import { useConfirm } from "@/components/confirm-dialog";
 import { formatDate, formatDateTime, formatMoney, fromDateTimeLocal, toDateTimeLocal } from "./format";
@@ -258,6 +258,103 @@ function FathomAddDialog({ clientId, onClose, onAdded }: { clientId: string; onC
     );
 }
 
+type CalendlyLinkResult = {
+    lead: { name: string | null; email: string; company: string | null };
+    bookings: { event: string | null; startTime: string | null; status: string }[];
+    salesCallIds: number[];
+    fathomCalls: { title: string | null; linked: boolean; error?: string }[];
+};
+
+function describeCalendlyLink(result: CalendlyLinkResult): string {
+    const who = result.lead.name || result.lead.email;
+    const bookings = result.bookings
+        .map((b) => `${b.event || "Meeting"}${b.startTime ? ` on ${formatDateTime(b.startTime)}` : ""}${b.status === "canceled" ? " (canceled)" : ""}`)
+        .join(", ");
+    const parts = [`Linked to ${who}: ${bookings}. Meeting booked is on their timeline and it's in the sales log.`];
+    const linked = result.fathomCalls.filter((c) => c.linked);
+    const failed = result.fathomCalls.filter((c) => !c.linked);
+    if (linked.length) parts.push(`Fathom: ${linked.map((c) => `“${c.title || "call"}”`).join(", ")} attached; the AI is reading it.`);
+    if (failed.length) parts.push(`Couldn't attach ${failed.map((c) => `“${c.title || "call"}” (${c.error})`).join(", ")}.`);
+    return parts.join(" ");
+}
+
+function CalendlyLinkDialog({ clientId, onClose, onLinked }: { clientId: string; onClose: () => void; onLinked: () => void }) {
+    const [leadEmail, setLeadEmail] = useState("");
+    const [bookingEmail, setBookingEmail] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState("");
+    const [failed, setFailed] = useState(false);
+
+    const submit = async () => {
+        setBusy(true);
+        setFailed(false);
+        setMessage("Linking…");
+        try {
+            const result = await apiJson<CalendlyLinkResult>(`/api/clients/${encodeURIComponent(clientId)}/metrics/calendly-links`, {
+                method: "POST",
+                body: JSON.stringify({ leadEmail: leadEmail.trim(), ...(bookingEmail.trim() ? { bookingEmail: bookingEmail.trim() } : {}) })
+            });
+            setMessage(describeCalendlyLink(result));
+            onLinked();
+        } catch (linkError) {
+            setFailed(true);
+            setMessage(linkError instanceof Error ? linkError.message : "Failed to link the Calendly booking.");
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return (
+        <div className="modal-overlay" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+            <div className="modal" role="dialog" aria-modal="true" aria-labelledby="calendly-link-title" style={{ maxWidth: "620px", padding: "2rem" }}>
+                <div className="modal__header">
+                    <div>
+                        <h2 id="calendly-link-title" className="modal__title" style={{ fontSize: "1.4rem" }}>Add a Calendly booking</h2>
+                        <p className="modal__description">
+                            For a lead whose booking didn&apos;t match, usually because they booked with a personal email. The booking is
+                            linked to the lead, they get a Meeting booked event (which stops follow-ups), it goes in the sales log, and any
+                            Fathom call recorded with that email is attached and analysed.
+                        </p>
+                    </div>
+                </div>
+                <div className="modal__body" style={{ gap: "0.75rem" }}>
+                    <input
+                        className="input"
+                        style={inputStyle}
+                        type="email"
+                        placeholder="Lead email, e.g. jennifer@shopmagnilay.com"
+                        value={leadEmail}
+                        onChange={(e) => setLeadEmail(e.target.value)}
+                        disabled={busy}
+                        aria-label="Lead email"
+                    />
+                    <input
+                        className="input"
+                        style={inputStyle}
+                        type="email"
+                        placeholder="Email they booked with, if different (e.g. a Gmail)"
+                        value={bookingEmail}
+                        onChange={(e) => setBookingEmail(e.target.value)}
+                        disabled={busy}
+                        aria-label="Booking email"
+                    />
+                    {message && (
+                        <p role={failed ? "alert" : "status"} className={failed ? "form-error" : undefined} style={{ margin: 0, fontSize: "0.82rem", color: failed ? undefined : "var(--app-text-muted)" }}>
+                            {message}
+                        </p>
+                    )}
+                    <div className="modal__actions">
+                        <button type="button" className="secondary-button" onClick={onClose}>Close</button>
+                        <button type="button" className="primary-button" onClick={() => void submit()} disabled={busy || !leadEmail.trim()}>
+                            {busy ? "Linking…" : "Link booking"}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function SalesCallDialog({ clientId, call, onClose, onSaved }: {
     clientId: string;
     call: SalesCall | null;
@@ -437,6 +534,7 @@ export function SalesLog({ clientId, onChanged }: { clientId: string; onChanged:
     const [error, setError] = useState("");
     const [editing, setEditing] = useState<SalesCall | "new" | null>(null);
     const [addingFathom, setAddingFathom] = useState(false);
+    const [addingCalendly, setAddingCalendly] = useState(false);
     const [shown, setShown] = useState(PAGE_SIZE);
     const [reloadKey, setReloadKey] = useState(0);
 
@@ -486,6 +584,9 @@ export function SalesLog({ clientId, onChanged }: { clientId: string; onChanged:
                 </button>
                 {open && (
                     <div style={{ display: "flex", gap: "0.5rem" }}>
+                        <button type="button" className="secondary-button" onClick={() => setAddingCalendly(true)} style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
+                            <CalendarPlus size={14} /> Add from Calendly
+                        </button>
                         <button type="button" className="secondary-button" onClick={() => setAddingFathom(true)} style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
                             <Video size={14} /> Add from Fathom
                         </button>
@@ -579,6 +680,14 @@ export function SalesLog({ clientId, onChanged }: { clientId: string; onChanged:
                 </button>
             )}
             </>
+            )}
+
+            {addingCalendly && (
+                <CalendlyLinkDialog
+                    clientId={clientId}
+                    onClose={() => setAddingCalendly(false)}
+                    onLinked={() => { setReloadKey((k) => k + 1); onChanged(); }}
+                />
             )}
 
             {addingFathom && (

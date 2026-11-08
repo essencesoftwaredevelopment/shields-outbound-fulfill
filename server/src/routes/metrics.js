@@ -9,6 +9,7 @@ import express from 'express';
 import { verifyFirebaseToken as requireAuth } from '../middleware/auth.js';
 import { resolveClientRow } from '../services/db/queries.js';
 import { loadFunnelMetrics } from '../services/funnelMetrics.js';
+import { linkCalendlyBookingToLead } from '../services/leadBookingLink.js';
 import {
     CALL_STATUSES,
     OUTCOMES,
@@ -132,6 +133,24 @@ router.post('/clients/:clientId/metrics/fathom-calls', requireAuth, async (req, 
         }));
     } catch (error) {
         sendError(res, error, 'Failed to add the Fathom call.');
+    }
+});
+
+/**
+ * Link a Calendly booking to a lead; body { leadEmail, bookingEmail? }.
+ * bookingEmail is the address they booked with when it isn't the lead's email.
+ */
+router.post('/clients/:clientId/metrics/calendly-links', requireAuth, async (req, res) => {
+    try {
+        const clientRow = await requireClient(req, res);
+        if (!clientRow) return;
+        res.json(await linkCalendlyBookingToLead({
+            clientRow,
+            leadEmail: typeof req.body?.leadEmail === 'string' ? req.body.leadEmail : '',
+            bookingEmail: typeof req.body?.bookingEmail === 'string' ? req.body.bookingEmail : null
+        }));
+    } catch (error) {
+        sendError(res, error, 'Failed to link the Calendly booking.');
     }
 });
 
