@@ -350,7 +350,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                     <Section title="3. Money">
                         <Grid>
                             <MetricCard
-                                label="30-day cash"
+                                label="30 Day New Cash"
                                 value={formatMoney(money?.newRevenue)}
                                 icon={<Banknote {...ICON_PROPS} />}
                                 hint="Cash collected upfront: build fees of deals closed in the period, plus the first month of retainers that started in it (paid upfront). Later retainer months aren't included. From the sales log."
