@@ -353,7 +353,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                                 label="30-day cash"
                                 value={formatMoney(money?.newRevenue)}
                                 icon={<Banknote {...ICON_PROPS} />}
-                                hint="Upfront cash: the flow build fees of deals closed in the period. Retainers aren't included. From the sales log."
+                                hint="Cash collected upfront: build fees of deals closed in the period, plus the first month of retainers that started in it (paid upfront). Later retainer months aren't included. From the sales log."
                             />
                             <MetricCard
                                 label="Average deal cash"
@@ -388,7 +388,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                                 value={money?.roas === null || money?.roas === undefined ? "—" : `${formatNumber(money.roas, 1)}x`}
                                 secondary={{ value: formatMoney(money?.outreachCost), label: "Marketing spend" }}
                                 icon={<TrendingUp {...ICON_PROPS} />}
-                                hint="30-day cash (upfront build fees) ÷ marketing spend (outreach cost)."
+                                hint="30-day cash (build fees + first retainer months) ÷ marketing spend (outreach cost)."
                             />
                         </Grid>
                     </Section>

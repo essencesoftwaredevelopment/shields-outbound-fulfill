@@ -131,12 +131,12 @@ test('computeSalesMetrics: funnel ratios inside the period', () => {
 
     assert.equal(money.buildRevenue, 3000);
     assert.equal(money.retainerRevenue, 2000);
-    // 30-day cash is upfront fees only
-    assert.equal(money.newRevenue, 3000);
-    assert.equal(money.avgDealValue, 3000);
+    // 30-day cash = build fee + first retainer month (paid upfront)
+    assert.equal(money.newRevenue, 5000);
+    assert.equal(money.avgDealValue, 5000);
     assert.equal(money.costPerBookedCall, Math.round(4000 / 6 * 100) / 100);
     assert.equal(money.costPerProposal, 2000);
-    assert.equal(money.roas, 0.75);
+    assert.equal(money.roas, 1.25);
     assert.equal(money.costPerClient, 4000);
     assert.equal(money.paybackMonths, 2);
     assert.equal(money.activeRetainers, 1);
@@ -187,9 +187,20 @@ test('computeSalesMetrics: retainer cash counts when the retainer starts, builds
     assert.equal(sales.dealsWon, 2);
     assert.equal(money.buildRevenue, 2250);
     assert.equal(money.retainerRevenue, 1400);
-    assert.equal(money.newRevenue, 2250);
+    assert.equal(money.newRevenue, 2250 + 1400);
     // average deal cash = new cash collected ÷ deals won
-    assert.equal(money.avgDealValue, 2250 / 2);
+    assert.equal(money.avgDealValue, 3650 / 2);
+});
+
+test('computeSalesMetrics: a retainer starting later this month is not cash yet', () => {
+    const now = new Date('2026-11-08T12:00:00Z');
+    const { start, end } = resolvePeriod('this_month', now);
+    const calls = [
+        call({ id: 1, outcome: 'won', closed_on: '2026-11-06', retainer_monthly: 600, retainer_start: '2026-11-06' }),
+        call({ id: 2, outcome: 'won', closed_on: '2026-11-05', build_value: 2250, retainer_monthly: 2500, retainer_start: '2026-11-16' })
+    ];
+    const { money } = computeSalesMetrics(calls, { start, end, now });
+    assert.equal(money.newRevenue, 600 + 2250);
 });
 
 test('computeSalesMetrics: churn, tenure and lifetime value', () => {

@@ -366,14 +366,18 @@ export function computeSalesMetrics(calls, { start, end, now = new Date(), posit
     // month counts when the retainer starts (close date if no start is set).
     const retainerStartOf = (c) => c.retainer_start || c.closed_on;
     const retainersStarting = onePerPerson(
-        calls.filter((c) => c.outcome === 'won' && Number(c.retainer_monthly) > 0 && inPeriod(retainerStartOf(c))),
+        calls.filter((c) => (
+            c.outcome === 'won' && Number(c.retainer_monthly) > 0
+            && inPeriod(retainerStartOf(c)) && toTime(retainerStartOf(c)) <= nowTime
+        )),
         retainerStartOf
     );
     const buildRevenue = won.reduce((sum, c) => sum + (Number(c.build_value) || 0), 0);
     const retainerRevenue = retainersStarting.reduce((sum, c) => sum + (Number(c.retainer_monthly) || 0), 0);
-    // 30-day cash: upfront fees only (flow builds of deals closed in the period).
-    // Retainers are tracked separately and never counted as new cash.
-    const newRevenue = buildRevenue;
+    // 30-day cash: cash collected upfront. Build fees of deals closed in the
+    // period, plus the first retainer month (paid upfront) of retainers that
+    // started in the period. Later retainer months are not counted.
+    const newRevenue = buildRevenue + retainerRevenue;
     const wonRetainers = won.map((c) => Number(c.retainer_monthly) || 0).filter((v) => v > 0);
 
     const retainerClients = calls.filter((c) => Number(c.retainer_monthly) > 0 && c.retainer_start);
