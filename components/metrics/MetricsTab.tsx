@@ -361,7 +361,7 @@ export function MetricsTab({ clientId }: { clientId: string }) {
                                 value={formatMoney(money?.avgDealValue)}
                                 secondary={{ value: formatNumber(sales?.dealsWon), label: "Deals won" }}
                                 icon={<Scale {...ICON_PROPS} />}
-                                hint="Per deal won in the period: build fee + first month of retainer, whenever the retainer starts."
+                                hint="New cash collected ÷ deals won in the period."
                             />
                             <MetricCard
                                 label="Cost per call"

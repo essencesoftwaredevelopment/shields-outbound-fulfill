@@ -187,8 +187,8 @@ test('computeSalesMetrics: retainer cash counts when the retainer starts, builds
     assert.equal(money.buildRevenue, 2250);
     assert.equal(money.retainerRevenue, 1400);
     assert.equal(money.newRevenue, 3650);
-    // average deal cash: deals won in the period, build + first month, (3750 + 800) / 2
-    assert.equal(money.avgDealValue, 2275);
+    // average deal cash = new cash collected ÷ deals won
+    assert.equal(money.avgDealValue, 3650 / 2);
 });
 
 test('computeSalesMetrics: churn, tenure and lifetime value', () => {
