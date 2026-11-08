@@ -35,6 +35,10 @@ test('resolvePeriod: last month and unknown keys', () => {
     assert.equal(lastMonth.end.toISOString(), '2026-11-01T00:00:00.000Z');
     assert.equal(lastMonth.days, 31);
     assert.equal(resolvePeriod('nonsense', NOW).key, '7d');
+    const fortnight = resolvePeriod('14d', NOW);
+    assert.equal(fortnight.days, 14);
+    assert.equal(fortnight.start.toISOString(), '2026-10-20T00:00:00.000Z');
+    assert.equal(fortnight.end.toISOString(), '2026-11-03T00:00:00.000Z');
 });
 
 test('countWorkingDays skips weekends', () => {

@@ -27,6 +27,7 @@ const INSTANTLY_CACHE_TTL_MS = 10 * 60 * 1000;
 export const METRIC_PERIODS = {
     '7d': 'Last 7 days',
     last_week: 'Last week (Mon–Sun)',
+    '14d': 'Last 14 days',
     '30d': 'Last 30 days',
     this_month: 'This month',
     last_month: 'Last month',
@@ -53,6 +54,7 @@ export function resolvePeriod(key, now = new Date()) {
     let start;
     let end = tomorrow;
     if (periodKey === '7d') start = addDays(today, -6);
+    else if (periodKey === '14d') start = addDays(today, -13);
     else if (periodKey === '30d') start = addDays(today, -29);
     else if (periodKey === '90d') start = addDays(today, -89);
     else if (periodKey === 'last_week') {
