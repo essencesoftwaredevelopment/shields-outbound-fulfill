@@ -40,8 +40,9 @@ function atLeast(value: number | null | undefined, good: number, warn: number): 
 const ICON_PROPS = { width: 18, height: 18, strokeWidth: 1.8 };
 
 /**
- * Same layout as the Analytics tab stat cards: big number, optional secondary
- * value + label, then icon + label. `hint` (formula, target) shows on hover.
+ * Stat card: icon + title (with the target dot and list button) on top, then the
+ * big number and an optional secondary value + label. `hint` (formula, target)
+ * shows on hover.
  */
 function MetricCard({ label, value, secondary, icon, status, hint, onShowList }: {
     label: string;
@@ -56,7 +57,6 @@ function MetricCard({ label, value, secondary, icon, status, hint, onShowList }:
         <div
             title={hint}
             style={{
-                position: "relative",
                 padding: "1.35rem 1.2rem",
                 borderRadius: "16px",
                 border: "1px solid var(--app-border-mid)",
@@ -65,19 +65,34 @@ function MetricCard({ label, value, secondary, icon, status, hint, onShowList }:
                 minWidth: 0
             }}
         >
-            {onShowList && (
-                <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={onShowList}
-                    aria-label={`Show who makes up ${label}`}
-                    title="Show the list"
-                    style={{ position: "absolute", top: "0.75rem", right: "0.75rem", padding: "0.3rem 0.45rem", display: "inline-flex", alignItems: "center" }}
-                >
-                    <List size={14} />
-                </button>
-            )}
-            <p style={{ margin: 0, fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>{value}</p>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minHeight: "1.75rem" }}>
+                <span style={{ display: "inline-flex", color: "var(--app-text)", flexShrink: 0 }}>{icon}</span>
+                <p style={{ margin: 0, fontSize: "0.86rem", color: "var(--app-text-muted)", minWidth: 0 }}>{label}</p>
+                {(status || onShowList) && (
+                    <div style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "0.5rem", flexShrink: 0 }}>
+                        {status && (
+                            <span
+                                role="img"
+                                aria-label={status === "good" ? "On target" : status === "warn" ? "Below target" : "Off target"}
+                                style={{ width: "8px", height: "8px", borderRadius: "999px", background: STATUS_COLOR[status] }}
+                            />
+                        )}
+                        {onShowList && (
+                            <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={onShowList}
+                                aria-label={`Show who makes up ${label}`}
+                                title="Show the list"
+                                style={{ padding: "0.3rem 0.45rem", display: "inline-flex", alignItems: "center" }}
+                            >
+                                <List size={14} />
+                            </button>
+                        )}
+                    </div>
+                )}
+            </div>
+            <p style={{ margin: "0.6rem 0 0", fontSize: "3rem", lineHeight: 1, fontWeight: 700 }}>{value}</p>
             <div style={{ margin: "0.45rem 0 0", minHeight: "1.32rem", lineHeight: 1.1 }}>
                 {secondary && (
                     <p style={{ margin: 0, fontSize: "1.2rem", fontWeight: 300, color: "var(--app-text-muted)", fontVariantNumeric: "tabular-nums" }}>
@@ -86,17 +101,6 @@ function MetricCard({ label, value, secondary, icon, status, hint, onShowList }:
                             {secondary.label}
                         </span>
                     </p>
-                )}
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", marginTop: "0.55rem" }}>
-                <span style={{ display: "inline-flex", color: "var(--app-text)", flexShrink: 0 }}>{icon}</span>
-                <p style={{ margin: 0, fontSize: "0.86rem", color: "var(--app-text-muted)" }}>{label}</p>
-                {status && (
-                    <span
-                        role="img"
-                        aria-label={status === "good" ? "On target" : status === "warn" ? "Below target" : "Off target"}
-                        style={{ marginLeft: "auto", width: "8px", height: "8px", borderRadius: "999px", background: STATUS_COLOR[status], flexShrink: 0 }}
-                    />
                 )}
             </div>
         </div>
