@@ -143,6 +143,7 @@ function FathomLinkForm({ clientId, salesCallId, onDone }: {
     onDone: (message: string) => void;
 }) {
     const [url, setUrl] = useState("");
+    const [leadEmail, setLeadEmail] = useState("");
     const [phase, setPhase] = useState<LinkPhase>("idle");
     const [message, setMessage] = useState("");
     const cancelled = useRef(false);
@@ -156,10 +157,15 @@ function FathomLinkForm({ clientId, salesCallId, onDone }: {
         try {
             const linked = await apiJson<{ recordingId: number; createdSalesCall: boolean; title: string | null }>(base, {
                 method: "POST",
-                body: JSON.stringify({ url, ...(salesCallId ? { salesCallId } : {}) })
+                body: JSON.stringify({
+                    url,
+                    ...(salesCallId ? { salesCallId } : {}),
+                    ...(!salesCallId && leadEmail.trim() ? { leadEmail: leadEmail.trim() } : {})
+                })
             });
             setPhase("analysing");
-            setMessage(`${linked.title ? `“${linked.title}”` : "Call"} found${linked.createdSalesCall ? ", added as a new entry" : ""}. The AI is reading it…`);
+            const target = !salesCallId && leadEmail.trim() ? ` for ${leadEmail.trim()}` : "";
+            setMessage(`${linked.title ? `“${linked.title}”` : "Call"} found${linked.createdSalesCall ? `, added as a new entry${target}` : target ? `, attached${target}` : ""}. The AI is reading it…`);
             const deadline = Date.now() + 3 * 60_000;
             while (!cancelled.current && Date.now() < deadline) {
                 await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -206,6 +212,18 @@ function FathomLinkForm({ clientId, salesCallId, onDone }: {
                     {busy ? "Working…" : "Add and analyse"}
                 </button>
             </div>
+            {!salesCallId && (
+                <input
+                    className="input"
+                    style={inputStyle}
+                    type="email"
+                    placeholder="Lead email (optional): attach the call to this lead"
+                    value={leadEmail}
+                    onChange={(e) => setLeadEmail(e.target.value)}
+                    disabled={busy}
+                    aria-label="Lead email"
+                />
+            )}
             {message && (
                 <p role={phase === "error" ? "alert" : "status"} className={phase === "error" ? "form-error" : undefined} style={{ margin: 0, fontSize: "0.82rem", color: phase === "error" ? undefined : "var(--app-text-muted)" }}>
                     {message}
@@ -223,8 +241,9 @@ function FathomAddDialog({ clientId, onClose, onAdded }: { clientId: string; onC
                     <div>
                         <h2 id="fathom-add-title" className="modal__title" style={{ fontSize: "1.4rem" }}>Add a Fathom call</h2>
                         <p className="modal__description">
-                            Paste the call&apos;s Fathom link. It&apos;s added to whoever the outside attendee is in the sales log, or as a new
-                            entry, and the AI fills in what happened. To attach it to a specific entry, use Edit on that row instead.
+                            Paste the call&apos;s Fathom link and the AI fills in what happened. Add the lead&apos;s email to attach it to that
+                            lead; leave it empty to match the call&apos;s outside attendee. Either way it goes to their sales log entry, or a new
+                            one. To attach it to a specific entry, use Edit on that row instead.
                         </p>
                     </div>
                 </div>

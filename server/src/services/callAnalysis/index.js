@@ -487,8 +487,11 @@ async function findFathomMeetingByUrl({ apiKey, url, known }) {
     return full.find((meeting) => String(meeting.recording_id) === String(hit.recording_id)) || null;
 }
 
-/** The sales call to attach to: one chosen by hand, or a match by attendee email, or a new one. */
-async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCallId }) {
+/**
+ * The sales call to attach to: one chosen by hand; else the lead whose email
+ * was given; else a match by outside attendee email; else a new entry.
+ */
+async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCallId, leadEmail = null }) {
     if (salesCallId) {
         const { rows: [call] } = await pool.query(
             'SELECT id FROM sales_calls WHERE id = $1 AND agency_id = $2 AND client_id = $3',
@@ -498,11 +501,16 @@ async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCa
         return { salesCallId: Number(call.id), created: false };
     }
 
-    const ownDomains = await loadOwnDomains(agencyId);
     const invitees = Array.isArray(recording.invitees) ? recording.invitees : [];
-    const emails = (recording.external_emails || []).filter((email) => !ownDomains.has(email.split('@')[1]));
-    if (!emails.length) {
-        throw badRequest('This call has no outside attendee to match. Open the person in the sales log and link the call from there.');
+    let emails;
+    if (leadEmail) {
+        emails = [leadEmail];
+    } else {
+        const ownDomains = await loadOwnDomains(agencyId);
+        emails = (recording.external_emails || []).filter((email) => !ownDomains.has(email.split('@')[1]));
+        if (!emails.length) {
+            throw badRequest('This call has no outside attendee to match. Enter the lead’s email, or open the person in the sales log and link the call from there.');
+        }
     }
 
     const { rows: [existing] } = await pool.query(
@@ -520,9 +528,14 @@ async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCa
     const email = emails[0];
     const invitee = invitees.find((i) => String(i?.email || '').toLowerCase() === email) || {};
     const { rows: [contact] } = await pool.query(
-        'SELECT id FROM contacts WHERE client_id = $1 AND LOWER(email) = $2 LIMIT 1',
+        `SELECT c.id, c.full_name, co.domain_normalized
+         FROM contacts c LEFT JOIN companies co ON co.id = c.company_id
+         WHERE c.client_id = $1 AND LOWER(c.email) = $2 LIMIT 1`,
         [clientRow.id, email]
     );
+    if (leadEmail && !contact) {
+        throw badRequest(`No lead with the email ${leadEmail} in this client. Check the address, or leave it empty to match the call's attendees.`, 404);
+    }
     const { rows: [created] } = await pool.query(
         `INSERT INTO sales_calls (
              agency_id, client_id, contact_id, company, contact_name, contact_email,
@@ -533,8 +546,8 @@ async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCa
             agencyId,
             clientRow.id,
             contact?.id || null,
-            businessDomains([email])[0] || null,
-            invitee.name || null,
+            contact?.domain_normalized || businessDomains([email])[0] || null,
+            contact?.full_name || invitee.name || null,
             email,
             recording.recorded_at || new Date().toISOString()
         ]
@@ -548,9 +561,11 @@ async function resolveSalesCallForLink({ agencyId, clientRow, recording, salesCa
  * client's sales log the outside attendee is, else to a new entry. A call that
  * was skipped before (its transcript discarded) is fetched again from Fathom.
  */
-export async function linkFathomCall({ agencyId, clientRow, url: rawUrl, salesCallId = null }) {
+export async function linkFathomCall({ agencyId, clientRow, url: rawUrl, salesCallId = null, leadEmail: rawLeadEmail = null }) {
     const url = normalizeFathomUrl(rawUrl);
     if (!url) throw badRequest('Paste a Fathom call link, like https://fathom.video/calls/123… or https://fathom.video/share/….');
+    const leadEmail = String(rawLeadEmail || '').trim().toLowerCase() || null;
+    if (leadEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(leadEmail)) throw badRequest('That lead email doesn’t look right.');
     const settings = await getAgencySettings(agencyId);
     const apiKey = String(settings?.fathom_key || '').trim();
     if (!apiKey) throw badRequest('Connect Fathom first: save the Fathom API key in the API vault.');
@@ -580,11 +595,11 @@ export async function linkFathomCall({ agencyId, clientRow, url: rawUrl, salesCa
     );
     const { recordingId } = await ingestFathomMeeting(agencyId, meeting);
     const recording = await loadRecording(recordingId, agencyId);
-    const target = await resolveSalesCallForLink({ agencyId, clientRow, recording, salesCallId });
+    const target = await resolveSalesCallForLink({ agencyId, clientRow, recording, salesCallId, leadEmail: salesCallId ? null : leadEmail });
 
     await setRecording(recordingId, agencyId, {
         status: 'matched',
-        match_reason: salesCallId ? 'manual' : (target.created ? 'manual_new' : 'manual_email'),
+        match_reason: salesCallId ? 'manual' : (leadEmail ? 'manual_lead_email' : (target.created ? 'manual_new' : 'manual_email')),
         sales_call_id: target.salesCallId,
         client_id: clientRow.id
     });

@@ -114,7 +114,7 @@ router.delete('/clients/:clientId/metrics/sales-calls/:id', requireAuth, async (
     }
 });
 
-/** Add a Fathom call by its link; body { url, salesCallId? } (no salesCallId = match or create). */
+/** Add a Fathom call by its link; body { url, salesCallId?, leadEmail? } (neither = match attendees or create). */
 router.post('/clients/:clientId/metrics/fathom-calls', requireAuth, async (req, res) => {
     try {
         const clientRow = await requireClient(req, res);
@@ -127,7 +127,8 @@ router.post('/clients/:clientId/metrics/fathom-calls', requireAuth, async (req, 
             agencyId: req.agencyId,
             clientRow,
             url: req.body?.url,
-            salesCallId
+            salesCallId,
+            leadEmail: typeof req.body?.leadEmail === 'string' ? req.body.leadEmail : null
         }));
     } catch (error) {
         sendError(res, error, 'Failed to add the Fathom call.');
