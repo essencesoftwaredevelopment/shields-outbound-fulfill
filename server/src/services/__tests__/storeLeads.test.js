@@ -76,7 +76,7 @@ describe('buildStoreLeadsDomainParams', () => {
         const params = Object.fromEntries(buildStoreLeadsDomainParams(segment));
         assert.equal(params['f:tech'], 'Klaviyo,Foo\\, Inc');
         assert.equal(params['f:tech:op'], 'and');
-        assert.equal(params['f:cratmin'], '2026-07-01');
+        assert.equal(params['f:cratmin'], '2026-07-01T00:00:00Z');
         assert.equal(params['f:ismy'], undefined);
     });
 });

@@ -210,7 +210,8 @@ export function buildStoreLeadsDomainParams(segment) {
             params.push(['f:tech:op', segment.technologiesMatch === 'all' ? 'and' : 'or']);
         }
     }
-    if (segment.createdAfter) params.push(['f:cratmin', segment.createdAfter]);
+    // Store Leads parses f:cratmin as RFC 3339; a bare date is rejected with HTTP 400.
+    if (segment.createdAfter) params.push(['f:cratmin', `${segment.createdAfter}T00:00:00Z`]);
     if (segment.customDomainsOnly) params.push(['f:ismy', 'false']);
     return params;
 }

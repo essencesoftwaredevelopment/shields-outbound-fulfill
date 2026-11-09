@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    clearDoNotEmailCache,
     doNotEmailSql,
     emailDomainIsBlocked,
     everWonSql,
@@ -38,15 +39,46 @@ test('pasted domains are normalized', () => {
     assert.equal(normalizeBlockedDomain('linearbar.com.'), 'linearbar.com');
 });
 
-test('findDoNotEmailEmails combines blocked domains with won/company-blocked contacts', async () => {
+test('findDoNotEmailEmails matches won emails, blocked email domains and blocked company domains in memory', async () => {
+    clearDoNotEmailCache();
+    const calls = [];
+    const lookedUp = [];
     const db = {
-        query: async (sql) => sql.includes('SELECT blocked_domains')
-            ? { rows: [{ blocked_domains: ['spicywear.com'] }] }
-            : { rows: [{ email: 'owner@gmail.com' }] }
+        query: async (sql, params) => {
+            calls.push(sql);
+            if (sql.includes('SELECT blocked_domains')) return { rows: [{ blocked_domains: ['spicywear.com', 'linearbar.com'] }] };
+            if (sql.includes('lead_closed')) return { rows: [{ email: 'won@gmail.com' }] };
+            // company-domain lookup, for exactly the emails being checked
+            lookedUp.push([...params[1]].sort());
+            return { rows: [{ email: 'owner@gmail.com', domain: 'shop.linearbar.com' }, { email: 'ok@shop.com', domain: 'shop.com' }] };
+        }
     };
-    const found = await findDoNotEmailEmails(db, 2, ['John@spicywear.com', 'owner@gmail.com', 'ok@shop.com']);
-    assert.deepEqual([...found].sort(), ['john@spicywear.com', 'owner@gmail.com']);
+    const found = await findDoNotEmailEmails(db, 2, ['John@spicywear.com', 'owner@gmail.com', 'ok@shop.com', 'WON@gmail.com']);
+    assert.deepEqual([...found].sort(), ['john@spicywear.com', 'owner@gmail.com', 'won@gmail.com']);
+    assert.deepEqual(lookedUp[0], ['john@spicywear.com', 'ok@shop.com', 'owner@gmail.com', 'won@gmail.com']);
     assert.equal((await findDoNotEmailEmails(db, 2, [])).size, 0);
+
+    // The list is cached: a second call only runs the company-domain lookup.
+    const before = calls.length;
+    await findDoNotEmailEmails(db, 2, ['ok@shop.com']);
+    assert.equal(calls.length - before, 1);
+    clearDoNotEmailCache();
+});
+
+test('no blocked domains means no company lookup', async () => {
+    clearDoNotEmailCache();
+    let lookups = 0;
+    const db = {
+        query: async (sql) => {
+            if (sql.includes('SELECT blocked_domains')) return { rows: [{ blocked_domains: [] }] };
+            if (sql.includes('lead_closed')) return { rows: [] };
+            lookups += 1;
+            return { rows: [] };
+        }
+    };
+    assert.equal((await findDoNotEmailEmails(db, 9, ['a@b.com'])).size, 0);
+    assert.equal(lookups, 0);
+    clearDoNotEmailCache();
 });
 
 test('isContactDoNotEmail reads the flag', async () => {

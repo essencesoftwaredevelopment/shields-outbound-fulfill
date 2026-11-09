@@ -86,29 +86,90 @@ export function emailDomainIsBlocked(email, blockedDomains) {
     return (blockedDomains || []).some((blocked) => domain === blocked || domain.endsWith(`.${blocked}`));
 }
 
+function domainIsBlocked(domain, blockedDomains) {
+    const value = String(domain || '').trim().toLowerCase();
+    if (!value) return false;
+    return (blockedDomains || []).some((blocked) => value === blocked || value.endsWith(`.${blocked}`));
+}
+
 /**
- * Lowercased emails, among those given, that must not be emailed for this
- * client: blocked email domains, plus contacts in the client that were ever
- * won or whose company domain is blocked.
+ * The client's whole do-not-email list is small (a few dozen blocked domains,
+ * a handful of won emails), so it is loaded once and matched in memory instead
+ * of evaluating doNotEmailSql per candidate row, which timed out on large
+ * auto-add batches. Cached briefly per process; a lead marked won is blocked
+ * within DO_NOT_EMAIL_CACHE_TTL_MS.
  */
-export async function findDoNotEmailEmails(db, clientId, emails) {
-    const wanted = [...new Set((emails || []).map((email) => String(email || '').trim().toLowerCase()).filter(Boolean))];
-    if (!wanted.length) return new Set();
-    const [clientResult, contactResult] = await Promise.all([
+const DO_NOT_EMAIL_CACHE_TTL_MS = 60_000;
+const doNotEmailCache = new Map();
+
+export function clearDoNotEmailCache() {
+    doNotEmailCache.clear();
+}
+
+export async function loadDoNotEmailList(db, clientId) {
+    const key = String(clientId);
+    const cached = doNotEmailCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+    const [clientResult, wonResult] = await Promise.all([
         db.query(`SELECT blocked_domains FROM clients WHERE id = $1`, [clientId]),
         db.query(
             `SELECT DISTINCT LOWER(c.email) AS email
              FROM contacts c
              WHERE c.client_id = $1
-               AND LOWER(c.email) = ANY($2::text[])
-               AND ${doNotEmailSql('c.id')}`,
-            [clientId, wanted]
+               AND c.email IS NOT NULL
+               AND c.id IN (
+                   SELECT e.contact_id
+                   FROM contact_instantly_events e
+                   WHERE e.agency_id = (SELECT agency_id FROM clients WHERE id = $1)
+                     AND e.client_id = $1
+                     AND e.event_type = '${WON_EVENT_TYPE}'
+                     AND e.contact_id IS NOT NULL
+                   UNION
+                   SELECT w.contact_id
+                   FROM contact_instantly_campaigns w
+                   WHERE w.interest_status = ${WON_INTEREST_STATUS}
+                      OR LOWER(COALESCE(w.interest_status_label, '')) = 'won'
+               )`,
+            [clientId]
         )
     ]);
-    const blockedDomains = clientResult.rows[0]?.blocked_domains || [];
-    const out = new Set(contactResult.rows.map((row) => row.email));
+    const value = {
+        blockedDomains: (clientResult.rows[0]?.blocked_domains || []).map((d) => String(d).toLowerCase()),
+        wonEmails: new Set(wonResult.rows.map((row) => row.email).filter(Boolean))
+    };
+    doNotEmailCache.set(key, { value, expiresAt: Date.now() + DO_NOT_EMAIL_CACHE_TTL_MS });
+    return value;
+}
+
+/**
+ * Lowercased emails, among those given, that must not be emailed for this
+ * client: the same email was ever won in the client, the email domain is
+ * blocked, or the contact's company domain is blocked.
+ */
+export async function findDoNotEmailEmails(db, clientId, emails) {
+    const wanted = [...new Set((emails || []).map((email) => String(email || '').trim().toLowerCase()).filter(Boolean))];
+    if (!wanted.length) return new Set();
+    const { blockedDomains, wonEmails } = await loadDoNotEmailList(db, clientId);
+
+    const out = new Set();
     for (const email of wanted) {
-        if (emailDomainIsBlocked(email, blockedDomains)) out.add(email);
+        if (wonEmails.has(email) || emailDomainIsBlocked(email, blockedDomains)) out.add(email);
+    }
+    if (blockedDomains.length) {
+        // Company-domain check: one indexed lookup for just these emails.
+        const companyResult = await db.query(
+            `SELECT LOWER(c.email) AS email, LOWER(co.domain_normalized) AS domain
+             FROM contacts c
+             JOIN companies co ON co.id = c.company_id
+             WHERE c.client_id = $1
+               AND c.email IS NOT NULL
+               AND LOWER(c.email) = ANY($2::text[])`,
+            [clientId, wanted]
+        );
+        for (const row of companyResult.rows) {
+            if (domainIsBlocked(row.domain, blockedDomains)) out.add(row.email);
+        }
     }
     return out;
 }
