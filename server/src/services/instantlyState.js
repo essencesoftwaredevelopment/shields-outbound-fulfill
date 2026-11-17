@@ -1299,7 +1299,7 @@ async function updateClientState(clientId, patch = {}) {
     return result.rows[0] || null;
 }
 
-async function upsertCampaign(db, { agencyId, clientId, instantlyCampaignId, name, status = null, startDate = null, rawCampaignPayload = {}, lastSyncedAt = null }) {
+export async function upsertCampaign(db, { agencyId, clientId, instantlyCampaignId, name, status = null, startDate = null, rawCampaignPayload = {}, lastSyncedAt = null }) {
     const result = await db.query(
         `INSERT INTO instantly_campaigns
             (agency_id, client_id, instantly_campaign_id, name, start_date, status, raw_campaign_payload, last_synced_at)
@@ -1416,7 +1416,7 @@ async function upsertInstantlyContactInsights(db, {
     );
 }
 
-async function ensureInstantlyContact(db, {
+export async function ensureInstantlyContact(db, {
     agencyId,
     clientId,
     campaign,

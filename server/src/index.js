@@ -37,6 +37,7 @@ import { requestJobsShutdown, cancelActiveJobsOnShutdown } from './services/jobP
 import { terminateAllRunningRunners, SHUTDOWN_RUNNER_OPTS } from './services/jobRunner.js';
 import { startAnalyticsSnapshotSweep } from './services/analyticsSnapshots.js';
 import { startInstantlyCleanupSweep } from './services/instantlyCleanup.js';
+import { startInstantlyPollReconcileSweep } from './services/instantlyPollReconcile.js';
 import { startInstantlyRefillSweep } from './services/instantlyRefill.js';
 import { warmSendingRunways } from './services/sendingRunway.js';
 
@@ -135,6 +136,7 @@ app.get('/health', (req, res) => {
 
 let stopAnalyticsSnapshotSweep = () => {};
 let stopInstantlyCleanupSweep = () => {};
+let stopInstantlyPollReconcileSweep = () => {};
 let stopInstantlyRefillSweep = () => {};
 
 const server = app.listen(PORT, async () => {
@@ -150,6 +152,7 @@ const server = app.listen(PORT, async () => {
     }
     stopAnalyticsSnapshotSweep = startAnalyticsSnapshotSweep(pool);
     stopInstantlyCleanupSweep = startInstantlyCleanupSweep();
+    stopInstantlyPollReconcileSweep = startInstantlyPollReconcileSweep();
     stopInstantlyRefillSweep = startInstantlyRefillSweep();
     // Warm the sending-runway cache so the first Metrics/Analytics view after a
     // deploy doesn't wait on Instantly. Production only: local dev shares the DB.
@@ -198,6 +201,7 @@ async function gracefulShutdown(signal) {
     server.close?.();
     stopAnalyticsSnapshotSweep();
     stopInstantlyCleanupSweep();
+    stopInstantlyPollReconcileSweep();
     stopInstantlyRefillSweep();
 
     try {

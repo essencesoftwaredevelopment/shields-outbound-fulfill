@@ -60,6 +60,10 @@ import {
     updateCleanupSettings
 } from '../services/instantlyCleanup.js';
 import {
+    getPollReconcileSettings,
+    updatePollReconcileSettings
+} from '../services/instantlyPollReconcile.js';
+import {
     getLatestRefillRun,
     getRefillSettings,
     listRefillCampaigns,
@@ -614,6 +618,39 @@ router.put('/clients/:clientId/instantly-cleanup', requireAuth, async (req, res)
     } catch (error) {
         console.error('PUT instantly-cleanup error:', error?.message || error);
         res.status(500).json({ error: 'Failed to save Instantly cleanup settings.' });
+    }
+});
+
+// Webhook stand-in: poll Instantly for interested leads when a webhook cannot be linked.
+router.get('/clients/:clientId/instantly-poll', requireAuth, async (req, res) => {
+    try {
+        setNoStoreHeaders(res);
+        const row = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        const settings = await getPollReconcileSettings(row.id);
+        res.json({ settings });
+    } catch (error) {
+        console.error('GET instantly-poll error:', error?.message || error);
+        res.status(500).json({ error: 'Failed to load Instantly reply poll settings.' });
+    }
+});
+
+router.put('/clients/:clientId/instantly-poll', requireAuth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+            return res.status(400).json({ error: 'enabled must be a boolean.' });
+        }
+        const row = await resolveClientRow(req.agencyId, req.params.clientId);
+        if (!row) return res.status(404).json({ error: 'Client not found.' });
+        if (body.enabled === true && !String(row.instantly_key || '').trim()) {
+            return res.status(400).json({ error: 'Add an Instantly API key before turning the reply poll on.' });
+        }
+        const settings = await updatePollReconcileSettings(row.id, { enabled: body.enabled });
+        res.json({ settings });
+    } catch (error) {
+        console.error('PUT instantly-poll error:', error?.message || error);
+        res.status(500).json({ error: 'Failed to save Instantly reply poll settings.' });
     }
 });
 
