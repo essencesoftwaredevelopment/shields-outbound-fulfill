@@ -1826,6 +1826,33 @@ type DomainListExportKind = 'new' | 'not-run';
 const CLIENT_TABS = ["analytics", "metrics", "info", "campaigns", "leads", "follow-ups"] as const;
 type ClientTab = typeof CLIENT_TABS[number];
 
+/** All Leads search + applied filters live in the URL so a refresh keeps them. */
+const LEAD_SEARCH_URL_PARAM = "q";
+const LEAD_FILTERS_URL_PARAM = "filters";
+type AppliedLeadFilter = { field: string; op: string; value: string; joinOp: 'AND' | 'OR' };
+
+function parseLeadFiltersFromUrl(raw: string | null | undefined): AppliedLeadFilter[] {
+    if (!raw) return [];
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed
+            .filter((item): item is Record<string, unknown> => (
+                !!item && typeof item === "object"
+                && typeof (item as Record<string, unknown>).field === "string"
+                && typeof (item as Record<string, unknown>).op === "string"
+            ))
+            .map((item) => ({
+                field: item.field as string,
+                op: item.op as string,
+                value: typeof item.value === "string" ? item.value : "",
+                joinOp: item.joinOp === "OR" ? "OR" : "AND",
+            }));
+    } catch {
+        return [];
+    }
+}
+
 function parseClientTab(raw: string | null | undefined): ClientTab {
     if (raw && (CLIENT_TABS as readonly string[]).includes(raw)) {
         return raw as ClientTab;
@@ -2763,13 +2790,18 @@ export default function ClientPage() {
     const [listModalContactId, setListModalContactId] = useState<string>("");
     const [listModalBusy, setListModalBusy] = useState(false);
     const [mutatingLists, setMutatingLists] = useState(false);
-    const [leadSearch, setLeadSearch] = useState<string>("");
-    const [debouncedLeadSearch, setDebouncedLeadSearch] = useState<string>("");
+    const [leadSearch, setLeadSearch] = useState<string>(() => searchParams?.get(LEAD_SEARCH_URL_PARAM) ?? "");
+    const [debouncedLeadSearch, setDebouncedLeadSearch] = useState<string>(() => searchParams?.get(LEAD_SEARCH_URL_PARAM) ?? "");
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
     const [leadFilterFields, setLeadFilterFields] = useState<LeadFilterField[]>([]);
     const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
-    const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>([]);
-    const [appliedLeadFilters, setAppliedLeadFilters] = useState<Array<{ field: string; op: string; value: string; joinOp: 'AND' | 'OR' }>>([]);
+    // Seeded from the URL (?q=…&filters=…) so a refresh restores the last query.
+    const [appliedLeadFilters, setAppliedLeadFilters] = useState<AppliedLeadFilter[]>(
+        () => parseLeadFiltersFromUrl(searchParams?.get(LEAD_FILTERS_URL_PARAM))
+    );
+    const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>(
+        () => appliedLeadFilters.map((filter) => ({ id: createLeadFilterId(), ...filter }))
+    );
     const [leadFilterDrawerOpen, setLeadFilterDrawerOpen] = useState(false);
     const listFilterId = useMemo(
         () => singleListIdFromLeadFilters(appliedLeadFilters),
@@ -2910,6 +2942,21 @@ export default function ClientPage() {
             window.clearTimeout(timeoutId);
         };
     }, [leadSearch]);
+
+    // Mirror the running query into the URL (replace, not push: no history entry
+    // per keystroke). Draft filters stay out until Run Query applies them.
+    useEffect(() => {
+        const current = window.location.search.replace(/^\?/, "");
+        const next = new URLSearchParams(current);
+        const search = debouncedLeadSearch.trim();
+        if (search) next.set(LEAD_SEARCH_URL_PARAM, search);
+        else next.delete(LEAD_SEARCH_URL_PARAM);
+        if (appliedLeadFilters.length > 0) next.set(LEAD_FILTERS_URL_PARAM, JSON.stringify(appliedLeadFilters));
+        else next.delete(LEAD_FILTERS_URL_PARAM);
+        const queryString = next.toString();
+        if (queryString === current) return;
+        window.history.replaceState(null, "", queryString ? `${window.location.pathname}?${queryString}` : window.location.pathname);
+    }, [appliedLeadFilters, debouncedLeadSearch]);
 
     useEffect(() => {
         const timeoutId = window.setTimeout(() => {
