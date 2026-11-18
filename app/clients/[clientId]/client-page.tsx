@@ -1826,7 +1826,7 @@ type DomainListExportKind = 'new' | 'not-run';
 const CLIENT_TABS = ["analytics", "metrics", "info", "campaigns", "leads", "follow-ups"] as const;
 type ClientTab = typeof CLIENT_TABS[number];
 
-/** All Leads search + applied filters live in the URL so a refresh keeps them. */
+/** All Leads search + the filter builder live in the URL so a refresh keeps them. */
 const LEAD_SEARCH_URL_PARAM = "q";
 const LEAD_FILTERS_URL_PARAM = "filters";
 type AppliedLeadFilter = { field: string; op: string; value: string; joinOp: 'AND' | 'OR' };
@@ -1851,6 +1851,13 @@ function parseLeadFiltersFromUrl(raw: string | null | undefined): AppliedLeadFil
     } catch {
         return [];
     }
+}
+
+const LEAD_FILTER_NO_VALUE_OPS = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed'];
+
+/** A clause from the URL that can run as-is (has a value, or needs none). */
+function isRunnableUrlLeadFilter(filter: AppliedLeadFilter): boolean {
+    return LEAD_FILTER_NO_VALUE_OPS.includes(filter.op) || filter.value.trim() !== "";
 }
 
 function parseClientTab(raw: string | null | undefined): ClientTab {
@@ -2795,12 +2802,16 @@ export default function ClientPage() {
     const [clientTotalLeads, setClientTotalLeads] = useState<number>(0);
     const [leadFilterFields, setLeadFilterFields] = useState<LeadFilterField[]>([]);
     const [leadFilterFieldsLoading, setLeadFilterFieldsLoading] = useState(false);
-    // Seeded from the URL (?q=…&filters=…) so a refresh restores the last query.
-    const [appliedLeadFilters, setAppliedLeadFilters] = useState<AppliedLeadFilter[]>(
-        () => parseLeadFiltersFromUrl(searchParams?.get(LEAD_FILTERS_URL_PARAM))
-    );
+    // Seeded from the URL (?q=…&filters=…): the builder comes back exactly as it
+    // was, and the clauses that are complete run straight away.
     const [leadFilters, setLeadFilters] = useState<LeadFilterClause[]>(
-        () => appliedLeadFilters.map((filter) => ({ id: createLeadFilterId(), ...filter }))
+        () => parseLeadFiltersFromUrl(searchParams?.get(LEAD_FILTERS_URL_PARAM))
+            .map((filter) => ({ id: createLeadFilterId(), ...filter }))
+    );
+    const [appliedLeadFilters, setAppliedLeadFilters] = useState<AppliedLeadFilter[]>(
+        () => leadFilters
+            .map(({ field, op, value, joinOp }) => ({ field, op, value, joinOp }))
+            .filter(isRunnableUrlLeadFilter)
     );
     const [leadFilterDrawerOpen, setLeadFilterDrawerOpen] = useState(false);
     const listFilterId = useMemo(
@@ -2943,20 +2954,21 @@ export default function ClientPage() {
         };
     }, [leadSearch]);
 
-    // Mirror the running query into the URL (replace, not push: no history entry
-    // per keystroke). Draft filters stay out until Run Query applies them.
+    // Mirror the search and the filter builder into the URL as they're edited
+    // (replace, not push: no history entry per keystroke), before Run Query.
     useEffect(() => {
         const current = window.location.search.replace(/^\?/, "");
         const next = new URLSearchParams(current);
         const search = debouncedLeadSearch.trim();
         if (search) next.set(LEAD_SEARCH_URL_PARAM, search);
         else next.delete(LEAD_SEARCH_URL_PARAM);
-        if (appliedLeadFilters.length > 0) next.set(LEAD_FILTERS_URL_PARAM, JSON.stringify(appliedLeadFilters));
+        const builder = leadFilters.map(({ field, op, value, joinOp }) => ({ field, op, value, joinOp }));
+        if (builder.length > 0) next.set(LEAD_FILTERS_URL_PARAM, JSON.stringify(builder));
         else next.delete(LEAD_FILTERS_URL_PARAM);
         const queryString = next.toString();
         if (queryString === current) return;
         window.history.replaceState(null, "", queryString ? `${window.location.pathname}?${queryString}` : window.location.pathname);
-    }, [appliedLeadFilters, debouncedLeadSearch]);
+    }, [leadFilters, debouncedLeadSearch]);
 
     useEffect(() => {
         const timeoutId = window.setTimeout(() => {
