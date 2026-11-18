@@ -2663,15 +2663,22 @@ export default function ClientPage() {
         other_signals?: string;
         meta_active_ads?: string;
     };
+    type JobPreviewColumn = {
+        key: keyof JobPreviewLead;
+        label: string;
+        multiline?: boolean;
+        link?: boolean;
+        minWidth?: string;
+    };
     const metaAdsRan = !!jobState?.metaAds && (
         (jobState.metaAds.counted || 0)
         + (jobState.metaAds.reused || 0)
         + (jobState.metaAds.errors || 0) > 0
     );
-    const jobPreviewColumns = useMemo(() => {
+    const jobPreviewColumns = useMemo((): JobPreviewColumn[] => {
         const shoppingAudit = isShoppingAuditPipelineJob(jobState);
-        const metaAdsColumn = metaAdsRan
-            ? [{ key: 'meta_active_ads' as const, label: 'Active Meta Ads' }]
+        const metaAdsColumn: JobPreviewColumn[] = metaAdsRan
+            ? [{ key: 'meta_active_ads', label: 'Active Meta Ads' }]
             : [];
         if (!shoppingAudit) {
             return [

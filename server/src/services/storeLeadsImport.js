@@ -402,17 +402,15 @@ export async function runStoreLeadsBackfill({ batchId, agencyId, clientId, apiKe
                 lastRequestAt = Date.now();
                 const rawDomains = await bulkLookupStoreLeadsDomains(apiKey, slice.map((row) => row.domain_normalized));
 
-                // Responses are keyed by Store Leads' canonical name (often www.-prefixed
-                // or a redirect target), so match on the normalized name and its aliases.
+                // Match the normalized name only. www. is already stripped. Aliases and
+                // redirect targets are different domains and must not inherit this store's sales.
                 const companyIdByDomain = new Map(slice.map((row) => [row.domain_normalized, row.id]));
                 const found = new Map();
                 for (const raw of rawDomains) {
                     const mapped = mapStoreLeadsDomain(raw);
                     if (!mapped) continue;
-                    for (const candidate of [mapped.domain, ...mapped.aliases]) {
-                        const companyId = companyIdByDomain.get(candidate);
-                        if (companyId !== undefined && !found.has(companyId)) found.set(companyId, mapped);
-                    }
+                    const companyId = companyIdByDomain.get(mapped.domain);
+                    if (companyId !== undefined && !found.has(companyId)) found.set(companyId, mapped);
                 }
                 const foundRows = [...found.entries()].map(([companyId, mapped]) => ({ companyId, mapped }));
                 const missingIds = slice.filter((row) => !found.has(row.id)).map((row) => row.id);
