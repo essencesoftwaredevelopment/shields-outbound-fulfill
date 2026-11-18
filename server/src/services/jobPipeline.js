@@ -71,7 +71,8 @@ const SQL_MIN_INTERVAL_MS = 2000;
 const REALTIME_STAGE_MIN_INTERVAL_MS = 500;
 import {
     DNS_QUERY_TIMEOUT_MS,
-    DNS_CHECK_CONCURRENCY
+    DNS_CHECK_CONCURRENCY,
+    shouldUpsertInitialDomains
 } from '../enrichment/domainPrepConfig.js';
 const PLACEHOLDER_CONTACT_MAX_DOMAINS = Math.max(
     0,
@@ -748,7 +749,17 @@ async function processJob(job) {
                     domainCheckSkipped
                 };
 
-                await upsertDomainsImmediately(job);
+                if (shouldUpsertInitialDomains(dedupeResult.stats, PLACEHOLDER_CONTACT_MAX_DOMAINS)) {
+                    await upsertDomainsImmediately(job);
+                } else if (
+                    Number(dedupeResult.stats?.new) === 0
+                    && (Number(dedupeResult.stats?.total) || 0) > PLACEHOLDER_CONTACT_MAX_DOMAINS
+                ) {
+                    log(
+                        job,
+                        `Domain upsert skipped: ${dedupeResult.stats.total} domains already exist`
+                    );
+                }
 
                 log(
                     job,

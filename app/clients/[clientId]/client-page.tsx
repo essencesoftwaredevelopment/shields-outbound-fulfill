@@ -2661,9 +2661,18 @@ export default function ClientPage() {
         ad_price?: string;
         page_price?: string;
         other_signals?: string;
+        meta_active_ads?: string;
     };
+    const metaAdsRan = !!jobState?.metaAds && (
+        (jobState.metaAds.counted || 0)
+        + (jobState.metaAds.reused || 0)
+        + (jobState.metaAds.errors || 0) > 0
+    );
     const jobPreviewColumns = useMemo(() => {
         const shoppingAudit = isShoppingAuditPipelineJob(jobState);
+        const metaAdsColumn = metaAdsRan
+            ? [{ key: 'meta_active_ads' as const, label: 'Active Meta Ads' }]
+            : [];
         if (!shoppingAudit) {
             return [
                 { key: 'domain' as const, label: 'Domain' },
@@ -2671,6 +2680,7 @@ export default function ClientPage() {
                 { key: 'email' as const, label: 'Email' },
                 { key: 'email_status' as const, label: 'Status' },
                 { key: 'personalization' as const, label: 'First line', multiline: true, minWidth: '280px' },
+                ...metaAdsColumn,
             ];
         }
         return [
@@ -2691,8 +2701,9 @@ export default function ClientPage() {
             { key: 'page_price' as const, label: 'Page price' },
             { key: 'other_signals' as const, label: 'Other signals' },
             { key: 'personalization' as const, label: 'Personalization', multiline: true, minWidth: '360px' },
+            ...metaAdsColumn,
         ];
-    }, [jobState]);
+    }, [jobState, metaAdsRan]);
 
     const renderJobPreviewCell = (lead: JobPreviewLead, column: { key: keyof JobPreviewLead; multiline?: boolean; link?: boolean; minWidth?: string }) => {
         const { key, multiline, link, minWidth } = column;

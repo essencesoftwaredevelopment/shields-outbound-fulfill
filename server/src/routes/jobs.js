@@ -16,6 +16,7 @@ import {
     formatUnifiedCsvLine,
     getUnifiedRowHeaders,
     isShoppingAuditJobById,
+    jobRanMetaAds,
     shoppingAuditFromJobRow,
     getJobById,
     jobHasRemainingPipelineWork,
@@ -1131,15 +1132,16 @@ router.get('/jobs/:id/result', async (req, res) => {
 
     try {
         const shoppingAudit = await isShoppingAuditJobById(jobId);
+        const metaAds = await jobRanMetaAds(jobId);
         const rows = await buildUnifiedRowsFromDb(
             jobId,
             scopeParam === 'valid' ? 'valid' : 'all',
-            { shoppingAudit }
+            { shoppingAudit, metaAds }
         );
         if (!rows.length) {
             return res.status(404).json({ error: 'No data to export.' });
         }
-        const headers = getUnifiedRowHeaders(shoppingAudit);
+        const headers = getUnifiedRowHeaders(shoppingAudit, metaAds);
         const filename = `results-${jobId}-${scopeParam}.csv`;
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);

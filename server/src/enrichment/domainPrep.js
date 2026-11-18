@@ -17,7 +17,8 @@ import {
     DNS_QUERY_TIMEOUT_MS,
     DNS_CHECK_CONCURRENCY,
     DNS_RECHECK_CONCURRENCY,
-    DNS_RECHECK_BUDGET_MS
+    DNS_RECHECK_BUDGET_MS,
+    shouldUpsertInitialDomains
 } from './domainPrepConfig.js';
 
 if (env.PGPOOL_MAX <= 10 && DNS_CHECK_CONCURRENCY > 50) {
@@ -296,7 +297,7 @@ export async function runDomainPrep(ctx) {
     });
 
     await assertJobActive(ctx.jobId, ctx.agencyId);
-    await setJobActivity(ctx.jobId, ctx.agencyId, 'Running domain prep…');
+    await setJobActivity(ctx.jobId, ctx.agencyId, 'Checking which domains already exist…');
 
     const pendingBefore = await listPendingJobDomains(ctx.jobId, 1);
     const reauditMonths = isShoppingAuditJob(job)
@@ -354,8 +355,17 @@ export async function runDomainPrep(ctx) {
 
     // Ads-only runs must not create or re-stamp leads (contacts.job_id): the
     // Meta ad count lives in domain_meta_ads, keyed by domain.
-    if (!ctx.options.metaAds?.only) {
+    if (!ctx.options.metaAds?.only && shouldUpsertInitialDomains(dedupeResult.stats, PLACEHOLDER_CONTACT_MAX_DOMAINS)) {
         await upsertInitialDomains(ctx);
+    } else if (
+        !ctx.options.metaAds?.only
+        && Number(dedupeResult.stats?.new) === 0
+        && (Number(dedupeResult.stats?.total) || 0) > PLACEHOLDER_CONTACT_MAX_DOMAINS
+    ) {
+        console.log(
+            `[domainPrep] job ${ctx.jobId}: skipped company upsert `
+            + `(${dedupeResult.stats.total} domains already exist)`
+        );
     }
 
     const cohortTotal = dnsStats.processable || pendingBefore.length;

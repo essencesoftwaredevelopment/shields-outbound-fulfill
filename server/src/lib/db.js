@@ -19,8 +19,10 @@ import { collectExistingDomains } from '../services/domainLookup.js';
 export const pool = dbPool;
 
 const MAX_SAFE_QUERY_PARAMS = 4000;
-const COMPANY_FIXED_PARAMS = 2;
 const CONTACT_FIXED_PARAMS = 1;
+// Index probes stay cheap at this size. A single multi-thousand-row INSERT does not:
+// planning the statement and rewriting existing rows both blow up.
+const COMPANY_LOOKUP_CHUNK = 1000;
 const CONTACT_PARAMS_PER_ROW = 12;
 
 function chunkArray(items, size) {
@@ -62,10 +64,47 @@ export async function withTx(fn) {
 }
 
 /**
- * Batch upsert companies with checkpoint management
- * All rows are scoped to a single agency and client
+ * Resolve company ids for domains that already exist.
+ * Lateral lookup on (client_id, domain_normalized) — a few index probes per
+ * domain, not a client-wide scan.
  *
- * @param {pg.PoolClient} txClient - Transaction client
+ * @param {pg.Pool | pg.PoolClient} db
+ * @param {number} clientId
+ * @param {string[]} domains
+ * @returns {Promise<Map<string, number>>}
+ */
+async function lookupCompanyIds(db, clientId, domains) {
+    const domainMap = new Map();
+    for (const chunk of chunkArray(domains, COMPANY_LOOKUP_CHUNK)) {
+        const result = await db.query(
+            `SELECT co.id, co.domain_normalized
+             FROM unnest($2::text[]) AS input(domain)
+             JOIN LATERAL (
+                 SELECT c.id, c.domain_normalized
+                 FROM companies c
+                 WHERE c.client_id = $1
+                   AND c.domain_normalized = input.domain
+                 LIMIT 1
+             ) co ON true`,
+            [clientId, chunk]
+        );
+        for (const row of result.rows) {
+            domainMap.set(row.domain_normalized, row.id);
+        }
+    }
+    return domainMap;
+}
+
+/**
+ * Ensure a company row per domain and return domain -> company id.
+ * All rows are scoped to a single agency and client.
+ *
+ * Existing rows are left untouched. `ON CONFLICT DO UPDATE SET updated_at = now()`
+ * rewrote every matching heap tuple and the trigram index; on a client with
+ * ~1.6M companies that was ~10–20s per 4,000 domains and was most of domain prep.
+ * Callers only need the ids.
+ *
+ * @param {pg.Pool | pg.PoolClient} txClient - Transaction client (or pool)
  * @param {string} agencyId - Agency identifier (Firebase uid)
  * @param {number} clientId - Client ID (required)
  * @param {Array} rows - Array of {domain, ...} objects
@@ -75,45 +114,38 @@ export async function batchUpsertCompanies(txClient, agencyId, clientId, rows) {
     if (!rows.length) return new Map();
     if (!clientId) throw new Error('clientId is required');
 
-    const domainMap = new Map();
     const uniqueDomains = [...new Set(rows.map((r) => normalizeDomain(r.domain)).filter(Boolean))];
 
     if (!uniqueDomains.length) {
         console.warn(`[batchUpsertCompanies] No valid domains found in ${rows.length} rows`);
-        return domainMap;
+        return new Map();
     }
 
-    const maxDomainsPerChunk = Math.max(1, MAX_SAFE_QUERY_PARAMS - COMPANY_FIXED_PARAMS);
-    const domainChunks = chunkArray(uniqueDomains, maxDomainsPerChunk);
-
     try {
-        let totalUpserted = 0;
+        const domainMap = await lookupCompanyIds(txClient, clientId, uniqueDomains);
+        const missing = uniqueDomains.filter((domain) => !domainMap.has(domain));
+        if (!missing.length) return domainMap;
 
-        for (const domainChunk of domainChunks) {
-            const valuesList = [];
-            const params = [agencyId, clientId];
-            let paramIndex = 3;
-
-            for (const domain of domainChunk) {
-                params.push(domain);
-                valuesList.push(`($1, $2, $${paramIndex})`);
-                paramIndex += 1;
-            }
-
-            const query = `
-                INSERT INTO companies (agency_id, client_id, domain_normalized)
-                VALUES ${valuesList.join(', ')}
-                ON CONFLICT (client_id, domain_normalized)
-                DO UPDATE SET updated_at = now()
-                RETURNING id, domain_normalized
-            `;
-
-            const result = await txClient.query(query, params);
-            totalUpserted += result.rows.length;
-
+        for (const chunk of chunkArray(missing, COMPANY_LOOKUP_CHUNK)) {
+            const result = await txClient.query(
+                `INSERT INTO companies (agency_id, client_id, domain_normalized)
+                 SELECT $1, $2, domain
+                 FROM unnest($3::text[]) AS input(domain)
+                 ON CONFLICT (client_id, domain_normalized) DO NOTHING
+                 RETURNING id, domain_normalized`,
+                [agencyId, clientId, chunk]
+            );
             for (const row of result.rows) {
                 domainMap.set(row.domain_normalized, row.id);
             }
+        }
+
+        // A concurrent insert can win the conflict. RETURNING omits that row,
+        // so pick up any id we still don't have.
+        const unresolved = missing.filter((domain) => !domainMap.has(domain));
+        if (unresolved.length) {
+            const recovered = await lookupCompanyIds(txClient, clientId, unresolved);
+            for (const [domain, id] of recovered) domainMap.set(domain, id);
         }
 
         return domainMap;

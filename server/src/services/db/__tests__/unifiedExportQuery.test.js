@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { formatUnifiedCsvLine, SHOPPING_AUDIT_UNIFIED_HEADERS } from '../jobs.js';
+import { formatUnifiedCsvLine, formatMetaActiveAds, getUnifiedRowHeaders, SHOPPING_AUDIT_UNIFIED_HEADERS, STANDARD_UNIFIED_HEADERS } from '../jobs.js';
 
 const jobsModulePath = fileURLToPath(new URL('../jobs.js', import.meta.url));
 const migrationPath = fileURLToPath(
@@ -28,6 +28,13 @@ describe('shopping-audit unified export SQL', () => {
         assert.match(sql, /CREATE INDEX IF NOT EXISTS idx_shopify_snapshots_job_domain/);
         assert.match(sql, /ON shopify_snapshots \(job_id, domain_normalized\)/);
     });
+
+    it('joins the Meta ad count only through the agency+domain key', () => {
+        assert.match(source, /LEFT JOIN domain_meta_ads dma/);
+        assert.match(source, /dma\.agency_id = c\.agency_id/);
+        assert.match(source, /dma\.active_ads AS meta_active_ads/);
+        assert.match(source, /jd\.meta_ads_status IS NOT NULL/);
+    });
 });
 
 describe('formatUnifiedCsvLine', () => {
@@ -44,5 +51,22 @@ describe('formatUnifiedCsvLine', () => {
             domain: 'a.com'
         });
         assert.equal(line, '"a.com","",""');
+    });
+
+    it('keeps a zero Meta ad count', () => {
+        const headers = getUnifiedRowHeaders(false, true);
+        assert.equal(headers.at(-1), 'meta_active_ads');
+        assert.equal(headers.length, STANDARD_UNIFIED_HEADERS.length + 1);
+        const line = formatUnifiedCsvLine(headers.slice(-1), {
+            meta_active_ads: formatMetaActiveAds(0)
+        });
+        assert.equal(line, '"0"');
+        assert.equal(formatMetaActiveAds(null), '');
+        assert.equal(formatMetaActiveAds(12), '12');
+    });
+
+    it('leaves the standard headers unchanged when Meta ads did not run', () => {
+        assert.deepEqual(getUnifiedRowHeaders(false, false), STANDARD_UNIFIED_HEADERS);
+        assert.equal(getUnifiedRowHeaders(true, true).at(-1), 'meta_active_ads');
     });
 });

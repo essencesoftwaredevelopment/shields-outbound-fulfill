@@ -1342,6 +1342,13 @@ const UNIFIED_ROW_FROM_BASE = `
     FROM contacts c
     JOIN companies co ON co.id = c.company_id`;
 
+// Latest count for this agency+domain. Only joined once the job has actually
+// run Meta ads, so other exports keep their existing columns.
+const META_ADS_ROW_JOIN = `
+    LEFT JOIN domain_meta_ads dma
+        ON dma.agency_id = c.agency_id
+       AND dma.domain_normalized = co.domain_normalized`;
+
 const UNIFIED_ROW_WHERE = `
     WHERE c.job_id = $1 AND c.role_type = 'founder'`;
 
@@ -1368,11 +1375,13 @@ function buildUnifiedOrderBy(shoppingAudit, { sortByCompleteness = false } = {})
     return 'ORDER BY co.domain_normalized ASC';
 }
 
-function buildUnifiedQueryParts(shoppingAudit) {
+function buildUnifiedQueryParts(shoppingAudit, metaAds = false) {
+    const metaSelect = metaAds ? ',\n        dma.active_ads AS meta_active_ads' : '';
+    const metaJoin = metaAds ? META_ADS_ROW_JOIN : '';
     if (!shoppingAudit) {
         return {
-            select: `SELECT ${UNIFIED_ROW_BASE_SELECT}`,
-            from: `${UNIFIED_ROW_FROM_BASE}${UNIFIED_ROW_WHERE}`
+            select: `SELECT ${UNIFIED_ROW_BASE_SELECT}${metaSelect}`,
+            from: `${UNIFIED_ROW_FROM_BASE}${metaJoin}${UNIFIED_ROW_WHERE}`
         };
     }
 
@@ -1390,9 +1399,9 @@ function buildUnifiedQueryParts(shoppingAudit) {
         se.observed AS signal_observed,
         se.expected AS signal_expected,
         se.export_vars AS signal_export_vars,
-        se.secondary_signals AS signal_secondary`,
+        se.secondary_signals AS signal_secondary${metaSelect}`,
         from: `${UNIFIED_ROW_FROM_BASE}
-    ${SHOPPING_AUDIT_ROW_JOINS}${UNIFIED_ROW_WHERE}`
+    ${SHOPPING_AUDIT_ROW_JOINS}${metaJoin}${UNIFIED_ROW_WHERE}`
     };
 }
 
@@ -1411,8 +1420,44 @@ export async function isShoppingAuditJobById(jobId) {
     return resolvePipelineMode(row.options || {}, row.stages || {}) === 'shopping_audit';
 }
 
-export function getUnifiedRowHeaders(shoppingAudit = false) {
-    return shoppingAudit ? SHOPPING_AUDIT_UNIFIED_HEADERS : STANDARD_UNIFIED_HEADERS;
+export function getUnifiedRowHeaders(shoppingAudit = false, metaAds = false) {
+    const headers = shoppingAudit ? SHOPPING_AUDIT_UNIFIED_HEADERS : STANDARD_UNIFIED_HEADERS;
+    if (!metaAds) return headers;
+    return [...headers, 'meta_active_ads'];
+}
+
+/** Blank when this domain was never successfully counted. Zero is a real count. */
+export function formatMetaActiveAds(value) {
+    if (value == null || value === '') return '';
+    const count = Number(value);
+    if (!Number.isFinite(count)) return '';
+    return String(Math.trunc(count));
+}
+
+/**
+ * True once this job's Meta ads stage has written at least one domain outcome.
+ * Enabled-but-not-started jobs stay on the original CSV columns.
+ */
+export async function jobRanMetaAds(jobId) {
+    const result = await pool.query(
+        `SELECT
+            COALESCE((options->'metaAds'->>'enabled') = 'true', false) AS enabled,
+            EXISTS (
+                SELECT 1 FROM job_domains jd
+                 WHERE jd.job_id = jobs.id
+                   AND jd.meta_ads_status IS NOT NULL
+            ) AS ran
+         FROM jobs
+         WHERE id = $1`,
+        [jobId]
+    );
+    const row = result.rows[0];
+    return row?.enabled === true && row?.ran === true;
+}
+
+async function resolveMetaAdsFlag(jobId, options = {}) {
+    if (typeof options.metaAds === 'boolean') return options.metaAds;
+    return jobRanMetaAds(jobId);
 }
 
 export function formatUnifiedCsvLine(headers, row) {
@@ -1422,7 +1467,7 @@ export function formatUnifiedCsvLine(headers, row) {
     }).join(',');
 }
 
-function mapUnifiedContactRow(row, shoppingAudit = false) {
+function mapUnifiedContactRow(row, shoppingAudit = false, metaAds = false) {
     const parts = String(row.founder_name || '').trim().split(/\s+/);
     const firstName = parts[0] || '';
     const lastName = parts.length > 1 ? parts.slice(1).join(' ') : '';
@@ -1435,6 +1480,9 @@ function mapUnifiedContactRow(row, shoppingAudit = false) {
         last_name: lastName,
         personalization: row.personalization || row.first_line || ''
     };
+    if (metaAds) {
+        base.meta_active_ads = formatMetaActiveAds(row.meta_active_ads);
+    }
     if (!shoppingAudit) return base;
 
     // Cold-email variables. export_vars is authoritative; rows emitted before the
@@ -1473,7 +1521,8 @@ async function resolveShoppingAuditFlag(jobId, options = {}) {
 
 export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {}) {
     const shoppingAudit = await resolveShoppingAuditFlag(jobId, options);
-    const { select, from } = buildUnifiedQueryParts(shoppingAudit);
+    const metaAds = await resolveMetaAdsFlag(jobId, options);
+    const { select, from } = buildUnifiedQueryParts(shoppingAudit, metaAds);
     const statusFilter = buildUnifiedScopeFilter(scope, options);
     const result = await pool.query(
         `${select}
@@ -1483,7 +1532,7 @@ export async function buildUnifiedRowsFromDb(jobId, scope = 'valid', options = {
         [jobId]
     );
 
-    return result.rows.map((row) => mapUnifiedContactRow(row, shoppingAudit));
+    return result.rows.map((row) => mapUnifiedContactRow(row, shoppingAudit, metaAds));
 }
 
 /**
@@ -1506,7 +1555,8 @@ export async function listAutoInstantlyCandidates(jobId, {
 } = {}) {
     if (Array.isArray(domains) && !domains.length) return [];
     const shoppingAudit = await resolveShoppingAuditFlag(jobId, {});
-    const { select, from } = buildUnifiedQueryParts(shoppingAudit);
+    const metaAds = await resolveMetaAdsFlag(jobId, {});
+    const { select, from } = buildUnifiedQueryParts(shoppingAudit, metaAds);
     const params = [jobId];
     let extra = `
          AND c.email IS NOT NULL AND BTRIM(c.email) <> ''`;
@@ -1538,7 +1588,7 @@ export async function listAutoInstantlyCandidates(jobId, {
         params
     );
     return result.rows.map((row) => ({
-        ...mapUnifiedContactRow(row, shoppingAudit),
+        ...mapUnifiedContactRow(row, shoppingAudit, metaAds),
         contact_id: String(row.contact_id)
     }));
 }
@@ -1551,7 +1601,8 @@ export async function listUnifiedRowsFromDb(jobId, {
     ...options
 } = {}) {
     const shoppingAudit = await resolveShoppingAuditFlag(jobId, options);
-    const { select, from } = buildUnifiedQueryParts(shoppingAudit);
+    const metaAds = await resolveMetaAdsFlag(jobId, options);
+    const { select, from } = buildUnifiedQueryParts(shoppingAudit, metaAds);
     const statusFilter = buildUnifiedScopeFilter(scope, options);
     const orderBy = buildUnifiedOrderBy(shoppingAudit, { sortByCompleteness });
     const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
@@ -1570,7 +1621,7 @@ export async function listUnifiedRowsFromDb(jobId, {
     const total = result.rows[0]?._total_count ?? 0;
     const rows = result.rows.map((row) => {
         const { _total_count: _ignored, ...dataRow } = row;
-        return mapUnifiedContactRow(dataRow, shoppingAudit);
+        return mapUnifiedContactRow(dataRow, shoppingAudit, metaAds);
     });
     return {
         rows,
@@ -1579,7 +1630,8 @@ export async function listUnifiedRowsFromDb(jobId, {
         offset: parsedOffset,
         hasMore: parsedOffset + rows.length < total,
         shoppingAudit,
-        headers: getUnifiedRowHeaders(shoppingAudit)
+        metaAds,
+        headers: getUnifiedRowHeaders(shoppingAudit, metaAds)
     };
 }
 

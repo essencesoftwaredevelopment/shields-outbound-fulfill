@@ -28,3 +28,19 @@ export const DOMAIN_PREP_CANCEL_CHECK_EVERY = Math.max(
     1,
     parseInt(process.env.DOMAIN_PREP_CANCEL_CHECK_EVERY || '50', 10)
 );
+
+/**
+ * Include-mode reruns are often entirely domains that already have companies.
+ * Above the placeholder-contact cap, the company upsert's only output (ids) is
+ * discarded, so there is nothing to write. Smaller runs still need those ids.
+ *
+ * @param {{ total?: number, new?: number }} stats
+ * @param {number} [maxPlaceholderDomains]
+ */
+export function shouldUpsertInitialDomains(stats, maxPlaceholderDomains = 5000) {
+    const total = Number(stats?.total) || 0;
+    const created = Number(stats?.new);
+    if (!total) return false;
+    if (created !== 0) return true;
+    return total <= maxPlaceholderDomains;
+}
