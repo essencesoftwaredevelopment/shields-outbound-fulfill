@@ -561,6 +561,22 @@ const STORE_COUNTRY_OPTIONS = [
  * Columns every scoped_companies CTE exposes to filter clauses (alias `co`).
  * The CTE is inlined by the planner, so unused columns cost nothing.
  */
+/**
+ * True when co.domain_normalized has a label in front of its registrable
+ * domain ("store.brand.com", "de.brand.co.uk"). "www." is already stripped by
+ * normalizeDomain. The base is two labels, or three for country second-level
+ * endings ("brand.co.uk", "brand.com.au") and CentralNic-style ones
+ * ("brand.uk.com"). A heuristic, not the full public-suffix list: checked on
+ * ESSENCE Retention's 1.33M domains (2026-11-18), the matches are real
+ * subdomains and co.uk / com.au stores are not flagged.
+ */
+const DOMAIN_HAS_SUBDOMAIN_SQL = `(
+    array_length(string_to_array(co.domain_normalized, '.'), 1) > CASE
+        WHEN co.domain_normalized ~ '\\.(co|com|net|org|gov|edu|ac|ltd|plc|gen|ne|or|go|nom|sch|mil|biz|info)\\.[a-z]{2}$'
+          OR co.domain_normalized ~ '\\.(uk|us|eu|gb|za|co|ru|cn|jp|de|br|sa|se|hu|no|kr|qc)\\.(com|net)$'
+        THEN 3 ELSE 2 END
+)`;
+
 const SCOPED_COMPANY_COLUMNS = `
                     id,
                     agency_id,
@@ -681,7 +697,9 @@ const LEAD_FILTER_FIELDS = [
             { key: 'starts_with', label: 'Starts With' },
             { key: 'ends_with', label: 'Ends With' },
             { key: 'is_empty', label: 'Is Empty' },
-            { key: 'not_empty', label: 'Is Not Empty' }
+            { key: 'not_empty', label: 'Is Not Empty' },
+            { key: 'has_subdomain', label: 'Contains a Subdomain' },
+            { key: 'no_subdomain', label: "Doesn't Contain a Subdomain" }
         ]
     },
     {
@@ -1739,7 +1757,8 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     // Operators that need no value
     if (operatorKey === 'is_empty' || operatorKey === 'not_empty'
         || operatorKey === 'is_true' || operatorKey === 'is_false'
-        || operatorKey === 'found_and_valid' || operatorKey === 'last_count_failed') return null;
+        || operatorKey === 'found_and_valid' || operatorKey === 'last_count_failed'
+        || operatorKey === 'has_subdomain' || operatorKey === 'no_subdomain') return null;
 
     // Multi-value operators — value is a JSON array string
     if (operatorKey === 'in' || operatorKey === 'not_in' || operatorKey === 'between') {
@@ -1829,7 +1848,7 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
     // Helper: bind each element of an array and return [ref, ref, ...]
     const bindArray = (arr) => arr.map((v) => bindParam(v));
 
-    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed']);
+    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed', 'has_subdomain', 'no_subdomain']);
 
     const buildInstantlyStatusMatch = (rawStatusValue) => {
         const labelToken = normalizeInstantlyStatusFilterToken(rawStatusValue);
@@ -2123,6 +2142,10 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
                 clauses.push(`(co.domain_normalized IS NULL OR BTRIM(co.domain_normalized) = '')`);
             } else if (operatorKey === 'not_empty') {
                 clauses.push(`(co.domain_normalized IS NOT NULL AND BTRIM(co.domain_normalized) <> '')`);
+            } else if (operatorKey === 'has_subdomain') {
+                clauses.push(`(co.domain_normalized IS NOT NULL AND ${DOMAIN_HAS_SUBDOMAIN_SQL})`);
+            } else if (operatorKey === 'no_subdomain') {
+                clauses.push(`(co.domain_normalized IS NOT NULL AND BTRIM(co.domain_normalized) <> '' AND NOT ${DOMAIN_HAS_SUBDOMAIN_SQL})`);
             }
             continue;
         }

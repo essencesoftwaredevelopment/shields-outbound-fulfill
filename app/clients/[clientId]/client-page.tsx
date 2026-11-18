@@ -1853,7 +1853,7 @@ function parseLeadFiltersFromUrl(raw: string | null | undefined): AppliedLeadFil
     }
 }
 
-const LEAD_FILTER_NO_VALUE_OPS = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed'];
+const LEAD_FILTER_NO_VALUE_OPS = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed', 'has_subdomain', 'no_subdomain'];
 
 /** A clause from the URL that can run as-is (has a value, or needs none). */
 function isRunnableUrlLeadFilter(filter: AppliedLeadFilter): boolean {
@@ -3647,7 +3647,7 @@ export default function ClientPage() {
         const field = leadFilterFieldMap.get(fieldKey);
         if (!field) return false;
         if (!field.operators.some((operator) => operator.key === operatorKey)) return false;
-        const noValueOps = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed'];
+        const noValueOps = LEAD_FILTER_NO_VALUE_OPS;
         return !noValueOps.includes(operatorKey);
     }, [leadFilterFieldMap]);
 
