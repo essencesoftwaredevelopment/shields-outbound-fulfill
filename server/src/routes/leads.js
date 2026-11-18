@@ -1598,7 +1598,11 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
     }
 
     if (typeof jobId === 'string' && jobId.trim()) {
-        whereClause += ` AND c.job_id = $${paramIndex}`;
+        const ref = `$${paramIndex}`;
+        whereClause += ` AND ${sqlLeadIdsMatchingJob(
+            `c_job.job_id = ${ref}`,
+            `j_meta.id = ${ref}`
+        )}`;
         params.push(jobId.trim());
         paramIndex++;
         paramsState.paramIndex = paramIndex;
@@ -1804,6 +1808,44 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     }
 
     return normalizedText;
+}
+
+/**
+ * Leads written by a job, plus existing leads on domains an ads-only Meta ad
+ * run counted or reused. Ads-only never sets contacts.job_id, so a Job ID
+ * filter on that column alone returns nothing.
+ *
+ * Both predicates are caller-bound (`$n` refs). `$1` / `$2` are the list
+ * query's agency and client. The union starts from the job, not from every
+ * contact: a correlated EXISTS here planned as a scan of the whole client.
+ */
+function sqlLeadIdsMatchingJob(contactPredicate, jobPredicate) {
+    return `c.id IN (
+        SELECT c_job.id
+          FROM contacts c_job
+         WHERE c_job.agency_id = $1
+           AND c_job.client_id = $2
+           AND (${contactPredicate})
+        UNION
+        SELECT c_ads.id
+          FROM jobs j_meta
+          JOIN job_domains jd_meta
+            ON jd_meta.job_id = j_meta.id
+           AND jd_meta.agency_id = j_meta.agency_id
+          JOIN companies co_meta
+            ON co_meta.client_id = j_meta.client_id
+           AND co_meta.agency_id = j_meta.agency_id
+           AND co_meta.domain_normalized = jd_meta.domain_normalized
+          JOIN contacts c_ads
+            ON c_ads.company_id = co_meta.id
+           AND c_ads.agency_id = co_meta.agency_id
+           AND c_ads.client_id = co_meta.client_id
+         WHERE j_meta.agency_id = $1
+           AND j_meta.client_id = $2
+           AND (j_meta.options->'metaAds'->>'only') = 'true'
+           AND jd_meta.meta_ads_status IN ('counted', 'reused')
+           AND (${jobPredicate})
+    )`;
 }
 
 /**
@@ -2181,16 +2223,28 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
         }
 
         // ── job_id ─────────────────────────────────────────────────────────
+        // Ads-only Meta ad runs never stamp contacts.job_id. The count lives
+        // on the domain, so equals / contains / not-equals also match existing
+        // leads whose domains this run counted or reused. See sqlLeadIdsMatchingJob.
         if (fieldKey === 'job_id') {
             if (operatorKey === 'contains') {
                 const ref = bindParam(`%${String(normalizedValue).toLowerCase()}%`);
-                clauses.push(`LOWER(COALESCE(c.job_id, '')) LIKE ${ref}`);
+                clauses.push(sqlLeadIdsMatchingJob(
+                    `LOWER(COALESCE(c_job.job_id, '')) LIKE ${ref}`,
+                    `LOWER(j_meta.id) LIKE ${ref}`
+                ));
             } else if (operatorKey === 'eq') {
                 const ref = bindParam(String(normalizedValue));
-                clauses.push(`COALESCE(c.job_id, '') = ${ref}`);
+                clauses.push(sqlLeadIdsMatchingJob(
+                    `COALESCE(c_job.job_id, '') = ${ref}`,
+                    `j_meta.id = ${ref}`
+                ));
             } else if (operatorKey === 'neq') {
                 const ref = bindParam(String(normalizedValue));
-                clauses.push(`COALESCE(c.job_id, '') <> ${ref}`);
+                clauses.push(`NOT (${sqlLeadIdsMatchingJob(
+                    `COALESCE(c_job.job_id, '') = ${ref}`,
+                    `j_meta.id = ${ref}`
+                )})`);
             } else if (operatorKey === 'is_empty') {
                 clauses.push(`(c.job_id IS NULL OR BTRIM(c.job_id) = '')`);
             } else if (operatorKey === 'not_empty') {
@@ -4590,7 +4644,11 @@ router.post('/leads/insights/klaviyo/query', verifyFirebaseToken, async (req, re
         }
 
         if (typeof jobId === 'string' && jobId.trim()) {
-            whereClause += ` AND c.job_id = $${paramIndex}`;
+            const ref = `$${paramIndex}`;
+            whereClause += ` AND ${sqlLeadIdsMatchingJob(
+                `c_job.job_id = ${ref}`,
+                `j_meta.id = ${ref}`
+            )}`;
             params.push(jobId.trim());
             paramIndex++;
             paramsState.paramIndex = paramIndex;

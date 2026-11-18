@@ -11193,7 +11193,7 @@ export default function ClientPage() {
                                                     onClick={() => {
                                                         const clause = {
                                                             field: 'job_id',
-                                                            op: 'contains',
+                                                            op: 'eq',
                                                             value: jobState.id,
                                                             joinOp: 'AND' as const
                                                         };
