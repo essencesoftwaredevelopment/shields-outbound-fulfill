@@ -10,6 +10,16 @@
 
 export const LEAD_ACTIVITY_FIELD_KEY = 'lead_activity';
 
+/** Union of the negative Instantly outcomes shown together in All Leads. */
+export const NEGATIVE_INTENT_EVENT_VALUE = 'negative_intent';
+export const NEGATIVE_INTENT_MEMBER_VALUES = [
+    'lead_not_interested',
+    'email_bounced',
+    'lead_wrong_person',
+    'lead_unsubscribed',
+    'bad_fit'
+];
+
 function instantlyEvent(value, label, aliases = [value]) {
     return {
         value,
@@ -34,6 +44,10 @@ function shieldsEvent(value, label, extras = {}) {
 }
 
 export const LEAD_ACTIVITY_EVENT_TYPES = [
+    {
+        ...instantlyEvent(NEGATIVE_INTENT_EVENT_VALUE, 'Negative intent'),
+        aggregate: 'negative_intent'
+    },
     instantlyEvent('email_sent', 'Email Sent'),
     instantlyEvent('email_opened', 'Email Opened'),
     instantlyEvent('email_link_clicked', 'Link Clicked'),
@@ -304,6 +318,7 @@ export function parseLeadActivityFilterValue(operatorKey, rawValue) {
         eventType: eventType.value,
         aliases: eventType.aliases,
         bounceLike: eventType.value === 'email_bounced',
+        aggregate: eventType.aggregate || null,
         kind: eventType.kind || 'instantly_event',
         column: eventType.column || null,
         source: eventType.source || 'instantly',
@@ -328,6 +343,30 @@ function intervalSql(unit) {
     return TIME_UNIT_MAP.get(unit)?.sql || '1 day';
 }
 
+function sqlStringLiteral(value) {
+    return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Rows that count as negative intent: a bounce, or any stored spelling of
+ * Not Interested, Wrong Person, Unsubscribed, and Bad Fit.
+ * The column expression is the only varying part so the All Leads filter and
+ * idx_contact_instantly_events_negative_intent share one predicate.
+ */
+export function negativeIntentMatchSql(column = 'event_type') {
+    const exact = new Set();
+    for (const memberValue of NEGATIVE_INTENT_MEMBER_VALUES) {
+        if (memberValue === 'email_bounced') continue;
+        const member = EVENT_TYPE_MAP.get(memberValue);
+        if (!member) continue;
+        for (const alias of expandEventTypeAliases(member.aliases)) {
+            exact.add(alias);
+        }
+    }
+    const list = [...exact].sort().map(sqlStringLiteral).join(', ');
+    return `(LOWER(COALESCE(${column}, '')) LIKE '%bounce%' OR ${column} = ANY(ARRAY[${list}]::text[]))`;
+}
+
 /** Instantly stores some custom statuses as title-case labels (`Bad Fit`). */
 export function expandEventTypeAliases(aliases) {
     const out = new Set();
@@ -346,6 +385,9 @@ export function expandEventTypeAliases(aliases) {
 }
 
 function buildEventMatchSql(parsed, bindParam) {
+    if (parsed.aggregate === 'negative_intent') {
+        return negativeIntentMatchSql('cie.event_type');
+    }
     if (parsed.bounceLike) {
         return `LOWER(COALESCE(cie.event_type, '')) LIKE '%bounce%'`;
     }

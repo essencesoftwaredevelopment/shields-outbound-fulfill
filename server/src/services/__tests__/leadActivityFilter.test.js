@@ -1,14 +1,22 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
     LEAD_ACTIVITY_FIELD_KEY,
+    NEGATIVE_INTENT_EVENT_VALUE,
     frequencyOpNeedsCount,
     parseLeadActivityFilterValue,
     buildLeadActivityFilterSql,
     expandEventTypeAliases,
     getLeadActivityFilterField,
-    leadActivityFilterNeedsJoins
+    leadActivityFilterNeedsJoins,
+    negativeIntentMatchSql
 } from '../leadActivityFilter.js';
+
+const negativeIntentIndexPath = fileURLToPath(
+    new URL('../../../migrations/0082_negative_intent_events_index.sql', import.meta.url)
+);
 
 function bindTracker() {
     const params = [];
@@ -43,6 +51,9 @@ describe('getLeadActivityFilterField', () => {
         assert.ok(field.operators.some((op) => op.key === 'at_least_once'));
         assert.ok(field.options.some((opt) => opt.value === 'email_opened'));
         assert.ok(field.options.some((opt) => opt.value === 'email_found'));
+        const negativeIntent = field.options.find((opt) => opt.value === NEGATIVE_INTENT_EVENT_VALUE);
+        assert.equal(negativeIntent?.label, 'Negative intent');
+        assert.equal(negativeIntent?.group, 'Instantly');
         assert.ok(field.options.every((opt) => opt.value !== 'instantly_activity'));
         assert.ok(field.timeframes.some((item) => item.key === 'in_the_last'));
         assert.ok(field.units.some((item) => item.key === 'days'));
@@ -159,6 +170,39 @@ describe('buildLeadActivityFilterSql', () => {
         assert.ok(params[0].includes('Bad Fit'));
         assert.ok(params[0].includes('bad fit'));
         assert.ok(params[0].includes('bad_fit'));
+    });
+
+    it('counts any negative outcome as Negative intent', () => {
+        const parsed = parseLeadActivityFilterValue(
+            'zero_times',
+            validValue({ eventType: 'negative_intent', timeframe: { kind: 'over_all_time' } })
+        );
+        assert.equal(parsed.eventType, 'negative_intent');
+        assert.equal(parsed.aggregate, 'negative_intent');
+
+        const { bindParam } = bindTracker();
+        const sql = buildLeadActivityFilterSql(
+            'zero_times',
+            validValue({ eventType: 'negative_intent', timeframe: { kind: 'over_all_time' } }),
+            bindParam
+        );
+        assert.match(sql, /^NOT EXISTS \(/);
+        assert.match(sql, /cie\.contact_id IS NOT NULL/);
+        assert.match(sql, /LIKE '%bounce%'/);
+        assert.match(sql, /'Not Interested'/);
+        assert.match(sql, /'Bad Fit'/);
+        assert.match(sql, /'lead_wrong_person'/);
+        assert.match(sql, /'lead_unsubscribed'/);
+        assert.ok(sql.includes(negativeIntentMatchSql('cie.event_type')));
+        assert.doesNotMatch(sql, /event_timestamp/);
+    });
+
+    it('indexes Negative intent with the same predicate the filter emits', () => {
+        const sql = readFileSync(negativeIntentIndexPath, 'utf8');
+        assert.match(sql, /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contact_instantly_events_negative_intent/);
+        assert.match(sql, /ON contact_instantly_events \(agency_id, client_id, contact_id, event_timestamp DESC\)/);
+        assert.match(sql, /WHERE contact_id IS NOT NULL/);
+        assert.ok(sql.includes(negativeIntentMatchSql('event_type')));
     });
 
     it('matches bounced events with LIKE', () => {
