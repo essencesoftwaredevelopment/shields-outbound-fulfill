@@ -4430,6 +4430,13 @@ export default function ClientPage() {
         campaignsData: row.campaignsData || [],
         lists: Array.isArray(row.lists) ? row.lists : [],
         store: row.store || null,
+        metaAds: row.metaAds && typeof row.metaAds === "object"
+            ? {
+                activeAds: typeof row.metaAds.activeAds === "number" ? row.metaAds.activeAds : null,
+                checkedAt: row.metaAds.checkedAt || null,
+                error: row.metaAds.error || null,
+            }
+            : null,
         insights: row.insights || undefined,
         latestEvent: row.latestEvent || null
     }), []);
