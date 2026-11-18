@@ -35,6 +35,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isFresh(row) {
     if (!row?.checked_at || row.active_ads == null) return false;
+    // The last attempt failed: check again rather than reuse the older count
+    // (this is what a "Last count failed" re-run is for).
+    if (row.error) return false;
     const age = Date.now() - new Date(row.checked_at).getTime();
     return age >= 0 && age < REUSE_DAYS * 24 * 60 * 60 * 1000;
 }

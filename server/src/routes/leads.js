@@ -975,8 +975,10 @@ const LEAD_FILTER_FIELDS = [
             { key: 'gte', label: 'Greater Than Or Equal' },
             { key: 'lt', label: 'Less Than' },
             { key: 'lte', label: 'Less Than Or Equal' },
+            { key: 'eq', label: 'Equals' },
             { key: 'is_empty', label: 'Never Counted' },
-            { key: 'not_empty', label: 'Counted' }
+            { key: 'not_empty', label: 'Counted' },
+            { key: 'last_count_failed', label: 'Last Count Failed' }
         ]
     },
     {
@@ -1737,7 +1739,7 @@ function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
     // Operators that need no value
     if (operatorKey === 'is_empty' || operatorKey === 'not_empty'
         || operatorKey === 'is_true' || operatorKey === 'is_false'
-        || operatorKey === 'found_and_valid') return null;
+        || operatorKey === 'found_and_valid' || operatorKey === 'last_count_failed') return null;
 
     // Multi-value operators — value is a JSON array string
     if (operatorKey === 'in' || operatorKey === 'not_in' || operatorKey === 'between') {
@@ -1827,7 +1829,7 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
     // Helper: bind each element of an array and return [ref, ref, ...]
     const bindArray = (arr) => arr.map((v) => bindParam(v));
 
-    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid']);
+    const NO_VALUE_OPS = new Set(['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed']);
 
     const buildInstantlyStatusMatch = (rawStatusValue) => {
         const labelToken = normalizeInstantlyStatusFilterToken(rawStatusValue);
@@ -2427,12 +2429,15 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
                  WHERE dma.agency_id = co.agency_id
                    AND dma.domain_normalized = co.domain_normalized
                    AND ${condition})`;
-            if (operatorKey === 'gt') clauses.push(metaAdsExists(`dma.active_ads > ${bindParam(Number(normalizedValue))}`));
+            if (operatorKey === 'eq') clauses.push(metaAdsExists(`dma.active_ads = ${bindParam(Number(normalizedValue))}`));
+            else if (operatorKey === 'gt') clauses.push(metaAdsExists(`dma.active_ads > ${bindParam(Number(normalizedValue))}`));
             else if (operatorKey === 'gte') clauses.push(metaAdsExists(`dma.active_ads >= ${bindParam(Number(normalizedValue))}`));
             else if (operatorKey === 'lt') clauses.push(metaAdsExists(`dma.active_ads < ${bindParam(Number(normalizedValue))}`));
             else if (operatorKey === 'lte') clauses.push(metaAdsExists(`dma.active_ads <= ${bindParam(Number(normalizedValue))}`));
             else if (operatorKey === 'is_empty') clauses.push(`NOT ${metaAdsExists('dma.active_ads IS NOT NULL')}`);
             else if (operatorKey === 'not_empty') clauses.push(metaAdsExists('dma.active_ads IS NOT NULL'));
+            // The most recent attempt failed (any older good count is kept).
+            else if (operatorKey === 'last_count_failed') clauses.push(metaAdsExists('dma.error IS NOT NULL'));
             continue;
         }
 

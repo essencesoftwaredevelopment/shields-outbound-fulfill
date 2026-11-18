@@ -3588,7 +3588,7 @@ export default function ClientPage() {
         const field = leadFilterFieldMap.get(fieldKey);
         if (!field) return false;
         if (!field.operators.some((operator) => operator.key === operatorKey)) return false;
-        const noValueOps = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid'];
+        const noValueOps = ['is_empty', 'not_empty', 'is_true', 'is_false', 'found_and_valid', 'last_count_failed'];
         return !noValueOps.includes(operatorKey);
     }, [leadFilterFieldMap]);
 

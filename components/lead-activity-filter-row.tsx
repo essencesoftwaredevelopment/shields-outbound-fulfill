@@ -92,7 +92,7 @@ function nextTimeframe(kind: string, previous: LeadActivityTimeframe): LeadActiv
 function filterValueMode(field: FilterField | undefined, operatorKey: string): string | null {
     if (!field) return null;
     if (isLeadActivityCategory(field)) return "activity";
-    const noValueOps = ["is_empty", "not_empty", "is_true", "is_false", "found_and_valid"];
+    const noValueOps = ["is_empty", "not_empty", "is_true", "is_false", "found_and_valid", "last_count_failed"];
     if (noValueOps.includes(operatorKey)) return null;
     if (operatorKey === "older_than_days") return "number";
     if (operatorKey === "between") return "between";
@@ -479,7 +479,7 @@ export function LeadActivityFilterRow({
                         triggerClassName={chipTriggerClass}
                         aria-label="Operator"
                         onChange={(nextOp) => {
-                            const noValueOps = ["is_empty", "not_empty", "is_true", "is_false", "found_and_valid"];
+                            const noValueOps = ["is_empty", "not_empty", "is_true", "is_false", "found_and_valid", "last_count_failed"];
                             onChange(filter.id, {
                                 op: nextOp,
                                 value: noValueOps.includes(nextOp) ? "" : filter.value
