@@ -2507,10 +2507,14 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
 
         if (fieldKey === 'store_technology') {
             const ref = bindParam(`%${String(normalizedValue)}%`);
-            const usesTech = `EXISTS (
-                SELECT 1 FROM unnest(COALESCE(co.store_technologies, '{}'::text[]) || COALESCE(co.store_apps, '{}'::text[])) AS tech(name)
-                WHERE tech.name ILIKE ${ref}
-            )`;
+            // One ILIKE over the joined names (chr(31) separator, never typed),
+            // not EXISTS(unnest …): the per-row subplan made Postgres pick a
+            // bitmap plan with lossy random reads — 45s vs 4.7s on ESSENCE
+            // Retention's 1.1M companies for "Facebook Pixel" (2026-11-18).
+            const usesTech = `(array_to_string(
+                COALESCE(co.store_technologies, '{}'::text[]) || COALESCE(co.store_apps, '{}'::text[]),
+                chr(31)
+            ) ILIKE ${ref})`;
             if (operatorKey === 'contains') clauses.push(usesTech);
             else if (operatorKey === 'not_contains') clauses.push(`NOT ${usesTech}`);
             continue;
