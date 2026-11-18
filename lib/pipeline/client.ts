@@ -1,4 +1,4 @@
-import { CreateJobResponse, PipelineMode } from "./types";
+import { CreateJobResponse, MetaAdsConfig, PipelineMode } from "./types";
 
 const DEFAULT_PIPELINE_URL = "http://localhost:4000";
 const pipelineBaseUrl = (process.env.NEXT_PUBLIC_PIPELINE_URL || DEFAULT_PIPELINE_URL).replace(/\/$/, "");
@@ -80,6 +80,7 @@ export interface CreatePipelineJobOptions {
     dedupeStrategy?: 'skip' | 'include';
     campaignId?: string;
     autoInstantly?: AutoInstantlyConfig;
+    metaAds?: MetaAdsConfig;
     findFounder?: boolean;
     skipFounderFinder?: boolean;
     findEmail?: boolean;
@@ -115,6 +116,7 @@ export interface CreateFilteredPipelineJobOptions {
     pipelineMode?: PipelineMode;
     campaignId?: string;
     autoInstantly?: AutoInstantlyConfig;
+    metaAds?: MetaAdsConfig;
     findFounder?: boolean;
     skipFounderFinder?: boolean;
     findEmail?: boolean;
@@ -142,6 +144,7 @@ export async function createFilteredPipelineJob({
     pipelineMode,
     campaignId,
     autoInstantly,
+    metaAds,
     findFounder,
     skipFounderFinder,
     findEmail,
@@ -163,6 +166,7 @@ export async function createFilteredPipelineJob({
     if (pipelineMode) payload.pipelineMode = pipelineMode;
     if (campaignId) payload.campaignId = campaignId;
     if (autoInstantly) payload.autoInstantly = autoInstantly;
+    if (metaAds) payload.metaAds = metaAds;
     if (typeof findFounder === 'boolean') payload.findFounder = String(findFounder);
     if (typeof skipFounderFinder === 'boolean') payload.skipFounderFinder = String(skipFounderFinder);
     if (typeof findEmail === 'boolean') payload.findEmail = String(findEmail);
@@ -212,6 +216,7 @@ export async function createPipelineJob({
     nicheLabel,
     campaignId,
     autoInstantly,
+    metaAds,
     findFounder,
     skipFounderFinder,
     findEmail,
@@ -247,6 +252,9 @@ export async function createPipelineJob({
     }
     if (autoInstantly) {
         formData.append("autoInstantly", JSON.stringify(autoInstantly));
+    }
+    if (metaAds) {
+        formData.append("metaAds", JSON.stringify(metaAds));
     }
     // Processing options
     if (typeof findFounder === 'boolean') {

@@ -91,6 +91,7 @@ describe('mapLeadListRow', () => {
             'founderName',
             'id',
             'lists',
+            'metaAds',
             'status',
             'verified'
         ]);
@@ -104,6 +105,17 @@ describe('mapLeadListRow', () => {
         assert.equal(mapped.insights, undefined);
         assert.equal(mapped.firstLine, undefined);
         assert.equal(mapped.latestEvent, undefined);
+    });
+
+    it('maps the Meta ad count, or null when the domain was never checked', () => {
+        assert.equal(mapLeadListRow(fullRow, { tableView: true }).metaAds, null);
+        const counted = mapLeadListRow(
+            { ...fullRow, meta_active_ads: 36, meta_ads_checked_at: '2026-11-18T00:00:00.000Z', meta_ads_error: null },
+            { tableView: true }
+        );
+        assert.deepEqual(counted.metaAds, { activeAds: 36, checkedAt: '2026-11-18T00:00:00.000Z', error: null });
+        const failed = mapLeadListRow({ ...fullRow, meta_active_ads: null, meta_ads_checked_at: null, meta_ads_error: 'blocked' });
+        assert.deepEqual(failed.metaAds, { activeAds: null, checkedAt: null, error: 'blocked' });
     });
 
     it('keeps the full export/detail payload by default', () => {

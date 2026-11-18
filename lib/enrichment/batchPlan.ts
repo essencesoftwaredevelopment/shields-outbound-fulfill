@@ -1,4 +1,4 @@
-import type { PipelineMode } from './types';
+import type { MetaAdsMode, PipelineMode } from './types';
 
 export const DEFAULT_BATCH_SIZE = 100;
 /** Smaller batches for shopping audit — keeps each workflow step under platform maxDuration. */
@@ -113,6 +113,7 @@ export function buildBatchLists(
 export type BatchPlan = {
   batches: PlannedBatch[];
   pipelineMode: PipelineMode;
+  metaAdsMode?: MetaAdsMode;
   batchSize: number;
   waveConcurrency: number;
 };

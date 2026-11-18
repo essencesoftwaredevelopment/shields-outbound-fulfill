@@ -5,7 +5,8 @@ import {
     loadSerperCacheMap,
     upsertSerperCacheBatch,
     markJobDomainsDone,
-    getJobById
+    getJobById,
+    filterUnskippedJobDomains
 } from '../../services/db/jobs.js';
 import { upsertLeadRowsBatch, upsertFounderSearchBatch } from '../../services/leads.js';
 import { isNotFoundValue } from '../../services/enrichmentCohort.js';
@@ -103,13 +104,22 @@ export async function runFoundersBatch(ctx, batchDomains, batchOpts = {}) {
         return summary;
     }
 
+    // Gated domains (Meta-ads minimum, shopping-audit matched-only) are
+    // 'skipped' and must not cost a founder search.
+    const lookupDomains = await filterUnskippedJobDomains(ctx.jobId, batchDomains);
+    if (!lookupDomains.length) {
+        const summary = { processed: 0, Found: 0, cost: 0 };
+        await finishJobStage(ctx, 'founders', summary);
+        return summary;
+    }
+
     await beginJobStage(ctx, 'founders', {
-        activity: `Founder lookup (${batchDomains.length} domains)…`,
+        activity: `Founder lookup (${lookupDomains.length} domains)…`,
         batchIndex
     });
 
     const summary = await runFounderFinder({
-        domains: batchDomains,
+        domains: lookupDomains,
         loadSerperCache: () => loadSerperCacheMap(ctx.jobId),
         saveSerperCache: (entries) => upsertSerperCacheBatch(ctx.jobId, entries),
         markDomainsDone: (domains) => markJobDomainsDone(ctx.jobId, domains),

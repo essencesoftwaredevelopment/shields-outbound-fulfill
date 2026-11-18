@@ -352,7 +352,11 @@ export async function runDomainPrep(ctx) {
         domainCheckSkipped
     };
 
-    await upsertInitialDomains(ctx);
+    // Ads-only runs must not create or re-stamp leads (contacts.job_id): the
+    // Meta ad count lives in domain_meta_ads, keyed by domain.
+    if (!ctx.options.metaAds?.only) {
+        await upsertInitialDomains(ctx);
+    }
 
     const cohortTotal = dnsStats.processable || pendingBefore.length;
     if (cohortTotal > 0) {

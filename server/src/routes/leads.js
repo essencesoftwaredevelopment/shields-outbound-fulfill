@@ -563,6 +563,7 @@ const STORE_COUNTRY_OPTIONS = [
  */
 const SCOPED_COMPANY_COLUMNS = `
                     id,
+                    agency_id,
                     domain_normalized,
                     est_monthly_sales_usd,
                     country_code,
@@ -962,6 +963,20 @@ const LEAD_FILTER_FIELDS = [
             { key: 'lte', label: 'Less Than Or Equal' },
             { key: 'is_empty', label: 'Not Set' },
             { key: 'not_empty', label: 'Is Set' }
+        ]
+    },
+    // ── Meta ads (domain_meta_ads, from the run modal's Meta ad count) ───────
+    {
+        key: 'meta_active_ads',
+        label: 'Active Meta Ads',
+        type: 'number',
+        operators: [
+            { key: 'gt', label: 'Greater Than' },
+            { key: 'gte', label: 'Greater Than Or Equal' },
+            { key: 'lt', label: 'Less Than' },
+            { key: 'lte', label: 'Less Than Or Equal' },
+            { key: 'is_empty', label: 'Never Counted' },
+            { key: 'not_empty', label: 'Counted' }
         ]
     },
     {
@@ -1715,7 +1730,7 @@ const DATE_FILTER_FIELDS = new Set([
 ]);
 const NUMERIC_FILTER_FIELDS = new Set([
     'campaign_count_all_time', 'campaign_count_active', 'annual_revenue_min', 'annual_revenue_max',
-    'est_monthly_sales_usd', 'domain_length'
+    'est_monthly_sales_usd', 'domain_length', 'meta_active_ads'
 ]);
 
 function normalizeLeadFilterValue(fieldKey, operatorKey, rawValue) {
@@ -2402,6 +2417,25 @@ function buildDynamicLeadFilterClauses(rawFilters, paramsState, { warmFollowUpIn
             continue;
         }
 
+        // ── Meta ads: last successful count per domain (domain_meta_ads) ──
+        // EXISTS on the (agency_id, domain) primary key, so filtered counts
+        // never join the table row by row. "Less than N" only matches domains
+        // that were counted; never-counted domains are "Never Counted".
+        if (fieldKey === 'meta_active_ads') {
+            const metaAdsExists = (condition) => `EXISTS (
+                SELECT 1 FROM domain_meta_ads dma
+                 WHERE dma.agency_id = co.agency_id
+                   AND dma.domain_normalized = co.domain_normalized
+                   AND ${condition})`;
+            if (operatorKey === 'gt') clauses.push(metaAdsExists(`dma.active_ads > ${bindParam(Number(normalizedValue))}`));
+            else if (operatorKey === 'gte') clauses.push(metaAdsExists(`dma.active_ads >= ${bindParam(Number(normalizedValue))}`));
+            else if (operatorKey === 'lt') clauses.push(metaAdsExists(`dma.active_ads < ${bindParam(Number(normalizedValue))}`));
+            else if (operatorKey === 'lte') clauses.push(metaAdsExists(`dma.active_ads <= ${bindParam(Number(normalizedValue))}`));
+            else if (operatorKey === 'is_empty') clauses.push(`NOT ${metaAdsExists('dma.active_ads IS NOT NULL')}`);
+            else if (operatorKey === 'not_empty') clauses.push(metaAdsExists('dma.active_ads IS NOT NULL'));
+            continue;
+        }
+
         // ── Store Leads fields (co alias = scoped_companies) ──────────────
         if (fieldKey === 'est_monthly_sales_usd') {
             const col = 'co.est_monthly_sales_usd';
@@ -2841,6 +2875,9 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pc.created_at,
                 pc.updated_at,`}
                 pc.domain_normalized,
+                dma.active_ads AS meta_active_ads,
+                dma.checked_at AS meta_ads_checked_at,
+                dma.error AS meta_ads_error,
                 ${isTableView ? '' : `
                 pc.est_monthly_sales_usd,
                 pc.country_code,
@@ -2866,6 +2903,8 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                 pcs.campaigns_data,
                 pll.lists
             FROM paged_contacts pc
+            LEFT JOIN domain_meta_ads dma
+                ON dma.agency_id = $1 AND dma.domain_normalized = pc.domain_normalized
             ${pagedCampaignStatsLateralJoin}
             ${pagedListsLateralJoin}
             ${isTableView ? '' : 'LEFT JOIN contact_insights ci ON ci.contact_id = pc.id'}
@@ -3208,6 +3247,9 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                 co.store_apps,
                 co.store_technologies,
                 co.storeleads_synced_at,
+                dma.active_ads AS meta_active_ads,
+                dma.checked_at AS meta_ads_checked_at,
+                dma.error AS meta_ads_error,
                 ci.annual_revenue_text,
                 ci.annual_revenue_min,
                 ci.annual_revenue_max,
@@ -3271,6 +3313,8 @@ router.get('/leads/lookup', verifyFirebaseToken, async (req, res) => {
                 ) AS lists
              FROM contacts c
              JOIN companies co ON co.id = c.company_id
+             LEFT JOIN domain_meta_ads dma
+                ON dma.agency_id = c.agency_id AND dma.domain_normalized = co.domain_normalized
              LEFT JOIN contact_insights ci ON ci.contact_id = c.id
              WHERE c.agency_id = $1
                AND c.client_id = $2

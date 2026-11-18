@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, ReactNode, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Fragment, ReactNode, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
 import { getAccessToken } from "@/lib/supabase/session";
 import {
@@ -48,6 +48,8 @@ import {
     PipelineJob,
     PipelineStageKey,
     PipelineStageState,
+    type MetaAdsConfig,
+    type MetaAdsJobState,
 } from "@/lib/pipeline/types";
 import {
     isCreditExhaustionText,
@@ -59,7 +61,7 @@ import { CopyableId } from "@/components/copyable-id";
 import { InstantlyCleanupSettings } from "@/components/instantly-cleanup-settings";
 import { InstantlyPollSettings } from "@/components/instantly-poll-settings";
 import { InstantlyRefillSettings } from "@/components/instantly-refill-settings";
-import { buildInstantlyCardModel, buildStageCardModel, formatStageCost, type StageCardModel } from "@/lib/pipeline/stageCardModel";
+import { buildInstantlyCardModel, buildMetaAdsCardModel, buildStageCardModel, formatStageCost, type StageCardModel } from "@/lib/pipeline/stageCardModel";
 import { useConfirm } from "@/components/confirm-dialog";
 import { LeadActivityFilterRow } from "@/components/lead-activity-filter-row";
 import { AppMultiSelect, AppSelect } from "@/components/app-select";
@@ -199,6 +201,12 @@ type Lead = {
         technologies?: string[];
         syncedAt?: string | null;
     } | null;
+    /** Active Meta ad count for the domain (domain_meta_ads); null = never checked. */
+    metaAds?: {
+        activeAds: number | null;
+        checkedAt: string | null;
+        error: string | null;
+    } | null;
     insights?: {
         annualRevenueText?: string | null;
         annualRevenueMin?: number | null;
@@ -301,7 +309,7 @@ type LeadFilterClause = {
 type LeadExportFieldDef = {
     key: string;
     label: string;
-    group: "Lead" | "Insights" | "Store" | "Campaigns" | "Events";
+    group: "Lead" | "Insights" | "Store" | "Meta Ads" | "Campaigns" | "Events";
     defaultSelected?: boolean;
 };
 
@@ -687,6 +695,9 @@ const LEAD_EXPORT_FIELDS: LeadExportFieldDef[] = [
     { key: 'store_apps', label: 'Store Apps', group: 'Store' },
     { key: 'store_technologies', label: 'Store Technologies', group: 'Store' },
     { key: 'storeleads_synced_at', label: 'Store Leads Synced At', group: 'Store' },
+    { key: 'meta_active_ads', label: 'Active Meta Ads', group: 'Meta Ads' },
+    { key: 'meta_ads_checked_at', label: 'Meta Ads Checked At', group: 'Meta Ads' },
+    { key: 'meta_ads_error', label: 'Meta Ads Last Error', group: 'Meta Ads' },
     { key: 'campaign_names', label: 'Campaign Names', group: 'Campaigns' },
     { key: 'campaign_count_all_time', label: 'Campaign Count All Time', group: 'Campaigns' },
     { key: 'campaign_count_active', label: 'Active Campaign Count', group: 'Campaigns' },
@@ -1164,6 +1175,12 @@ function getLeadExportValue(lead: Lead, key: string): unknown {
         return (lead.store?.technologies || []).join('; ');
     case 'storeleads_synced_at':
         return lead.store?.syncedAt || '';
+    case 'meta_active_ads':
+        return lead.metaAds?.activeAds ?? '';
+    case 'meta_ads_checked_at':
+        return lead.metaAds?.checkedAt || '';
+    case 'meta_ads_error':
+        return lead.metaAds?.error || '';
     case 'campaign_names':
         return getLeadCampaignNames(lead).join('; ');
     case 'campaign_count_all_time':
@@ -1971,6 +1988,11 @@ export default function ClientPage() {
     const [productPromptProducts, setProductPromptProducts] = useState(3);
     const [skipFounderFinder, setSkipFounderFinder] = useState(false);
     const [skipEmailFinder, setSkipEmailFinder] = useState(false);
+    // Meta ad count (Context.dev scrape of the Ad Library), chosen per run.
+    const [metaAdsEnabled, setMetaAdsEnabled] = useState(false);
+    const [metaAdsOnly, setMetaAdsOnly] = useState(false);
+    const [metaAdsGate, setMetaAdsGate] = useState(false);
+    const [metaAdsMin, setMetaAdsMin] = useState("1");
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState("");
     const [jobState, setJobState] = useState<PipelineJob | null>(null);
@@ -3040,9 +3062,17 @@ export default function ClientPage() {
     const stageCompletionPercent = useMemo(() => {
         if (!jobState) return 0;
         const stageOrder = resolveStageOrder(jobState);
-        const stageWeight = 100 / stageOrder.length;
+        // The Meta ad count is a stage of its own (job options, not jobs.stages).
+        const meta = jobState.metaAds;
+        const stageWeight = 100 / (stageOrder.length + (meta ? 1 : 0));
         const dedupedTotal = deriveDedupedDomainBaseline(jobState);
         let percent = 0;
+
+        if (meta) {
+            const checked = meta.counted + meta.reused + meta.errors;
+            const total = jobState.dedupeStats?.processable ?? dedupedTotal;
+            if (total && total > 0) percent += stageWeight * Math.min(1, checked / total);
+        }
 
         for (const key of stageOrder) {
             const stage = jobState.stages[key];
@@ -4192,6 +4222,10 @@ export default function ClientPage() {
                 autoInstantly: data.autoInstantly,
                 autoInstantlyStats: data.autoInstantlyStats,
             }),
+            // The API already sends the card state (server metaAdsJobState).
+            metaAds: data.metaAds && typeof data.metaAds === "object"
+                ? (data.metaAds as MetaAdsJobState)
+                : null,
         };
     }, [normalizeStages]);
 
@@ -6177,6 +6211,7 @@ export default function ClientPage() {
                 pipelineMode: 'standard',
                 campaignId: selectedCampaignId || undefined,
                 autoInstantly: autoInstantlyEnabled && autoInstantlyConfig ? autoInstantlyConfig : undefined,
+                metaAds: buildMetaAdsConfig(),
                 findFounder,
                 skipFounderFinder,
                 findEmail,
@@ -6210,12 +6245,23 @@ export default function ClientPage() {
         }
     };
 
+    /** The run modal's Meta ads choice as sent to the API; undefined when off. */
+    const buildMetaAdsConfig = (): MetaAdsConfig | undefined => {
+        if (!metaAdsEnabled) return undefined;
+        const min = Number.parseInt(metaAdsMin, 10);
+        return {
+            enabled: true,
+            only: metaAdsOnly,
+            minActiveAds: !metaAdsOnly && metaAdsGate && Number.isFinite(min) && min > 0 ? min : null,
+        };
+    };
+
     const handleUploadClick = async () => {
         if (!user) {
             reportUploadError("You must be signed in to upload leads.");
             return;
         }
-        if (autoInstantlyEnabled && !autoInstantlyConfig) {
+        if (autoInstantlyEnabled && !autoInstantlyConfig && !(metaAdsEnabled && metaAdsOnly)) {
             reportUploadError("Set up the Instantly campaign for auto-add, or turn auto-add off.");
             return;
         }
@@ -6236,7 +6282,9 @@ export default function ClientPage() {
                 return;
             }
             const activeNiche = niches.find(n => n.id === clientIndustry);
-            const pipelineMode = useShoppingAuditPipeline ? 'shopping_audit' as const : 'standard' as const;
+            const pipelineMode = useShoppingAuditPipeline && !(metaAdsEnabled && metaAdsOnly) ? 'shopping_audit' as const : 'standard' as const;
+            // Ads-only runs count every domain in the file, already-enriched ones included.
+            const effectiveDedupeStrategy = metaAdsEnabled && metaAdsOnly ? 'include' as const : dedupeStrategy;
             const selectedProductPromptVersion: 'old' | 'new_gpt5mini' | undefined =
                 clientIndustry === 'ecom' && personalizeFirstLine && pipelineMode !== 'shopping_audit'
                     ? (productPromptUseNew ? 'new_gpt5mini' : 'old')
@@ -6253,7 +6301,8 @@ export default function ClientPage() {
                 nicheId: pipelineMode === 'shopping_audit' ? 'shopping_audit' : activeNiche?.id,
                 nicheLabel: pipelineMode === 'shopping_audit' ? 'Shopping Audit' : activeNiche?.label,
                 pipelineMode,
-                dedupeStrategy,
+                dedupeStrategy: effectiveDedupeStrategy,
+                metaAds: buildMetaAdsConfig(),
                 campaignId: selectedCampaignId || undefined,
                 findFounder,
                 skipFounderFinder,
@@ -6286,7 +6335,7 @@ export default function ClientPage() {
                 const existingCount = typeof existing === 'number' ? existing : Math.max(0, uniqueCount - newCount);
 
                 // Check if no domains will be processed (skip strategy with 0 new domains)
-                if (dedupeStrategy === 'skip' && newCount === 0) {
+                if (effectiveDedupeStrategy === 'skip' && newCount === 0) {
                     const msg = `${skipped} duplicate domain${skipped !== 1 ? 's' : ''} removed. 0 unique domains to process. Upload cancelled.`;
                     setToastMessage(msg);
                     setToastVisible(true);
@@ -6297,7 +6346,7 @@ export default function ClientPage() {
                     return;
                 }
 
-                if (dedupeStrategy === 'include') {
+                if (effectiveDedupeStrategy === 'include') {
                     const msg = `✓ Normalized & validated. Processing ${uniqueCount} unique domain${uniqueCount !== 1 ? 's' : ''} (${newCount} new, ${existingCount} existing). Existing domains will merge non-empty updates.`;
                     setToastMessage(msg);
                     setToastVisible(true);
@@ -9704,6 +9753,7 @@ export default function ClientPage() {
                                             <th>Verification</th>
                                             <th>Lead Status</th>
                                             <th>Domain</th>
+                                            <th title="Active Meta ads for the domain, from the last count">Meta Ads</th>
                                             <th>Campaign</th>
                                             <th>Lists</th>
                                         </tr>
@@ -9761,6 +9811,20 @@ export default function ClientPage() {
                                                     })()}
                                                 </td>
                                                 <td>{lead.domain || '—'}</td>
+                                                <td
+                                                    title={lead.metaAds?.checkedAt
+                                                        ? `Counted ${new Date(lead.metaAds.checkedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}${lead.metaAds.error ? ` · last check failed: ${lead.metaAds.error}` : ''}`
+                                                        : lead.metaAds?.error
+                                                            ? `Count failed: ${lead.metaAds.error}`
+                                                            : 'Never counted'}
+                                                    style={{ fontVariantNumeric: 'tabular-nums' }}
+                                                >
+                                                    {lead.metaAds?.activeAds != null
+                                                        ? lead.metaAds.activeAds.toLocaleString()
+                                                        : lead.metaAds?.error
+                                                            ? <span style={{ color: 'var(--app-warn-text)' }}>Failed</span>
+                                                            : '—'}
+                                                </td>
                                                 <td>
                                                     {(() => {
                                                         const names = getCampaignNamesForLead(lead);
@@ -11183,7 +11247,22 @@ export default function ClientPage() {
                                                 personalizeFirstLine: jobState.personalizeFirstLine === true,
                                             });
                                             const eta = model.tone === 'running' ? stageEtas[stageKey] : undefined;
-                                            return renderStageCard(stageKey, STAGE_METADATA[stageKey].title, model, eta);
+                                            const card = renderStageCard(stageKey, STAGE_METADATA[stageKey].title, model, eta);
+                                            // Meta ads runs right after domain prep (before founders when it gates).
+                                            if (stageKey !== 'domainPrep' || !jobState.metaAds) return card;
+                                            return (
+                                                <Fragment key={stageKey}>
+                                                    {card}
+                                                    {renderStageCard(
+                                                        'metaAds',
+                                                        jobState.metaAds.only ? 'Meta ads (only)' : 'Meta ads',
+                                                        buildMetaAdsCardModel(jobState.metaAds, jobState, {
+                                                            total: jobState.dedupeStats?.processable ?? null,
+                                                            upstreamTitle: STAGE_METADATA.domainPrep.title,
+                                                        }),
+                                                    )}
+                                                </Fragment>
+                                            );
                                         })}
                                         {jobState.autoInstantly && renderStageCard(
                                             'instantly',
@@ -13556,6 +13635,83 @@ export default function ClientPage() {
                                         borderRadius: '8px',
                                         border: '1px solid var(--app-border)'
                                     }}>
+                                        <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem', cursor: 'pointer', padding: '0.5rem' }}>
+                                            <input
+                                                type="checkbox"
+                                                checked={metaAdsEnabled}
+                                                onChange={(e) => {
+                                                    setMetaAdsEnabled(e.target.checked);
+                                                    if (!e.target.checked) setMetaAdsOnly(false);
+                                                }}
+                                                style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: 'var(--app-info-solid)', flexShrink: 0, marginTop: '0.2rem' }}
+                                            />
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ fontWeight: 500, color: 'var(--app-text)' }}>
+                                                    Count active Meta ads
+                                                </div>
+                                                <div style={{ fontSize: '0.8rem', color: 'var(--app-text-muted)', marginTop: '0.15rem' }}>
+                                                    Reads each domain&apos;s active ad count from Meta&apos;s Ad Library with your Context.dev key (API Vault). Up to 120 domains a minute; counts from the last 7 days are reused.
+                                                </div>
+                                            </div>
+                                        </label>
+                                        {metaAdsEnabled && (
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', paddingLeft: '2.25rem' }}>
+                                                <label className="settings-field">
+                                                    <span className="settings-field__label">What to run</span>
+                                                    <AppSelect
+                                                        value={metaAdsOnly ? 'only' : 'with'}
+                                                        options={[
+                                                            { value: 'with', label: 'Count ads, then enrich' },
+                                                            { value: 'only', label: "Count ads only (don't touch lead data)" }
+                                                        ]}
+                                                        onChange={(value) => setMetaAdsOnly(value === 'only')}
+                                                    />
+                                                    <span className="settings-field__hint">
+                                                        {metaAdsOnly
+                                                            ? `Only the ad count runs. Founders, emails, verification, personalization and Instantly are skipped, and no lead's data changes${enrichSource === 'csv' ? ' — every domain in the file is counted, including ones already enriched' : ''}.`
+                                                            : 'The ad count runs alongside the other stages you choose below.'}
+                                                    </span>
+                                                </label>
+                                                {!metaAdsOnly && (
+                                                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', cursor: skipFounderFinder ? 'not-allowed' : 'pointer', opacity: skipFounderFinder ? 0.6 : 1 }}>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={metaAdsGate && !skipFounderFinder}
+                                                            disabled={skipFounderFinder}
+                                                            onChange={(e) => setMetaAdsGate(e.target.checked)}
+                                                            style={{ width: '16px', height: '16px', cursor: 'inherit', accentColor: 'var(--app-info-solid)' }}
+                                                        />
+                                                        <span style={{ color: 'var(--app-text)' }}>Skip founder lookup when a domain has fewer than</span>
+                                                        <input
+                                                            type="number"
+                                                            min={1}
+                                                            value={metaAdsMin}
+                                                            disabled={skipFounderFinder || !metaAdsGate}
+                                                            onChange={(e) => setMetaAdsMin(e.target.value)}
+                                                            style={{ width: '80px' }}
+                                                            aria-label="Minimum active Meta ads"
+                                                        />
+                                                        <span style={{ color: 'var(--app-text)' }}>active ads</span>
+                                                        <span className="settings-field__hint" style={{ flexBasis: '100%' }}>
+                                                            {skipFounderFinder
+                                                                ? 'Founder lookup is off for this run, so there is nothing to skip.'
+                                                                : 'Skipped domains get no founder, email or personalization. The count finishes before founder lookup starts, so the run takes longer. A domain whose count fails is never skipped.'}
+                                                        </span>
+                                                    </label>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div style={{
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '0.75rem',
+                                        padding: '1rem',
+                                        background: 'var(--app-surface-3)',
+                                        borderRadius: '8px',
+                                        border: '1px solid var(--app-border)'
+                                    }}>
                                         <label style={{
                                             display: 'flex',
                                             alignItems: 'center',
@@ -13587,7 +13743,7 @@ export default function ClientPage() {
                                             </div>
                                         </label>
 
-                                        {enrichSource === 'filtered' && (
+                                        {enrichSource === 'filtered' && !(metaAdsEnabled && metaAdsOnly) && (
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', padding: '0.5rem' }}>
                                                 <label className="settings-field">
                                                     <span className="settings-field__label">Founder names</span>
@@ -13656,7 +13812,7 @@ export default function ClientPage() {
                                             </div>
                                         )}
 
-                                        {enrichSource !== 'filtered' && (<>
+                                        {enrichSource !== 'filtered' && !(metaAdsEnabled && metaAdsOnly) && (<>
                                         <label style={{
                                             display: 'flex',
                                             alignItems: 'center',
@@ -13865,7 +14021,12 @@ export default function ClientPage() {
                             )}
 
                             {/* Step 4: Personalization */}
-                            {wizardStep === 4 && (
+                            {wizardStep === 4 && metaAdsEnabled && metaAdsOnly && (
+                                <p className="settings-field__hint" style={{ fontSize: '0.9rem' }}>
+                                    Ads-only run: nothing to personalize or add to Instantly. Start the run to count active Meta ads.
+                                </p>
+                            )}
+                            {wizardStep === 4 && !(metaAdsEnabled && metaAdsOnly) && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
                                     <label className="settings-field">
                                         <span className="settings-field__label">Industry</span>
@@ -16931,6 +17092,14 @@ export default function ClientPage() {
                                             { label: 'Store Status', value: store?.state || null },
                                             { label: 'Store Apps', value: formatList(store?.apps) },
                                             { label: 'Store Technologies', value: formatList(store?.technologies) },
+                                            {
+                                                label: 'Active Meta Ads',
+                                                value: selectedLead.metaAds?.activeAds != null
+                                                    ? `${selectedLead.metaAds.activeAds.toLocaleString('en-US')}${selectedLead.metaAds.checkedAt ? ` (counted ${new Date(selectedLead.metaAds.checkedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })})` : ''}`
+                                                    : selectedLead.metaAds?.error
+                                                        ? `Count failed: ${selectedLead.metaAds.error}`
+                                                        : null
+                                            },
                                             {
                                                 label: 'Store Leads Synced',
                                                 value: store?.syncedAt

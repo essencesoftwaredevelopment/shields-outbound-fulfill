@@ -36,6 +36,8 @@ export { runVerificationBatch } from './stages/verificationBatch.js';
 export { submitEnrowBatch, collectEnrowBatch, runEnrowInline, isEnrowEnabled } from './stages/enrowBatch.js';
 export { runInstantlyAutoAddBatch, retryFailedAutoAdds } from './stages/instantlyBatch.js';
 export { runPersonalizationBatch } from './stages/personalizationBatch.js';
+export { runMetaAdsBatch } from './stages/metaAdsBatch.js';
+export { metaAdsModeFromOptions } from './metaAdsOptions.js';
 export {
     createStageLogger,
     persistStageProgress,

@@ -2,6 +2,7 @@
  * SQL job orchestration — replaces Firestore jobs / activeJob / jobQueue.
  */
 
+import { metaAdsJobState } from '../../enrichment/metaAdsOptions.js';
 import { pool } from '../../config/db.js';
 import { normalizeDomain } from '../../utils/domain.js';
 import { parse as csvParse } from 'csv-parse/sync';
@@ -108,7 +109,9 @@ export function jobRowToState(row) {
                 campaignName: options.autoInstantly.campaignName || null
             }
             : null,
-        autoInstantlyStats: options.autoInstantlyStats || null
+        autoInstantlyStats: options.autoInstantlyStats || null,
+        // Meta ad count (Pipeline tab card): config + running tally.
+        metaAds: metaAdsJobState(options)
     };
 }
 
@@ -242,6 +245,22 @@ export async function markJobDomainsSkipped(jobId, domains) {
             [jobId, chunk]
         );
     }
+}
+
+/**
+ * The batch's domains that are not marked 'skipped' (dedupe, DNS, the
+ * shopping-audit matched-only gate, the Meta-ads gate), in input order.
+ */
+export async function filterUnskippedJobDomains(jobId, domains) {
+    if (!domains?.length) return [];
+    const result = await pool.query(
+        `SELECT domain_normalized FROM job_domains
+          WHERE job_id = $1 AND domain_normalized = ANY($2::text[]) AND status = 'skipped'`,
+        [jobId, domains]
+    );
+    if (!result.rows.length) return domains;
+    const skipped = new Set(result.rows.map((r) => r.domain_normalized));
+    return domains.filter((d) => !skipped.has(d));
 }
 
 /**
@@ -497,7 +516,9 @@ export async function listJobOverviewsForClient(agencyId, clientId, limit = 50) 
                         'campaignId', options->'autoInstantly'->'campaignId',
                         'campaignName', options->'autoInstantly'->'campaignName'
                     ),
-                    'autoInstantlyStats', options->'autoInstantlyStats'
+                    'autoInstantlyStats', options->'autoInstantlyStats',
+                    'metaAds', options->'metaAds',
+                    'metaAdsStats', options->'metaAdsStats'
                 )) AS options,
                 (SELECT COALESCE(
                     jsonb_object_agg(s.key, jsonb_build_object('status', s.value->'status', 'error', s.value->'error')),
@@ -625,7 +646,7 @@ export async function listJobDomainsForJob(
  * resume or the stall reaper. Stamps remaining founder-cohort rows as attempted
  * and marks unfinished job_domains done.
  */
-export async function closeRemainingPipelineWork({ agencyId, clientId, jobId }) {
+export async function closeRemainingPipelineWork({ agencyId, clientId, jobId, leadsUntouched = false }) {
     await pool.query(
         `UPDATE job_domains
             SET status = 'done', updated_at = NOW()
@@ -633,6 +654,8 @@ export async function closeRemainingPipelineWork({ agencyId, clientId, jobId }) 
             AND status IN ('pending', 'processing')`,
         [jobId]
     );
+    // Ads-only runs promise not to touch the leads' data.
+    if (leadsUntouched) return;
     // Only leads the email finder would search (a real founder name): stamping a
     // no-founder lead as searched shows it as "Email Not Found" when no search
     // ever ran (9k+ ESSENCE Retention leads before this, 2026-09-24).

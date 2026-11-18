@@ -69,6 +69,8 @@ export async function stageHasRemainingWork(ctx, stageKey) {
  * @returns {Promise<string[]>} sorted, de-duplicated domain list
  */
 export async function listResumeStageDomainNames(ctx) {
+    // Ads-only runs never touch lead stages, not even leftover queue work.
+    if (ctx.options?.metaAds?.only) return [];
     const { reprocessInclude, jobStartedAt } = await queueLimits(ctx);
     const opts = {
         reprocessInclude,

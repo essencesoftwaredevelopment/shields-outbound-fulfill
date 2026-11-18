@@ -121,6 +121,8 @@ export interface PipelineJob {
     detail?: "full" | "overview";
     /** Mid-run add to Instantly (jobs.options.autoInstantly + autoInstantlyStats); null when off. */
     autoInstantly?: AutoInstantlyJobState | null;
+    /** Meta ad count (jobs.options.metaAds + metaAdsStats); null when off. */
+    metaAds?: MetaAdsJobState | null;
     activityMessage?: string | null;
     activityUpdatedAt?: string | null;
     timingTotals?: Record<string, { count: number; totalMs: number; totalRows: number; maxMs: number }>;
@@ -238,6 +240,28 @@ export interface CreateJobResponse {
     jobId: string;
     job: PipelineJob;
 }
+
+/** What the run modal sends as `metaAds`. */
+export type MetaAdsConfig = {
+    enabled: true;
+    /** Skip founder lookup for domains with fewer active ads; null = no gate. */
+    minActiveAds: number | null;
+    /** Count ads only: no lead stage runs and no lead's data changes. */
+    only: boolean;
+};
+
+/** Pipeline card: Meta ad count config + running tally. */
+export type MetaAdsJobState = {
+    minActiveAds: number | null;
+    only: boolean;
+    counted: number;
+    reused: number;
+    withAds: number;
+    errors: number;
+    gated: number;
+    credits: number;
+    lastError: string | null;
+};
 
 export type AutoInstantlyJobState = {
     campaignName: string | null;

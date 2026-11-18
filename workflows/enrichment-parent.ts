@@ -26,7 +26,7 @@
  */
 import { createHook } from 'workflow';
 import { start } from 'workflow/api';
-import type { ParentWorkflowInput } from '@/lib/enrichment/types';
+import type { MetaAdsMode, ParentWorkflowInput } from '@/lib/enrichment/types';
 import {
   buildBatchLists,
   resolveBatchSize,
@@ -85,6 +85,7 @@ export async function enrichmentParentWorkflow(input: ParentWorkflowInput) {
           batchIndex,
           pipelineMode: plan.pipelineMode,
           resumeStagesOnly: batch.resumeStagesOnly,
+          metaAdsMode: plan.metaAdsMode ?? 'off',
           completionToken: completionHook.token,
         };
       };
@@ -272,6 +273,7 @@ async function prepareBatchPlanStep(input: ParentWorkflowInput) {
 
   return {
     pipelineMode: ctx.pipelineMode,
+    metaAdsMode: enrichment.metaAdsModeFromOptions(ctx.options) as MetaAdsMode,
     batchSize,
     waveConcurrency,
     batches: buildBatchLists(pendingDomains, resumeStageDomains, batchSize),

@@ -51,6 +51,7 @@ import { deleteQueueJob, enqueuePipelineJob, getQueueJob, getRunnerRecord, setQu
 import { dispatchEnrichmentJob } from '../enrichment/dispatch.js';
 import { clearWorkflowRunId, forceCompleteJob } from '../enrichment/persist.js';
 import { resolveExecutionRunner } from '../enrichment/executionRunner.js';
+import { sanitizeMetaAdsInput } from '../enrichment/metaAdsOptions.js';
 import { queryFilteredLeadSeedRows } from './leads.js';
 
 async function enrichJobWithQueueRuntime(jobState, jobId) {
@@ -568,10 +569,23 @@ router.post('/jobs', uploadFields, async (req, res) => {
         apiKeys.kitt = settings?.trykitt_key || '';
         const emailVerificationProvider = settings?.email_verification_provider || 'trykitt';
 
-        if (!apiKeys.openai || !apiKeys.serper) {
+        // Meta ad count (stages/metaAdsBatch.js). Ads-only runs skip every lead
+        // stage, so they need neither OpenAI/Serper nor TryKitt.
+        const metaAds = sanitizeMetaAdsInput(req.body?.metaAds);
+        const adsOnly = metaAds?.only === true;
+        if (metaAds) {
+            if (!apiKeys.contextDev) {
+                return res.status(400).json({ error: 'Add your Context.dev API key in the API Vault to count Meta ads.' });
+            }
+            if (resolveExecutionRunner({ settings }) !== 'vercel') {
+                return res.status(400).json({ error: 'Meta ad counts run on the Vercel workflow runner, which is off for this agency.' });
+            }
+        }
+
+        if (!adsOnly && (!apiKeys.openai || !apiKeys.serper)) {
             return res.status(400).json({ error: 'Missing required API keys (OpenAI, Serper) in agency settings.' });
         }
-        if (emailVerificationProvider === 'trykitt' && !apiKeys.kitt) {
+        if (!adsOnly && emailVerificationProvider === 'trykitt' && !apiKeys.kitt) {
             return res.status(400).json({ error: 'Missing Kitt API key for TryKitt provider.' });
         }
 
@@ -581,10 +595,12 @@ router.post('/jobs', uploadFields, async (req, res) => {
 
         // Filtered-leads jobs re-process rows that by definition already exist;
         // 'skip' would silently no-op the entire job.
-        const dedupeStrategy = leadFilter ? 'include' : (req.body.dedupeStrategy || 'skip').toString();
+        // Ads-only runs count every domain in the file, including ones already
+        // enriched, so nothing may be deduped away.
+        const dedupeStrategy = leadFilter || adsOnly ? 'include' : (req.body.dedupeStrategy || 'skip').toString();
         const rawSkipFounder = String(req.body.skipFounderFinder || '').toLowerCase() === 'true';
         const rawFindFounder = String(req.body.findFounder ?? 'true').toLowerCase() !== 'false';
-        const skipFounderFinder = rawSkipFounder || !rawFindFounder;
+        const skipFounderFinder = adsOnly || rawSkipFounder || !rawFindFounder;
         const industry = (req.body.industry || req.body.nicheId || '').toString().trim();
         const nicheId = (req.body.nicheId || '').toString().trim();
         const nicheLabel = (req.body.nicheLabel || '').toString().trim();
@@ -596,16 +612,16 @@ router.post('/jobs', uploadFields, async (req, res) => {
             ? Math.max(1, Math.min(productPromptProductsParsed, 5))
             : 3;
         let skipVerification = String(req.body.skipVerification || '').toLowerCase() === 'true';
-        if (emailVerificationProvider === 'self_hosted') skipVerification = true;
-        const skipEmailFinder = String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
+        if (emailVerificationProvider === 'self_hosted' || adsOnly) skipVerification = true;
+        const skipEmailFinder = adsOnly || String(req.body.skipEmailFinder || '').toLowerCase() === 'true';
         const skipDomainCheck = String(req.body.skipDomainCheck || '').toLowerCase() === 'true';
         const pipelineModeRaw = String(req.body.pipelineMode || 'standard').trim().toLowerCase();
-        const pipelineMode = pipelineModeRaw === 'shopping_audit' ? 'shopping_audit' : 'standard';
+        const pipelineMode = pipelineModeRaw === 'shopping_audit' && !adsOnly ? 'shopping_audit' : 'standard';
         if (pipelineMode === 'shopping_audit' && !hasShoppingAuditFeature(settings)) {
             return res.status(403).json({ error: 'Shopping audit pipeline is not enabled for this agency.' });
         }
         // Shopping audit does not run first-line personalization.
-        if (pipelineMode === 'shopping_audit') personalizeFirstLine = false;
+        if (pipelineMode === 'shopping_audit' || adsOnly) personalizeFirstLine = false;
 
         let seedEntries = null;
         let jobFileName = file?.originalname || null;
@@ -637,13 +653,14 @@ router.post('/jobs', uploadFields, async (req, res) => {
             jobFileName = `Filtered leads (${seedEntries.length.toLocaleString('en-US')} domains)`;
         }
 
-        const autoInstantly = sanitizeAutoInstantlyInput(req.body?.autoInstantly);
-        if (req.body?.autoInstantly && !autoInstantly) {
+        const autoInstantly = adsOnly ? null : sanitizeAutoInstantlyInput(req.body?.autoInstantly);
+        if (!adsOnly && req.body?.autoInstantly && !autoInstantly) {
             return res.status(400).json({ error: 'Instantly auto-add needs a campaign, an Email mapping and at least one email status.' });
         }
 
         const job = await createJobRecord(file?.buffer || null, jobFileName, apiKeys, uid, clientSlug, dedupeStrategy, {
             autoInstantly,
+            metaAds,
             skipFounderFinder,
             skipEmailFinder,
             skipVerification,

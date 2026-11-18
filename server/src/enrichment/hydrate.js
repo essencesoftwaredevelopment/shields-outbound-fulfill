@@ -9,6 +9,7 @@ import {
 } from '../services/db/agencySettings.js';
 import { DEFAULT_PRICING } from '../utils/pricing.js';
 import { getPricingDefaults } from '../services/db/agencySettings.js';
+import { metaAdsOptionsFrom } from './metaAdsOptions.js';
 
 async function loadPricing(agencyId) {
     const settings = await getAgencySettings(agencyId);
@@ -70,6 +71,8 @@ export async function hydrateJobContext(jobId, agencyId) {
             productPromptProducts: options.productPromptProducts ?? 3,
             emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
             columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
+            // Meta ad count (stages/metaAdsBatch.js); null when off.
+            metaAds: metaAdsOptionsFrom(options),
             executionRunner: options.executionRunner || 'pm2',
             workflowRunId: options.workflowRunId || null,
             // Agency plan limits first, explicit per-job overrides win.

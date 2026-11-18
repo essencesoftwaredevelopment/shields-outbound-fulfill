@@ -68,6 +68,16 @@ export function mapLeadStore(row) {
     };
 }
 
+/** Meta ad count for the lead's domain; null when it was never checked. */
+export function mapLeadMetaAds(row) {
+    if (row.meta_ads_checked_at == null && row.meta_ads_error == null) return null;
+    return {
+        activeAds: toNumberOrNull(row.meta_active_ads),
+        checkedAt: row.meta_ads_checked_at ?? null,
+        error: row.meta_ads_error ?? null
+    };
+}
+
 export function mapLeadListRow(row, { tableView = false } = {}) {
     const lists = Array.isArray(row.lists) ? row.lists : [];
     const campaignsData = Array.isArray(row.campaigns_data) ? row.campaigns_data : [];
@@ -83,7 +93,8 @@ export function mapLeadListRow(row, { tableView = false } = {}) {
         emailVerifyCompletedAt: row.email_verify_completed_at,
         founderFindCompletedAt: row.founder_find_completed_at,
         campaignsData: tableView ? mapTableCampaigns(campaignsData) : campaignsData,
-        lists
+        lists,
+        metaAds: mapLeadMetaAds(row)
     };
 
     if (tableView) return mapped;

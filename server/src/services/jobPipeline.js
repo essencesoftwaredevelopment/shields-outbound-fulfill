@@ -1,3 +1,4 @@
+import { metaAdsJobState } from '../enrichment/metaAdsOptions.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -407,6 +408,8 @@ async function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId,
         ...(options.leadFilter ? { leadFilter: options.leadFilter } : {}),
         // Mid-run Instantly auto-add (enrichment/stages/instantlyBatch.js).
         ...(options.autoInstantly ? { autoInstantly: options.autoInstantly } : {}),
+        // Meta ad count (enrichment/stages/metaAdsBatch.js).
+        ...(options.metaAds ? { metaAds: options.metaAds } : {}),
         initialStages: stages
     };
 
@@ -455,6 +458,7 @@ async function createJobRecord(fileBuffer, originalName, apiKeys, uid, clientId,
         productPromptProducts: Number.isFinite(options.productPromptProducts) ? options.productPromptProducts : 3,
         emailVerificationProvider: options.emailVerificationProvider || 'trykitt',
         columnMapping: options.columnMapping || { domain: 'domain', founder: '', email: '' },
+        metaAds: options.metaAds || null,
         cost: 0,
         stages,
         paths: {},
@@ -1660,6 +1664,7 @@ function serializeJob(job) {
         productPromptVersion: job.productPromptVersion || 'old',
         productPromptProducts: Number.isFinite(job.productPromptProducts) ? job.productPromptProducts : 3,
         skipDomainCheck: !!job.skipDomainCheck,
+        metaAds: metaAdsJobState({ metaAds: job.metaAds }),
         timingTotals: job.timingTotals || {},
         timingLog: job.timingLog || []
     };

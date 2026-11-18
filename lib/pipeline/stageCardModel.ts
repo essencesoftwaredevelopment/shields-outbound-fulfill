@@ -1,4 +1,4 @@
-import type { AutoInstantlyJobState, PipelineJob, PipelineStageKey, PipelineStageState } from "@/lib/pipeline/types";
+import type { AutoInstantlyJobState, MetaAdsJobState, PipelineJob, PipelineStageKey, PipelineStageState } from "@/lib/pipeline/types";
 
 /**
  * What a Pipeline-tab stage card shows. Every card has the same anatomy — one
@@ -308,5 +308,63 @@ export function buildInstantlyCardModel(
     hero: auto.added,
     heroLabel: "Added",
     detail: `${campaign}${failedText}`,
+  };
+}
+
+/**
+ * "Meta ads" card: active Meta ad count per domain (Context.dev scrape of the
+ * Ad Library). Hero = domains running at least one active ad. Counts reused
+ * from the last 7 days count as checked; a failed domain keeps its old count
+ * and is never gated.
+ */
+export function buildMetaAdsCardModel(
+  meta: MetaAdsJobState,
+  job: Pick<PipelineJob, "status" | "paused" | "error">,
+  opts: { total?: number | null; upstreamTitle?: string | null } = {},
+): StageCardModel {
+  const checked = meta.counted + meta.reused + meta.errors;
+  const total = opts.total && opts.total > 0 ? opts.total : null;
+  const parts = [
+    total ? `${fmt(Math.min(checked, total))} of ${fmt(total)} checked` : `${fmt(checked)} checked`,
+  ];
+  if (meta.minActiveAds) parts.push(`${fmt(meta.gated)} skipped (< ${fmt(meta.minActiveAds)} ads)`);
+  if (meta.errors > 0) parts.push(`${fmt(meta.errors)} failed`);
+  if (meta.credits > 0) parts.push(`${fmt(Math.round(meta.credits))} credits`);
+  const detail = parts.join(" · ");
+  const base: StageCardModel = {
+    tone: "pending",
+    chip: "Pending",
+    hero: null,
+    heroLabel: "",
+    detail: opts.upstreamTitle ? `Waiting for ${opts.upstreamTitle}` : "Queued",
+    cost: null,
+    creditExhausted: false,
+  };
+  const withAds = { hero: meta.withAds, heroLabel: "With active ads" };
+  const active = job.status === "running" || job.status === "queued";
+  // A stopped run whose last error came from Context.dev (bad key, no credits).
+  const providerStop = !active && job.status !== "completed" && !!meta.lastError
+    && !!job.error && /context\.dev/i.test(job.error);
+
+  if (providerStop) {
+    return { ...base, ...withAds, tone: "error", chip: "Stopped", detail: `${detail} — ${meta.lastError!.slice(0, 120)}` };
+  }
+  if (job.status === "completed" || (!active && checked > 0)) {
+    const allFailed = checked > 0 && meta.errors === checked;
+    return {
+      ...base,
+      ...withAds,
+      tone: allFailed ? "error" : "completed",
+      chip: allFailed ? "Failed" : "Completed",
+      detail: allFailed && meta.lastError ? `${detail} — ${meta.lastError.slice(0, 120)}` : detail,
+    };
+  }
+  if (checked === 0) return base;
+  return {
+    ...base,
+    ...withAds,
+    tone: job.paused ? "pending" : "running",
+    chip: job.paused ? "Paused" : "Running",
+    detail,
   };
 }

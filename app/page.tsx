@@ -46,13 +46,14 @@ type Niche = {
   hint: string;
 };
 
-const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "storeleads", "close", "fathom"] as const;
+const API_KEY_FIELDS = ["openai", "serper", "kitt", "enrow", "contextdev", "storeleads", "close", "fathom"] as const;
 type ApiKeyName = (typeof API_KEY_FIELDS)[number];
 const FIRESTORE_FIELD_MAP: Record<ApiKeyName, string> = {
   openai: "openai_key",
   serper: "serper_key",
   kitt: "trykitt_key",
   enrow: "enrow_key",
+  contextdev: "context_dev_key",
   storeleads: "storeleads_key",
   close: "close_key",
   fathom: "fathom_key",
@@ -62,6 +63,7 @@ const API_KEY_LABELS: Record<ApiKeyName, string> = {
   serper: "Serper",
   kitt: "TryKitt",
   enrow: "Enrow",
+  contextdev: "Context.dev",
   storeleads: "Store Leads",
   close: "Close",
   fathom: "Fathom",
@@ -79,6 +81,7 @@ const createEmptyKeys = (): ApiKeyState => ({
   serper: "",
   kitt: "",
   enrow: "",
+  contextdev: "",
   storeleads: "",
   close: "",
   fathom: "",
@@ -119,6 +122,7 @@ type AgencySettingsPayload = {
   serper_key?: string;
   trykitt_key?: string;
   enrow_key?: string;
+  context_dev_key?: string;
   storeleads_key?: string;
   close_key?: string;
   fathom_key?: string;
@@ -132,6 +136,7 @@ const readKeysFromAgencySettings = (
   serper: data?.serper_key || "",
   kitt: data?.trykitt_key || "",
   enrow: data?.enrow_key || "",
+  contextdev: data?.context_dev_key || "",
   storeleads: data?.storeleads_key || "",
   close: data?.close_key || "",
   fathom: data?.fathom_key || "",
@@ -400,6 +405,7 @@ function HomeContent() {
           serper_key: sanitizedKeys.serper,
           trykitt_key: sanitizedKeys.kitt,
           enrow_key: sanitizedKeys.enrow,
+          context_dev_key: sanitizedKeys.contextdev,
           storeleads_key: sanitizedKeys.storeleads,
           close_key: sanitizedKeys.close,
           fathom_key: sanitizedKeys.fathom,
@@ -706,6 +712,19 @@ function HomeContent() {
               />
               <p className="text-xs text-muted-foreground">
                 Backup email finder for leads TryKitt misses. Turn it on in Account → Pipeline &amp; rate limits.
+              </p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="contextdev-key">Context.dev API Key (optional)</Label>
+              <Input
+                id="contextdev-key"
+                type="text"
+                placeholder="Context.dev key"
+                value={apiKeys.contextdev}
+                onChange={(event) => handleKeyChange(event, "contextdev")}
+              />
+              <p className="text-xs text-muted-foreground">
+                Counts each domain&apos;s active Meta ads from the Ad Library. Turn it on per run in the enrichment options.
               </p>
             </div>
             <div className="grid gap-2">

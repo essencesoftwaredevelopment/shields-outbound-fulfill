@@ -1,4 +1,4 @@
-import type { AutoInstantlyJobState } from "@/lib/pipeline/types";
+import type { AutoInstantlyJobState, MetaAdsJobState } from "@/lib/pipeline/types";
 /**
  * Realtime `jobs` row → page job state. Pure so it can be unit-tested away from
  * the Supabase client (the hook in lib/hooks/useJobRealtime.ts re-exports it).
@@ -56,6 +56,30 @@ export function autoInstantlyFromOptions(options: Record<string, unknown>): Auto
     };
 }
 
+/**
+ * Meta ad count config + tally from job options. Mirrors the server's
+ * metaAdsJobState (server/src/enrichment/metaAdsOptions.js). null when off.
+ */
+export function metaAdsFromOptions(options: Record<string, unknown>): MetaAdsJobState | null {
+    const config = options.metaAds as Record<string, unknown> | null | undefined;
+    if (!config || typeof config !== "object" || config.enabled !== true) return null;
+    const stats = (options.metaAdsStats || {}) as Record<string, unknown>;
+    const count = (value: unknown) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    const only = config.only === true;
+    const min = Number(config.minActiveAds);
+    return {
+        minActiveAds: !only && Number.isFinite(min) && min > 0 ? min : null,
+        only,
+        counted: count(stats.counted),
+        reused: count(stats.reused),
+        withAds: count(stats.withAds),
+        errors: count(stats.errors),
+        gated: count(stats.gated),
+        credits: count(stats.credits),
+        lastError: typeof stats.lastError === "string" && stats.lastError ? stats.lastError : null,
+    };
+}
+
 /** Option-derived job fields; only emitted when the payload actually carried `options`. */
 function optionsToJobState(options: Record<string, unknown>) {
     // Prefer explicit options.pipelineMode. Do not infer shopping_audit from stage
@@ -78,6 +102,7 @@ function optionsToJobState(options: Record<string, unknown>) {
         activityMessage: typeof options.activityMessage === 'string' ? options.activityMessage : null,
         activityUpdatedAt: typeof options.activityUpdatedAt === 'string' ? options.activityUpdatedAt : null,
         autoInstantly: autoInstantlyFromOptions(options),
+        metaAds: metaAdsFromOptions(options),
     };
 }
 

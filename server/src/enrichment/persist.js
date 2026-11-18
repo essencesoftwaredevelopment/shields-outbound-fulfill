@@ -269,7 +269,8 @@ export async function forceCompleteJob(jobId, agencyId) {
     await closeRemainingPipelineWork({
         agencyId,
         clientId: row.client_id,
-        jobId
+        jobId,
+        leadsUntouched: row.options?.metaAds?.only === true
     });
 
     const stages = markStagesCompletedForForceComplete(row.stages);

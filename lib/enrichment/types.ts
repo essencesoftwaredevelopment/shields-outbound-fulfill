@@ -8,7 +8,7 @@ export type EnrichmentContext = {
   clientId: number;
   clientSlug: string;
   pipelineMode: PipelineMode;
-  apiKeys: { openai: string; serper: string; trykitt?: string; enrow?: string };
+  apiKeys: { openai: string; serper: string; trykitt?: string; enrow?: string; contextDev?: string };
   options: Record<string, unknown>;
   auditFeatures?: Record<string, unknown>;
   stages?: Record<string, unknown>;
@@ -27,7 +27,15 @@ export type ChildBatchInput = {
    * skips the shopping-audit and founders stages entirely.
    */
   resumeStagesOnly?: boolean;
+  /**
+   * Meta ad count for this batch (server/src/enrichment/metaAdsOptions.js):
+   * 'gate' runs before founders, 'parallel' alongside the lead stages, 'only'
+   * replaces them. Missing (children planned before this existed) = 'off'.
+   */
+  metaAdsMode?: MetaAdsMode;
 };
+
+export type MetaAdsMode = 'off' | 'parallel' | 'gate' | 'only';
 
 export type ParentWorkflowInput = {
   jobId: string;

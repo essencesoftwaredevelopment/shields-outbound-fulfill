@@ -91,25 +91,62 @@ export async function enrichmentChildWorkflow(input: ChildBatchInput) {
       auditSummary = await finalizeShoppingAuditStep(input, auditState);
     }
 
-    if (!input.resumeStagesOnly) {
-      await foundersStep(input);
+    // Meta ad count (resume batches already had theirs). 'only' replaces
+    // every lead stage; 'gate' must finish before founders so the gate can
+    // skip low-ad domains; 'parallel' overlaps the lead stages and adds no time.
+    const metaAdsMode = input.resumeStagesOnly && input.metaAdsMode !== 'only'
+      ? 'off'
+      : (input.metaAdsMode ?? 'off');
+    if (metaAdsMode === 'only') {
+      if (!input.resumeStagesOnly) await metaAdsStep(input);
+      return {
+        batchIndex: input.batchIndex,
+        domainCount: input.batchDomains.length,
+        auditSignals: auditSummary?.stats?.signals ?? 0,
+      };
     }
-    await emailsStep(input);
-    await enrowFallback(input, 'find');
-    // A TryKitt throttle/timeout on a few emails used to end the batch here,
-    // skipping the Enrow re-check and personalization for the ~98 emails that
-    // DID verify (job 1790116521925-r8pj7j: 28 of 95 batches). Finish the
-    // batch first, then surface the failure so the job still ends resumable.
+    if (metaAdsMode === 'gate') {
+      await metaAdsStep(input);
+    }
+    const metaAdsRun: Promise<unknown> | null = metaAdsMode === 'parallel'
+      ? (async () => {
+          try {
+            await metaAdsStep(input);
+            return null;
+          } catch (err) {
+            return err ?? new Error('Meta ad count failed');
+          }
+        })()
+      : null;
+
     let deferredVerifyError: unknown = null;
     try {
-      await verificationStep(input);
-    } catch (err) {
-      if (!isTryKittThrottledError(err)) throw err;
-      deferredVerifyError = err;
+      if (!input.resumeStagesOnly) {
+        await foundersStep(input);
+      }
+      await emailsStep(input);
+      await enrowFallback(input, 'find');
+      // A TryKitt throttle/timeout on a few emails used to end the batch here,
+      // skipping the Enrow re-check and personalization for the ~98 emails that
+      // DID verify (job 1790116521925-r8pj7j: 28 of 95 batches). Finish the
+      // batch first, then surface the failure so the job still ends resumable.
+      try {
+        await verificationStep(input);
+      } catch (err) {
+        if (!isTryKittThrottledError(err)) throw err;
+        deferredVerifyError = err;
+      }
+      await enrowFallback(input, 'verify');
+      await personalizationStep(input);
+      await instantlyAutoAddStep(input);
+    } finally {
+      // Never leave the parallel count running past the batch: let it settle
+      // even when a lead stage failed, then surface its own failure.
+      if (metaAdsRun) {
+        const metaAdsError = await metaAdsRun;
+        if (metaAdsError && !deferredVerifyError) deferredVerifyError = metaAdsError;
+      }
     }
-    await enrowFallback(input, 'verify');
-    await personalizationStep(input);
-    await instantlyAutoAddStep(input);
     if (deferredVerifyError) throw deferredVerifyError;
 
     return {
@@ -192,6 +229,18 @@ async function foundersStep(input: ChildBatchInput) {
   const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
   await enrichment.assertJobActive(input.jobId, input.agencyId);
   return enrichment.runFoundersBatch(ctx, input.batchDomains, {
+    batchIndex: input.batchIndex,
+  });
+}
+
+/** Count active Meta ads for the batch; applies the gate / finishes ads-only domains. */
+async function metaAdsStep(input: ChildBatchInput) {
+  'use step';
+
+  const enrichment = await loadEnrichment();
+  const ctx = await enrichment.hydrateJobContext(input.jobId, input.agencyId);
+  await enrichment.assertJobActive(input.jobId, input.agencyId);
+  return enrichment.runMetaAdsBatch(ctx, input.batchDomains, {
     batchIndex: input.batchIndex,
   });
 }
@@ -301,6 +350,9 @@ finalizeShoppingAuditStep.maxRetries = 1;
 // Standard stages re-query the DB queue each run, so a retry only processes still-pending
 // rows (already-done items drop out) — safe to retry through transient provider failures.
 foundersStep.maxRetries = 2;
+// Domains this job already counted drop out (job_domains.meta_ads_status), so
+// a retry only scrapes what's left.
+metaAdsStep.maxRetries = 2;
 emailsStep.maxRetries = 2;
 verificationStep.maxRetries = 2;
 personalizationStep.maxRetries = 2;
