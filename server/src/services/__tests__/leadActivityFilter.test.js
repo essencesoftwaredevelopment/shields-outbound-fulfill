@@ -17,6 +17,9 @@ import {
 const negativeIntentIndexPath = fileURLToPath(
     new URL('../../../migrations/0082_negative_intent_events_index.sql', import.meta.url)
 );
+const campaignProbeIndexPath = fileURLToPath(
+    new URL('../../../migrations/0084_campaign_add_probe_index.sql', import.meta.url)
+);
 
 function bindTracker() {
     const params = [];
@@ -142,6 +145,26 @@ describe('buildLeadActivityFilterSql', () => {
         const { bindParam } = bindTracker();
         const sql = buildLeadActivityFilterSql('zero_times', validValue(), bindParam);
         assert.match(sql, /^NOT EXISTS \(/);
+        assert.match(sql, /LIMIT 1/);
+    });
+
+    it('keeps an all-time zero-times event as one index probe', () => {
+        const { bindParam } = bindTracker();
+        const sql = buildLeadActivityFilterSql(
+            'zero_times',
+            validValue({ eventType: 'email_sent', timeframe: { kind: 'over_all_time' } }),
+            bindParam
+        );
+        assert.match(sql, /^NOT EXISTS \(/);
+        assert.match(sql, /cie\.contact_id = c\.id/);
+        assert.match(sql, /LIMIT 1/);
+        assert.doesNotMatch(sql, /event_timestamp/);
+    });
+
+    it('does not cap at least once, so a rare event can stay a hash semi-join', () => {
+        const { bindParam } = bindTracker();
+        const sql = buildLeadActivityFilterSql('at_least_once', validValue(), bindParam);
+        assert.doesNotMatch(sql, /LIMIT 1/);
     });
 
     it('groups matching contacts for equals N', () => {
@@ -269,6 +292,32 @@ describe('buildLeadActivityFilterSql', () => {
         assert.match(sql, /^NOT EXISTS \(/);
         assert.match(sql, /ad_observations ao/);
         assert.match(sql, /ao\.domain_normalized = co\.domain_normalized/);
+    });
+
+    it('probes a zero-times campaign add from the contact, then the campaign', () => {
+        const { params, bindParam } = bindTracker();
+        const sql = buildLeadActivityFilterSql(
+            'zero_times',
+            validValue({
+                eventType: 'added_to_campaign',
+                timeframe: { kind: 'in_the_last', amount: 3, unit: 'days' }
+            }),
+            bindParam
+        );
+        assert.match(sql, /^NOT EXISTS \(/);
+        assert.match(sql, /cic\.contact_id = c\.id/);
+        assert.match(sql, /cic\.added_at >= NOW\(\) - \(\$3::int \* INTERVAL '1 day'\)/);
+        assert.match(sql, /ic\.id = cic\.campaign_id/);
+        assert.equal(sql.match(/LIMIT 1/g).length, 2);
+        assert.equal(params[0], 3);
+    });
+
+    it('covers the campaign-add probe so a hit does not read raw_lead_payload', () => {
+        const sql = readFileSync(campaignProbeIndexPath, 'utf8');
+        assert.match(sql, /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contact_campaigns_contact_added_cover/);
+        assert.match(sql, /ON contact_instantly_campaigns \(contact_id, added_at DESC\)/);
+        assert.match(sql, /INCLUDE \(campaign_id\)/);
+        assert.match(sql, /DROP INDEX CONCURRENTLY IF EXISTS idx_contact_campaigns_contact_added_at/);
     });
 
     it('counts added-to-campaign against campaign memberships', () => {

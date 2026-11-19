@@ -453,12 +453,18 @@ function matchingContactsSql(parsed, bindParam, havingOp) {
             HAVING COUNT(*) ${havingOp} ${countRef}`;
 }
 
-function existsSql(parsed, bindParam) {
+function existsSql(parsed, bindParam, { stopAtFirstRow = false } = {}) {
+    // LIMIT 1 is load-bearing. Without it the planner lifts NOT EXISTS into a
+    // hash anti-join and builds that hash from every matching event row,
+    // payload included. A zero-times page then times out before LIMIT can
+    // stop it. The cap keeps a per-contact index probe on
+    // (contact_id, event_type).
     return `EXISTS (
             SELECT 1
             FROM contact_instantly_events cie
             WHERE cie.contact_id = c.id
               AND ${eventsWhereSql(parsed, bindParam)}
+            ${stopAtFirstRow ? 'LIMIT 1' : ''}
         )`;
 }
 
@@ -486,13 +492,38 @@ function campaignAddWhereSql(parsed, bindParam) {
             ${campaignWhereSql(parsed, bindParam)}${buildTimeframeSql(parsed.timeframe, bindParam, 'cic.added_at')}`;
 }
 
-function campaignAddExistsSql(parsed, bindParam) {
-    return `EXISTS (
+function campaignAddExistsSql(parsed, bindParam, { stopAtFirstRow = false } = {}) {
+    if (!stopAtFirstRow) {
+        return `EXISTS (
             SELECT 1
             FROM contact_instantly_campaigns cic
             JOIN instantly_campaigns ic ON ic.id = cic.campaign_id
             WHERE cic.contact_id = c.id
               AND ${campaignAddWhereSql(parsed, bindParam)}
+        )`;
+    }
+
+    // Same fence as the event probe. A joined NOT EXISTS is planned as a hash
+    // anti-join over contact_instantly_campaigns (raw_lead_payload included).
+    // Look up this contact's memberships first, then the campaign's tenant by
+    // primary key, and stop at the first hit. Bind the window only on this
+    // path; the join above binds it itself.
+    const timeSql = buildTimeframeSql(parsed.timeframe, bindParam, 'cic.added_at');
+    return `EXISTS (
+            SELECT 1
+            FROM contact_instantly_campaigns cic
+            WHERE cic.contact_id = c.id
+              ${timeSql}
+              AND EXISTS (
+                SELECT 1
+                FROM instantly_campaigns ic
+                WHERE ic.id = cic.campaign_id
+                  AND ic.agency_id = $1
+                  AND ic.client_id = $2
+                  ${campaignWhereSql(parsed, bindParam)}
+                LIMIT 1
+              )
+            LIMIT 1
         )`;
 }
 
@@ -506,13 +537,13 @@ function campaignAddMatchingSql(parsed, bindParam, havingOp) {
             HAVING COUNT(*) ${havingOp} ${countRef}`;
 }
 
-function buildCountedSql(op, count, existsSql, matchingSql) {
+function buildCountedSql(op, count, existsFor, matchingSql) {
     if (op === 'at_least_once' || (op === 'gt' && count === 0) || (op === 'gte' && count === 1) || (op === 'neq' && count === 0)) {
-        return existsSql();
+        return existsFor(false);
     }
 
     if (op === 'zero_times' || (op === 'eq' && count === 0) || (op === 'lte' && count === 0) || (op === 'lt' && count === 1)) {
-        return `NOT ${existsSql()}`;
+        return `NOT ${existsFor(true)}`;
     }
 
     if (op === 'gte' && count === 0) {
@@ -626,7 +657,7 @@ function buildInstantlySql(parsed, bindParam) {
     return buildCountedSql(
         parsed.op,
         parsed.count,
-        () => existsSql(parsed, bindParam),
+        (stopAtFirstRow) => existsSql(parsed, bindParam, { stopAtFirstRow }),
         (havingOp) => matchingContactsSql(parsed, bindParam, havingOp)
     );
 }
@@ -635,7 +666,7 @@ function buildCampaignAddSql(parsed, bindParam) {
     return buildCountedSql(
         parsed.op,
         parsed.count,
-        () => campaignAddExistsSql(parsed, bindParam),
+        (stopAtFirstRow) => campaignAddExistsSql(parsed, bindParam, { stopAtFirstRow }),
         (havingOp) => campaignAddMatchingSql(parsed, bindParam, havingOp)
     );
 }

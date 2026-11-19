@@ -1241,15 +1241,15 @@ function parseLeadFiltersInput(rawFilters) {
 function buildLeadListBaseWithClause(
     requiresFilterCampaignStats,
     requiresFilterInsights,
-    { requiresStatusLabels = true } = {}
+    { requiresStatusLabels = true, includeScopedCompanies = true } = {}
 ) {
     return `
-            WITH scoped_companies AS (
+            WITH ${includeScopedCompanies ? `scoped_companies AS (
                 SELECT${SCOPED_COMPANY_COLUMNS}
                 FROM companies
                 WHERE agency_id = $1
                 AND client_id = $2
-            ),
+            ),` : ''}
             scoped_campaigns AS (
                 SELECT
                     id,
@@ -1683,10 +1683,19 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
     paramIndex = paramsState.paramIndex;
 
     const filterParams = [...params];
+    const requiresStatusLabels = leadFiltersRequireStatusLabels(dynamicFilters);
     const baseWithClause = buildLeadListBaseWithClause(
         requiresFilterCampaignStats,
         requiresFilterInsights,
-        { requiresStatusLabels: leadFiltersRequireStatusLabels(dynamicFilters) }
+        { requiresStatusLabels }
+    );
+    // The page query joins companies by primary key after LIMIT. It must not
+    // carry scoped_companies: that CTE selects store_apps and store_technologies,
+    // and an inlined copy is read for every candidate the activity filters reject.
+    const pageWithClause = buildLeadListBaseWithClause(
+        requiresFilterCampaignStats,
+        requiresFilterInsights,
+        { requiresStatusLabels, includeScopedCompanies: false }
     );
     const filterJoins = `
             ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
@@ -1697,6 +1706,7 @@ export async function buildLeadListFilterContext(agencyId, clientId, queryInput 
         whereClause,
         filterParams,
         baseWithClause,
+        pageWithClause,
         filterJoins,
         requiresFilterCampaignStats,
         requiresFilterInsights,
@@ -2729,6 +2739,7 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
             whereClause,
             filterParams,
             baseWithClause,
+            pageWithClause,
             requiresFilterCampaignStats,
             requiresFilterInsights,
             hasAnyLeadFilters,
@@ -2825,18 +2836,49 @@ router.get('/leads', verifyFirebaseToken, async (req, res) => {
                     cs.campaign_count_active,
                     cs.last_campaign_added_at` : ''}`;
 
+        const leadOrderBy = `${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC, c.id DESC`;
+        /*
+         * Decide the page on contact ids, then load company columns for those
+         * ids only. The export list reads store_apps / store_technologies, and
+         * joining that heap before LIMIT walked every candidate the activity
+         * filters rejected (ESSENCE Retention is ~1.3M companies) until the
+         * statement timed out. A company predicate still joins `co` for the
+         * filter; otherwise the tenant check is a correlated PK probe so the
+         * companies table cannot become the driving scan.
+         */
+        const companyScopeSql = countNeedsCompanies
+            ? ''
+            : `AND EXISTS (
+                    SELECT 1
+                    FROM companies co_scope
+                    WHERE co_scope.id = c.company_id
+                      AND co_scope.agency_id = $1
+                      AND co_scope.client_id = $2
+                    LIMIT 1
+                )`;
         const pagedWithClause = `
-            ${baseWithClause},
-            paged_contacts AS (
-                SELECT
-                    ${pagedContactColumns}
+            ${pageWithClause},
+            paged_ids AS (
+                SELECT c.id
                 FROM contacts c
-                JOIN ${isTableView ? 'companies co ON co.id = c.company_id' : 'scoped_companies co ON c.company_id = co.id'}
+                ${countNeedsCompanies ? `JOIN companies co
+                  ON co.id = c.company_id
+                 AND co.agency_id = $1
+                 AND co.client_id = $2` : ''}
                 ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
                 ${requiresFilterInsights ? 'LEFT JOIN filter_insights fi ON fi.contact_id = c.id' : ''}
                 WHERE ${whereClause}
-                ORDER BY ${requiresFilterCampaignStats ? 'cs.last_campaign_added_at DESC NULLS LAST, ' : ''}c.created_at DESC, c.id DESC
+                ${companyScopeSql}
+                ORDER BY ${leadOrderBy}
                 LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+            ),
+            paged_contacts AS (
+                SELECT
+                    ${pagedContactColumns}
+                FROM paged_ids ids
+                JOIN contacts c ON c.id = ids.id
+                JOIN companies co ON co.id = c.company_id
+                ${requiresFilterCampaignStats ? 'LEFT JOIN filter_campaign_stats cs ON cs.contact_id = c.id' : ''}
             )
         `;
 
